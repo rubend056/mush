@@ -48,7 +48,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   now read `Chat::bounded_transcript` — the system prompt, the transcript and
   the same `trim_history` an actor gets — and the A audit's counterexample (a
   window whose fold cannot fit, A8) was that commit's finding; the pane keeps
-  its full record on purpose.
+  its full record on purpose — with the one exception the wave's byte cap
+  names: a picture's payload a conversation cannot keep is given up
+  (`IMAGE_BYTES_KEPT`, finding R1, §8.112), so the record keeps every message
+  and every fact about a picture, not necessarily its bytes.
 - **H18** — ✅ fixed by `af6ba05` (`mush/109`, §8.32): a parent whose send finds no
   actor behind its child's mailbox now hands the *command* to the UI in an event
   (`AgentEvent::ChildAsleep`), and the UI delivers it through the door the
@@ -475,7 +478,8 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   the model's work. The check is gone, `write_tool` no longer takes `state`,
   and what bounds a write is the tool's one-line answer, the request's own
   over-window refusal (`over_window_line` — the bytes are already on disk, and
-  a later trim sheds the turn) and the human's Stop. Pinned by
+  a later trim sheds the turn), the byte-ceiling refusal (`MAX_REQUEST_BYTES`,
+  counted by `request_bytes`, `8ac80f7`, §8.112) and the human's Stop. Pinned by
   `a_write_past_the_old_cap_lands_whole` and
   `a_write_over_the_window_ends_the_turn_and_leaves_the_file`.
 - **H47** — ✅ fixed by `f954cfb` + `ccd9766` + `7bd7f9b`, merged by `5e296b1`
@@ -871,6 +875,361 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   than scrolling. The child called it honest; a ruling could keep the cap or
   spend the pane's width on fewer, wider columns. The code's home is `text.rs`'s
   `table`; it is a judgement, not a defect, and no test is owed until a ruling.
+
+**The four audits' findings are rows now (H81–H137).** One row per finding of
+`docs/audits/{docs-vs-code,runtime-risks,input-robustness,paint-and-measure}.md`
+(§8.110), in each audit's own order and carrying its id: R1–R19 are H81–H99,
+IN1–IN16 are H100–H115, PM1–PM9 are H116–H124, D1–D10 are H125–H134, and the
+docs-vs-code appendix A1–A3 are H135–H137 (marked as that audit's, because
+`A1`–`A23` are also the old agent-and-wire audit's ids). The overlapped pairs
+carry both ids — IN4 = R12 (H103/H92) and IN5 = PM1 (H104/H116) — and share the
+commit. Each row says what the finding was, the commit that closed it (with the
+wave's section) and the test that pins it. The D rows' pins are mostly their
+commits: D1's own conclusion is that a hand-written sentence has no test — only
+the generated blocks are checked, by `the_keys_block_matches_the_code`,
+`the_commands_block_matches_the_code`, `the_marks_block_matches_the_code`,
+`the_manual_frame_matches_the_code` and `the_readme_frame_matches_the_code` — so
+a D row names a test only where the claim is printed from the code.
+
+- **H81** — ✅ closed by `1362648` + `84b749a` (§8.112; runtime-risks **R1**,
+major). The pane's record was the one copy of a conversation nothing bounded in
+**bytes** — every pasted picture's
+payload lived in it for the process's life while the meter priced pictures by
+pixels — and the same bytes were cloned into every save snapshot. The fix:
+`retain_image_bytes` gives payloads up newest-first past `IMAGE_BYTES_KEPT`
+(8 MiB) in both copies, the newest message's own pictures never given up, and
+the size a stored fact (`Image::size`). Pinned by
+`the_cap_keeps_the_newest_pictures_and_gives_up_the_older_ones`,
+`the_newest_messages_pictures_are_never_given_up`,
+`a_message_that_straddles_the_cap_keeps_its_newest_pictures`,
+`a_picture_past_the_cap_reads_as_the_placeholder_on_the_wire`,
+`the_pane_gives_up_old_payloads_and_still_names_their_size` and
+`a_picture_keeps_its_size_and_its_price_when_its_payload_is_given_up`.
+- **H82** — ✅ closed by `240a9b2` (+ `70d9baa` for R6) (§8.112; runtime-risks
+R2, major): a failed session write was dropped, never retried, and it cleared
+the dirty mark — the exit flush was skipped, so one ENOSPC lost everything since
+the last *successful* write, not the documented minute. `Session::save` borrows
+the value, the writer keeps the snapshot a failed attempt could not write and
+retries on its next wake and its own final drain, and both App roads put the
+mark back. Pinned by `a_failed_write_is_kept_and_lands_on_the_next_wake`,
+`a_retained_snapshot_lands_when_the_writer_is_dropped`,
+`a_failed_background_write_leaves_the_mark_for_the_exit_flush` and
+`a_failed_flush_leaves_the_mark_for_the_next_road`.
+- **H83** — ✅ closed by `cb9ccde` (§8.112; runtime-risks R3, latent, with PM6):
+the exit restored the terminal and removed the socket **before** the flush and
+the kills, so the natural second signal died raw with every process group
+running. The road runs before the hand-backs now, and the signals are a
+self-pipe the watcher counts. Pinned by the double-SIGTERM pty probe (before:
+exit −15, raw pty, socket left, group alive, no answer written; after: exit 0,
+modes restored, socket gone, no group member, answer in `session.json`) and
+`signals::tests::a_press_is_counted_and_the_count_decides`,
+`session_save::tests::a_hurried_flush_gives_up_at_its_next_poll`,
+`the_exit_road_is_idempotent`.
+- **H84** — ✅ closed by `098867f` (§8.112; runtime-risks R4, latent): the
+writer's `join` and `kill_all`'s `child.wait()` had no bound — a store whose
+mount stopped answering blocked the exit with the workspace lock still held.
+`JOIN_DEADLINE` and `REAP_DEADLINE` (2 s each) with the reason said on the
+handed-back terminal. Pinned by
+`a_stuck_writer_is_left_at_the_deadline_and_the_reason_is_said` and
+`a_reap_past_its_deadline_is_a_reason_not_a_wait`.
+- **H85** — ✅ closed by `195db30` (§8.112; runtime-risks R5, latent): the quit
+killed once and never stopped the actors, and a launch during the walk could
+register a fresh process group after the maps were read. The fence goes up
+first under the registry's lock (`launch` reads it under the same lock), and
+`App`'s drop tells every actor to end before the walk. Probe: `launch after
+kill_all -> Ok(JobId(2))` before, `Err(Quitting)` after. Pinned by
+`a_launch_after_the_quit_is_refused_and_its_group_is_killed` and
+`the_quit_fence_is_up_before_the_walk`.
+- **H86** — ✅ closed by `70d9baa` (§8.112; runtime-risks R6, minor): the
+save-failure line was raised from `tick` with no frame owed and through `fail`
+rather than the durable `fail_for`, so on an idle app it was never painted and
+`/notes` never held it. One door now (`session_save_failed`) says the bar's
+line, notes the failure and marks the frame owed. Pinned by
+`a_save_failure_is_painted_and_kept_in_the_notes`.
+- **H87** — ✅ closed by `c364ab8` (§8.112; runtime-risks R7, minor):
+`tree.cut_off` armed no `✉`, so a child that died by panic fell out of `kept`
+and the reap's `ForgetChild` erased its `ChildDone` before the parent's fold —
+the one line F6/§8.73 exists to deliver reached neither model nor screen. The
+mark arms as a stop's does and the dying thread files the line. Pinned by
+`a_cut_off_child_keeps_its_row_until_its_parent_reads_it` and
+`a_cut_off_childs_line_reaches_its_parents_model_and_its_row_waits_for_the_read`.
+- **H88** — ✅ closed by `0f6939c` (§8.112; runtime-risks R8, latent, with
+IN10): `find -- /` slipped the whole-disk guard (`--` read as the expression's
+first word, the fallback asking about the cwd). `--` ends find's own options
+now. Pinned by `a_root_spelled_by_a_marker_or_a_glob_is_still_refused`.
+- **H89** — ✅ closed by `66a12c9` + `3d288a8` (§8.112; runtime-risks R9,
+latent): the lock-identity guard had one caller, so a displaced mush still
+wrote Ctrl-N's `.mush/session.json.previous` into the store a second window now
+owned. `SessionSave::store_is_mine` gates both store writes, and the refusal
+says the store. Pinned by `a_displaced_mush_does_not_write_the_previous_session`.
+- **H90** — ✅ closed by `d4ee1e7` (§8.112; runtime-risks R10, minor): every git
+mutation of the worktree sweep ran on the UI thread (per landable id inside
+`Msg::Git`, the whole pass in `App::new`). The removals run on the `mush-sweep`
+worker now, asking the tree per worktree through `Msg::SweepAsk`, with
+`SweepOwed` carrying what the caller owed; measured `App::new` 818.5 ms →
+2.6 ms, `Msg::Git` 716.6 ms → 0.30 ms. Pinned by
+`the_start_defers_the_sweep_and_the_restore_to_the_worker`,
+`a_landable_worktree_is_removed_by_the_worker_not_by_the_read`,
+`a_node_that_starts_running_after_the_read_keeps_its_worktree`,
+`a_read_that_lands_while_a_sweep_is_out_is_asked_again_not_stacked` and
+`a_refused_sweep_still_runs_what_it_held_up_and_says_so`.
+- **H91** — ✅ closed by `cdcd046` (+ `d4ee1e7`'s refused sweep) (§8.112;
+runtime-risks R11, latent): four bare `std::thread::spawn`s (git read, model
+discovery, clipboard write and read) panicked where every other thread road
+returns a refusal — a box at its `ulimit -u` took the TUI down, and the git read
+froze the facts for the session. One named `WorkerSpawn` road now, the flag
+falling and the bar saying the line. Pinned by
+`a_refused_git_read_clears_the_flag_and_says_the_facts_are_stale`,
+`a_refused_model_fetch_clears_the_flag_and_can_be_asked_again`,
+`a_refused_clipboard_write_says_the_copy_did_not_happen` and
+`a_refused_clipboard_read_says_the_read_did_not_start`.
+- **H92** — ✅ closed by `59a5332` (§8.112; runtime-risks R12, minor — **= IN4**,
+H103): the attach answer had no write bound, so a client that stopped reading
+parked its connection thread in the kernel and 64 of them held every slot. The
+write takes the same idle window as the read. Pinned by
+`a_client_that_stops_reading_mid_answer_is_reaped_at_the_write_bound`; residual:
+the bound is a progress bound, not a whole-answer deadline.
+- **H93** — ✅ closed by `74ddc10` (§8.112; runtime-risks R13, latent, appendix):
+an `Interrupted` (e.g. `SIGWINCH`) on a socket read was read as the client gone,
+dropping a live persistent client mid-session. `EINTR` retries now, the bytes
+already gathered kept. Pinned by
+`an_interrupted_read_is_retried_and_is_not_a_close`.
+- **H94** — ✅ closed by `abc9dff` (§8.112; runtime-risks R14, latent, appendix):
+the socket's mode was the umask's, so a shared-group checkout was readable and
+answerable by every group member. `set_permissions(0600)` right after the bind.
+Pinned by `the_socket_is_owner_only`; residual: no peer-credential check
+(`SO_PEERCRED` is not asked).
+- **H95** — ✅ closed by `7c17344` (§8.112; runtime-risks R15, latent, appendix):
+the CLI's answer read was unbounded, so a stranger at a free `mush.sock`
+streaming endlessly grew `mush read`'s heap. `MAX_ANSWER_BYTES` (16 MiB) now
+caps both sides. Pinned by
+`an_answer_past_the_ceiling_is_replaced_by_a_naming_refusal` and
+`the_cli_refuses_an_answer_past_the_ceiling`.
+- **H96** — ✅ closed by `f255d5f` (§8.112; runtime-risks R16, minor):
+`discover_worktrees`' reap forgot the tree node but not the `Chat`, so a reaped
+leftover kept its whole transcript for the session. The reap forgets both. Pinned
+by `a_reaped_leftover_drops_its_chat_record`.
+- **H97** — ✅ closed by `bec71c9` (§8.112; runtime-risks R17, minor): every
+snapshot cloned image bytes on the UI thread that `Session::save` then dropped.
+`Message::without_image_payloads` is the clone the bounded view needed. Pinned by
+`the_bounded_view_carries_no_picture_payloads`.
+- **H98** — ✅ closed by `9322dac` (§8.112; runtime-risks R18, latent): a `.mush/`
+recreated mid-run had no ignore line, so the next `git add -A` staged the store.
+Both write roads go through `ensure_mush_dir` now. Pinned by
+`a_store_write_recreates_the_mush_dir_with_its_ignore_line`.
+- **H99** — ✅ closed by `31fe48e` (§8.112; runtime-risks R19, minor):
+`/model`, `/provider` and `/url` changed what the session stores and never
+marked it dirty, so the next start silently reverted the pick. Each marks the
+session dirty where it writes the cell. Pinned by
+`a_picked_model_is_marked_for_the_session_file`,
+`a_picked_provider_is_marked_for_the_session_file` and
+`a_new_endpoint_is_marked_for_the_session_file`.
+- **H100** — ✅ closed by `8a2fc58` (§8.112; input-robustness IN1, major): a
+16-hex-digit chunk size on any chunk after the first wrapped `out.len() + size`
+— a debug panic on the actor's thread, and in release a framing refusal read as
+the endpoint's. The check is `size > MAX_BODY_BYTES - out.len()` now. Pinned by
+`a_late_chunk_size_claim_past_the_cap_is_framing_too`.
+- **H101** — ✅ closed by `1522ea2` (§8.112; input-robustness IN2, major): an id
+one below the ceiling pinned the agent counter at `u64::MAX`, whose next draw's
+`+ 1` panicked in debug and handed the root's id in release. `git::MAX_AGENT_ID`
+(`u64::MAX - 2`) is the last holdable id, `Ids::next_agent` is fallible, and
+`worktree_id`, `spawn_tool` and `vet_stored_agents` refuse by name. Pinned by
+`a_stored_id_one_below_the_ceiling_is_refused_and_the_counter_still_answers`,
+`a_branch_one_below_the_ceiling_is_refused_by_name`,
+`a_draw_with_no_room_above_its_id_answers_none` and
+`a_name_with_no_room_to_count_above_its_id_is_not_a_child`; residual:
+`the_id_space_is_spent`'s spawn-level sentence has no direct test.
+- **H102** — ✅ closed by `b9643a6` + `1e5174f` (§8.112; input-robustness IN3,
+major): the store was read with `fs::read` — a FIFO parked the open before the
+first frame, a symlink to `/dev/zero` read without bound, and `restore_notices`
+was O(rows × agents). Shape, size and a 256 MiB cap now come from
+`symlink_metadata` (`SESSION_READ_CAP`), `restore_notices` is one pass
+(20k rows 20.296 s → 127.65 ms), and every refusal takes the `.bak` road. Pinned
+by `a_fifo_named_as_the_store_is_refused_without_opening_it`,
+`a_symlinked_store_is_refused_not_followed`,
+`a_store_past_the_cap_is_refused_from_its_size` and
+`restoring_a_store_sized_notice_list_is_one_pass`.
+- **H103** — ✅ closed by `59a5332` (§8.112; input-robustness IN4, major —
+**= R12**, H92): the attach server's answer had no write deadline. Same fix, same
+pin (`a_client_that_stops_reading_mid_answer_is_reaped_at_the_write_bound`);
+same residual (a progress bound, not a whole-answer deadline).
+- **H104** — ✅ closed by `a3274b3` + `0aa0623` (§8.112; input-robustness IN5,
+major **suspected** — **= PM1**, H116): the box painted the human's paste and the
+bar its `⌂ <root>` cell with no `sanitize`, and the record disagreed with itself
+about whether ratatui filters. The `TestBackend` probe settled it: `set_stringn`
+does **not** filter, so `docs/audits/tui.md:898` was the false sentence. Pinned
+by `the_message_box_paints_a_hostile_draft_defanged`,
+`the_bar_paints_a_hostile_workspace_path_defanged` and
+`a_raw_span_paints_a_control_byte_verbatim`.
+- **H105** — ✅ closed by `8ac80f7` (§8.112; input-robustness IN6, major): the
+request was weighed in pixels and sent in megabytes. `request_bytes` serializes
+the assembled body into a counting sink and counts it against
+`MAX_REQUEST_BYTES` (16 MiB) before the turn is announced; measured a 2 MiB png
+weighing 14,773 bytes against a 2,802,443-byte body (189.7× undercount). Pinned
+by `a_request_under_the_window_can_still_be_refused_for_its_bytes`.
+- **H106** — ✅ closed by `c6a5cc1` (§8.112; input-robustness IN7, minor): the
+listing/search/edit walk descended into live children's `.mush/wt`. The walk
+skips it and `real_path` refuses it. Pinned by
+`a_siblings_worktree_is_invisible_to_the_file_roads`.
+- **H107** — ✅ closed by `fa227b4` (§8.112; input-robustness IN8, minor): the
+attach socket's *type* was never asked, so a planted symlink could reach a
+stranger's listener. `symlink_metadata` classifies the name and only a socket or
+an absent name goes on. Pinned by
+`a_name_that_is_not_a_socket_is_refused_and_never_followed`.
+- **H108** — ✅ closed by `de0bdbb` (+ `55558e7` for the sentence) (§8.112;
+input-robustness IN9, minor): `list_files` walked and sorted the whole subtree
+before its cap. The cap ends the walk where it lands; 100 dirs × 100 files with
+cap 400 measured 112 ms → 4.9 ms. Pinned by
+`a_listing_cap_stops_the_walk_instead_of_the_sort`.
+- **H109** — ✅ closed by `0f6939c` (§8.112; input-robustness IN10, minor —
+**= R8**, H88): the guard read `find /*` as a path named `/*`. A glob in the
+name directly under `/` is refused now (the reading cannot tell its width), a
+name is provably one of `/`'s entries, and a glob deeper (`find /tmp/*`) stays
+allowed. Pinned by `a_root_spelled_by_a_marker_or_a_glob_is_still_refused`; the
+residual is the honesty: a refusal, not a proof about globs.
+- **H110** — ✅ closed by `1f6d508` (§8.112; input-robustness IN11, minor): the
+TLS handshake was the one phase with no cancel poll, so a Stop waited up to the
+ten-minute deadline, and a write timeout was mapped to `spend()`. Driven in
+`READ_SLICE` slices with the watch asked before every flush; measured a Stop at
+100 ms waiting 3.254 s of a 3 s deadline before, under a second after. Pinned by
+`a_cancelled_tls_handshake_stops_within_a_slice`.
+- **H111** — ✅ closed by `a1a68d3` (+ `46d5ea8`'s kept refusal) (§8.112;
+input-robustness IN12, minor): the `/key`, `/provider` and model-pick acks said
+`saved to …` after the save may have failed, and the one status slot erased the
+failure. `persist_user_config` answers whether the write landed and says the
+failure itself; the acks speak only on success. Pinned by
+`a_save_that_failed_is_not_replaced_by_an_ack_that_says_saved`.
+- **H112** — ✅ closed by `f3355c0` (§8.112; input-robustness IN13, latent): an
+IPv6 endpoint's `Host:` went out unbracketed (`::1:8443`). Bracketed now. Pinned
+by `an_ipv6_endpoint_is_addressed_with_a_bracketed_host_header`.
+- **H113** — ✅ closed by `46d5ea8` (§8.112; input-robustness IN14, latent): with
+`HOME` unset and no `MUSH_CONFIG`, `config_path` fell back to the relative
+`.mush-user-config.json` in the cwd. It answers `Option<PathBuf>` now — no home,
+no home config — and the read and the save say `HOME is not set`. **The premise
+did not reproduce on the ordinary road**: `dirs` falls back to `getpwuid_r`, so
+the old behaviour needed the passwd lookup to fail too (driven with an
+`LD_PRELOAD` shim; the fix was written for that machine anyway). Pinned by
+`a_machine_with_no_home_has_no_home_config_path`,
+`a_machine_with_no_home_config_says_home_is_not_set` and
+`a_key_on_a_machine_with_no_home_config_says_home_is_not_set`.
+- **H114** — ✅ closed by `68f8413` (§8.112; input-robustness IN15, latent): both
+attach-side connects ran with no deadline — a full accept queue parked the
+server's start probe before the first frame and the CLI before its own bound.
+`connect_bounded` runs the blocking connect on its own thread and waits with a
+bound; 4097 queued connections on this box used to wedge both sites. Pinned by
+`a_full_accept_queue_does_not_wedge_a_connect`,
+`the_cli_connect_names_its_deadline_rather_than_claiming_nothing_runs` and
+`a_probe_that_times_out_leaves_a_socket_a_live_listener_may_hold`; residual:
+the abandoned connect's cost is not directly tested.
+- **H115** — ✅ closed by `3d138e8` (§8.112; input-robustness IN16, latent): a
+tool call whose arguments could not be read was rewritten to `{}`, so every
+tool's defaults applied and `list_files` listed the workspace root. The marker
+key `UNREADABLE_ARGUMENTS` travels in the valid JSON the wire needs and
+`exec_tool` refuses it before the tool match. Pinned by
+`a_tool_call_whose_arguments_were_unreadable_is_refused_not_run` and
+`a_model_that_repeats_an_unreadable_call_is_still_stopped_as_a_loop`.
+- **H116** — ✅ closed by `a3274b3` (§8.112; paint-and-measure PM1, major —
+**= IN5**, H104): the message box is the one painted surface `sanitize` never
+saw. Same fix, same pins. H117–H124 follow.
+- **H117** — ✅ closed by `74c2293` (§8.112; paint-and-measure PM2, minor): the
+picker's hint (44 into 38) and the bar's idle hint (71 into 40) were painted
+wider than their rows and cut mid-word. The picker's sentence is 38 columns now;
+the bar's is elided by whole cells. Pinned by
+`the_hints_paint_what_fits_at_the_40_column_floor`.
+- **H118** — ✅ closed by `0561637` (§8.112; paint-and-measure PM3, minor): a
+known-zero-width character was measured as one column in every width road. One
+rule, `glyph_width`, beside the wrappers; a combining mark and a ZWJ cost no
+column. Pinned by `a_known_zero_width_character_takes_no_column`.
+- **H119** — ✅ closed by `824b44f` (§8.112; paint-and-measure PM4, minor): an
+image row was painted whole and its size was lost past the pane. `image_label`
+takes the columns the row really has and truncates the name, keeping
+`(mime · size)` whole. Pinned by
+`an_image_row_truncates_its_name_and_keeps_its_size`.
+- **H120** — ✅ closed by `4cbee27` (§8.112; paint-and-measure PM5, minor): a
+resize and a key in one drain step the cursor at the last painted measure while
+the frame painted at the new one, so one `↓` could leap a fold tail and `↑` not
+return. The measure is voided at the resize and the coming frame's own
+derivation republishes it. Pinned by
+`a_resize_and_a_key_in_one_drain_step_at_the_new_measure`.
+- **H121** — ✅ closed by `cb9ccde` (§8.112; paint-and-measure PM6, minor): a
+second SIGTERM/SIGHUP/SIGINT — or any SIGKILL — ended mush with the terminal
+still raw in the alternate screen. The second press only hurries the bounded
+waits now; the third (and SIGKILL) still dies raw, and that cost is recorded in
+`signals.rs`. Pinned by `signals::tests::a_press_is_counted_and_the_count_decides`
+and the double-SIGTERM pty probe.
+- **H122** — ✅ closed by `0e4bb52` (§8.112; paint-and-measure PM7, latent): the
+two wrappers recomputed a broken tail on different rules, so ZWJ text wrapped to
+different row counts in the plain and styled views. `wrap_capped` recomputes its
+tail with `glyph_width` now, and the parity fuzz alphabet grew a combining mark,
+a ZWJ and an emoji (111,110 strings at widths 1..=12). Pinned by
+`a_plain_message_wraps_exactly_like_wrap_text`.
+- **H123** — ✅ closed by `acb96af` (§8.112; paint-and-measure PM8, latent):
+`TerminalGuard::enter` could leave raw mode on with no guard built when the
+alternate-screen write or `Terminal::new` failed. The entry is all-or-nothing
+and restores the modes on either failure. Pinned by
+`tests::a_failed_enter_restores_the_modes` (probe: pty
+`ECHO/ICANON False/False` → `True/True`, exit 1 both).
+- **H124** — ✅ closed by `ff94e8d` (§8.112; paint-and-measure PM9, latent): a
+non-owner panic printed its words to a stderr the alternate screen was painting
+over. The words are held (`PanicRoute`, `KEPT_PANIC_WORDS`) and printed by the
+exit road once the shell owns its screen. Pinned by
+`main::tests::a_worker_panic_leaves_the_terminal_alone` and
+`the_held_panic_words_are_bounded_and_the_bound_is_said`.
+- **H125** — ✅ closed by `c94d2ee` (§8.112; docs-vs-code D1, major): README
+said every table in either file is generated and test-checked; the manual has
+five hand-written tables and four generated blocks. The sentence now says only
+the generated blocks are checked (`the_keys_block_matches_the_code`,
+`the_commands_block_matches_the_code`, `the_marks_block_matches_the_code`,
+`the_manual_frame_matches_the_code`, `the_readme_frame_matches_the_code`), and
+the hand-written tables are prose — which is how D2 survived.
+- **H126** — ✅ closed by `db18cc9` (§8.112; docs-vs-code D2, minor): §7 billed
+itself as "the whole budget" and omitted `rustix`, `signal-hook` and the
+workspace's own `mush-core`. The table names all fourteen unique direct
+dependencies. No test (a hand-written sentence).
+- **H127** — ✅ closed by `a37031f` (§8.112; docs-vs-code D3, latent): §5's
+`.mush/` inventory omitted `lock` — the file whose replacement lets a second
+mush write over the conversation — and the `session.json.bak` family. Both are
+named in the manual and README now. No test.
+- **H128** — ✅ closed by `be2c710` (§8.112; docs-vs-code D4, minor, with A3,
+H137): §3.5 said the only modal state the keyboard has is the picker;
+`keys::key` takes a fourth argument, `selecting`, and dispatches the whole
+keyboard to `select` while Ctrl-Y's mode is on. §3.5 and its `keys::key` sketch
+now carry both modes. No test.
+- **H129** — ✅ closed by `6730098` (§8.112; docs-vs-code D5, minor): §8 put
+`CHAT_DEADLINE` in `http.rs` (it is `model.rs`'s) and README put "the retry
+rule's own code" there too (`RETRY_ATTEMPTS`, `retrying`). Both point at
+`model.rs` now. No test.
+- **H130** — ✅ closed by `4f72d5a` (§8.112; docs-vs-code D6, minor): §4.5
+derived "two children never read the same" from the derived title, which is a
+pure function of one brief and not injective. The manual says what the rule is
+and that a `title` is the road to a distinct row. No test.
+- **H131** — ✅ closed by `cd1b526` (§8.112; docs-vs-code D7, latent): §5.6
+justified the machine-wide job cap with "eight agents hold eight builds each"
+while `MAX_AGENTS` is 16 (128 builds, not 64). Both sites say "every agent
+`MAX_AGENTS` allows" now. No test.
+- **H132** — ✅ closed by `cb3e698` (§8.112; docs-vs-code D8, minor): §10 named
+four pty scenarios where `scripts/smoke.py` runs five (`--lock`), and its gate
+line called only resize and cancel endpoint-free. The list, the gate line,
+README and the script's docstring say five, and name what needs nothing. No
+test; the script itself is the road.
+- **H133** — ✅ closed by `43cba1e` (§8.112; docs-vs-code D9, minor): a doc
+comment named `App::reclaim_worktrees`, which exists in no revision. It points
+at `App::refresh_git` → `App::sweep_worktrees` now. No test.
+- **H134** — ✅ closed by `0e793a7` (§8.112; docs-vs-code D10, minor): §5.6
+quoted the killed-job line as `4h0m` where `short_age` prints `4h00m` (the
+code's own test asserts it). The quote matches the painter. No test on the
+sentence; `jobs.rs`'s kill test pins the line.
+- **H135** — ✅ closed by `35963b0` + `635eebe` (§8.112; docs-vs-code's A1,
+appendix): §5 Stage 3's "`ui.rs` is 298 lines" and "fifteen sizes × fourteen
+states" were stale (1,218 lines; 18 states, 15 sizes). The sentence says what
+is true by construction, and `docs/refactor.md`'s B17 cell counts 15 × 18. No
+test; `SWEEP_SIZES` and `sweep_states` are the code.
+- **H136** — ✅ closed by `0c8986f` (§8.112; docs-vs-code's A2, appendix):
+`screen::facts_line`'s own sample read `master ±3 +12 −3` where the painter
+joins `+12−3`. The sample matches the painter. No test.
+- **H137** — ✅ closed by `be2c710` (§8.112; docs-vs-code's A3, appendix, with
+D4/H128): `docs/refactor.md`'s keymap sketch missed the `selecting` argument.
+The sketch and the keymap doc take both. No test.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -2353,14 +2712,18 @@ by `Reclaimable::Landable(Landing)` and `Reclaimed::Removed { branch_kept,
 landing }`, and `Landed` (the row) and `StoredLanded` (the session file) gained
 the third variant, so a restart paints the same row. Both removal paths carry the
 answer to the row: `agent::reclaim_own_worktree` → `AgentEvent::Reclaimed
-{ landing }`, and `App::sweep_worktrees`, which re-asks `git::reclaim` at the
-moment it removes — base name and fork revision both re-read, because the
-decision was a snapshot.
+{ landing }`, and the sweep's own path — `App::sweep_worktrees` hands each
+removal to the `mush-sweep` worker, and `git::reclaim` re-derives the decision
+there, the base name and fork revision travelling with the removal and the
+branch's state read again at the moment of removal, because the read's decision
+was a snapshot (`d4ee1e7`, §8.112).
 
 **Where the fork is unknown, mush keeps the answer it has always given, and says
 why.** A revived agent and a leftover found on disk have no fork revision — the
 session file never held one — and `App::discover_worktrees` sweeps against
-`HEAD`. There the two states are the same git shape, and “nothing committed”
+`HEAD` (`App::isolated_removals` is the pass that reads them, `Removal`
+`against_head`; since `d4ee1e7` (§8.112) `discover_worktrees` only registers
+what it finds). There the two states are the same git shape, and “nothing committed”
 would be a guess; it is the guess that costs most, because it erases a real run's
 work from the row, so those paths answer `Merged` and the rustdoc says so.
 Removal safety is otherwise untouched: uncommitted work is never removed,
@@ -3250,7 +3613,11 @@ actor still pointed at the dead path. The startup reclaim is now its own method,
 `restore_agents` and again by `discover_worktrees` for the repository as it
 stands; the restored agent derives its branch through `agent::live_branch` after
 the sweep, gets no branch and no landing it never had, and is revived in the
-root. `a_restored_actor_is_built_after_the_sweep_that_takes_its_worktree`
+root. **Re-pointed by `d4ee1e7` (§8.112):** the read is `App::isolated_removals`
+and the removals run on the `mush-sweep` worker through `App::start_sweep`, with
+`App::new` deferring the restore to the sweep's answer (`SweepOwed::Restore`);
+`discover_worktrees` registers the leftovers it finds and no longer sweeps —
+the order is the caller's since the removal became a message. `a_restored_actor_is_built_after_the_sweep_that_takes_its_worktree`
 (`app/mod.rs:5621`) restores a stored child at a real zero-commit `mush/2`
 worktree, then asserts the row claims no merge, nothing refuses a nudge, and the
 actor's first request — read off a recording loopback endpoint — names the root,
@@ -3308,7 +3675,9 @@ prod 14,397 · tests 24,594 · comments 14,753): total 57,814 · **prod 14,427**
 tests 24,894 · comments 14,905 — 512 lines: 30 production, 300 test, 152
 comment, 30 blank. The production lines are `reclaim_isolated`,
 `no_actor_line`, the `ChildResumed` variant and its two marks, and
-`report_cut_off`'s one road.
+`report_cut_off`'s one road (the landing's names: the sweep wave split
+`reclaim_isolated` into `App::isolated_removals` + `App::start_sweep`,
+`d4ee1e7`, §8.112; the census itself is that landing's).
 
 ## 8.41 A stop is news, and it says who asked
 
@@ -4284,7 +4653,9 @@ the decision is being written for the first time):
   which is what `result_cap` is for, and it stays for every real result road;
 - the conversation's own invariant at the wire bounds the **request**: the
   assembled request is weighed before it is sent (`over_window_line` in
-  `run_loop`'s assembly), and a write big enough to push the request past the
+  `run_loop`'s assembly) and, since `8ac80f7` (§8.112), counted in bytes against
+  the body's ceiling too (`request_bytes` against `MAX_REQUEST_BYTES`), and a
+  write big enough to push the request past the
   window ends **that turn** with that line. The write ran first, so the bytes
   are on disk and the work is not lost; and the turn cannot be cut while it is
   the newest, so the window can be broken for a while but not for good — the
@@ -4386,10 +4757,12 @@ the tabbed multi-line text), `the_first_writer_that_takes_the_text_wins`,
 `a_text_no_writer_took_did_not_reach_the_clipboard`,
 `no_writer_at_all_names_what_to_install`,
 `a_writer_that_never_takes_the_text_is_killed_at_the_deadline` (1 MiB into a
-`sh -c 'echo $$ > …; sleep 30'` at a 50 ms deadline: the caller returns in well
-under a second, and on Linux the writer's own `$$` has no `/proc` entry — killed
-and reaped, not a zombie) and
-`the_writers_are_the_three_programs_in_the_documented_order`.
+`sh -c 'echo $$ > …; sleep 30'` at a 250 ms deadline — 50 ms raced the writer's
+own `echo $$`, and a kill that still wins the race is its own asserted case,
+`5a12702`, §8.112: the caller returns in well under a second, and on Linux the
+writer's own `$$` has no `/proc` entry — killed and reaped, not a zombie) and
+`the_writers_are_the_four_programs_in_the_documented_order` (`a81498f`,
+§8.112: Windows's `clip` joined after `pbcopy`).
 
 **Zen: the focused pane takes the screen (`ccd9766`).** `Ctrl-F` toggles a view
 where the focused pane covers the frame. Chat focused, the chat takes the rows
@@ -4807,7 +5180,9 @@ D7–D18, D20–D26, B13, B14, B16, C8, C10–C12, E6, E8–E10 and F2, F4, F5, 
 `7338d81` the tree has grown to **87 068** (· 4 999 blank · 24 513 comment ·
 38 456 tests · 19 100 prod — +445, and prod +8 of it), and D9's leftover is
 closed: the row whose parent the history window reaped now wears `⚮` and no
-longer passes for a root child (§8.87). The counts above remain the snapshot at
+longer passes for a root child (§8.87). (The wave's `4bc82ae` + `251238f`
+(§8.109) then moved the row itself: it hangs under its nearest surviving
+ancestor, dim, and does not sit at the top level at all.) The counts above remain the snapshot at
 `7338d81`; no finding's status moved.
 
 **Addendum, 23 September 2026 — this sheet now speaks for `e73ed85`, master's
@@ -4833,6 +5208,15 @@ where the row names them. The wave's nine sections are §8.89–§8.100, the
 human's rulings are §8.101 and the suite's flakes are §8.102; the new ledger
 rows are H70–H75, and H54, H55, H56, H60, H63 and H64–H69 were closed on their
 own rows.
+
+**Addendum, 23 September 2026 — this sheet now speaks for `f9a911d`, master's
+tip after the audit-fix wave.** `python3 scripts/census.py` at that base prints
+**TOTAL 102,334 · blank 5,684 · comment 29,619 · tests 45,195 · prod 21,836**;
+the counts above stand at **103 fixed, 1 partial (A19), 0 open**, because no
+finding of the 104 moved: the wave between `e73ed85` and this tip
+(§8.108–§8.112) closed findings of the four *new* audits — docs-vs-code,
+runtime-risks, input-robustness and paint-and-measure (§8.110) — and those are
+carried by the H81–H137 rows, not this sheet.
 
 ### agent-and-wire (`docs/audits/agent-and-wire.md`)
 
@@ -4986,11 +5370,12 @@ events, one before each ask; with the emit removed it emits 0, and the UI reads
 `Activity("run_command printf hello > note.txt")` — the reported defect.
 
 **The fix.** `AgentEvent::Thinking` is emitted at the one place a request is
-asked — after the fold, the trim and the `over_window_line` fit test,
+asked — after the fold, the trim and the fit tests (`over_window_line` and,
+since `8ac80f7`, the body's byte ceiling through `request_bytes` — §8.112),
 immediately before the ask — and `AgentTree::thinking` keeps `activity`'s guards
 and restarts `since`. The doc comment says why there: the request fits the
 window and is about to go on the wire, so nothing is running locally any more;
-emitted after the fit test so a request the window refuses paints no phase.
+emitted after the fit tests so a request either gate refuses paints no phase.
 
 Pinned by `a_run_says_it_is_thinking_before_the_request_that_follows_a_tool`,
 `a_finished_tool_does_not_hold_the_row_while_the_model_is_asked_again` and
@@ -5009,7 +5394,8 @@ frame.
 **What was true.** `Shell::spawn` built `sh -c` from the inherited environment
 and never removed `MUSH_API_KEY`, so every `run_command` the root or a child
 issued could read the credential — and its output is stored verbatim in
-`.mush/session.json` and handed to any local user through the attach socket.
+`.mush/session.json` and handed to any local user through the attach socket —
+owner-only since `abc9dff` (§8.112), so only the owner's account reaches it now.
 The git road had the same hole for no reason at all (a hook is a child of git,
 and git does not talk to the provider), and both clipboard doors — the readers
 and the writers — spawned their programs from the same environment.
@@ -5356,7 +5742,11 @@ recreated it as a plain path inside the human's checkout, the state the commit
 guard now refuses. The pass asks the tree first (`worktree_in_use`): a node in
 flight, or one a busy child or unread result will wake, holds its checkout — the
 same guard `refresh_git`'s sweep already uses — while a leftover with no node
-holds nothing and is still reclaimed. Pinned by `a_commit_never_leaves_the_worktree`
+holds nothing and is still reclaimed. **Re-pointed by `d4ee1e7` (§8.112):** the
+removal runs on the `mush-sweep` worker now, which asks the tree once more per
+worktree through `Msg::SweepAsk` — answered by `App::worktree_in_use` — right
+before `git::reclaim`, so the guard is the same and asked at the latest moment
+there is. Pinned by `a_commit_never_leaves_the_worktree`
 and `ctrl_n_never_reclaims_a_worktree_a_live_node_holds` (both halves: a
 thinking node and a resting parent with a running child).
 
@@ -5443,7 +5833,11 @@ happens when a terminal window is closed. The probe, a real pty and `kill
 -TERM`: the socket survived, an orphan wrote 31 → 51 B and was still alive after
 two minutes, the scratch grew to 3,020 B. `signal_hook::flag::register` now sets
 an `AtomicBool` the 30 ms event loop reads and turns into `App::signal_quit`;
-the second signal re-raises the default. Pinned by
+the second signal re-raises the default. **Corrected by `cb9ccde` (§8.112):**
+the registration is a self-pipe read by a watcher thread now — the first press
+asks for the quit, the second only hurries the exit road's bounded waits, and
+the third is the one that raises SIGKILL — and the road now flushes and kills
+before the terminal and the socket are handed back. Pinned by
 `a_signal_takes_the_quit_road_without_the_arming_press`, and the new pty
 scenario drives it end to end. **Recorded:** an in-flight turn or question takes
 the same road, which the doc says.
@@ -5823,6 +6217,16 @@ buffer whose size the client does not choose". Pinned by
 MiB costs ~+1.8 MB of RSS, 100 idle clients cost 64 connection threads, and the
 client past the cap reads
 `{"error":{"kind":"unavailable","message":"the attach surface already holds 64 connections — retry when one is free"},"id":null}`.
+**The wave's edges (`34e7479`, §8.112):** the socket file is owner-only, 0600
+whatever the umask (`abc9dff`); the name is asked what it is and never followed
+(`fa227b4`); an interrupted read is retried, not read as a close (`74ddc10`);
+the answer is capped on both sides at `MAX_ANSWER_BYTES` (**16 MiB**, `7c17344`);
+and the answer's **write** takes the same idle window as the read, so a client
+that stops reading mid-answer loses its slot at the bound (`59a5332`) — the
+fourth bound this paragraph was missing, R12/IN4. Two residuals the child named:
+there is still no peer-credential check (`SO_PEERCRED` is not asked), and the
+write bound is a progress bound — a per-write idle window, not a whole-answer
+deadline.
 
 **The merge.** `0bf64db` is the hand resolution of E7 and B11 with the lock's
 identity: `Writer::new(root, lock)` and `without_worker(root, lock, reason)`
@@ -7097,6 +7501,10 @@ painted parent's — and `screen.rs`'s `row` is the one line that reads it. The
 stored depth stays what it is, so the prompt, the spawn limit and a stored
 session are untouched. Pinned by
 `a_row_without_a_painted_parent_is_painted_at_the_top_level`.
+(The wave's placement (`4bc82ae` + `251238f`, §8.109) moved it: a row whose
+stored parent the tree no longer holds hangs under its nearest surviving
+ancestor — the root when none of its own survive — at that ancestor's depth + 1,
+dim. This paragraph is the D9 record as it stood.)
 
 **A status never erases the cancelling mark (`c848deb`; D10).** `activity` and
 `thinking` refused to replace a fold and nothing else, and a `Cancelling` phase
@@ -7930,6 +8338,14 @@ one spelling of the nesting, and a parent the window reaped is the one case wher
 the order says *top level* while the link says otherwise. The rule is kept and
 the leftover is said — the row is still ordered and indented as a top-level row,
 and the mark is what keeps its orphan from reading as the root's own child.
+**Corrected by the wave's placement (`4bc82ae` + `251238f`, §8.109):** the row is
+no longer ordered or indented as a top-level one. It hangs under its nearest
+surviving ancestor — the root only when none of its own survive — at that
+ancestor's depth + 1, in its chronological place among that ancestor's children,
+and it paints dim; the `⚮` alone says the stored link is not the row it sits
+under. The frames above and the cells they pin are that wave's reading of the
+old walk: the same row's after-frame is now `   ✓ #2 ⚮ probe  done`, one indent
+in.
 
 ---
 
@@ -8687,7 +9103,11 @@ The accent work the ruling cancelled was an ink half — the mark was to be pain
 in the theme's hue like the focused cursor's row — and no line of it landed: the
 ruling arrived before the commit did. What stands is the row mark as §8.87
 painted it, pinned as painted by its own cell-level tests, and the accent's nine
-sites are the ones §8.91 and the next paragraph count.
+sites are the ones §8.91 and the next paragraph count. **Corrected by `251238f`
+(§8.109):** “the row's ordinary ink” is the module's content ink, `dim()` —
+`Color::DarkGray` — since the placement wave, the mark included; the ruling's
+point is unmoved: the mark wears no *accent*, and dim is content ink, not the
+hue.
 
 **The module doc lists every hue site the file paints (`1a50837`; H69's second
 half).** The doc's list of what wears the accent had drifted from the code it
@@ -9366,7 +9786,12 @@ and *“perhaps we could generate the docs from the code … that way the code s
 its own manual”* — are that wave's whole brief. The root read them back as one
 rule and the manual's own top now carries it: a fact the code can print is a
 generated block checked by a test, a sentence a human reads is written, and a
-mechanism is a pointer at the module that owns it.
+mechanism is a pointer at the module that owns it. **Corrected by the wave's
+placement (`4bc82ae` + `251238f`, §8.109):** the earlier ruling's *keep the row
+and the mark* half stands, the place does not — the row hangs under its nearest
+surviving ancestor (the root only when none of its own survive), at that
+ancestor's depth + 1, in its chronological place among that ancestor's children,
+dim.
 
 **The gate runs under `set -o pipefail`, and the mistake that made it a rule.**
 The root's process change this wave: every gate command is run with `set -o
@@ -10124,4 +10549,934 @@ green — both names on §8.102's list, the machine one added by this pass.
 
 This pass changes no line under `crates/` or `scripts/`: every number above is
 a command's output or a commit's own body re-read at this base.
+
+---
+
+## 8.108 The human's restore report: a parentless row comes back as the orphan it is (#153, `7394ee0` + `330ebcc`, merged `d68c639`)
+
+**The report.** "a bunch of this noise when opening a session" — and the row
+loss behind it. The human's own store held seven rows (`#103`–`#109`) naming
+parents (`#99`, `#100`, `#101`) the history window had reaped in an earlier
+session and the file therefore never named again. `vet_stored_agents` refused
+every row whose parent chain did not reach the root through the file's own
+links, so those seven were dropped at the open — with their transcripts — and,
+because a skipped row is not in the tree, written out of the session at the
+next save. The refusal was also a `NoticeKind::Error` about the root: it was
+stored in `session.json` as the root's last failure, replayed at every later
+open, and it named one row — the last — while the others went unnamed.
+
+**The measured before → after** (through `App::new`, the human's own shape:
+rows 103←99, 104←99, 105←101, 106←101, 107←101, 108←100, 109←100, plus the
+ordinary 110←0 and 111←110):
+
+- **before:** 3 rows (the root, `#110`, `#111`); the seven orphans gone with
+  their transcripts; the bar and the pane's foot said "could not restore agent
+  #109 …; the row was skipped"; 1 notice stored and replayed.
+- **after:** 10 rows; every orphan keeps its stored parent id, so
+  `AgentTree::parent_gone` is true and its row wears `⚮`; its transcript and
+  its `✉` mark came back; nothing is said about any of them; 0 notices after
+  the open, the save and a second open.
+
+**The rules the file's links get.** A `None` link is not a refusal: a stored
+row with no parent (mush's own record of a leftover worktree) is a top-level
+row and comes back as one, unmarked. A *cycle* is still refused — a parent
+that is in the tree is not an orphan, so `painted_depth` would walk the loop
+forever — and a row hanging off the loop is not in one: its chain ends at a
+refused row and it comes back as the orphan that refusal leaves it. Held rows
+come back **parents-first** (a stable sort by how much of the file a row hangs
+under), because `restore_agents` reads a child's parent mailbox *before* it
+revives the child, so the old "the file is in spawn order" was load-bearing: a
+file listing a child before its parent gave that child a dead channel, and its
+completion could only travel through the UI instead of into its parent's
+books.
+
+**The report is said, not stored.** The refusal line goes through
+`App::stored_row_skipped` — `chat::is_restore_report` is the one predicate
+both roads read — so it is raised at *that* open (the bar, the root pane's
+foot, read back whole by `/notes`), writes no failure and marks nothing dirty;
+`stored_notices` leaves it out of the save and `restore_notices` drops the
+legacy shape ("could not restore agent #98 …; the row was skipped") on the way
+in, so a file an older version already accused is not painted from either. The
+*unreadable* session notice is untouched: it names a file mush could not
+parse, a one-time event pointing at where the conversation went, and stays
+stored (`an_unreadable_session_is_said_rather_than_dropped`). The line also
+had to become true: every refusal was a separate `note_error_for(ROOT, …)` and
+a pane keeps one line per agent, so only the last survived — the report is now
+**one line naming every skipped row and its reason** ("could not restore 2 rows
+in .mush/session.json — #0: it holds the root's id; #2: its id is already
+taken; the rows were skipped").
+
+**Pinned by** `a_stored_row_whose_parent_is_gone_restores_as_the_orphan_it_is`,
+`a_stored_row_with_no_parent_is_kept`,
+`a_row_restored_before_its_parent_still_reports_to_it`,
+`a_parent_link_that_leads_back_to_the_row_is_refused`,
+`a_restore_report_is_not_carried_into_the_next_session`,
+`the_restore_names_every_row_it_skipped` and
+`a_legacy_restore_report_is_not_painted_from_the_file`. All seven fail on
+`e926526` (3 rows instead of 10; the out-of-order child refused instead of
+restored and wired; the row off the loop refused instead of kept; and a line
+said — and stored — about a parentless row that was on screen the whole time).
+The merge was gated on the branch (906 + 294 tests, clippy, fmt, census, build,
+rustdoc, three fresh-dir smokes; one known `lock` flake re-run alone) and
+re-gated by the root on the merge.
+
+---
+
+## 8.109 A forgotten row hangs under its nearest surviving ancestor, dim (#154, `4bc82ae` + `251238f`, merged `10e1e3c`)
+
+**The pane the human read**, top to bottom:
+
+```
+✓ #149 The markdown view grows
+✓ #150 The pty unknowns
+✓ #151 Select cursor up-follow
+✓ #152 Record pass six
+◐ #153 Restore keeps orphans      mush/153
+✓ #103 ⚮ A10 chunk framing fix
+✓ #104 ⚮ A9 usage overflow fix
+✓ #105 ⚮ Tree rows and phases
+✓ #106 ⚮ Chat focus and git
+✓ #107 ⚮ Window source and cell
+✓ #110 verify three pinned fix…
+✓ #108 ⚮ markdown wrap parity
+```
+
+`#103`–`#109`'s stored parents `#99/#100/#101` were reaped by the history
+window, so their links dangle; `#107` is `#110`'s parent, alive as a row. The
+walk from the root could not reach the forgotten ones, so `rows()` seeded each
+of them as a top-level row *after* the root's whole (younger) family, and
+`painted_depth` said 0 — the root's own depth. They read as a second set of
+top-level actors.
+
+**The rule.** The root is the only top-level actor; every other row hangs
+under its nearest surviving ancestor — the stored parent when the tree holds
+it, otherwise the parent of the ids the window forgot, walked until a link
+lands on a row — ordered chronologically (spawn order) among that ancestor's
+children, with the child's own family behind it. A row whose stored parent is
+gone keeps `⚮` and paints **dim**; a leftover worktree found on disk
+(`parent: None`, not the root) hangs under the root too and wears neither
+mark, because nothing was lost.
+
+**Measured** (probe, deleted; the human's shape — `#99/#100/#101` root
+children, `#103/#104` under `#99`, `#105/#106` and `#108/#109` under `#100`,
+`#107` under `#101`, `#110` under `#107`, `#111` and `#149`–`#153` root
+children — reaped `[99,100,101]`, painted at 110×40 by the real pane):
+
+```
+before: painted ids [0, 111, 149, 150, 151, 152, 153, 103, 104, 105, 106,
+        107, 110, 108, 109]; #103…#109 painted_depth 0 / indent 1, #110
+        depth 1 / indent 3; `⚮` on #103…#109.
+after:  painted ids [0, 103, 104, 105, 106, 107, 110, 108, 109, 111, 149,
+        150, 151, 152, 153]; #103…#109 depth 1 / indent 3, #110 depth 2 /
+        indent 5, #111 and #149…#153 depth 1 / indent 3; `⚮` on #103…#109
+        only (#110's own parent #107 is a row).
+```
+
+The tail's sequence `#107, #110, #108` does not change: the rule puts `#110`
+right behind the parent it rides, exactly as the old walk did. What moves is
+the block's *place* — before the root's younger children instead of behind
+them — and the depth the block wears.
+
+**The dim ink, measured** (probe, deleted; the human's shape painted at 110×40
+by the real pane, the ink of every cell that carries a symbol, the cursor moved
+onto a forgotten row): before, every cell of `#103`'s row read
+`fg=Some(Reset)`; after, `fg=Some(DarkGray),bg=Some(Reset)` on all 20 symbol
+cells of every forgotten row — the `⚮` among them — while the cursor row stays
+`fg=Some(Black),bg=Some(Cyan)` with the pane focused (and `fg=Some(Cyan)` with
+the chat focused): the band and the quiet mark both win over the dim. No reaping
+rule changes: `past_history`, `reapable`, `kept` and `CHILD_HISTORY` are
+untouched; this memory changes what a kept row hangs under, never what the
+window drops.
+
+**The memory, and its one limitation.** Once `reap` drops a node its own
+`parent` link is gone from the tree, so a grandchild whose *parent* was reaped
+could never be placed under its still-living grandparent — the link that said
+where the forgotten node sat lived on the node, and the node is gone.
+`AgentTree::forgotten` keeps exactly that one link (id ↦ the id it hung under),
+captured as `reap` retains, and `prune_forgotten` rebuilds the needed set from
+every surviving row's dangling chain, so the map cannot grow with everything
+the window has ever dropped. The memory lives in the tree, **not in
+`session_save`** — `AgentSession` has `parent` and `depth` and no forgotten
+map — so after a restart a *nested* orphan (its parent reaped in an earlier
+session while the parent's own ancestor survived) falls back to the root: the
+walk runs out of links (`nearest_surviving_ancestor` answers `None`, and
+`painted_parent` hands the row to the root). The human's own shape is
+unaffected either way: every parent their rows name was a root child, so the
+root is the nearest survivor with the map or without it.
+
+**Pinned by** `tree::tests::a_row_whose_parent_is_gone_hangs_under_its_nearest_surviving_ancestor`
+(failed `left: 0, right: 2` on the nested case on `e926526`: root→#1→#2→#3,
+reap #2, #3 under #1 at depth 2; the flat case is #2 under the root at depth 1,
+and a leftover and a link that never landed on a row both hang under the root
+at depth 1), `tree::tests::a_forgotten_family_keeps_its_chronological_place_among_the_root_children`
+(the painted order above, pinning each id, depth and mark), and
+`ui::tests::a_forgotten_row_paints_dim_and_a_leftover_worktree_does_not` (the
+forgotten row's cells carry `Color::DarkGray` including the `⚮`; a leftover
+worktree's row does not — nothing was lost, so it is not dimmed — and the
+cursor row's highlight band wins over the dim; red on `e926526`: the forgotten
+row's cells read `[Some(Reset); 13]`).
+`screen::tests::a_row_whose_parent_the_window_reaped_says_its_parent_is_gone`
+and `app::tests::a_row_without_a_painted_parent_is_painted_at_the_top_level`
+moved their expected cells one indent in (`" ✓ #2 ⚮ probe  done"` →
+`"   ✓ #2 ⚮ probe  done"`, `" ✓ #2 ⚮ 2  done"` → `"   ✓ #2 ⚮ 2  done"`), the
+reap road unchanged. The prose that said the row was placed at the top level —
+`AgentTree::{rows, painted_parent, nearest_surviving_ancestor, parent_gone,
+painted_depth}`, `AgentNode::depth`, `screen::row`, `ui::agent_line`, and the
+manual's `⚮` sentences — was repaired with the code (`20278e7`, `a7a5f58`,
+landed `f9a911d`).
+
+---
+
+## 8.110 The four deep-dive audits: docs vs code, the runtime, the input, the paint (`b61afb3`, `418ac0f`, `2336206`, `47fb610`, merged `39a2a43`)
+
+**What they were.** Four blind audits of the wave's base (`e926526`), one new
+file each and nothing else created or changed; a *read-only* pass — no
+`cargo`, no test, no script, no server, no mush binary — over four slices of
+the tree, with every finding ranked, its claim quoted verbatim against the
+code that contradicts it (`file:line` both halves), its premise re-verified
+at the base, and the record read first (`grep` by id, keyword and title) so
+nothing already filed was re-reported. "Blind" means no doc comment is taken
+as true: each one is a claim, and what follows is what the code does. The rule
+they audited against is the workspace's own: a value from a wire, a file, an
+environment variable, a terminal or a model is untrusted until it is read
+through a bounded, honest road, and a failure must be *said* rather than
+hidden. Where settling a claim would need a run, it went to the file's
+*not verified* / *unsolved* section instead of being asserted. A claim that
+could only be imagined was filed under *Suspect and held*, not as a finding.
+
+**Their shape.** `docs/audits/docs-vs-code.md` (401 lines): 10 findings — 1
+major, 7 minor, 2 latent — plus 3 appendix items, checking the four surfaces
+that read as a contract (`docs/mush.md`, `README.md`, `docs/refactor.md`, the
+code's own doc comments) claim by claim — every number, constant, key, file
+name, quoted sentence and ordering a machine could falsify — against the code
+with `grep`, `sed`, `python3` and `git log -S`.
+`docs/audits/runtime-risks.md` (718 lines): 12 ranked — 2 major, 4 minor, 6
+latent — plus 7 appendix, five read-only passes over the actor model, the
+jobs/machine/lock roads, every exit road, the session writer, and growth,
+panics and UI-thread blocking; claims about *timing* are labelled estimates
+and say what would have to be true. `docs/audits/input-robustness.md` (802
+lines): 16 — 6 major, 7 minor, 3 latent — over the endpoint's request and
+reply framing and its phases, the tool-call arguments and the commands they
+run, the paths and the filesystem, the session file, the attach socket, the
+terminal that paints what a model or a command wrote, and the environment and
+config files; three readers worked three slices and the file's author re-read
+every quoted line at its line. `docs/audits/paint-and-measure.md` (475 lines):
+9 — 1 major, 5 minor, 3 latent — over the width arithmetic, the geometry of
+every tier from 200×50 down to the 40×10 floor, the stop/fold machinery the
+select mode steps through, the terminal's own state on every exit road, the
+cost and safety of one frame, and the marks and palette that reach the glass.
+The four landed as one merge, `39a2a43` (an octopus of the four audit
+branches), after `10e1e3c`; their files stayed evidence of their base and were
+not edited, save the one line a later child proved false (below).
+
+**The overlap.** Two findings were filed twice, once by each lane that reached
+them: **IN4 = R12** (the attach surface's answer has no write bound) and
+**IN5 = PM1** (the message box and the bar's `⌂ <root>` cell paint foreign
+text with no `sanitize` call). The record carries both ids on the rows and
+counts the fix once.
+
+**The one claim a fix made false, and the question it settled.** The paint
+audit filed the experiment it could not run — "whether ratatui 0.29's
+`Buffer::set_stringn` drops control graphemes" — because the crate's source is
+outside the workspace; the repository's own record at `9039e82` was the
+evidence it filed on, and `docs/audits/tui.md:898` claimed the crate filters.
+The one line was run by the paint fix child: painting `Span::raw("\u{1b}[2J")`
+into a `TestBackend` at 10×1 leaves the buffer's first four cells
+`["\u{1b}", "[", "2", "J", "x", " ", …]`, and crossterm's backend writes
+`cell.symbol()` verbatim, so those bytes reach the terminal as a frame wipe.
+`Buffer::set_stringn` does **not** filter: `tui.md:898` was the false sentence,
+and the probe stays as `ui::tests::a_raw_span_paints_a_control_byte_verbatim`
+(`0aa0623`; the audit's bullet now states the measured answer, and nothing else
+in the audit was touched). The second was a premise that did **not** reproduce:
+IN14's relative `./.mush-user-config.json` needs `dirs::config_dir()` to answer
+`None` with no `HOME`, and on this machine `dirs` falls back to the passwd
+database (`getpwuid_r`) — reached only through an `LD_PRELOAD` shim returning
+no entry, which is how the child drove the unfixed road. The fix (#189) was
+still written for the machine the premise needs rather than dropped as
+unreachable (§8.112).
+
+---
+
+## 8.111 A table's columns are sized by their content (#167, `2d8f13b`, merged `771e057`)
+
+**The fact.** A table's columns are no longer handed equal shares of the pane.
+Each column is measured on the cells it will paint — the header counts as a row
+— for two widths: `want`, its widest cell (the most a column can use), and
+`need`, its longest stretch the wrapper cannot break (`longest_unit`: a word, a
+path, a token, in `runs_width`'s arithmetic, where a tab is four columns and
+joins, a no-break space joins, and a run boundary (`**bold**word`) is not a
+break). The room (`width - 3 * (painted - 1)`, unchanged: the `│` separators
+are layout) is then spent as water-filling: first every column toward its
+`need`, so a pane that can afford them all breaks no word; then toward its
+`want`, in even shares, each column stopping where its cap is nearer than the
+share — so no column grows past its content while another whose words need the
+room is still short. The room left when every column already holds its widest
+cell can be used by none of them; it is shared evenly, because the widths must
+still sum to exactly the room — and the odd columns the division leaves go to
+the widest wants, ties leftmost. Every column keeps at least one column of
+content: the fold rule leaves the room that many columns at least. A pane that
+cannot afford every `need` degrades to the even share and `wrap_runs` breaks
+the word that does not fit — nothing is dropped, and no row outgrows the pane
+at any width.
+
+**Measured before → after** on the table the report came from —
+`| lane | agent | report | hunting for |`, a token, the path
+`docs/audits/runtime-risks.md` (28 columns, no space to break at) and a
+one-sentence cell. Column widths are read off the separator; the rows are the
+painted rows each source row took:
+
+| pane | before widths | after widths | before rows | after rows | the path |
+|------|---------------|--------------|-------------|------------|----------|
+| 126  | 30, 30, 30, 29 | 4, 5, 28, 80 | header 2, body 4 | header 2, body 2 | whole both (30 > 28 was luck) |
+| 115  | 27, 28, 27, 26 | 4, 5, 28, 69 | header 2, body 4 | header 2, body 2 | before `docs/audits/runtime-risks.` + `md` — mid-word; after whole |
+| 60   | 13, 14, 14, 12 | 4, 5, 28, 14 | header 2, body 9 | header 2, body 8 | before `docs/audits/r` + `untime-risks.` + `md`; after whole |
+| 40   | 8, 9, 9, 7     | 4, 5, 15, 7  | header 3, body 16 | header 3, body 16 | both break (the pane cannot afford 28): before `docs/aud`/`its/runt`/`ime-risk`/`s.md`, after `docs/audits/run`/`time-risks.md` |
+
+The two symptoms, exactly: at 115 the `agent` column held `#156` in 28 columns
+of blank (now 5 — `#156` and the header's one wider column), and the path broke
+mid-word at 115 and 60 (now whole at both). The prose cell — which needs 88
+columns and is why the pane cannot give everyone their want — went from 26
+columns and 4 painted rows to 69 and 2 at 115, and from 12 and 9 to 14 and 8 at
+60; at 126, from 29 and 4 rows to 80 and 2. The `1..=40` sweep still paints
+every row inside the pane (the folded table included: eight columns at four
+still fold to one column of width 4 with map `[9, 0, 8]`), and the fold rule
+(`painted = columns.min(width.div_ceil(4)).max(1)`, open item H80) is
+untouched.
+
+**Pinned by** three new `text.rs` pins —
+`a_tables_columns_are_sized_by_their_content` (the shape the report came from:
+`[4, 5, 28, 80]` at 126 with every short column exactly its widest cell and
+the path whole, the same first three columns at 115 and 60, `[4, 5, 15, 7]` at
+40 with the path's column still holding every character in order, and no row
+outgrowing the pane),
+`a_table_column_is_not_wider_than_its_content_while_another_is_short` (the
+water-filling property, swept 16..=120 on a table of known wants, plus the
+direct pin at 45) and `a_narrow_table_pane_still_paints_every_cell` (a pane
+that cannot give either column its ten-column word shares the room and breaks
+both words, every character back in order) — all failing on the parent tree's
+equal shares (`[30, 30, 30, 29]` instead of `[4, 5, 28, 80]`; the property
+broken at 100 by `[24, 24, 24, 19]`; the asymmetric narrow case at `[5, 4]`
+instead of `[1, 8]`). Five existing pins moved with the rule and their new
+numbers are the content-based ones:
+`a_tables_alignment_is_the_delimiter_rows` (`[10, 12, 11]`, was `[11, 11,
+11]`), `a_wrapped_cell_stays_inside_its_column` (`[1, 16]`, header 2 rows, was
+`[9, 8]` and 5), `a_pipe_that_is_text_is_not_a_cell_boundary` (`[11, 7]`, was
+`[10, 8]`), `a_ragged_table_row_keeps_every_cell` (`[8, 10]`, was `[9, 9]`)
+and `a_table_is_painted_through_the_pane` (`[6, 4]`, was `[5, 5]`). Unchanged
+where the content rule and the equal share agree: `name`/`age` at 20
+(`[9, 8]`), `a_table_never_outgrows_the_pane`'s sweep and fold, and
+`a_row_without_a_delimiter_is_text`. The prose that said the old rule went with
+it: the module doc's "the columns fill the pane exactly" now names the content
+rule beside it, `table`'s "the cells share the width fairly" is gone, and the
+manual's sentence was repaired with the code (`115f2f1`, landed `f9a911d`).
+
+---
+
+## 8.112 The fix wave: the four audits answered (≈20 children, `3332693`..`f9a911d`)
+
+The wave's plan is one child per area, and every area's paragraph below carries
+what the child measured before → after and the tests it left. The children are
+named by their issue number in the root's plan where a commit body names it;
+the merge that landed each area is in its paragraph. The wave was gated on each
+child's branch and re-gated by the root on each merge; every gate that ran red
+did so only on a flake (each re-run green alone; §8.102 and the tail below).
+The first five areas landed as wave 1 (`3332693`→`0615070`), the rest as wave 2
+(`ec79154`→`f9a911d`).
+
+**The exit road (#170; R3, R4, R5, PM6, PM8, PM9; `acb96af`, `cb9ccde`,
+`098867f`, `195db30`, `ff94e8d`, merged `0615070`).** Four facts in one area.
+(1) *The order:* `run` dropped the terminal guard, then the attach guard, and
+only then let `App`'s drop flush the session and walk the jobs, so a second
+SIGTERM in that window killed the process with every group still running and
+the socket already removed — the record's own proof that a clean exit ran. The
+road now runs first (`App::shutdown`: the flush, the actors' endings, the quit
+fence, the kill walk, the writer's thread) and the terminal and the socket are
+handed back last. (2) *The presses:* the signal road was `flag::register` plus
+`register_conditional_default`, so from the first press on the next signal
+restored the default and re-raised, dying raw. It is a self-pipe read by one
+watcher thread now: the first press asks for the quit, the second sets
+`forced` (the exit waits poll it and give up at their next poll instead of
+their deadlines), and the third — the press that no longer believes mush will
+finish — raises SIGKILL. The cost is recorded in the module: the third press,
+and any SIGKILL, still die in the alternate screen; the second no longer does.
+(3) *The waits:* `session_save::{flush_within,close_within,join_within}` and
+`machine::reap_within` take the `forced` predicate and poll in their own
+slices, each leaving a sentence naming the hurry; `JOIN_DEADLINE` and
+`REAP_DEADLINE` are 2 s, and a bound that expires never blocks the exit — the
+reason travels out to `main` and is printed on the handed-back terminal.
+(4) *The terminal:* `TerminalGuard::enter` is one all-or-nothing function
+(raw mode, the screen escapes, the terminal; a failure in either of the last
+two runs `restore_terminal_modes` before the error travels), and a
+non-owner panic's words are held (`PanicRoute`, `KEPT_PANIC_WORDS = 8`; what
+the bound drops is counted and said) until the shell owns its screen again.
+Measured: the double-SIGTERM probe (a detached `sleep 600; touch marker` job,
+a fake endpoint) — before: exit −15, pty `ECHO/ICANON False/False`, socket
+left on disk, the job's group alive, the answer never written (3 runs of 3);
+after: exit 0, `True/True`, socket gone, no group member left, the answer in
+`session.json` (3 of 3). The failed-enter probe (a pty child whose stdout is
+`/dev/full`): before `pty ECHO/ICANON: False/False` with "No space left on
+device", after `True/True`, same exit 1. Pinned by
+`signals::tests::{a_press_is_counted_and_the_count_decides,
+a_delivery_sets_the_flag_it_names_and_no_other,
+a_take_reads_a_flag_and_clears_it_once}`,
+`session_save::tests::{a_hurried_flush_gives_up_at_its_next_poll,
+a_hurried_close_gives_up_at_its_next_poll}`,
+`machine::tests::a_hurried_reap_does_not_wait`,
+`a_stuck_writer_is_left_at_the_deadline_and_the_reason_is_said`,
+`a_reap_past_its_deadline_is_a_reason_not_a_wait`,
+`the_exit_road_is_idempotent`,
+`a_launch_after_the_quit_is_refused_and_its_group_is_killed`,
+`the_quit_fence_is_up_before_the_walk`,
+`tests::a_failed_enter_restores_the_modes`,
+`main::tests::a_worker_panic_leaves_the_terminal_alone` and
+`the_held_panic_words_are_bounded_and_the_bound_is_said`.
+
+**The session store's failure roads (#171; R2, R6, R9, R16, R18, R19, IN3;
+`b9643a6`, `1e5174f`, `240a9b2`, `70d9baa`, `66a12c9`, `3d288a8`, `f255d5f`,
+`9322dac`, `31fe48e`, merged `3bb56ec`).** A failed write no longer ends the
+road: `Session::save` borrows the value, the writer keeps the snapshot a
+failed attempt could not write and tries again on its next wake and on its own
+final drain at drop, and both App roads that observe a failure put the dirty
+mark back — so the exit flush still goes out and the document's minute bound
+is not void after one ENOSPC. The failure is one door now:
+`session_save_failed` says the bar's line, notes it in the root's pane (so
+`/notes` and a restart hold it) and marks the frame owed, where before it was
+raised from `tick` with nothing owed — on an idle app the human read a stale
+workspace as saved. The lock-identity guard gates **both** store writes:
+`SessionSave::store_is_mine` is the one spelling the worker and Ctrl-N's
+`.mush/session.json.previous` copy both ask, so a displaced mush no longer
+writes over the slot the owning window's Ctrl-N warning points at (the
+refusal reads "the store was not written (another mush may own this
+workspace)"). The store is read as an untrusted file: `symlink_metadata`
+classifies the name (a FIFO is no longer opened, a symlinked store is never
+followed), the size comes from the same stat, and the read is bounded to
+`SESSION_READ_CAP` (256 MiB — the store's own bound's outer margin), every
+refusal taking the `.bak` road and telling the human. `restore_notices` reads
+the list back to front and keeps each agent's first row, one pass instead of
+`retain` per row: measured 20,000 rows → 20.296 s before, 127.65 ms after;
+40,000 → 70.490 s before, 216.10 ms after (the pinned 200k-row case needs
+~29 minutes on the old shape and took 0.56 s). A reaped leftover drops its
+chat record too (`discover_worktrees`' reap forgot the node and not the
+`Chat`); a recreated `.mush/` comes back with its ignore line because both
+write roads go through `ensure_mush_dir` now; and `/model`, `/provider` and
+`/url` mark the session dirty at the moment they write the cell, so a pick no
+longer silently reverts at the next start. Pinned by
+`a_failed_write_is_kept_and_lands_on_the_next_wake`,
+`a_retained_snapshot_lands_when_the_writer_is_dropped`,
+`a_failed_background_write_leaves_the_mark_for_the_exit_flush`,
+`a_failed_flush_leaves_the_mark_for_the_next_road`,
+`a_save_failure_is_painted_and_kept_in_the_notes`,
+`a_displaced_mush_does_not_write_the_previous_session`,
+`a_fifo_named_as_the_store_is_refused_without_opening_it`,
+`a_symlinked_store_is_refused_not_followed`,
+`a_store_past_the_cap_is_refused_from_its_size`,
+`restoring_a_store_sized_notice_list_is_one_pass`,
+`a_stored_list_keeps_the_newest_row_per_agent_in_order`,
+`a_reaped_leftover_drops_its_chat_record`,
+`a_store_write_recreates_the_mush_dir_with_its_ignore_line` and the three
+picked-pick tests (`a_picked_model_is_marked_for_the_session_file`, likewise
+provider and endpoint).
+
+**The wire (#172; IN1, IN2, IN6, IN11, IN13, IN15, IN16; `8a2fc58`, `1522ea2`,
+`8ac80f7`, `f3355c0`, `1f6d508`, `68f8413`, `3d138e8`, merged `124ced7`).**
+(1) `read_chunked` compared `out.len() + size` with the cap; on any chunk after
+the first a claimed `FFFFFFFFFFFFFFFF` overflowed it — a debug-build panic on
+the actor's thread, and in release a wrapped sum under the cap whose
+misclassification blames the endpoint for the framing's own lie (A10's class,
+one chunk later). The check now compares `size > MAX_BODY_BYTES - out.len()`,
+which cannot overflow under the loop's invariant. (2) The last holdable id is
+`git::MAX_AGENT_ID` (`u64::MAX - 2`); an id one below the ceiling was accepted
+and pinned the counter, and the next draw's `counter += 1` panicked in debug /
+handed the root's own id in release. `worktree_id` refuses every name above
+that id, `Ids::next_agent` is fallible (`None` once the counter stands above
+it, the lost pool still popped first), and `spawn_tool` and `vet_stored_agents`
+refuse with sentences naming the spent space. (3) The window's meter is pixels
+and the wire's body is bytes, and only the first was asked: measured, one 2 MiB
+png at 2560×1440 weighed 14,773 bytes against a built body of 2,802,443 — a
+**189.7× undercount** — twenty of them 295,338 against 55,931,573 bytes, and
+seven 2 MiB pngs on a vision-capable actor passed a 4,186-byte window check
+into a 19,583,871-byte body and went out. `request_bytes` serializes the
+assembled request into a counting sink (the same serializer `model.rs` runs,
+so the number is the exact body length; the hundreds of megabytes are never
+allocated) and is counted against `MAX_REQUEST_BYTES` (16 MiB — the message
+box's own `BOX_IMAGE_BYTES` rule generalised to the body) before the turn is
+announced and before a byte is spent; the same seven-picture fixture is
+refused, the model never asked, with the refusal naming the bytes, the ceiling
+and the roads (downscale, drop, `/compact`). (4) An IPv6 endpoint's `Host`
+keeps its brackets (`Host: ::1:8443` → `Host: [::1]:8443`). (5) The TLS
+handshake is driven in `READ_SLICE` slices with the watch asked before every
+`flush()`, so a Stop lands within a slice and a timeout is a slice or the
+deadline, never the 30 s write ceiling in the deadline's voice — measured: a
+silent listener, a 3 s deadline and a Stop at 100 ms left the Stop waiting
+3.254 s before, under a second after. (6) Both attach-side connects are
+bounded (`connect_bounded` runs the blocking connect on a thread of its own
+and waits with `recv_timeout`, as `resolve_bounded` bounds a lookup): a full
+accept queue (4097 queued connections on this box) used to park `serve`
+before the first frame and the CLI before its own bound; the server's probe, a
+timed-out connect and the CLI's `ask` now name their deadlines. (7) A tool
+call whose arguments `sanitize_tool_calls` could not read is refused instead
+of being rewritten to `{}` — the rewrite left every tool's defaults applying,
+and `list_files`, whose schema has no required field, answered a mangled call
+with a full listing of the workspace root. The marker key `UNREADABLE_ARGUMENTS`
+travels in the valid JSON object the wire needs, and `exec_tool` refuses it
+before the tool match (`list_files` on `{oops` answered `marker.txt` before,
+`error: the model's arguments were not valid JSON — this call was not run`
+after; the refusal is `Failed`, not `Refused`, so the loop guard counts a
+model that repeats it). Pinned by
+`a_late_chunk_size_claim_past_the_cap_is_framing_too`,
+`a_stored_id_one_below_the_ceiling_is_refused_and_the_counter_still_answers`,
+`a_branch_one_below_the_ceiling_is_refused_by_name`,
+`a_draw_with_no_room_above_its_id_answers_none`,
+`a_name_with_no_room_to_count_above_its_id_is_not_a_child`,
+`a_request_under_the_window_can_still_be_refused_for_its_bytes`,
+`an_ipv6_endpoint_is_addressed_with_a_bracketed_host_header`,
+`a_cancelled_tls_handshake_stops_within_a_slice`,
+`a_full_accept_queue_does_not_wedge_a_connect`,
+`the_cli_connect_names_its_deadline_rather_than_claiming_nothing_runs`,
+`a_probe_that_times_out_leaves_a_socket_a_live_listener_may_hold`,
+`a_tool_call_whose_arguments_were_unreadable_is_refused_not_run` and
+`a_model_that_repeats_an_unreadable_call_is_still_stopped_as_a_loop`.
+
+**What the tools may touch (#173; IN7, IN9, R8, IN10; `c6a5cc1`, `de0bdbb`,
+`55558e7`, `0f6939c`, merged `d88deb8`).** `.mush` stays reachable — its
+session file is one a model may be asked to look at — but `.mush/wt`, where
+every isolated child is checked out, is read twice: the walk does not descend
+into it and `real_path` refuses a path at or under it, so a path a listing
+prints is no longer one `edit_file` writes into a *live* sibling's tree (the
+probe: `list_files("")` answered `[".mush/wt/3/src/main.rs", "main.rs"]` and
+a write landed in the sibling before; `["main.rs"]` and a refusal after).
+`list_files`' cap ends the walk where it lands, not after sorting the whole
+subtree: `list_files("", 2)` over `a/z.txt`, `a.txt`, `z.txt` answered
+`["a.txt", "a/z.txt"]` before (walked, sorted, cut — allocating a `String` per
+file to print two names) and `["a.txt", "z.txt"]` after, the order now the
+walk's own (each directory's files in name order, its subdirectories after
+them, depth-first); 100 dirs × 100 files with cap 400 measured 112 ms → 4.9 ms
+(uncapped 107/110 ms the same). The schema and the record's §3 row say the new
+order. The whole-disk guard reads `find -- /` and `find /*` as the root they
+are: `--` ends find's own options, and a glob in the name directly under `/`
+is refused because the reading cannot tell how wide a glob is — it refuses the
+shape rather than guesses, where a name under `/` is provably one of `/`'s
+entries; a glob deeper than `/`'s own children (`find /tmp/*`) is a walk of
+some other root and stays allowed. Pinned by
+`a_siblings_worktree_is_invisible_to_the_file_roads`,
+`a_listing_cap_stops_the_walk_instead_of_the_sort` and
+`a_root_spelled_by_a_marker_or_a_glob_is_still_refused`.
+
+**Every painted foreign string (#174; IN5/PM1, PM2, PM4; `a3274b3`,
+`824b44f`, `74c2293`, merged `3332693`).** The message box's draft — a
+bracketed paste, or an attach client's `edit` — and the bar's `⌂ <root>` cell
+painted a string mush did not write with no `sanitize` on the path; the
+record disagreed with itself about the mechanism (`docs/audits/tui.md:898`
+read ratatui as filtering; `33409d4` had measured an escape reaching the
+terminal). The probe settled it (§8.110). Measured with the real painter over
+a box holding `HOSTILE = "\x1b]0;PWNED\x07\r\u{2066}escaped"` at 120×32:
+before, `'\u{1b}' at 43,27 commands the display` (a hostile paste) and
+`'\u{1b}' at 30,31` (a workspace path); after, both frames paint the words and
+no control byte. The defang is at the paint boundary only: `Input::view`
+sanitizes each line and `Input::cursor_line` measures the cursor's column over
+the same line, so the cursor and the renderer cannot disagree; the bar's cell
+is defanged where the frame's word is built (`facts_line`), and `Input::take`
+still hands the send exactly the bytes that were typed. The image row keeps
+its size and truncates its name (`▣ name (mime · size)` past the pane cut the
+name mid-word and took the size — the one fact two screenshots a second apart
+differ in): at the 40×12 floor the box's row was
+`│▣ Screenshot from 2024-01-01 12-00-00.│` and is
+`│▣ Screenshot from 2024… (png · 1.5 MB)│` (38 columns); the transcript row at
+80×24 ends `(png · 1.5 MB)` where it used to drop the size. `image_label`
+takes the columns the row really has, `text::truncate` does the shortening,
+and only a row narrower than the tail itself falls back to the house rule over
+the whole label; `assert_shape` now reads every attachment row against the
+field it is painted in, the sweep's blind spot the audit named. The two fixed
+sentences at the floor: the picker's hint is now the 38 columns of the popup's
+inner row — ` j/k · PgUp/PgDn · Enter · Esc cancel ` where the verb used to be
+clipped — and the bar's idle hint keeps its full 62-column sentence (the
+100-column sample frame carries it) and is elided by whole cells at narrower
+widths (` chat  Tab cycles panes` at 40, every clause at 100). Pinned by
+`the_message_box_paints_a_hostile_draft_defanged`,
+`the_bar_paints_a_hostile_workspace_path_defanged`,
+`a_raw_span_paints_a_control_byte_verbatim`,
+`an_image_row_truncates_its_name_and_keeps_its_size` and
+`the_hints_paint_what_fits_at_the_40_column_floor`.
+
+**The measure (#183; PM3, PM7; `0561637`, `0e4bb52`, merged `ec79154`).**
+`UnicodeWidthChar::width` answers `Some(0)` for the characters the tables know
+take no display column — a combining mark, ZWJ, ZWNJ, ZWSP, BOM, SHY — and
+`None` only for a control character, which `sanitize` has already removed; but
+every measuring road floored the answer with `.max(1)` and read the known zero
+as a missing one. The spellings become one rule, `glyph_width`, beside the
+wrappers (`wrap_capped`'s break, `wrap_runs`' break and tail, `runs_width`,
+the table's `longest_unit`, and the test helper no longer restates it):
+measured `runs_width("a\u{301}b")` 3 → 2, `Screenshot\u{301}.png` at 14 two
+rows → one, a family ZWJ emoji at 6 two rows → one, a table
+`| Cafe\u{301} | abcdefgh |` at 15 `[5, 7]` → `[4, 8]`, a styled `" \u{301}ab"`
+at 2 three rows → two; CJK and emoji presentation keep their two columns. The
+two wrappers now compute a broken tail by one rule (`wrap_capped` used
+`UnicodeWidthStr::width`, `wrap_runs` a per-character sum; a ZWJ emoji read as
+one two-column glyph by one and as each emoji plus its joiner by the other), so
+the same text wraps to the same rows in both views; the parity test's fuzz
+alphabet grows three characters (a combining mark, a ZWJ, U+1F468 emoji
+presentation) and walks 111,110 strings (10^1..10^5) at widths 1..=12, with the
+fixed texts now twelve at widths 1..=24. Measured before → after for the two
+finding inputs: `"a 👨‍👩‍👧 b"` at 6 was styled 3 rows / plain 2 and is 3/3;
+`" 👨‍👨　"` at 5 was styled `["", "👨‍👨", "　"]` / plain
+`["", "👨‍👨　"]` and is `["", "👨‍👨", "　"]` in both. Pinned by
+`a_known_zero_width_character_takes_no_column` (red on the parent at
+`'\u{301}' costs no column in a run: left: 3, right: 2`) and
+`a_plain_message_wraps_exactly_like_wrap_text`.
+
+**The image byte cap (#186; R1, R17; `84b749a`, `1362648`, `bec71c9`, merged
+`07df54e`).** The human's ruling: a **flat byte cap, not a token window**.
+`IMAGE_BYTES_KEPT = 8 MiB` (`crates/mush-core/src/message.rs`), one named
+constant; `retain_image_bytes` gives up payloads newest-first while the
+conversation's total fits the cap, and both copies read it — the pane's
+record, on every line appended (`Chat::push_message`), and the actor's own
+history, before it builds a request (`run_turns`) — so memory is the cap plus
+the newest message whatever the token window is. A picture that gives up its
+bytes keeps its entry, its path, its mime, its pixels and **its size**
+(`Image::size` is a stored fact now — `Image::new` is the one way a picture is
+built from bytes, `give_up_payload` the one way it loses them — so the row
+`▣ shots/screen.png (png · 2.1 MB)` reads the same before and after), and the
+wire spells it as the existing `Message::drop_images` placeholder sentence
+(`[image: name (png) — bytes dropped to save room; read the file again if you
+need them]`), the path surviving so `read_file` can bring it back. The newest
+message's own pictures are never given up (the box accepts `BOX_IMAGE_BYTES` =
+8 × 2 MiB in one message; the peak is that plus the cap), pricing is untouched
+(`Image::weight` still pixels ÷ 750), and R17 rides along: `without_image_payloads`
+is the clone `bounded_transcript` needs, so a save's parked snapshot copies no
+picture bytes (`App::session_snapshot` says so beside the store). Measured:
+ten in-memory 2 MiB pictures, one per message, retained 20,971,520 B before
+and 10,485,760 B after (the cap's 8 MiB plus the newest message's own 2), the
+oldest row's sentence unchanged. The cost is stated in the code: giving a
+picture's payload up rewrites what the request says at that message, so an
+endpoint that cached the prefix re-prefills the tail from there — about every
+fourth new 2 MiB picture for the flat cap, against about every twelfth for the
+shape one constant away (a 32 MiB ceiling, shed back to 8 MiB in one pass).
+The human chose flat 8 MiB. Pinned by
+`the_cap_keeps_the_newest_pictures_and_gives_up_the_older_ones`,
+`the_newest_messages_pictures_are_never_given_up`,
+`a_message_that_straddles_the_cap_keeps_its_newest_pictures`,
+`a_picture_past_the_cap_reads_as_the_placeholder_on_the_wire`,
+`the_pane_gives_up_old_payloads_and_still_names_their_size`,
+`a_picture_keeps_its_size_and_its_price_when_its_payload_is_given_up` and
+`a_pictures_row_says_the_same_size_after_its_payload_is_given_up`.
+
+**The small lies (#189; R7, IN12, IN14, PM5; `c364ab8`, `a1a68d3`, `46d5ea8`,
+`4cbee27`, merged `167f352`).** (1) `tree.cut_off` armed no `✉`, where
+`finish`/`fail`/`stopped` do, so a child whose thread died mid-run was a
+droppable row: the tick's reap sent its parent `ForgetChild` behind the
+child's own `ChildDone` and the parent's one drain erased the completion before
+the fold found it. The mark now arms exactly as a stop's does and the dying
+thread files its line (`agent::file_death`), so "#N cut off: the run never
+ended — nothing was committed" reaches the parent's model and the row waits
+for the fold's read. (2) `/key`, `/provider` and a picked model answered
+`saved to …` without asking the config-write road what it did, and the single
+status slot erased the failure: `persist_user_config` now returns whether the
+write landed, says the failure itself naming the file it could not reach
+(`could not save home config <path>: File exists (os error 17)`), and the
+three acks speak only on success (`/url` keeps its speak-then-save order, the
+reason written beside it). (3) With `HOME` unset and `MUSH_CONFIG` unset,
+`config_path` fell back to the *relative* `.mush-user-config.json` — the key
+read and written in plain text in whatever directory mush was launched from.
+`config_path` now answers `Option<PathBuf>`: `MUSH_CONFIG` names one outright
+and the platform config directory is the only other road, so a machine with
+neither has no home config; the read says `HOME is not set` through
+`Loaded.complaint`, the four `config::resolve` refusals name it, and a save
+refuses with the same words. The audit's premise needed `dirs::config_dir()`
+to answer `None`, which on this machine needs `getpwuid_r` to fail — driven
+with an `LD_PRELOAD` shim, where the old road printed
+`PROBE config_path() with no home = ".mush-user-config.json" (absolute:
+false)` and `--print-config` on the fixed tree prints `home config unreadable
+— no home config to read: HOME is not set and MUSH_CONFIG names no file — set
+HOME or MUSH_CONFIG; using defaults`. (4) A resize and a key in one drain step
+stepped the select cursor at the *last painted* measure while the frame painted
+at the new one: one `↓` could leap a whole fold tail and `↑` did not return.
+`App::set_term_size` voids the published measure and asks the coming frame's
+own derivation (the layout the paint runs), so the step lands at the measure
+the frame paints; a frame that paints no transcript publishes nothing and the
+step walks source lines (`Chat::forget_select_measure`). Measured: at 40×24
+the cursor on `row02`, a `set_term_size(120, 24)` and one `Move(1)` in the same
+drain, the frame at 120×24 — before it landed on line 3
+(`["  …  +28 more lines"]`), after on `row03`, with `↑` returning to `row02`
+and `Enter` copying `row02 …`, the stop the pane painted. Pinned by
+`a_cut_off_child_keeps_its_row_until_its_parent_reads_it`,
+`a_cut_off_childs_line_reaches_its_parents_model_and_its_row_waits_for_the_read`,
+`a_save_that_failed_is_not_replaced_by_an_ack_that_says_saved`,
+`a_machine_with_no_home_has_no_home_config_path`,
+`a_machine_with_no_home_config_says_home_is_not_set`,
+`a_key_on_a_machine_with_no_home_config_says_home_is_not_set` and
+`a_resize_and_a_key_in_one_drain_step_at_the_new_measure`.
+
+**The two tests that raced a clock, and the fixture that leaked its group
+(#187, #188; `4e0d6d3`, `5a12702`, `73e2d17`, merged `c73147e` and `0db32f2`).**
+The draw sweep wanted `#c1` at every size, and at 79×24 the compact agents
+strip is three rows — the selected row's foot has no row to paint in — so the
+word could only come from the bar's transient line, which `status_line()`
+hides after `INFO_TTL = 5 s`, while the whole sweep paints eighteen states at
+fifteen sizes over 4–10 s: which shots still saw the word was a function of how
+fast the machine ran. `renew_status` is called before every shot now (the
+sibling of the `age_status` the TTL tests use; `INFO_TTL` itself untouched);
+measured 6 of 20 consecutive runs failed on the parent (6.92–9.49 s against
+the 5 s line) and 20 of 20 pass on the fix (3.97–9.64 s, several crossing the
+TTL with the word still painted). The clipboard fixture's writer is
+`sh -c 'echo $$ > …; sleep 30'` killed at a 50 ms deadline and the test then
+read the pid file unconditionally, so a machine slow to start `sh` killed the
+writer before the `echo` — 2 of 20 runs failed with `NotFound`; the deadline is
+250 ms now, a kill that still wins the race is its own asserted case, and
+`DEADLINE` (2 s) and the refusal sentence are unmoved. The machine waiting-group
+fixture spawned its shell and only then read `root/pgid` with `unwrap`s, the
+caller building the `GroupGuard` after — so the empty-file window or the 5 s
+deadline panicked *unguarded* and orphaned a 100 %-CPU shell forever: **the
+human found eight such groups in htop, one with 15h53m of CPU** (16 procs,
+all killed), and the leak was also the load that made other tests flake. The
+fixture takes the group at the spawn now (`Shell.spawn`'s job handed to
+`GroupGuard::own`, naming the group from `Job::process_group`; the file is the
+check, never the guard, and `Drop` kills through the name), and the read
+retries until the file parses to the job's id; measured: the forced failure
+left `group 1544497 … with 2 members` before and nothing after. Pinned by
+`a_group_whose_file_never_arrives_is_ended_by_its_guard` and the two adapted
+kill tests; the draw sweep and clipboard tests keep their names.
+
+**The UI thread's guests (#F8; R10, R11; `d4ee1e7`, `cdcd046`, merged
+`0ea9fd2`).** Every git *mutation* of the worktree sweep ran on the UI thread
+— `git::reclaim` is a chain of `git` processes per worktree, once per landable
+id inside `Msg::Git`, and the whole pass inside `App::new` before the first
+frame. The sweep now has three parts: the read that names the repository's
+residue (`for-each-ref`, one process, ~2.5 ms here) and the decisions
+(`git::Reclaimable`) stay on the UI thread; the removals run on one named
+worker (`mush-sweep`) that asks the tree once more per worktree
+(`Msg::SweepAsk`) before `git::reclaim`, so the at-rest guard is asked at the
+latest moment there is; the row updates come back as `Msg::Swept`, and what the
+caller owes (`SweepOwed`: `Restore` for a start, `Discover` for a new chat) is
+run when the answer lands. One worker at a time, a batch that arrives while
+one is out is remembered and the read asked again. Measured with 70 landable
+ids on this checkout: `App::new` **818.5 ms → 2.6 ms**, a `Msg::Git` update
+**716.6 ms → 0.30 ms** (+ frame 723.8 → 10.7 ms). The four bare
+`std::thread::spawn`s (git read, model discovery, clipboard write, clipboard
+read) panicked where every other thread road returns a refusal — a box at its
+`ulimit -u` took the whole TUI down, and the git read left `git_in_flight` up,
+frozen for the session. They go through one named `WorkerSpawn` road now, each
+caller saying what it does with the refusal (the flag falls, the bar says the
+line): the old road's contract measured `ulimit -u 1` → `failed to spawn
+thread: Os { code: 11, … }`, exit 101. Pinned by
+`the_start_defers_the_sweep_and_the_restore_to_the_worker`,
+`a_landable_worktree_is_removed_by_the_worker_not_by_the_read`,
+`a_node_that_starts_running_after_the_read_keeps_its_worktree`,
+`a_read_that_lands_while_a_sweep_is_out_is_asked_again_not_stacked`,
+`a_refused_sweep_still_runs_what_it_held_up_and_says_so`,
+`a_refused_git_read_clears_the_flag_and_says_the_facts_are_stale`,
+`a_refused_model_fetch_clears_the_flag_and_can_be_asked_again`,
+`a_refused_clipboard_write_says_the_copy_did_not_happen` and
+`a_refused_clipboard_read_says_the_read_did_not_start`.
+
+**The attach surface's edges (#185; R12/IN4, R13, R14, R15, IN8; `abc9dff`,
+`74ddc10`, `fa227b4`, `7c17344`, `59a5332`, merged `34e7479`).** The socket
+file is narrowed to **0600** right after the bind, whatever the umask (a
+shared-group checkout left it readable and answerable by every group member:
+`PROBE: socket mode = 0777` → `0600`). The name's *type* is asked before any
+connect (`symlink_metadata`): only a socket or an absent name goes on; a
+symlink, directory, regular file or FIFO is refused with a sentence naming
+what it is and is never followed (a planted link used to reach the stranger's
+listener and steer `mush read`/`edit --send` at it). An `EINTR` on a socket
+read is retried, not read as a close, and the bytes earlier reads gathered
+stay in the line — a `SIGWINCH` no longer drops a live client with "mush
+closed the connection without an answer". The answer is capped on both sides
+at `MAX_ANSWER_BYTES` = 16 MiB (the ceiling the tree already trusts for one
+model request): the server replaces a past-cap answer with a naming refusal
+(`ReplyError::too_large`), and the CLI stops at the cap instead of draining the
+stream — measured against a stranger streaming one 64 MiB line: `VmRSS 78428
+kB / VmHWM 209348 kB` and an encoded 67,108,880-byte answer before,
+`12508 / 29796 kB` and a refusal after. The answer's **write** is bounded by
+the same idle window as the read, so a client that stops reading mid-answer
+loses its slot at the bound instead of parking a connection thread in the
+kernel: before, a stalled 8 MiB answer (500 ms bound) left the connection
+thread alive at +2 s and a second client was answered `unavailable`; after,
+only the accept threads are there and the second client is served. Two
+residuals the child named rather than papered over: there is still **no
+peer-credential check** (`SO_PEERCRED` is not asked; 0600 is the whole rule),
+and the write bound is a **progress bound** — a per-write idle window, not a
+whole-answer deadline, so a client that reads slowly but steadily can hold a
+connection longer than the window in total. Pinned by
+`the_socket_is_owner_only`,
+`an_interrupted_read_is_retried_and_is_not_a_close`,
+`a_name_that_is_not_a_socket_is_refused_and_never_followed`,
+`an_answer_past_the_ceiling_is_replaced_by_a_naming_refusal`,
+`the_cli_refuses_an_answer_past_the_ceiling` and
+`a_client_that_stops_reading_mid_answer_is_reaped_at_the_write_bound`.
+
+**The child niceness (#191; `d2d451d`, merged `f692fad`).** Every command mush
+runs is a guest: `CHILD_NICE = 10` is set once, at `Shell::spawn` — the one
+door every command passes through — with
+`rustix::process::setpriority_process(Some(pid), 10)` right after the spawn
+(no `unsafe`, no new dependency, no `/usr/bin/nice` that can be missing), and
+the failure is ignored on purpose: the priority is a courtesy, never a
+precondition. A detached job is the same process handed to the registry, so it
+keeps the value and its grandchildren inherit it; a mush started below 10
+leaves its children at that lower priority (an unprivileged process cannot
+hand a child a better priority — measured `EPERM`), which is why the test
+asserts `child == CHILD_NICE || (own > CHILD_NICE && child == own)`. The
+probe, the child reading its own niceness (`ps -o ni= -p $$`): before
+`own=0 child=0`, after `own=0 child=10`; the human's two rulings this session
+are this one and the image cap (§8.112's image paragraph). Pinned by
+`a_command_mush_spawns_runs_at_the_niceness_mush_gives_it`.
+
+**The platform policy (#192; `e0ee1e3`, `852899e`, `a81498f`, merged
+`dd1fd88`; the manual's sentences landed `f9a911d`).** Linux is the platform
+mush is built and gated on; macOS is expected to build and run — nothing in
+the program is Linux-specific, only POSIX — but it has never been built there,
+so that is a claim from reading, not a measurement, and no promise follows it;
+Windows is not supported, and the five roads that make it structural are the
+shell every command goes through (`sh -c`), the process-group cleanup that ends
+a command's tree, the one-mush-per-workspace lock (`flock`), the attach socket,
+and the signal road. The one trivial product item was taken anyway: the
+Windows clipboard **writer** `clip` joins `wl-copy` → `xclip` → `pbcopy` →
+`clip` in that order (the order is not a guess at the session — a program of
+the wrong display server fails as fast as a missing one, and a program that is
+not on the machine reports `Missing` and the next is tried, so the line costs
+Linux and macOS nothing); the read road is untouched, so Windows is the write
+road alone. The probe, a `PATH` where every writer name resolved to the test's
+own shim (`clip` catting stdin to a file): before
+`answer=Err("the text did not reach the clipboard …")`, after `Ok(())` with
+the shim file written; `writers()`'s doc, the write seam and `App::write_clipboard`'s
+doc were repaired with it. Pinned by
+`the_writers_are_the_four_programs_in_the_documented_order`.
+
+**The contract's sentences (`6f030bb`, `f9a911d`).** The wave's owed sentences
+landed in the files that own them, not here: the restore's orphan and the ⚮
+placement, the table's content rule, the image byte cap, the refusal's byte
+ceiling, the home config on a machine with no `HOME`, the platform policy, the
+guest rule, the draw sweep's 15 sizes × 18 states, the wrap parity test's
+twelve texts and ten-character fuzz, the attach socket's owner-only mode, and
+the `.mush/wt` rule in the `list_files` row — in `docs/mush.md`, `README.md`,
+`docs/refactor.md`, `docs/dedup/`, the one repair in `docs/audits/tui.md`'s
+false `set_stringn` sentence, and the code doc comments the same landing
+repaired (`workspace.rs`'s `IMAGE_FILE_CAP`, `agent.rs`'s `for_the_model`,
+`session.rs`'s `shed_images`, `main.rs`'s Resize comment). This record does not
+repeat them; the file that owns each carries it.
+
+**What the wave deliberately left, named rather than papered over.**
+
+- **The attach road:** no peer-credential check (`SO_PEERCRED`); 0600 and the
+  type check are the whole rule. And its write bound is a progress bound —
+  a per-write idle window, not a whole-answer deadline.
+- **IN2's spawn-level sentence** (`the_id_space_is_spent`, `agent.rs`) has no
+  direct test: the four new pins read the id spaces and the stored-row
+  refusals, and the sentence itself has only its call site.
+- **IN15's cost** has no direct test either: the three pins read that both
+  connects *return* at their bounds; that the abandoned connect is left to the
+  OS to collect is the design and is not measured.
+- **The 8 MB cap's cache cost** stands as stated: dropping an old picture
+  changes the request prefix and the endpoint re-prefills from there — about
+  every fourth new 2 MiB picture; the 32 MiB ceiling variant (about every
+  twelfth, and one constant away) was offered and not taken.
+- **The whole-disk guard's reading of globs** is honest about what it cannot
+  see: a glob directly under `/` is refused because its width cannot be read,
+  and one deeper (`find /tmp/*`) stays allowed as a walk of some other root —
+  a refusal, not a proof.
+- **`AgentTree::forgotten` is not in the session file** (§8.109): after a
+  restart a nested orphan falls back to the root.
+- **Two flakes the wave met** beyond §8.102's list: `app::tests::the_notes_popup_opens_on_the_head_of_the_newest_note`
+  (seen twice by #189's gate — a 0s/1s clock stamp, the shape §8.97 fixed once)
+  and `session_save::tests::the_writer_thread_is_named` (seen once under load,
+  a poisoned worker).
+- **The leak-watcher house rule:** after any gate that touched machine/jobs
+  tests, check `ps -eo pid,cmd | grep '[w]hile :; do :; done'` and kill the
+  group (`kill -9 -- -<pgid>`). The human's eight htop groups are why; the
+  root's `.mush/leak-watch.sh` swept every 15 s while the fixture fix was in
+  flight and killed two more groups (`15:33:50 killed leaked group 1760748`,
+  `15:38:06 killed leaked group 1846102`).
+- **The human's rulings this session:** the flat image byte cap (above), that
+  every command mush spawns is a guest at `nice` 10 (above), and the platform
+  scoping (above).
+
+---
+
+## 8.113 The census at `f9a911d`, the rows this pass opens, the closure sheet, and this pass's gates
+
+**The census.** `python3 scripts/census.py` at `f9a911d` (master's tip, the
+wave's last merge) prints **TOTAL 102,334 · blank 5,684 · comment 29,619 ·
+tests 45,195 · prod 21,836**, the test-module span 59,141. The four audits and
+this record are outside the script's count — it walks `crates/` only — so every
+line of the wave's **+7,992** over §8.107's `f46859f` reading (94,342 · 5,293 ·
+26,692 · 41,761 · 20,596) is code with its tests and comments. §11's anchor
+moves from `332fe21` (92,505 · 5,243 · 26,093 · 40,741 · 20,428) to this
+reading: prod +1,408, tests +4,454, comments +3,526, blank +441. The audits did
+not change the code they audited; the wave's chips are its tests, its sentences
+and the code the findings asked for.
+
+**The rows this pass opens.** H81–H137 — one per finding of the four audits
+(§8.110), the overlapped pairs carrying both ids (IN4 = R12, IN5 = PM1), each
+naming what it was, its commit and its pin; the three docs-vs-code appendix
+items are marked as that audit's, because `A1`–`A23` are also the old
+agent-and-wire audit's. H77–H80 stand open as §8.107 left them (the crafted
+braid, `is_row`, the pty workdir, the `ceil(width/4)` fold cap — the last still
+a judgement for a human's eye).
+
+**The closure sheet.** §8.52's sheet gets a dated addendum saying it now speaks
+for `f9a911d`; its counts stand at **103 fixed, 1 partial (A19), 0 open**,
+because no finding of the 104 moved — this wave's findings are the four new
+audits', and they are carried by the H81–H137 rows.
+
+**The sentences this wave made false in this file's own earlier sections** —
+each corrected in place, with a flag where the text is a historical
+measurement rather than a claim:
+
+- H17's "the pane keeps its full record on purpose" gains the byte cap's one
+  exception (R1, §8.112);
+- §8.34's startup-reclaim paragraph re-points `App::reclaim_isolated` to
+  `App::isolated_removals` + `App::start_sweep` (with `SweepOwed::Restore`) and
+  says `discover_worktrees` only registers now (`d4ee1e7`);
+- §8.40's three: the sweep's removal path (the worker's `git::reclaim`), the
+  `HEAD` reading (`App::isolated_removals`, not `discover_worktrees`) and the
+  landing's census that named `reclaim_isolated` (flagged, the census itself
+  kept as that landing's);
+- §8.49's clipboard test — 250 ms, the pid-file race and the fourth writer
+  (`5a12702`, `a81498f`);
+- §8.54's "handed to any local user through the attach socket" — owner-only
+  since `abc9dff`;
+- §8.60's `worktree_in_use` pass — the worker asks the tree through
+  `Msg::SweepAsk` now (`d4ee1e7`) — and the same `reclaim_isolated` bullet in
+  `docs/dedup/app-and-panes.md`'s queue, re-pointed to `Msg::SweepAsk`'s
+  answer;
+- §8.61's signal road — the self-pipe and the two-press quit (`cb9ccde`);
+- §8.67's three socket bounds gain the wave's fourth bound (the answer's write)
+  and its two residuals (`34e7479`);
+- §8.81's D9 record and §8.87's, §8.93's and §8.101's placement/ink/top-level
+  sentences — flagged, not rewritten: §8.109's placement governs now;
+- §8.48's write-bounds list and §8.57's fit-test sentence gain `request_bytes`
+  and `MAX_REQUEST_BYTES` (`8ac80f7`).
+
+§8.102's flake list gains the two flakes the wave met (§8.112's tail), and
+`app::tests::the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` and
+`clipboard::tests::a_writer_that_never_takes_the_text_is_killed_at_the_deadline`
+leave it: their races were the defect F11 fixed.
+
+**This pass's gates.** On a clean tree (this file's append, `docs/refactor.md`
+§11's anchor and one bullet of `docs/dedup/app-and-panes.md` are the only
+changes), every pipeline under `set -o pipefail`, run as
+`nice -n 19 ionice -c 3` with `CARGO_BUILD_JOBS=3` (each exit 0 unless its
+bullet says otherwise):
+
+- `cargo fmt --all -- --check` — exit 0.
+- `cargo clippy --all-targets -- -D warnings` — exit 0.
+- `cargo build --workspace` — exit 0.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` —
+  exit 0.
+- `cargo test --workspace` — **981 passed + 4 ignored** (`mush`) and **313
+  passed** (`mush-core`), 0 doc-tests, 0 failed, exit 0; green on the pass's
+  first run and green again alone. One re-run while a sibling's suite was
+  loading the machine failed once in the `mush` binary (980 passed, 1 failed)
+  and was green alone immediately after; the gate's own pipeline kept only the
+  result lines, so the failing name is reported unnamed rather than guessed at,
+  and it is not added to §8.102's list — re-run alone, not chased.
+- `python3 scripts/census.py` — the totals above.
+- the three endpoint-free pty scenarios, one at a time, each in its own fresh
+  `mktemp -d` — `python3 scripts/smoke.py target/debug/mush "$(mktemp -d)/resize"
+  --resize` and likewise `--cancel`, `--sigterm`: the resize redrew 4,766 bytes
+  with no keypress and still took a key, the cancel freed the agent in 0.90 s
+  over exactly two chats, and the sigterm's four checks passed — the marker was
+  never created, the exit flush wrote the answer, the socket was gone, and the
+  next start reaped the scratch pair to 0 left.
+
+Every number above is a command's output or a commit's own body re-read at
+`f9a911d`; the pass changes no line under `crates/` or `scripts/`.
 
