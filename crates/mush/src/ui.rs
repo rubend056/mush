@@ -108,8 +108,24 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
         .iter()
         .map(|row| ListItem::new(agent_line(row, row_width)))
         .collect();
-    let list =
-        List::new(items).highlight_style(Style::default().fg(Color::Black).bg(theme.accent()));
+    // The cursor's mark depends on who has the keyboard, because the band *is*
+    // the cursor: focused, the row is `Color::Black` on the hue — mush's one
+    // way of putting text on a colour — and it is the same band the chat's
+    // selection wears. With the chat focused the human asked for a quieter mark
+    // ("an outline or something less intrusive (instead of fill)"): a filled
+    // band in a pane that is not active reads as a second cursor, and the only
+    // thing the row has to say there is "this is the agent the pane would act
+    // on". The hue as the row's own ink says it with no cell's background
+    // changed and no column spent, which is why an outline, an underline or the
+    // old `› ` highlight symbol were all worse: any of them spends or moves a
+    // cell, and the row's first cells are the tree's `▶` and the agent's own
+    // `⊘`/`⏸`/`✓` glyph, which are state and not this mark's to paint over.
+    let highlight = if focus == Focus::Agents {
+        Style::default().fg(Color::Black).bg(theme.accent())
+    } else {
+        Style::default().fg(theme.accent())
+    };
+    let list = List::new(items).highlight_style(highlight);
     let mut state = ListState::default();
     state.select(Some(pane.cursor));
     // The rows go where the pane said they go. The geometry is derived once, in
@@ -200,11 +216,12 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
 ///
 /// The selection is the theme's hue as a background with `Color::Black` on it:
 /// mush has exactly one way of putting a colour behind text, and this is it —
-/// the bar's badge and the agents pane's selected row paint the same pair, and
-/// the hue is chosen in the L* 65–84 band precisely so it works *under* black
-/// text. The old mark kept each span's own ink over the band instead, so a
-/// dimmed tool result and a green reply stayed themselves inside it; that is
-/// given up on purpose, because a light band under light text is mud.
+/// the bar's badge and the agents pane's selected row, while that pane has the
+/// keyboard, paint the same pair, and the hue is chosen in the L* 65–84 band
+/// precisely so it works *under* black text. The old mark kept each span's own
+/// ink over the band instead, so a dimmed tool result and a green reply stayed
+/// themselves inside it; that is given up on purpose, because a light band
+/// under light text is mud.
 ///
 /// The cursor is that band's inverse — the hue as the text's own colour on a
 /// `Color::Black` background — and span-only for the same reason, so a
@@ -216,12 +233,13 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
 /// row is marked even when it is blank: a blank source line has only its indent
 /// cells, and they are still its own.
 ///
-/// Neither mark is the agents pane's selected row. That row is `Black` on the
-/// hue too — there is one way to put the hue behind text — but it is a whole
-/// row of a *list*, a place in the tree painted by the list's own highlight,
-/// while these are a *range of the transcript* painted under the lines it
-/// covers and the shape of the keyboard's own row. The select row's pad stays
-/// the pane's background, which is what the tree's row never does.
+/// Neither mark is the agents pane's selected row. That row wears `Black` on
+/// the hue too while the tree has the keyboard — there is one way to put the
+/// hue behind text — but it is a whole row of a *list*, a place in the tree
+/// painted by the list's own highlight, while these are a *range of the
+/// transcript* painted under the lines it covers and the shape of the
+/// keyboard's own row. The select row's pad stays the pane's background, which
+/// is what the tree's row never does.
 fn select_painted(
     lines: &[Line<'static>],
     select: &SelectRows,
@@ -433,7 +451,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
-    use crate::app::Painted;
+    use crate::app::{AgentId, Painted};
     use crate::theme::EnvText;
 
     /// A picker at `area` with one item, so a frame has a border, a selected
@@ -720,5 +738,180 @@ mod tests {
         assert_eq!(style_at(&buffer, 1, 1).fg, Some(Color::Black));
         assert_eq!(style_at(&buffer, 1, 1).bg, Some(theme.accent()));
         assert_eq!(style_at(&buffer, 1, 4).fg, Some(Color::DarkGray));
+    }
+
+    /// An agents pane at `area` with the tree's four leading shapes — an idle
+    /// `·`, the `⊘` a stopped agent wears, a finished `✓`, and a running `◐`
+    /// three levels in with its `⏸` count — and the cursor on the `✓` row, so
+    /// the mark has rows on both sides of it and the leading glyphs it must not
+    /// paint over. The geometry is `App::agents_pane`'s at a plain size: a
+    /// bordered pane with no footer, so the list gets the whole inner rect.
+    fn agents_pane(area: Rect) -> AgentsPane {
+        let rows = ["·", "⊘", "✓", "◐"]
+            .into_iter()
+            .enumerate()
+            .map(|(at, glyph)| AgentRow {
+                id: AgentId(at as u64),
+                depth: at,
+                glyph,
+                focused: false,
+                waiting: at,
+                result_unread: false,
+                unread_children: 0,
+                title: format!("row {at}"),
+                place: String::new(),
+                activity: String::new(),
+            })
+            .collect();
+        AgentsPane {
+            area,
+            list_area: Block::default().borders(Borders::ALL).inner(area),
+            title: " agents ".to_string(),
+            rows,
+            cursor: 2,
+            footer: Vec::new(),
+        }
+    }
+
+    /// [`agents_pane`] painted by the pane's own painter with `focus` holding
+    /// the keyboard, the way `draw` hands the focus over — so what the test
+    /// reads are the cells `draw_agents` really paints, not the styles it was
+    /// handed.
+    fn agents_buffer(area: Rect, focus: Focus, theme: &Theme) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| draw_agents(frame, &agents_pane(area), focus, theme))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The agents pane's cursor is a filled band only while that pane has the
+    /// keyboard; with the chat focused the selected row is marked with the
+    /// accent as its own ink instead. The fill *is* the cursor, and a filled
+    /// band in a pane that is not active reads as a second cursor — the human
+    /// asked for a quieter mark there ("an outline or something less intrusive
+    /// (instead of fill)"). The quiet mark spends no column and moves no cell,
+    /// which an outline, an underline or a `highlight_symbol` could not promise:
+    /// the selected row's leading cells are the tree's `▶` and the agent's own
+    /// `⊘`/`⏸`/`✓` glyph, and those are state, not this mark's to paint over.
+    #[test]
+    fn the_agents_cursor_is_a_band_only_while_the_pane_has_the_keyboard() {
+        /// The cell wears the band: `Black` text on the accent's background.
+        fn wears_band(buffer: &Buffer, x: u16, y: u16, accent: Color) -> bool {
+            let style = style_at(buffer, x, y);
+            style.fg == Some(Color::Black) && style.bg == Some(accent)
+        }
+        /// The cell's text is the accent and its background is not: the quiet
+        /// mark, which is ink and never a fill.
+        fn wears_ink(buffer: &Buffer, x: u16, y: u16, accent: Color) -> bool {
+            let style = style_at(buffer, x, y);
+            style.fg == Some(accent) && style.bg != Some(accent)
+        }
+
+        let area = Rect::new(0, 0, 30, 8);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let cursor = inner.y + 2;
+        // Every form the accent resolves in: the fixed palette, a workspace
+        // hue's own bytes, and that hue's nearest 256-colour entry. One accent
+        // is both marks in each, so the cursor reads the same through all of
+        // them — a theme changes the colour, not the shape.
+        let root = std::path::Path::new("/nonexistent/mush/cursor");
+        let hued = Theme::resolve(
+            &EnvText {
+                theme: None,
+                colorterm: Some("truecolor".to_string()),
+                term: None,
+            },
+            root,
+        )
+        .unwrap();
+        let indexed = Theme::resolve(
+            &EnvText {
+                theme: None,
+                colorterm: None,
+                term: Some("linux".to_string()),
+            },
+            root,
+        )
+        .unwrap();
+        for theme in [Theme::default(), hued, indexed] {
+            let accent = theme.accent();
+            let focused = agents_buffer(area, Focus::Agents, &theme);
+            let quiet = agents_buffer(area, Focus::Chat, &theme);
+
+            // Focused, the cursor is the band across the pane's own row —
+            // every cell of it, the way `List` paints its highlight — and no
+            // other row wears it.
+            for x in inner.x..inner.right() {
+                assert!(
+                    wears_band(&focused, x, cursor, accent),
+                    "{accent:?}: the focused cursor at ({x}, {cursor})"
+                );
+            }
+            for y in inner.y..inner.bottom() {
+                if y == cursor {
+                    continue;
+                }
+                for x in inner.x..inner.right() {
+                    assert!(
+                        !wears_band(&focused, x, y, accent),
+                        "{accent:?}: ({x}, {y}) is not the cursor"
+                    );
+                }
+            }
+
+            // With the chat focused no cell of the pane is filled with the
+            // accent — the band does not survive — and the cursor's row is the
+            // one row whose text is the accent.
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    assert_ne!(
+                        style_at(&quiet, x, y).bg,
+                        Some(accent),
+                        "{accent:?}: the band survived at ({x}, {y})"
+                    );
+                }
+            }
+            for x in inner.x..inner.right() {
+                assert!(
+                    wears_ink(&quiet, x, cursor, accent),
+                    "{accent:?}: the quiet mark at ({x}, {cursor})"
+                );
+            }
+            for y in inner.y..inner.bottom() {
+                if y == cursor {
+                    continue;
+                }
+                for x in inner.x..inner.right() {
+                    assert!(
+                        !wears_ink(&quiet, x, y, accent),
+                        "{accent:?}: ({x}, {y}) is not the cursor's row"
+                    );
+                }
+            }
+
+            // And nothing moved: the two frames carry the same glyphs in the
+            // same cells — the pane's geometry, every row's fields, and the
+            // cursor row's own `✓` and `⏸` among them.
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    assert_eq!(
+                        quiet[(x, y)].symbol(),
+                        focused[(x, y)].symbol(),
+                        "{accent:?}: ({x}, {y}) moved with the focus"
+                    );
+                }
+            }
+            assert_eq!(
+                quiet[(inner.x + 5, cursor)].symbol(),
+                "✓",
+                "{accent:?}: the cursor row's own glyph"
+            );
+            assert_eq!(
+                quiet[(inner.x + 3, inner.y + 1)].symbol(),
+                "⊘",
+                "{accent:?}: and the row above it keeps its own"
+            );
+        }
     }
 }
