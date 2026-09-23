@@ -18,13 +18,32 @@
 
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 
 use mush_core::session::Session;
+
+/// How long a flush waits for its write before it reports the session as not
+/// saved.
+///
+/// The number bounds the *caller's* wait, not the disk's work: `flush` runs on
+/// the thread that reads every key, resize and `Ctrl-Q`, so a write wedged on
+/// an NFS mount or a full disk must not hold the UI at all. Ten seconds is far
+/// past what a local write owes and far short of a freeze.
+///
+/// A flush that reaches the deadline has not failed the write: the worker is
+/// still writing, and when it finishes it answers whoever is waiting then. The
+/// deadline is reported as a failure anyway — the human asked for "on disk"
+/// and it is not — and the next flush parks a fresh waiter, so the write is
+/// asked for again; the abandoned waiter is taken back out of the queue, so a
+/// run of timeouts cannot grow it without bound. What the deadline buys the
+/// human is a report where a freeze used to be.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Where a snapshot of the session is written.
 ///
@@ -73,6 +92,25 @@ struct Inner {
     #[cfg(test)]
     writes: AtomicUsize,
     failed: Mutex<Option<String>>,
+    /// Whether the worker thread is there to answer a flush.
+    ///
+    /// Set when the thread is started and cleared by the [`Alive`] guard on the
+    /// thread's stack, so it goes down on *any* way the thread can end — a
+    /// panic, an early return — and never for a write that is merely slow. A
+    /// flush reads it before it parks a waiter: a worker that is gone will
+    /// never wake one, and waiting for it is exactly how the UI froze (finding
+    /// E7).
+    alive: AtomicBool,
+}
+
+impl Inner {
+    /// Leave a failure where the UI's next tick will find it, and hand it back
+    /// to a caller that can be the test.
+    fn fail(&self, message: impl Into<String>) -> String {
+        let message = message.into();
+        *self.failed.lock().unwrap() = Some(message.clone());
+        message
+    }
 }
 
 /// What the writer still owes.
@@ -91,10 +129,39 @@ impl Pending {
     }
 }
 
+/// Clears [`Inner::alive`] from the worker's own stack.
+///
+/// A `Drop` guard rather than a line at the end of [`writer`], because a panic
+/// unwinds the stack and skips the line — and a worker that died by panic is
+/// exactly the case a flush must not wait on. The guard is made before the loop
+/// and dropped after it, however it ends.
+struct Alive(Arc<Inner>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::SeqCst);
+    }
+}
+
 impl Writer {
-    pub fn new(root: PathBuf) -> Self {
+    /// A writer with its thread already running. A thread the OS will not give
+    /// is returned as the error it is, never raised (see [`Self::run`]).
+    pub fn new(root: PathBuf) -> Result<Self, String> {
         let mut writer = Self::parked(root);
-        writer.run();
+        writer.run()?;
+        Ok(writer)
+    }
+
+    /// A writer that will never write, and the reason why: what `main` keeps
+    /// when [`Self::new`]'s thread will not start.
+    ///
+    /// The session cannot be saved by this writer — `save` parks snapshots
+    /// nothing takes, and every `flush` fails at once through `take_error` —
+    /// but the app still runs, and the human reads the reason on the status
+    /// line instead of a startup that refuses the workspace over a thread.
+    pub fn without_worker(root: PathBuf, reason: String) -> Self {
+        let writer = Self::parked(root);
+        writer.inner.fail(reason);
         writer
     }
 
@@ -109,6 +176,7 @@ impl Writer {
                 #[cfg(test)]
                 writes: AtomicUsize::new(0),
                 failed: Mutex::new(None),
+                alive: AtomicBool::new(false),
             }),
             wake: None,
             worker: None,
@@ -116,11 +184,39 @@ impl Writer {
     }
 
     /// Start the writer's thread.
-    fn run(&mut self) {
+    ///
+    /// The thread carries a name — `mush-save`, where every other thread in the
+    /// process is `mush-agent-{id}` or `mush-job-{id}` — so a panic on it says
+    /// which thread died instead of `<unnamed>`. A thread the OS refuses is
+    /// *returned*, not raised: the caller runs with [`Self::without_worker`]
+    /// and tells the human, because a process with nowhere to save is a smaller
+    /// loss than one that will not start.
+    fn run(&mut self) -> Result<(), String> {
         let (wake, woken) = bounded::<()>(1);
         let inner = self.inner.clone();
-        self.worker = Some(std::thread::spawn(move || writer(inner, woken)));
-        self.wake = Some(wake);
+        // Set *before* the spawn, never after: a worker that ran and died
+        // before this line would otherwise leave a stale `true` behind, and the
+        // next flush would park a waiter nothing wakes — the freeze this flag
+        // exists to prevent. The spawn's failure path stores it back to `false`;
+        // the guard on the thread's stack clears it on every other way out.
+        self.inner.alive.store(true, Ordering::SeqCst);
+        let started = thread::Builder::new()
+            .name("mush-save".to_string())
+            .spawn(move || {
+                let _alive = Alive(inner.clone());
+                writer(inner, woken);
+            });
+        match started {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.wake = Some(wake);
+                Ok(())
+            }
+            Err(error) => {
+                self.inner.alive.store(false, Ordering::SeqCst);
+                Err(format!("could not start the session writer: {error}"))
+            }
+        }
     }
 
     /// Nudge the worker: there is something to write (or someone to wake).
@@ -148,20 +244,71 @@ impl SessionSave for Writer {
     }
 
     fn flush(&self) {
-        let (done, waited) = bounded(1);
-        self.inner.pending.lock().unwrap().waiting.push(done);
-        self.poke();
-        // The worker drops the sender when it takes the waiter, which happens
-        // after the write in front of it lands — so this returns with the file
-        // current. Blocking here is the point of the call; blocking *forever*
-        // would need the worker to die holding the waiter, and the one thing it
-        // calls that could panic out (`Session::save`) returns its errors
-        // instead.
-        let _ = waited.recv();
+        let _ = self.flush_within(FLUSH_DEADLINE);
     }
 
     fn take_error(&self) -> Option<String> {
         self.inner.failed.lock().unwrap().take()
+    }
+}
+
+impl Writer {
+    /// [`SessionSave::flush`], with the deadline a parameter so a test can hold
+    /// the clock instead of the clock holding the test.
+    ///
+    /// Three things end the wait, and none of them is "as long as it takes":
+    /// the worker answering (the file is then current), the worker being gone
+    /// (a waiter nothing can wake is never parked), or the deadline (the write
+    /// is still in flight; the waiter is taken back out of the queue and the
+    /// failure is left in [`SessionSave::take_error`]). The deadline is not
+    /// sticky — it does not mark the worker dead — so the next flush parks a
+    /// fresh waiter and asks again, which is what makes a write that lands
+    /// late still land.
+    fn flush_within(&self, deadline: Duration) -> Result<(), String> {
+        if !self.inner.alive.load(Ordering::SeqCst) {
+            return Err(self
+                .inner
+                .fail("the session writer is gone — the session was not saved"));
+        }
+        let (done, waited) = bounded(1);
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .waiting
+            .push(done.clone());
+        self.poke();
+        // The worker sends on the waiter after the write in front of it lands,
+        // so a `recv` that returns means the file is current; a `recv` that
+        // disconnects means the worker died without answering.
+        match waited.recv_timeout(deadline) {
+            Ok(()) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => {
+                // The worker may still be inside the write; the answer it owes
+                // is owed to whoever waits then, not to this caller, and a
+                // waiter left in the queue would grow the queue once per
+                // timed-out flush. Take ours back out. The worker holds the
+                // queue only long enough to empty it, so this cannot become a
+                // second unbounded wait.
+                self.inner
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .waiting
+                    .retain(|waiter| !waiter.same_channel(&done));
+                if !self.inner.alive.load(Ordering::SeqCst) {
+                    return Err(self
+                        .inner
+                        .fail("the session writer is gone — the session was not saved"));
+                }
+                Err(self.inner.fail(format!(
+                    "the session writer did not answer within {deadline:?} — the write is still in flight, and the next flush will ask again"
+                )))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(self.inner.fail(
+                "the session writer died before the write landed — the session was not saved",
+            )),
+        }
     }
 }
 
@@ -278,11 +425,14 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use mush_core::message::Message;
     use mush_core::session::{session_path, Session};
 
-    use super::{SessionSave, Writer};
+    use super::{SessionSave, Writer, FLUSH_DEADLINE};
 
     /// A directory to write a session into, and to leave behind nothing.
     fn root(label: &str) -> std::path::PathBuf {
@@ -315,13 +465,37 @@ mod tests {
             .to_string()
     }
 
+    /// Whether a `flush` on its own thread returned within `deadline` — the UI
+    /// thread's experience of a flush that parks, kept as a probe: a regression
+    /// fails the test rather than hanging the suite.
+    fn flushed_within(writer: &Arc<Writer>, deadline: Duration) -> bool {
+        let (done, waited) = crossbeam_channel::bounded::<()>(1);
+        let writer = writer.clone();
+        std::thread::spawn(move || {
+            writer.flush();
+            let _ = done.send(());
+        });
+        waited.recv_timeout(deadline).is_ok()
+    }
+
+    /// Wait, bounded, for the worker's `Drop` guard to clear the flag it owns:
+    /// the wait is on the thread's own stack clearing, not a guess at how long
+    /// a panic takes.
+    fn wait_until_dead(writer: &Writer) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.inner.alive.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the worker never died");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// The write lands where `Session::load` looks, in the format it reads: a
     /// session written on the writer's thread is the same file the UI thread
     /// used to write.
     #[test]
     fn a_handed_over_snapshot_is_on_disk_when_flush_returns() {
         let root = root("roundtrip");
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone()).expect("the worker starts");
         writer.save(saying("hello"));
         writer.flush();
         assert_eq!(last_message(&root), "hello");
@@ -339,7 +513,7 @@ mod tests {
         writer.save(saying("one"));
         writer.save(saying("two"));
         writer.save(saying("three"));
-        writer.run();
+        writer.run().expect("the worker starts");
         writer.flush();
         assert_eq!(writer.writes(), 1, "three snapshots are one write");
         assert_eq!(last_message(&root), "three", "and the newest one");
@@ -351,12 +525,141 @@ mod tests {
     #[test]
     fn a_flush_with_nothing_pending_still_returns() {
         let root = root("empty");
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone()).expect("the worker starts");
         writer.flush();
         assert!(!session_path(&root).exists(), "nothing was handed over");
         writer.save(saying("after"));
         writer.flush();
         assert_eq!(last_message(&root), "after");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A worker that is gone must not take the flush with it: the waiter is
+    /// never parked, the call returns at once, and the failure it leaves is the
+    /// one the UI's next tick reads.
+    ///
+    /// Both shapes of "gone" are here: a worker that never started — what a
+    /// thread the OS refused leaves behind, and what a worker that died leaves
+    /// too — and a worker that died by panic on the queue it took.
+    #[test]
+    fn a_flush_with_a_dead_writer_returns_with_an_error() {
+        let root = root("dead-flush");
+
+        let never = Arc::new(Writer::parked(root.clone()));
+        never.save(saying("lost"));
+        assert!(
+            flushed_within(&never, FLUSH_DEADLINE),
+            "a flush with no worker waited past the deadline"
+        );
+        let error = never.take_error().expect("the missing writer is reported");
+        assert!(error.contains("writer"), "the failure names it: {error}");
+        assert!(
+            error.contains("not saved"),
+            "and says what was lost: {error}"
+        );
+
+        let died = Arc::new(Writer::new(root.clone()).expect("the worker starts"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = died.inner.pending.lock().unwrap();
+            panic!("poison the queue on purpose");
+        }));
+        died.poke();
+        wait_until_dead(&died);
+        assert!(
+            flushed_within(&died, FLUSH_DEADLINE),
+            "a flush with a dead worker waited past the deadline"
+        );
+        let error = died.take_error().expect("the death is reported");
+        assert!(error.contains("writer"), "the failure names it: {error}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The worker's thread is named, so a panic on it reads
+    /// `thread 'mush-save'` where the alternative says `<unnamed>` — every
+    /// other thread in the process (`mush-agent-{id}`, `mush-job-{id}`) says
+    /// what it is. The name is read from the panicking thread, which is where
+    /// the default hook reads it, and formatted the way that hook formats it.
+    #[test]
+    fn the_writer_thread_is_named() {
+        let root = root("named");
+        let writer = Writer::new(root.clone()).expect("the worker starts");
+        // The worker's own death: the queue it must take is poisoned under it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = writer.inner.pending.lock().unwrap();
+            panic!("poison the queue on purpose");
+        }));
+
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let previous = Arc::new(std::panic::take_hook());
+        {
+            let seen = seen.clone();
+            let previous = previous.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                let current = std::thread::current();
+                let name = current.name().unwrap_or("<unnamed>");
+                if name == "mush-save" {
+                    *seen.lock().unwrap() = Some(format!("thread '{name}' {info}"));
+                } else {
+                    previous(info);
+                }
+            }));
+        }
+        writer.poke();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the worker never panicked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+
+        let message = seen.lock().unwrap().clone().expect("the worker panicked");
+        assert!(message.contains("mush-save"), "{message}");
+        // And the app can read that the worker is gone.
+        writer.flush();
+        assert!(writer.take_error().is_some(), "the dead worker is reported");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A write that is stuck, not dead, is the third way a flush ends: it gives
+    /// up at the deadline and reports it, without marking the worker dead and
+    /// without leaving its waiter behind — so a later flush parks a fresh one
+    /// and asks again, and a run of timeouts cannot grow the queue.
+    #[test]
+    fn a_timed_out_flush_leaves_the_next_one_able_to_try() {
+        let root = root("flush-timeout");
+        let writer = Writer::parked(root.clone());
+        // The shape of a worker stuck inside `Session::save`: the thread is
+        // there (the flag says so), the answer is not. Nothing is parked on the
+        // queue, so the wait can only end at the deadline — which the test
+        // holds, because `flush_within` takes it.
+        writer.inner.alive.store(true, Ordering::SeqCst);
+        writer.save(saying("lost"));
+
+        let started = Instant::now();
+        let first = writer
+            .flush_within(Duration::from_millis(50))
+            .expect_err("a stuck worker is not an answer");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the deadline is the clock: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            first.contains("in flight"),
+            "the report says the write is still going: {first}"
+        );
+        assert!(
+            writer.inner.pending.lock().unwrap().waiting.is_empty(),
+            "the abandoned waiter is taken back out"
+        );
+        assert_eq!(writer.take_error().as_deref(), Some(first.as_str()));
+
+        let _ = writer.flush_within(Duration::from_millis(50));
+        assert!(
+            writer.inner.pending.lock().unwrap().waiting.is_empty(),
+            "and the second timeout does not grow the queue"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -368,7 +671,7 @@ mod tests {
         // `.mush` as a *file* is a workspace the session cannot be written to,
         // exactly as a full disk or a read-only checkout would be.
         fs::write(root.join(".mush"), "not a directory").unwrap();
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone()).expect("the worker starts");
         writer.save(saying("lost"));
         writer.flush();
         let error = writer.take_error().expect("the failure is reported");

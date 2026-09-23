@@ -938,8 +938,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let root = agent::spawn(cell.handle(), tx.clone(), workspace.root().to_path_buf());
     // The session goes out through its own thread: the UI thread hands a
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
-    // exit flush.
-    let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
+    // exit flush. A thread the OS will not give is not a reason to refuse the
+    // workspace: the writer returns its spawn failure, and a writer with no
+    // worker reports every flush at once, on the status line (finding E7).
+    let save: Arc<dyn session_save::SessionSave> =
+        match session_save::Writer::new(workspace.root().to_path_buf()) {
+            Ok(writer) => Arc::new(writer),
+            Err(error) => {
+                eprintln!("mush: the session will not be saved — {error}");
+                Arc::new(session_save::Writer::without_worker(
+                    workspace.root().to_path_buf(),
+                    error,
+                ))
+            }
+        };
     let attach_root = workspace.root().to_path_buf();
     let mut app = App::new(workspace, cell, stored, root, tx.clone(), save);
     // The attach socket comes up before the first frame, so a client can
