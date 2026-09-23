@@ -440,6 +440,7 @@ the blocks below (a test fails while either is stale):
     /context [N|auto]            say the window's size and road, state one, or auto for the table
     /compact                     fold the focused agent's conversation into a summary
     /notes                       read every note about the focused agent, in full
+    /glyphs [ascii|symbols]      show the mark each tool wears, or paint them in ascii
     /help                        list the keys and these commands
     /quit                        leave mush
 ```
@@ -539,6 +540,29 @@ whatever the human chose. A reasoning that trims to nothing paints no row at all
 The call's row is the *same row in both views* — the pane's call grid — and the
 compact log differs only in what follows it: a header, no details, no payload.
 
+The grid is a function of the pane's width alone, because a turn is often a
+single call and a column that lines up only inside one message lines up with
+nothing: an outcome column of `(width / 3).clamp(12, 28)` columns on the right,
+the `→` at `width - outcome_w`, two columns of gap before it, and the ask in
+what is left after the call's own **mark** — the tool's glyph and the space
+after it, two columns wide, measured rather than assumed so a wider glyph moves
+the ask and nothing else. The ask and the outcome are each cut with `…`
+from the right (the first clause is the one that matters, and the digest orders
+an outcome's clauses exit-status first); where the ask's column would fall under
+fourteen columns the outcome moves to a row of its own, under the ask and in the
+same outcome column, and the ask takes the pane — an outcome is never dropped.
+The ask is built from the call's own arguments — a path shown relative to the
+workspace, a read's window (`text.rs 1408→1530`), a search's pattern and where
+it looked, a command's redundant leading `cd <workspace root> &&` and its
+trailing output shaping (`2>&1`, `2>/dev/null`, `| cat`, `| head -N`, `| tail
+-N`) stripped, because what the shaping cost is already in the outcome's line
+count. The outcome is read from the result's own sentences: an exit code with
+the command's own time (`exit 0 · 41 lines · 5s`), a read's line and byte
+counts, a listing's rows, a wait's delivered `#185 done`/`#c2 done`, the words
+that outranked it (`user spoke`, `parent spoke`), and mush's own `nothing to
+wait for`; the tone colours it: clean green, failure red, in-flight or unknown
+dim.
+
 In the unfolded view the facts the outcome does not carry are painted under the
 call's header, dim, at the header's own gutter — a read's `of 812 lines`, the
 files a search hit, a command's `stderr 12 lines`, a spawn's `mush/188 ·
@@ -553,6 +577,31 @@ turns read as one dense list. Like `Ctrl-T` the key writes nothing and is not
 stored, and the same press brings every row back. Two rows stay in both states,
 because a hidden failure would be a lie about what happened: a failed result's
 own `! error: …` row and a `#1 failed: …` report.
+
+Each tool's call wears one glyph before its name — `▤ read_file`, `❯
+run_command`, `⌕ search`, `↳ spawn_agent`, `⧗ wait` — and a result's payload
+stands at that mark's own width, so a call and its output read as one block.
+The table is the tool's: `read_file ▤`, `write_file ✎`, `edit_file ±`,
+`list_files ☰`, `search ⌕`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
+`control ⇄`, `wait ⧗`, and `⚙` for a name no tool answers to (the model can
+invent one); each mark is one glyph and one space, and every glyph is one
+column, which is what lets a result — carrying a call's id and not its tool's
+name — paint its payload under a blank of the same width. A terminal whose
+encoding cannot be shown to carry UTF-8 gets the **ascii rung** instead: `R`,
+`W`, `E`, `L`, `?`, `$`, `+`, `S`, `!`, `.`, and `#` for an invented name, one
+seven-bit mark per tool, so a font or a locale that mangles `⧗` still shows
+something for the wait. The rung is the locale's answer — the first non-empty
+of `LC_ALL`, `LC_CTYPE`, `LANG`, with `utf-8`/`utf8` anywhere in it (case-blind)
+saying the symbols and everything else, including a shell that exported no
+locale at all, saying ascii — and `/glyphs ascii` / `/glyphs symbols` overrules
+it for the session; `/glyphs` alone opens the table: one block per tool, the
+glyph, the tool's name and an example of the row it wears, painted by the grid's
+own arithmetic at the popup's width — the outcome's own stacked row included,
+under the head, where that width cannot hold the ask and the outcome together.
+The switch is a **view**, like
+`Ctrl-T` and `Ctrl-O`: it writes nothing, is not stored, and outlives the chat
+it was made in — the settings road the tree's fold numbers are waiting for is
+where it will live next.
 
 ---
 

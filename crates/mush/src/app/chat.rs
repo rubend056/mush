@@ -64,13 +64,15 @@ use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::{Image, Message};
 use mush_core::session;
-use mush_core::text::{markdown_row_counts, truncate, wrap_text, wrap_text_capped};
+use mush_core::text::{markdown_row_counts, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
 use crate::agent::{call_digest, CallFacts, FAILED};
+use crate::app::call_grid;
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
+use crate::app::symbols::Symbols;
 use crate::ids::AgentId;
 use crate::input::Input;
 use crate::ui::{dim, image_count};
@@ -1011,6 +1013,18 @@ pub struct Chat {
     /// rule — a failure is never what the fold gives up ([`Fold`]) — is what
     /// keeps a hidden failure visible; this flag knows nothing about it.
     output: bool,
+    /// The glyph rung every call's mark is painted through: the symbols the
+    /// human's font can show, or the ascii rung for a terminal that cannot
+    /// ([`Symbols`]).
+    ///
+    /// A *view* like the two beside it. It is chosen from the locale when the
+    /// chat opens ([`Symbols::from_env`]) and `/glyphs ascii` / `/glyphs
+    /// symbols` overrules it for the session; it is never stored, never said
+    /// into the conversation, and `clear` leaves it alone — the human's choice
+    /// outlives the chat it was made in. The settings road the fold numbers are
+    /// waiting for is this switch's future home; until then there is no config
+    /// key for it.
+    symbols: Symbols,
     /// How much of each kind of block this conversation's panes paint: the one
     /// [`Fold`] behind every pane, so two panes cannot fold the same kind to
     /// two numbers — and so a view that sets one has one place to set it.
@@ -1050,6 +1064,7 @@ impl Chat {
             pending: None,
             reasoning: true,
             output: true,
+            symbols: Symbols::from_env(),
             fold: Fold::DEFAULT,
         }
     }
@@ -1084,6 +1099,18 @@ impl Chat {
     /// here: a hidden failure would be a lie about what happened.
     pub fn set_output(&mut self, on: bool) {
         self.output = on;
+    }
+
+    /// The glyph rung the panes paint marks through ([`Symbols`]).
+    pub fn symbols(&self) -> Symbols {
+        self.symbols
+    }
+
+    /// `/glyphs ascii` / `/glyphs symbols`: overrule the locale's rung for this
+    /// session. A view, like [`Self::set_output`]: not a change to the
+    /// conversation, not stored, and `clear` deliberately leaves it alone.
+    pub fn set_symbols(&mut self, symbols: Symbols) {
+        self.symbols = symbols;
     }
 
     /// The fold this conversation's panes paint through: the conversation's own
@@ -2596,6 +2623,7 @@ impl Chat {
             width,
             self.reasoning,
             fold,
+            self.symbols,
             &facts,
         );
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
@@ -3072,19 +3100,6 @@ impl Chat {
 /// below this the mark goes and the words stay.
 const MIN_BODY: usize = 4;
 
-/// The most of a tool call's arguments a label ever shows. A tool call is a
-/// heading for its result, not a transcript of the call: `edit_file src/lex.rs`,
-/// not forty lines of JSON (`docs/mush.md` §4.5 R4).
-const LABEL_ARGS: usize = 60;
-
-/// One tool call's row: `  ⚙ name summarized-args`, budgeted to the pane.
-///
-/// The arguments are what a path or a command is read from, so the columns they
-/// are given are the pane's less the `  ⚙ name ` head's — the number `truncate`
-/// was handed used to be a flat 60 that ignored the head, so on a narrow pane a
-/// path was cut mid-word with the `…` that says so falling outside the border.
-/// The name is never the part that goes: a row too narrow for both keeps the
-/// name.
 /// The result a call is paired with: the first `tool` message after it that
 /// carries the call's id.
 ///
@@ -3097,25 +3112,6 @@ fn result_for<'a>(messages: &'a [Message], index: usize, id: &str) -> Option<&'a
         .iter()
         .find(|message| message.tool_call_id.as_deref() == Some(id))
         .map(Message::text)
-/// `summary` is the reading [`Chat::call_summaries`] remembers, and `None` — a
-/// caller painting a message without a `Chat` in hand — takes the same reading
-/// itself. Either way the reading is what `agent::summarize_args` gives, cut to
-/// [`LABEL_ARGS`] first, because the cached copy is stored at that width and a
-/// second cut to the pane's budget is the same cut (finding A13).
-fn tool_label(call: &mush_core::ToolCall, width: usize, summary: Option<&str>) -> String {
-    // `agent::summarize_args` is the same reading the tree shows.
-    let head = format!("  ⚙ {} ", call.function.name);
-    let budget = LABEL_ARGS.min(width.saturating_sub(head.width()));
-    if budget < MIN_BODY {
-        return head.trim_end().to_string();
-    }
-    let summary = match summary {
-        Some(summary) => summary.to_string(),
-        None => truncate(&summarize_args(&call.function.arguments), LABEL_ARGS),
-    };
-    format!("{head}{}", truncate(&summary, budget))
-        .trim_end()
-        .to_string()
 }
 
 /// The rows of one turn's `reasoning_content`, or none at all.
@@ -3609,10 +3605,15 @@ fn folded_block(message: &Message, voice: Option<Voice>) -> Option<(Kind, Head<'
             // this is the one kind of line in the transcript that reports
             // something did not happen; its row is the one the fold never gives
             // up, at any number ([`Fold`]).
+            //
+            // The plain mark is the call grid's own gutter — every result row
+            // stands under the header and the detail rows it belongs to — and
+            // the failure mark is the same two columns, so a failure is not the
+            // one result that reads out of the block.
             let (mark, style) = if message.text().trim_start().starts_with(FAILED) {
-                ("  ! ", Style::default().fg(Color::Red))
+                ("! ", Style::default().fg(Color::Red))
             } else {
-                ("  ", dim())
+                (Symbols::GUTTER_MARK, dim())
             };
             Some((Kind::Result, Head::solid(mark, style)))
         }
@@ -3803,11 +3804,25 @@ fn folded_marked(
 ///
 /// `reasoning` is the pane's `Ctrl-T` choice and `fold` the pane's [`Fold`] —
 /// how much of each kind of block it paints. Both are threaded in rather than
-/// read off a `Chat` this free function has no handle on. `summaries` is the
-/// same kind of threading for the tool-call labels: one entry per entry of
-/// `message.tool_calls()`, the reading [`Chat::call_summaries`] cached, and
-/// empty for a caller that has no cache — the label path then takes the
-/// reading itself, which is what the cache would have stored.
+/// read off a `Chat` this free function has no handle on. `symbols` is the same
+/// kind of threading for the glyph rung every call's mark is painted through
+/// ([`Symbols`]), and `facts` for the calls themselves: one [`CallFacts`] per
+/// entry of `message.tool_calls()`, the reading [`Chat::call_facts`] cached, and
+/// empty — or short of the call — for a caller that has none, when the header
+/// falls back to the call's own arguments read with no result and no workspace
+/// to trim a path against rather than guessing one.
+///
+/// A tool call's rows are the *same* rows in both views — the digest header
+/// [`call_grid`] paints — and the views differ only in what follows it: the
+/// unfolded view paints the result's detail rows and then the result message
+/// itself paints the payload at the grid's gutter, while the compact log hides
+/// both and leaves one row per call.
+///
+/// The arguments are the pane's own facts, threaded in one by one — the fold,
+/// the two views, and the cached reading — which is one past clippy's limit and
+/// deliberately so: a struct bundling them would be a second place that names
+/// them, and this function's callers are its only readers.
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
@@ -3815,6 +3830,7 @@ fn render_message(
     width: usize,
     reasoning: bool,
     fold: Fold,
+    symbols: Symbols,
     facts: &[CallFacts],
 ) -> Vec<Option<Stop>> {
     let start = out.len();
@@ -3909,11 +3925,17 @@ fn render_message(
                         &fallback
                     }
                 };
-                out.push(Line::from(Span::styled(
-                    tool_label(call, width, summaries.get(at).map(String::as_str)),
-                    Style::default().fg(Color::Yellow),
-                )));
-                rows.push(None);
+                let mark = symbols.mark(&call.function.name);
+                for row in call_grid::header(call, facts, width, mark) {
+                    out.push(row);
+                    rows.push(None);
+                }
+                if !compact {
+                    for row in call_grid::details(facts, width, mark) {
+                        out.push(row);
+                        rows.push(None);
+                    }
+                }
             }
             if spoke || !compact {
                 closing_blank(out, &mut rows, start);
@@ -4029,6 +4051,8 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    use mush_core::text::truncate;
+
     use crate::app::keys::{self, Intent};
     use crate::app::{Compacting, Focus, Phase};
 
@@ -4140,7 +4164,16 @@ mod tests {
         fold: Fold,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        render_message(&mut lines, message, voice, width, reasoning, fold, &[]);
+        render_message(
+            &mut lines,
+            message,
+            voice,
+            width,
+            reasoning,
+            fold,
+            Symbols::SYMBOLS,
+            &[],
+        );
         lines
     }
 
@@ -5092,7 +5125,8 @@ mod tests {
     }
 
     /// A truncated label says it was truncated. The arguments are budgeted the
-    /// columns the `  ⚙ name ` head leaves, so the `…` lands *inside* the pane;
+    /// columns the call's mark and name leave, so the `…` lands *inside* the
+    /// pane;
     /// the flat 60 it used to be ignored the head, so on a narrow pane a path
     /// was cut mid-word and the mark that says something was dropped fell past
     /// the border.
@@ -5121,7 +5155,7 @@ mod tests {
             let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), width, 4));
             let label = rows
                 .iter()
-                .find(|row| row.contains("⚙"))
+                .find(|row| row.contains("read_file"))
                 .unwrap_or_else(|| panic!("no label at {width}: {rows:?}"));
             assert!(
                 UnicodeWidthStr::width(label.as_str()) <= width,
@@ -5155,7 +5189,7 @@ mod tests {
         );
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 4));
         assert!(
-            rows.iter().any(|row| row == "  ⚙ read_file src/a.rs"),
+            rows.iter().any(|row| row == "▤ read_file src/a.rs"),
             "{rows:?}"
         );
     }
@@ -5431,7 +5465,7 @@ mod tests {
     }
 
     /// A tool-call turn is a turn too, and its reasoning is the only place the
-    /// model said why it is calling: the block is painted above the `⚙` rows,
+    /// model said why it is calling: the block is painted above the call rows,
     /// and the turn's empty `content` paints no `mush › ` row above them.
     #[test]
     fn a_tool_call_turn_shows_its_reasoning_above_the_calls() {
@@ -5454,7 +5488,7 @@ mod tests {
         );
         assert_eq!(
             shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 2)),
-            vec!["  ⋯ read the file first", "  ⚙ read_file src/a.rs"]
+            vec!["  ⋯ read the file first", "▤ read_file src/a.rs"]
         );
     }
 
@@ -5561,7 +5595,7 @@ mod tests {
 
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
         assert!(!rows.contains('\x1b'), "{rows:?}");
-        assert!(rows.contains("⚙ read_file src/"), "{rows:?}");
+        assert!(rows.contains("▤ read_file src/"), "{rows:?}");
 
         // And a command whose argument carries an escape: the label keeps its
         // words and loses the sequence.
@@ -5583,7 +5617,7 @@ mod tests {
             },
         );
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
-        assert!(rows.contains("⚙ run_command cat log"), "{rows:?}");
+        assert!(rows.contains("❯ run_command cat log"), "{rows:?}");
     }
 
     /// A result that came back `error: …` is not a result. Painting it exactly
@@ -5605,7 +5639,7 @@ mod tests {
         let rows = pane_rows(&chat, &pane(AgentId::ROOT), 60, 8);
         let painted = shown(&rows);
         assert!(
-            painted.iter().any(|row| row.starts_with("  ! error:")),
+            painted.iter().any(|row| row.starts_with("! error:")),
             "{painted:?}"
         );
         assert!(
@@ -7168,7 +7202,16 @@ mod tests {
         let source = "# Steps\n\n- **run** `cargo test`\n\nsee [the docs](https://example.com/a)";
         let message = Message::assistant(source);
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 60, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            60,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         assert_eq!(
             shown(&rows),
             vec![
@@ -7219,7 +7262,16 @@ mod tests {
     fn a_rule_is_a_dim_pane_wide_line() {
         let message = Message::assistant("before\n\n---\n\nafter");
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            40,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         let painted = shown(&rows);
         let rule = painted
             .iter()
@@ -7247,7 +7299,16 @@ mod tests {
     fn a_quote_is_a_dim_bar_beside_the_source_of_its_words() {
         let message = Message::assistant("> quoted words\n\n> **bold** and plain");
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            40,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         let painted = shown(&rows);
         assert_eq!(painted[0], "mush › │ quoted words");
         assert_eq!(painted[2], "       │ bold and plain");
@@ -7274,7 +7335,16 @@ mod tests {
     fn a_task_item_paints_as_a_box_in_the_bullets_accent() {
         let message = Message::assistant("- [ ] todo\n- [x] done");
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            40,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         assert_eq!(
             shown(&rows),
             vec![
@@ -7303,7 +7373,16 @@ mod tests {
     fn nested_emphasis_paints_as_adjacent_spans() {
         let message = Message::assistant("**a *b* c**");
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            40,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         assert_eq!(shown(&rows)[0], "mush › a b c");
         let spans: Vec<(&str, bool, bool)> = rows[0]
             .spans
@@ -7338,7 +7417,16 @@ mod tests {
         let source = "| name | age |\n| :--- | ---: |\n| ana | 3 |";
         let message = Message::assistant(source);
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 20, false, Fold::DEFAULT, &[]);
+        render_message(
+            &mut rows,
+            &message,
+            None,
+            20,
+            false,
+            Fold::DEFAULT,
+            Symbols::SYMBOLS,
+            &[],
+        );
         assert_eq!(
             shown(&rows),
             vec![
@@ -7397,6 +7485,7 @@ mod tests {
             126,
             false,
             Fold::DEFAULT,
+            Symbols::SYMBOLS,
             &[],
         );
         let painted = shown(&rows);
@@ -7425,6 +7514,7 @@ mod tests {
             60,
             false,
             Fold::DEFAULT,
+            Symbols::SYMBOLS,
             &[],
         );
         assert_eq!(
@@ -7456,6 +7546,7 @@ mod tests {
             80,
             false,
             Fold::DEFAULT,
+            Symbols::SYMBOLS,
             &[],
         );
         assert_eq!(shown(&rows)[0], format!("you › {source}"));
@@ -7488,7 +7579,16 @@ mod tests {
         let message = Message::assistant(text);
         for width in [10usize, 12, 14, 20, 33, 40, 80] {
             let mut rows = Vec::new();
-            render_message(&mut rows, &message, None, width, false, Fold::DEFAULT, &[]);
+            render_message(
+                &mut rows,
+                &message,
+                None,
+                width,
+                false,
+                Fold::DEFAULT,
+                Symbols::SYMBOLS,
+                &[],
+            );
             let painted = shown(&rows);
             for row in &painted {
                 assert!(
@@ -7616,7 +7716,7 @@ mod tests {
             );
             assert_eq!(rows[9], "", "and the blank closes the message");
         }
-        assert_eq!(shown(&result)[0], "  line 0", "the result's own indent");
+        assert_eq!(shown(&result)[0], "  line 0", "the result's own gutter");
         assert_eq!(shown(&report)[0], "· line 0", "mush's own mark");
         assert_eq!(shown(&brief)[0], "brief › line 0", "the brief's mark");
 
@@ -7670,7 +7770,7 @@ mod tests {
         ));
         assert_eq!(
             rows,
-            vec!["  ! error: the call was refused".to_string(), String::new(),]
+            vec!["! error: the call was refused".to_string(), String::new(),]
         );
 
         // The same text as a *success* paints nothing at all at 0 — not even
@@ -7739,7 +7839,7 @@ mod tests {
     /// The human's ask: a way out if all they want to see is the main model's
     /// output. `Ctrl-O` hides the output rows — a tool's result and mush's own
     /// report about a child — and leaves every other row exactly where it was.
-    /// The assistant's turn keeps its `⚙ name args` labels, so the human can
+    /// The assistant's turn keeps its `mark name args` labels, so the human can
     /// still see that a call happened, and there is no `…` left behind
     /// counting what the pane no longer shows. The same key brings the same
     /// rows back.
@@ -7790,7 +7890,7 @@ mod tests {
             hidden,
             vec![
                 "mush › running the tests".to_string(),
-                "  ⚙ run_command cargo test".to_string(),
+                grid_row("❯ run_command cargo test", "exit 0 · 3 lines", 60),
                 String::new(),
                 "· #1 done: the parser is written".to_string(),
             ],
@@ -7817,6 +7917,534 @@ mod tests {
             before,
             "the second press restores exactly the rows that were there"
         );
+    }
+
+    /// One call shape the width matrix sweeps: the tool, the arguments, and the
+    /// result the transcript pairs with it — `None` for the call still in
+    /// flight.
+    struct Shape {
+        id: &'static str,
+        tool: &'static str,
+        args: &'static str,
+        result: Option<&'static str>,
+    }
+
+    /// The transcript the matrix paints: every shape the layout has to survive,
+    /// in the order a turn really meets them — calls in batches, a child's
+    /// report between two of them, a prose turn, and one call still in flight
+    /// at the end.
+    ///
+    /// The shapes are deliberately a *set* and not one per view: a pane paints
+    /// the same header rows whatever else is on screen, and the matrix proves
+    /// it by painting all of them at once.
+    fn matrix_chat() -> (Chat, Vec<(&'static str, bool)>) {
+        let shapes = vec![
+            // A short ask and a short outcome.
+            Shape {
+                id: "m1",
+                tool: "run_command",
+                args: r#"{"command":"echo hi"}"#,
+                result: Some("hi\n[exit 0]"),
+            },
+            // A long ask — and one whose output-shaping tail the digest drops.
+            Shape {
+                id: "m2",
+                tool: "run_command",
+                args: r#"{"command":"seq 1 60 2>&1 | tail -3 | cat"}"#,
+                result: Some("57\n58\n59\n60\n[exit 0]"),
+            },
+            // Details: a listing with children, jobs and a state word each.
+            Shape {
+                id: "m3",
+                tool: "status",
+                args: "{}",
+                result: Some(
+                    "agents:\n#1 ◐ running on mush/1\n#2 ✉ ✓ wrote the lexer\njobs:\n#c1 running 3s · \
+                     cargo test",
+                ),
+            },
+            // Details: a window names the file's own size.
+            Shape {
+                id: "m4",
+                tool: "read_file",
+                args: r#"{"path":"src/text.rs","offset":5,"limit":3}"#,
+                result: Some("one\ntwo\nthree\n[mush: lines 5–7 of 812 — read on with offset=8]"),
+            },
+            // Details: the files a search hit.
+            Shape {
+                id: "m5",
+                tool: "search",
+                args: r#"{"pattern":"column_widths","path":"crates"}"#,
+                result: Some(
+                    "crates/a.rs:1: let column_widths = 1;\ncrates/a.rs:2: let it be 2;\n\
+                     crates/b.rs:9: let column_widths = 3;",
+                ),
+            },
+            // Details: a listing the cap stopped.
+            Shape {
+                id: "m6",
+                tool: "list_files",
+                args: r#"{"path":"src"}"#,
+                result: Some(
+                    "src/a.rs\nsrc/b.rs\n[mush: the first 400 files — list a narrower path to see \
+                     the rest]",
+                ),
+            },
+            // A long outcome that carries a `→` of its own.
+            Shape {
+                id: "m7",
+                tool: "write_file",
+                args: r#"{"path":"src/lex.rs"}"#,
+                result: Some("wrote src/lex.rs — 41 lines → 3 lines"),
+            },
+            // A spawn, then the wait that answers it, then steering: the three
+            // calls a tree is steered with, in sequence.
+            Shape {
+                id: "m8",
+                tool: "spawn_agent",
+                args: r#"{"brief":"table layout fixes"}"#,
+                result: Some(
+                    "spawned agent #188 on mush/188 at 1a2b3c4 · runs until it stops calling tools · \
+                     wait returns its summary",
+                ),
+            },
+            Shape {
+                id: "m9",
+                tool: "wait",
+                args: "{}",
+                result: Some("#188 done: the table is laid out"),
+            },
+            // A long outcome, and a refusal: the two the outcome column has to
+            // cut.
+            Shape {
+                id: "m10",
+                tool: "control",
+                args: r#"{"id":"999","action":"stop"}"#,
+                result: Some("error: no such child agent #999 — status lists yours"),
+            },
+            Shape {
+                id: "m11",
+                tool: "run_command",
+                args: r#"{"command":"exit 3"}"#,
+                result: Some("[exit 3]"),
+            },
+            Shape {
+                id: "m12",
+                tool: "read_file",
+                args: r#"{"path":"nope.txt"}"#,
+                result: Some("error: reading nope.txt: No such file or directory (os error 2)"),
+            },
+            // The call still in flight: no result message, no arrow.
+            Shape {
+                id: "m13",
+                tool: "wait",
+                args: "{}",
+                result: None,
+            },
+        ];
+        let batch = |text: &str, shapes: &[&Shape]| Message {
+            tool_calls: Some(
+                shapes
+                    .iter()
+                    .map(|shape| tool_call(shape.id, shape.tool, shape.args))
+                    .collect(),
+            ),
+            ..Message::assistant(text)
+        };
+        let (first, rest) = shapes.split_at(7);
+        let first: Vec<&Shape> = first.iter().collect();
+        let rest: Vec<&Shape> = rest.iter().collect();
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, batch("", &first));
+        for shape in &first {
+            if let Some(result) = shape.result {
+                chat.push_message(AgentId::ROOT, Message::tool(shape.id, result));
+            }
+        }
+        // A child's report lands between the two batches: a report row between
+        // two calls, which is no call's row and must not disturb their grid.
+        chat.push_message(
+            AgentId::ROOT,
+            Message::mush("#188 done: wrote the deep thing"),
+        );
+        // And the turn that follows says words before it calls: prose between
+        // two calls.
+        chat.push_message(
+            AgentId::ROOT,
+            batch("the report landed — the tree is next", &rest),
+        );
+        for shape in &rest {
+            if let Some(result) = shape.result {
+                chat.push_message(AgentId::ROOT, Message::tool(shape.id, result));
+            }
+        }
+        let calls = shapes
+            .iter()
+            .map(|shape| (shape.tool, shape.result.is_some()))
+            .collect();
+        (chat, calls)
+    }
+
+    /// Whether a painted row carries the grid's own arrow: a `→ ` at exactly
+    /// [`call_grid::Grid`]'s outcome column. An ask or an outcome may hold a
+    /// `→` of its own (`1408→1530`, `41 lines → 3 lines`) — those are text, and
+    /// this is the column the layout wrote.
+    fn has_grid_arrow(row: &str, width: usize) -> bool {
+        let arrow_x = call_grid::Grid::of(width).arrow_x();
+        row.char_indices().any(|(at, _)| {
+            row[at..].starts_with("→ ") && UnicodeWidthStr::width(&row[..at]) == arrow_x
+        })
+    }
+
+    /// The invariants one pane's rows must hold at one width, for one view:
+    /// nothing wider than the pane; every settled call's `→` on its own row at
+    /// the grid's column; no outcome dropped; the ask never separated from its
+    /// outcome; and the two-row block exactly where the ask floor says.
+    ///
+    /// What it returns is the calls' own header rows, in transcript order — the
+    /// row each mark and name opens, and the row its arrow stands on — so the
+    /// two views can be compared on exactly the rows they share.
+    fn check_matrix(
+        rows: &[String],
+        width: usize,
+        calls: &[(&str, bool)],
+        view: &str,
+        symbols: Symbols,
+    ) -> Vec<String> {
+        let grid = call_grid::Grid::of(width);
+        for row in rows {
+            assert!(
+                UnicodeWidthStr::width(row.as_str()) <= width,
+                "{view} at {width}: {row:?} is wider than the pane"
+            );
+        }
+        let mut headers = Vec::new();
+        let mut from = 0;
+        for (tool, settled) in calls {
+            // The head is the mark and the *start* of the tool's name: at the
+            // ask floor the name itself is what the column cuts (`run_comma…`),
+            // so only the first eight columns are a call's identity at every
+            // width. The walk below is ordered, so two calls of one tool never
+            // read each other's row.
+            let head = format!("{}{}", symbols.mark(tool), &tool[..tool.len().min(8)]);
+            let ask = rows[from..]
+                .iter()
+                .position(|row| row.contains(&head))
+                .map(|at| from + at)
+                .unwrap_or_else(|| panic!("{view} at {width}: no row for {tool}: {rows:?}"));
+            headers.push(rows[ask].clone());
+            if *settled {
+                // The arrow that belongs to *this* call: the first one on or
+                // after its ask row, and only ever on that row (the outcome
+                // shares it) or the row under it (the floor's two-row block).
+                let arrow = rows[ask..]
+                    .iter()
+                    .position(|row| has_grid_arrow(row, width))
+                    .map(|at| ask + at)
+                    .unwrap_or_else(|| panic!("{view} at {width}: {tool} lost its outcome"));
+                let expected = if grid.stacked() { ask + 1 } else { ask };
+                assert_eq!(
+                    arrow, expected,
+                    "{view} at {width}: {tool}'s block shape: {rows:?}"
+                );
+                headers.push(rows[arrow].clone());
+            } else {
+                assert!(
+                    !has_grid_arrow(&rows[ask], width),
+                    "{view} at {width}: {tool} is in flight and paints no arrow: {rows:?}"
+                );
+            }
+            from = ask + 1;
+        }
+        headers
+    }
+
+    /// The width matrix: **every pane from 20 to 200 columns** against one
+    /// transcript that carries every call shape — a short ask with a short
+    /// outcome, a long ask, a long outcome, an ask with no result yet, a
+    /// failure, a refusal, calls with details, a call whose outcome cannot fit,
+    /// a `spawn_agent`/`wait`/`control` sequence, a report row between two
+    /// calls and a prose turn between two of them.
+    ///
+    /// It asserts, at every width and in both views: no painted row is wider
+    /// than the pane; every call's `→` stands at the same column — the grid's
+    /// own — in every message and in both views; no outcome is dropped; the ask
+    /// is never separated from its outcome; and the two-row block appears
+    /// exactly where the ask floor says it must. **Both glyph rungs are swept**:
+    /// the layout is arithmetic on the mark's measured width, so the ascii
+    /// marks must not be a ragged second case.
+    ///
+    /// To *read* the matrix, print it — one screenful per width, both views and
+    /// both rungs:
+    ///
+    /// ```text
+    /// cargo test -p mush the_call_grid_matrix -- --nocapture --test-threads=1
+    /// ```
+    #[test]
+    fn the_call_grid_matrix() {
+        let pane = pane(AgentId::ROOT);
+        let mut printed = String::new();
+        for symbols in [Symbols::SYMBOLS, Symbols::ASCII] {
+            let (mut chat, calls) = matrix_chat();
+            chat.set_symbols(symbols);
+            for width in 20..=200 {
+                let shown_rows = shown(&pane_rows(&chat, &pane, width, 400));
+                let shown_headers = check_matrix(&shown_rows, width, &calls, "shown", symbols);
+                toggle_output(&mut chat);
+                let compact_rows = shown(&pane_rows(&chat, &pane, width, 400));
+                let compact_headers =
+                    check_matrix(&compact_rows, width, &calls, "compact", symbols);
+                // The headers are the *same rows* in both views: `Ctrl-O` hides
+                // the details and the payload and moves no call's line.
+                assert_eq!(
+                    shown_headers, compact_headers,
+                    "the same headers in both views at {width}"
+                );
+                let rung = symbols.rung().word();
+                printed.push_str(&format!("\n===== {width} columns · {rung} · shown =====\n"));
+                printed.push_str(&shown_rows.join("\n"));
+                printed.push_str(&format!(
+                    "\n===== {width} columns · {rung} · compact =====\n"
+                ));
+                printed.push_str(&compact_rows.join("\n"));
+                toggle_output(&mut chat);
+            }
+        }
+        println!("{printed}");
+    }
+
+    /// One tool call as the transcript stores it: the id is what pairs it with
+    /// its result.
+    fn tool_call(id: &str, name: &str, arguments: &str) -> mush_core::ToolCall {
+        mush_core::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    /// The transcript the human drew the compact log from: a turn of nine tool
+    /// calls with the results the transcript pairs with them, then the failure
+    /// row the fold never gives up, a report, another agent's words, the
+    /// human's own words and the model's reply.
+    ///
+    /// The two readings of the same conversation are pinned in the two tests
+    /// below: this function is the transcript, and the tests are the views.
+    fn drawn_transcript() -> Chat {
+        let mut chat = Chat::bare();
+        let calls = vec![
+            tool_call("c1", "status", "{}"),
+            tool_call(
+                "c2",
+                "read_file",
+                r#"{"path":"text.rs","offset":1408,"limit":123}"#,
+            ),
+            tool_call(
+                "c3",
+                "search",
+                r#"{"pattern":"column_widths","path":"crates"}"#,
+            ),
+            tool_call(
+                "c4",
+                "edit_file",
+                r#"{"path":"text.rs","edits":[{},{},{}]}"#,
+            ),
+            tool_call(
+                "c5",
+                "run_command",
+                r#"{"command":"cargo test -p mush-core"}"#,
+            ),
+            tool_call(
+                "c6",
+                "run_command",
+                r#"{"command":"cargo clippy --all-targets"}"#,
+            ),
+            tool_call("c7", "spawn_agent", r#"{"brief":"table layout fixes"}"#),
+            tool_call("c8", "wait", "{}"),
+            tool_call("c9", "wait", "{}"),
+            tool_call("c10", "control", r#"{"id":"9","action":"stop"}"#),
+        ];
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(calls),
+                ..Message::assistant("")
+            },
+        );
+        // The read's window: 123 lines of 34 bytes each, so the payload weighs
+        // a shade over 4 KB — the size clause is the pane's own spelling.
+        let window: String = (0..123)
+            .map(|n| format!("line {n:03} in the table's own column\n"))
+            .collect();
+        let window = window.trim_end();
+        let read = format!("{window}\n[mush: lines 1408–1530 of 9000 — read on with offset=1531]");
+        let search = "crates/a.rs:1: let column_widths = 1;\n\
+             crates/a.rs:2: let column_widths = 2;\n\
+             crates/a.rs:3: let column_widths = 3;\n\
+             crates/b.rs:1: let column_widths = 4;\n\
+             crates/b.rs:2: let column_widths = 5;\n\
+             crates/c.rs:9: let column_widths = 6;\n\
+             crates/c.rs:12: let column_widths = 7;";
+        let cargo: String = (0..41)
+            .map(|n| format!("test {n} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let results =
+            vec![
+            (
+                "c1",
+                "agents:\n#1 ◐ running on mush/1\n#2 ✉ ✓ wrote the lexer\njobs:\n#c1 running 3s \
+                 · cargo test"
+                    .to_string(),
+            ),
+            ("c2", read),
+            ("c3", search.to_string()),
+            ("c4", "edited text.rs — 3 edits".to_string()),
+            ("c5", format!("{cargo}\n[exit 0 after 5s]")),
+            ("c6", "[exit 101]".to_string()),
+            (
+                "c7",
+                "spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · \
+                 wait returns its summary"
+                    .to_string(),
+            ),
+            ("c8", "#185 done: the table is laid out".to_string()),
+            (
+                "c9",
+                "interrupted — the human wrote to you while you waited; it is in your transcript. \
+                 Answer it; your work is still running. use wait again when you need it."
+                    .to_string(),
+            ),
+            ("c10", "error: no such child agent #9 — status lists yours".to_string()),
+        ];
+        for (id, text) in results {
+            chat.push_message(AgentId::ROOT, Message::tool(id, text));
+        }
+        chat.push_message(
+            AgentId::ROOT,
+            Message::mush("#185 done: the table is laid out"),
+        );
+        // Another agent's words arriving unasked: a parent's steering, which is
+        // the same one-row block a child's brief is.
+        chat.push_message(AgentId::ROOT, Message::user("keep the table whole"));
+        say(&mut chat, AgentId::ROOT, "make the tree show every state");
+        chat.push_message(
+            AgentId::ROOT,
+            Message::assistant("Every mark is on a row above."),
+        );
+        chat
+    }
+
+    /// The compact log the human drew: **one row per tool call** — what it
+    /// asked and, on the pane's own grid, what came back — a report and another
+    /// agent's words at one row each, the failure row the fold never gives up,
+    /// and the human's own words and the model's reply whole. There is no blank
+    /// between the call rows (a command-only turn is one dense list), and a blank
+    /// after each block that spoke, because the only prose left is what was
+    /// spoken.
+    #[test]
+    fn the_compact_log_is_one_row_per_tool_call() {
+        let mut chat = drawn_transcript();
+        toggle_output(&mut chat);
+        let pane = pane(AgentId::ROOT);
+        let rows = shown(&pane_rows(&chat, &pane, 88, 60));
+        // Every call's arrow stands at the same column — the pane's own outcome
+        // column, [`call_grid::Grid::arrow_x`] — in this message and in every
+        // other: that is what makes the log a column of arrows rather than the
+        // ragged, edge-aligned run it used to be.
+        let arrow_x = call_grid::Grid::of(88).arrow_x();
+        for row in &rows {
+            // Every row that carries a call's arrow has it at the grid's own
+            // column — in this message and in every other. A `→` of the ask
+            // itself (`read_file text.rs 1408→1530`) is text and not the arrow;
+            // the grid's is the one with a space after it, at the fixed column.
+            if !row.contains("→ ") {
+                continue;
+            }
+            let at = row.char_indices().any(|(at, _)| {
+                row[at..].starts_with("→ ") && UnicodeWidthStr::width(&row[..at]) == arrow_x
+            });
+            assert!(at, "the arrow is at the grid's column: {row:?}");
+        }
+        assert_eq!(
+            rows,
+            vec![
+                grid_row("◐ status", "2 agents · 1 job · 1 unread", 88),
+                grid_row("▤ read_file text.rs 1408→1530", "123 lines · 4 KB", 88),
+                grid_row(
+                    "⌕ search \"column_widths\" in crates",
+                    "7 hits · 3 files",
+                    88
+                ),
+                grid_row("± edit_file text.rs", "3 hunks", 88),
+                grid_row(
+                    "❯ run_command cargo test -p mush-core",
+                    "exit 0 · 41 lines · 5s",
+                    88
+                ),
+                grid_row("❯ run_command cargo clippy --all-targets", "exit 101", 88),
+                grid_row("↳ spawn_agent table layout fixes", "#185 on mush/185", 88),
+                grid_row("⧗ wait", "#185 done", 88),
+                grid_row("⧗ wait", "user spoke", 88),
+                grid_row(
+                    "⇄ control #9 stop",
+                    "error: no such child agent #9 — status lists yours",
+                    88
+                ),
+                // The failure row the fold never gives up, and the blank that
+                // closes it: the failure said words of its own.
+                "! error: no such child agent #9 — status lists yours".to_string(),
+                String::new(),
+                // A report and another agent's words, one row each, whole.
+                "· #185 done: the table is laid out".to_string(),
+                String::new(),
+                "parent › keep the table whole".to_string(),
+                String::new(),
+                // The human's own words and the model's reply: the only prose
+                // left, and the only rows that keep their blank.
+                "you › make the tree show every state".to_string(),
+                String::new(),
+                "mush › Every mark is on a row above.".to_string(),
+            ],
+            "the compact log, one row per call: {rows:#?}"
+        );
+        // Nothing of a result's own payload is painted, and no row counts what
+        // the human asked not to read: the failure row is the one exception. A
+        // `…` inside a call's own header is a *column* cut — the grid's ask and
+        // outcome are cut to their columns — and not an elision standing for
+        // rows: the fold's elision row is `… +N more lines`.
+        assert!(
+            !rows.iter().any(|row| row.contains("test 3 ... ok")),
+            "the command's output is not painted: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("… +")),
+            "no row stands for the rows the compact log does not paint: {rows:?}"
+        );
+        // The prose keeps its blank and the call rows do not: four blanks, one
+        // per message that spoke, and none between the call lines.
+        assert_eq!(
+            rows.iter().filter(|row| row.is_empty()).count(),
+            4,
+            "blanks close the blocks that said words: {rows:?}"
+        );
+    }
+
+    /// One call's header row as the grid builds it: the ask, the arrow at the
+    /// grid's own column, and the outcome cut to its own budget. The golden
+    /// tests share it, so a row that drifts from the grid is a mismatch in a
+    /// table rather than arithmetic repeated by hand.
+    fn grid_row(ask: &str, outcome: &str, width: usize) -> String {
+        let grid = call_grid::Grid::of(width);
+        let gap = grid.arrow_x().saturating_sub(UnicodeWidthStr::width(ask));
+        format!(
+            "{ask}{}→ {}",
+            " ".repeat(gap),
+            truncate(outcome, grid.outcome_columns())
+        )
     }
 
     /// The compact log's own numbers: a tool's result at **none** (the call's
@@ -7885,6 +8513,154 @@ mod tests {
         );
     }
 
+    /// The outcome lives in a *different* message than the call — the `tool`
+    /// message carrying the same id — so the frame that paints a call while it
+    /// is still in flight has no arrow, and the frame after the result lands has
+    /// it. The digest is re-read because the transcript grew, and never because
+    /// the call's own text changed.
+    #[test]
+    fn a_call_painted_in_flight_gains_its_arrow_when_the_result_lands() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    r#"{"command":"cargo test"}"#,
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        toggle_output(&mut chat);
+        let pane = pane(AgentId::ROOT);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 6)),
+            vec!["❯ run_command cargo test".to_string()],
+            "a call with no result paints no arrow"
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("c1", "ok\n[exit 0]"));
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 6)),
+            vec![grid_row("❯ run_command cargo test", "exit 0 · 1 line", 60)],
+            "the result landed: the arrow is read from the message that carried it"
+        );
+    }
+
+    /// The shown view (`Ctrl-O` off), row for row, for the very transcript the
+    /// compact log is drawn from: the **same digest header** the compact log
+    /// paints, the paired result's detail rows under it, and the result's
+    /// payload at the grid's gutter — every block still at the fold's own eight
+    /// rows with its `…`, the failure and the report as they were, and a blank
+    /// closing every message.
+    ///
+    /// This is the promise that one transcript and one header have two views:
+    /// the compact log hides what the folded one shows and moves nothing the
+    /// two share. The shown view is pinned whole — its fold numbers, its `…`
+    /// rows and its blanks included.
+    #[test]
+    fn the_shown_view_keeps_its_rows_for_the_same_transcript() {
+        let chat = drawn_transcript();
+        let pane = pane(AgentId::ROOT);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 88, 400)),
+            vec![
+                // The calls' own headers — the same rows the compact log paints,
+                // arrow and all — and the detail rows their results hold.
+                grid_row("◐ status", "2 agents · 1 job · 1 unread", 88),
+                "  #1 running".to_string(),
+                "  #2 done".to_string(),
+                "  #c1 running".to_string(),
+                grid_row("▤ read_file text.rs 1408→1530", "123 lines · 4 KB", 88),
+                "  of 9000 lines".to_string(),
+                grid_row("⌕ search \"column_widths\" in crates", "7 hits · 3 files", 88),
+                "  7 hits in crates/a.rs, crates/b.rs, crates/c.rs".to_string(),
+                grid_row("± edit_file text.rs", "3 hunks", 88),
+                grid_row(
+                    "❯ run_command cargo test -p mush-core",
+                    "exit 0 · 41 lines · 5s",
+                    88
+                ),
+                grid_row("❯ run_command cargo clippy --all-targets", "exit 101", 88),
+                grid_row("↳ spawn_agent table layout fixes", "#185 on mush/185", 88),
+                "  mush/185 · .mush/wt/185".to_string(),
+                grid_row("⧗ wait", "#185 done", 88),
+                "  from #185".to_string(),
+                grid_row("⧗ wait", "user spoke", 88),
+                grid_row(
+                    "⇄ control #9 stop",
+                    "error: no such child agent #9 — status lists yours",
+                    88
+                ),
+                String::new(),
+                // Each result at the fold's eight rows (or fewer, where the
+                // result is shorter), with the `…` where it runs on — and every
+                // payload row at the headers' own gutter.
+                "  agents:".to_string(),
+                "  #1 ◐ running on mush/1".to_string(),
+                "  #2 ✉ ✓ wrote the lexer".to_string(),
+                "  jobs:".to_string(),
+                "  #c1 running 3s · cargo test".to_string(),
+                String::new(),
+                "  line 000 in the table's own column".to_string(),
+                "  line 001 in the table's own column".to_string(),
+                "  line 002 in the table's own column".to_string(),
+                "  line 003 in the table's own column".to_string(),
+                "  line 004 in the table's own column".to_string(),
+                "  line 005 in the table's own column".to_string(),
+                "  line 006 in the table's own column".to_string(),
+                "  line 007 in the table's own column".to_string(),
+                "  … +116 more lines".to_string(),
+                String::new(),
+                "  crates/a.rs:1: let column_widths = 1;".to_string(),
+                "  crates/a.rs:2: let column_widths = 2;".to_string(),
+                "  crates/a.rs:3: let column_widths = 3;".to_string(),
+                "  crates/b.rs:1: let column_widths = 4;".to_string(),
+                "  crates/b.rs:2: let column_widths = 5;".to_string(),
+                "  crates/c.rs:9: let column_widths = 6;".to_string(),
+                "  crates/c.rs:12: let column_widths = 7;".to_string(),
+                String::new(),
+                "  edited text.rs — 3 edits".to_string(),
+                String::new(),
+                "  test 0 ... ok".to_string(),
+                "  test 1 ... ok".to_string(),
+                "  test 2 ... ok".to_string(),
+                "  test 3 ... ok".to_string(),
+                "  test 4 ... ok".to_string(),
+                "  test 5 ... ok".to_string(),
+                "  test 6 ... ok".to_string(),
+                "  test 7 ... ok".to_string(),
+                "  … +34 more lines".to_string(),
+                String::new(),
+                "  [exit 101]".to_string(),
+                String::new(),
+                "  spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · wait"
+                    .to_string(),
+                "  returns its summary".to_string(),
+                String::new(),
+                "  #185 done: the table is laid out".to_string(),
+                String::new(),
+                "  interrupted — the human wrote to you while you waited; it is in your transcript."
+                    .to_string(),
+                "  Answer it; your work is still running. use wait again when you need it."
+                    .to_string(),
+                String::new(),
+                // The failure row, the report, the other agent's words, the
+                // human's line and the reply: all as they are in both views.
+                "! error: no such child agent #9 — status lists yours".to_string(),
+                String::new(),
+                "· #185 done: the table is laid out".to_string(),
+                String::new(),
+                "parent › keep the table whole".to_string(),
+                String::new(),
+                "you › make the tree show every state".to_string(),
+                String::new(),
+                "mush › Every mark is on a row above.".to_string(),
+            ],
+            "the shown view, row for row"
+        );
+    }
+
     /// The failure exemption holds at the view's zero: a failed result's
     /// `! error: …` row and a `#1 failed: …` report's first row are painted in
     /// both states, because a hidden failure would be a lie about what
@@ -7930,7 +8706,7 @@ mod tests {
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 20)),
             vec![
-                "  ! error: the call was refused".to_string(),
+                "! error: the call was refused".to_string(),
                 String::new(),
                 "· #1 failed: no route to the endpoint".to_string(),
                 "  … +1 more lines".to_string(),

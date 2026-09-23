@@ -9,10 +9,13 @@ as text, so it can be read (or pasted into an issue) without a screenshot.
 Usage:
     python3 scripts/screen.py [BINARY] [WORKDIR]
         [--sizes 200x50,120x32,80x24,60x17,40x10,30x8]
-        [--keys STR] [--ask STR] [--settle SECONDS]
+        [--keys STR] [--keys-after STR] [--ask STR] [--settle SECONDS]
         [--url URL] [--model NAME]
 
 `--keys` sends keystrokes after the first paint (`\\t` is Tab, `\\x1b` Escape).
+`--keys-after` sends them after `--ask` has settled and between the screens, so
+each size shows the pane where the batch before it left it: `\\e[5~` is PageUp,
+and a call block taller than one pane is walked a screen at a time.
 `--ask` types a message and waits, which needs a reachable model; without it the
 screens need no endpoint at all (mush is pointed at a closed port).
 """
@@ -271,6 +274,11 @@ def main() -> int:
     parser.add_argument("workdir", nargs="?", default="/tmp/mush-screen")
     parser.add_argument("--sizes", default="200x50,120x32,80x24,60x17,40x10,30x8")
     parser.add_argument("--keys", default="", help="keystrokes after the first paint")
+    parser.add_argument(
+        "--keys-after",
+        default="",
+        help="keystrokes sent after --ask settles, between the printed screens",
+    )
     parser.add_argument("--ask", default="", help="a message to send (needs a model)")
     parser.add_argument("--settle", type=float, default=1.5, help="seconds per screen")
     parser.add_argument("--url", default="", help="endpoint (default: a closed port)")
@@ -304,6 +312,7 @@ def main() -> int:
 
     try:
         keys = decode_keys(args.keys) if args.keys else ""
+        keys_after = decode_keys(args.keys_after) if args.keys_after else ""
     except ValueError as exc:
         print(f"bad --keys value {args.keys!r}: {exc}", file=sys.stderr)
         return 2
@@ -321,6 +330,11 @@ def main() -> int:
                 tui.resize(cols, rows)
             print(f"\n===== {cols}x{rows} =====")
             print(tui.screen.text())
+            if keys_after:
+                # Between screens, not once: the printed screen is the pane
+                # where the last batch left it, so a call block taller than
+                # one pane is walked (PgUp) one screen per size.
+                tui.send(keys_after, settle=0.6)
     finally:
         tui.close()
     return 0

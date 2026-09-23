@@ -28,6 +28,7 @@
 //! | `/context [N|auto]` | optional | say the window and its road, state one, or re-derive |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read every note about the focused agent |
+//! | `/glyphs [ascii\|symbols]` | optional | show the tool marks, or switch the rung |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
 //! | `/quit` (`/q`) | ignored | leave mush |
 //!
@@ -40,6 +41,8 @@
 //!
 //! Anything else is an error value: an unknown slash, or a real command whose
 //! argument does not read.
+
+use crate::app::symbols::Symbols;
 
 /// A command, with its arguments read the way the executor will use them.
 ///
@@ -68,6 +71,13 @@ pub enum Command {
     /// lists the agent's whole set of notices, the ones the foot already showed
     /// included, because that is what the lines mush wrote about the agent are.
     Notes,
+    /// `/glyphs`: the marks the panes paint, one row per tool, and — with an
+    /// argument — the rung to paint them at.
+    ///
+    /// The argument is read here like every other ([`Symbols::parse`]) and the
+    /// arm that carries it out moves a typed value, so the words the switch
+    /// accepts and the words its refusal names cannot drift apart.
+    Glyphs(Option<Symbols>),
 }
 
 /// `/context`'s argument: what the human asked of the window.
@@ -187,6 +197,12 @@ pub const COMMANDS: &[Spec] = &[
         help: "read every note about the focused agent, in full",
     },
     Spec {
+        name: "/glyphs",
+        aliases: &[],
+        args: "[ascii|symbols]",
+        help: "show the mark each tool wears, or paint them in ascii",
+    },
+    Spec {
         name: "/help",
         aliases: &["/?"],
         args: "",
@@ -284,6 +300,21 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         },
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
+        // No argument reads the table; a word switches the rung. The reading is
+        // [`Symbols::parse`], the one place the words are spelled, and a word
+        // mush does not know is refused with the two it takes — a typo answered
+        // by silence is a switch the human thinks they made.
+        "/glyphs" => match argument {
+            "" => Command::Glyphs(None),
+            word => match Symbols::parse(word) {
+                Some(symbols) => Command::Glyphs(Some(symbols)),
+                None => {
+                    return Err(CommandError::Usage(format!(
+                        "/glyphs {word} — the rungs are ascii and symbols"
+                    )))
+                }
+            },
+        },
         "/provider" => Command::Provider(optional(argument)),
         // A key is written into the request head raw, so a control character
         // in one is a header line of its own (finding C7). The door is here,
@@ -408,6 +439,34 @@ pub(crate) mod tests {
         }
         assert_eq!(parse_command("/q"), Ok(Command::Quit));
         assert_eq!(parse_command("/?"), Ok(Command::Help));
+    }
+
+    /// `/glyphs` reads its one word here, once: no argument is the table, and a
+    /// word that is not a rung is refused with the two that are. Silence would
+    /// be a switch the human thinks they made.
+    #[test]
+    fn the_glyphs_argument_is_a_rung() {
+        assert_eq!(parse_command("/glyphs"), Ok(Command::Glyphs(None)));
+        assert_eq!(
+            parse_command("/glyphs ascii"),
+            Ok(Command::Glyphs(Some(Symbols::ASCII)))
+        );
+        assert_eq!(
+            parse_command("/glyphs symbols"),
+            Ok(Command::Glyphs(Some(Symbols::SYMBOLS)))
+        );
+        assert_eq!(
+            parse_command("/glyphs ASCII"),
+            Ok(Command::Glyphs(Some(Symbols::ASCII))),
+            "a word is read letter-blind, like every other argument"
+        );
+        let Err(CommandError::Usage(line)) = parse_command("/glyphs emoji") else {
+            panic!("an unknown rung is refused");
+        };
+        assert!(
+            line.contains("emoji") && line.contains("ascii") && line.contains("symbols"),
+            "the refusal names the word and the rungs: {line:?}"
+        );
     }
 
     /// A line that is not a slash command is a message, and mush says so

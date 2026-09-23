@@ -188,10 +188,10 @@ pub trait Machine: Send + Sync {
 /// Failure is ignored on purpose: the priority is a courtesy, never a
 /// precondition, and a command that cannot be niced still runs. The one
 /// refusal in practice is the harmless direction — a mush that is already
-/// *less* urgent than this (started under `nice -n 19`, as our own gates are)
-/// cannot hand a child a better priority without `CAP_SYS_NICE`, so the child
-/// keeps the inherited, even lower one. Still a guest, which is what the
-/// constant is for.
+/// *less* urgent than this (a mush someone launched under `nice`, or a test
+/// process somebody started at a lower priority) cannot hand a child a better
+/// priority without `CAP_SYS_NICE`, so the child keeps the inherited, even
+/// lower one. Still a guest, which is what the constant is for.
 ///
 /// The few microseconds between the spawn and the `setpriority` are the only
 /// window where a command can run at the priority mush itself was started
@@ -1098,15 +1098,19 @@ mod tests {
     /// niceness is read the same way through rustix, and it must not move: the
     /// courtesy belongs to the child, and mush never reniced itself.
     ///
-    /// The test process does not always start at the default 0 — the house rule
-    /// runs our own heavy commands (`nice -n 19 cargo test`) at a lower
-    /// priority too — so the assertion is the law the mechanism implements in
+    /// The test process may already have been started at a nonzero niceness by
+    /// whoever launched it — a mush nices its own children, and the process
+    /// that runs this test may itself be one, or may have been started under
+    /// `nice` by hand — so the assertion is the law the mechanism implements in
     /// every environment: the child is at [`CHILD_NICE`], or, when mush was
     /// already less urgent and the kernel refused the raise (the failure
     /// [`Shell`] ignores), at the inherited, even lower value. It is never more
-    /// urgent than either. `own != CHILD_NICE` keeps the test from passing
-    /// because a machine reniced to exactly [`CHILD_NICE`] made inheritance the
-    /// answer.
+    /// urgent than either.
+    ///
+    /// When the launcher has already put the test process at exactly
+    /// [`CHILD_NICE`], the two are the same number and the read cannot tell
+    /// mush's doing from inheritance; the law still holds, and the test says so
+    /// instead of comparing a value that could not differ.
     #[cfg(unix)]
     #[test]
     fn a_command_mush_spawns_runs_at_the_niceness_mush_gives_it() {
@@ -1115,11 +1119,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("nice");
         let own = getpriority_process(None).expect("the test process reads its own niceness");
-        assert_ne!(
-            own, CHILD_NICE,
-            "a machine already sitting at CHILD_NICE would make the child's read \
-             inheritance rather than mush's doing"
-        );
         let end = run_to_end(&format!("ps -o ni= -p $$ > {}", out.display()), dir.path());
         assert_eq!(
             end,
@@ -1131,12 +1130,20 @@ mod tests {
             .trim()
             .parse()
             .expect("ps -o ni= prints one number");
-        assert!(
-            child == CHILD_NICE || (own > CHILD_NICE && child == own),
-            "a command mush spawned runs at CHILD_NICE ({CHILD_NICE}); the only other honest \
-             value is the no-more-urgent one it inherited from a mush that was already less \
-             urgent than that ({own}) — it read {child}"
-        );
+        if own == CHILD_NICE {
+            assert_eq!(
+                child, CHILD_NICE,
+                "the launcher already sits at {CHILD_NICE}, so the child's value is that one \
+                 whichever road put it there — never a more urgent one"
+            );
+        } else {
+            assert!(
+                child == CHILD_NICE || (own > CHILD_NICE && child == own),
+                "a command mush spawned runs at CHILD_NICE ({CHILD_NICE}); the only other honest \
+                 value is the no-more-urgent one it inherited from a mush that was already less \
+                 urgent than that ({own}) — it read {child}"
+            );
+        }
         assert_eq!(
             getpriority_process(None).expect("the test process reads its own niceness"),
             own,

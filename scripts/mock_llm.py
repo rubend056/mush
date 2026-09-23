@@ -49,17 +49,74 @@ takes no arguments. Scenarios, selected by the root's first user message:
    finished. Quitting mush while it runs is the S4 check: the `sh`, its `sleep`
    and its marker must not outlive mush.
 
+7. SHAPES (user message contains "SHAPES"): every tool-call shape in one
+   conversation, so a hand-driven `scripts/screen.py` run can show how each one
+   renders at a given width — a short ask with a short outcome, a long ask, two
+   long refusals (a missing file, an unknown `control` target), a failure
+   (`exit 3`), an ask whose result has not landed yet (a foreground
+   `sleep 6`), a windowed `read_file` with a `search` and a `status`, a
+   spawn_agent -> wait -> control sequence, a child's `#N done: …` report row
+   landing between two call rows, and prose between call rows. The turn number
+   is read off the transcript (the tool results so far), so the server keeps no
+   state and a second run replays the same shapes. See "Seeing the shapes".
+
+Seeing the shapes (scenario 7). The workdir is a fresh git repository with one
+commit, because the child is isolated with `base: HEAD`; `--settle` has to
+outlast the scripted conversation (the `sleep 6` is deliberate). The block is
+taller than one pane, so `--keys-after` sends PageUp between the screens and the
+three sizes walk it: the first screen is the tail of the conversation, the next
+two show the rows above it, and between them every shape is on screen. (The
+chat pane holds the keys; `\\e[5~` is PageUp, ten rows a press.)
+
+    rm -rf /tmp/mush-shapes && mkdir -p /tmp/mush-shapes
+    git -C /tmp/mush-shapes init -q
+    git -C /tmp/mush-shapes -c user.email=mock@mush -c user.name=mock \\
+        commit -q --allow-empty -m "shapes baseline"
+    python3 scripts/mock_llm.py 8731 &
+    python3 scripts/screen.py target/debug/mush /tmp/mush-shapes \\
+        --url http://127.0.0.1:8731 --model mock \\
+        --sizes 133x45,90x40,133x45 --settle 20 \\
+        --keys-after '\\e[5~\\e[5~\\e[5~' \\
+        --ask "SHAPES: show me every call shape"
+    kill %1
+
+The same scenario with a short `--settle` and a fresh workdir catches shape 5
+the way it can only be caught while it runs — the transcript ends on the
+`sleep 6` call, whose in-flight header is on the pane; the run reaches that
+call in about a second, so a settle anywhere in the sleep lands mid-call (a
+second workdir, because mush resumes the first one's conversation):
+
+    rm -rf /tmp/mush-shapes-flight && mkdir -p /tmp/mush-shapes-flight
+    git -C /tmp/mush-shapes-flight init -q
+    git -C /tmp/mush-shapes-flight -c user.email=mock@mush -c user.name=mock \\
+        commit -q --allow-empty -m "shapes baseline"
+    python3 scripts/screen.py target/debug/mush /tmp/mush-shapes-flight \\
+        --url http://127.0.0.1:8731 --model mock \\
+        --sizes 133x45,90x40 --settle 5 \\
+        --ask "SHAPES: show me every call shape"
+    kill %1
+
+The mock holds its port until it is killed, and `MOCK_TRACE=1` in its
+environment prints one line per request — who asked, how many tool results its
+transcript holds, the tail of what it read — which is how a scripted turn is
+debugged.
+
 Subagents are told apart by "mush subagent" in the system prompt, and child
 vs grandchild by "at depth 1" vs "at depth 2". The parent's task travels as
 subagent's first user message, so task keywords ("iso.txt") are found in the
 joined transcript rather than in the system prompt.
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MARKER = sys.argv[2] if len(sys.argv) > 2 else None
+# `MOCK_TRACE=1` prints one line per request (who, how many tool results, the
+# tail of the transcript) to stderr: what a scenario's next turn was decided
+# from. Quiet unless asked for.
+TRACE = os.environ.get("MOCK_TRACE")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -90,12 +147,96 @@ class Handler(BaseHTTPRequestHandler):
             "command": f"printf '{content}' > {path} && echo wrote {path}",
         })
 
+    def prose_call(self, text, name, arguments):
+        """A turn that says a sentence *and* makes a call.
+
+        A tool-free turn is what ends a run, so prose that has to sit between
+        two call rows rides with the call that follows it."""
+        call = self.tool_call(name, arguments)
+        call["content"] = text
+        return call
+
+    def shapes(self, messages, joined, system):
+        """Scenario 7: every tool-call shape, once, in one conversation.
+
+        The turn is read off the transcript — the tool results mush has folded
+        in so far — so the server holds no state a second run would inherit.
+        The order is deliberately not 1..9: the slow call (shape 5) sits after
+        the spawn so the child finishes while it runs, and its report row lands
+        between two call rows.
+        """
+        turn = sum(1 for m in messages if m.get("role") == "tool")
+        if "mush subagent" in system:
+            # The child writes in its own worktree, so the run's end commits
+            # that work (the worktree survives as unmerged work, which is what
+            # lets the parent's later `control` message resume this child),
+            # and then reports.
+            if "one more line" in joined:
+                return {"role": "assistant",
+                        "content": "shapes child: one more line read, still nothing to change"}
+            if turn == 0:
+                return self.tool_call("run_command", {
+                    "command": "printf 'child work\\n' > child_out.txt && echo wrote child_out.txt",
+                })
+            return {"role": "assistant", "content": "shapes child wrote child_out.txt"}
+
+        long_ask = (
+            "seq 1 20 | tail -3 2>&1 && echo the-ask-is-long-on-purpose-so-that-a-90-column-pane-"
+            "has-to-wrap-it-and-say-where-it-breaks"
+        )
+        script = [
+            # 1 — short ask, short outcome.
+            self.tool_call("run_command", {"command": "echo hi"}),
+            # 2 — a long ask (a real command, 120+ characters).
+            self.tool_call("run_command", {"command": long_ask}),
+            # 3 — long outcomes: a missing file and a child that does not exist.
+            self.tool_call("read_file", {"path": "no_such_file.txt"}),
+            self.tool_call("control", {"id": "9", "action": "stop"}),
+            # 4 — a failure.
+            self.tool_call("run_command", {"command": "exit 3"}),
+            # 6 — details: build a file, window it, search, list the board.
+            self.tool_call("run_command", {
+                "command": "seq 1 40 | sed 's/^/line /' > target_file.txt "
+                           "&& echo wrote target_file.txt",
+            }),
+            self.tool_call("read_file", {"path": "target_file.txt", "offset": 1, "limit": 5}),
+            self.tool_call("search", {"pattern": "line", "path": "."}),
+            self.tool_call("status", {}),
+            # 7/8 — spawn a child; it finishes while the slow call below runs,
+            # so its `#1 done: …` report lands between two call rows.
+            self.tool_call("spawn_agent", {
+                "brief": "SHAPES child: create child_out.txt in your worktree containing "
+                         "exactly: child work, then report",
+                "title": "shapes child",
+                "base": "HEAD",
+            }),
+            # 5 — an ask with no result yet (the in-flight header is shape 5).
+            self.tool_call("run_command", {"command": "sleep 6 && echo slow"}),
+            # 7 — wait, then control the child in sequence.
+            self.tool_call("wait", {}),
+            self.tool_call("control", {"id": "#1", "action": "message", "text": "one more line"}),
+            # 9 — prose between call rows.
+            self.prose_call("the child is awake again, so I look at the board before I stop",
+                            "status", {}),
+            self.tool_call("wait", {}),
+            # The plain-text reply that ends the run.
+            {"role": "assistant", "content": "every call shape ran - this sentence ends the run"},
+        ]
+        return script[min(turn, len(script) - 1)]
+
     def do_POST(self):  # /v1/chat/completions
         length = int(self.headers.get("Content-Length", 0))
         request = json.loads(self.rfile.read(length))
         messages = request["messages"]
         joined = "\n".join(m.get("content") or "" for m in messages)
         system = messages[0].get("content") or "" if messages else ""
+        is_subagent = "mush subagent" in system
+        depth2 = "at depth 2" in system
+        if TRACE:
+            who = "child" if is_subagent else "root"
+            results = sum(1 for m in messages if m.get("role") == "tool")
+            print(f"[mock] {who} results={results} joined={joined[-240:]!r}",
+                  file=sys.stderr, flush=True)
 
         # A SLOWCHAIN or SLOWISO first message asks for the same tree with a
         # subagent that holds its reply open. The flag is on the server because
@@ -128,15 +269,16 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"role": "assistant", "content": "first reply"}
         elif "STEERME" in joined:
             reply = {"role": "assistant", "content": "steered"}
+        elif "SHAPES" in joined:
+            # Scenario 7: the call shapes, one turn each (the command is in the
+            # module docstring, "Seeing the shapes").
+            reply = self.shapes(messages, joined, system)
         elif "TURNS" in joined:
             # The same call, unchanged, every turn: nothing counts turns any
             # more (finding H45), so what stops this hand-driven run is the
             # loop guard — the same tool batch `LOOP_ROUNDS` (5) rounds over.
             reply = self.tool_call("run_command", {"command": "true"})
         else:
-            is_subagent = "mush subagent" in system
-            depth2 = "at depth 2" in system
-
             # The SLOW knob: a subagent's first reply is held, so the tree above
             # it is still doing something when the screen is caught. The root is
             # deliberately never held — what these shots need is the tree.

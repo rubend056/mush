@@ -12,11 +12,13 @@
 //! the agents read too. This module routes messages into all of them and
 //! renders what they say.
 
+mod call_grid;
 mod chat;
 pub mod commands;
 pub mod keys;
 mod screen;
 mod settings;
+mod symbols;
 mod tree;
 
 pub use chat::{Chat, Pane, Rank, SelectRows};
@@ -175,6 +177,9 @@ pub enum PickerKind {
     /// The keys and the commands, for `/help`. Like `Notes`, nothing here is a
     /// choice: the list exists to be read, and it opens at the top.
     Help,
+    /// The mark each tool wears, for `/glyphs`. A reading too — the switch
+    /// itself is the command's argument, not a row to pick.
+    Glyphs,
 }
 
 /// One row of a `Picker`: what it stands for, and what it says.
@@ -232,6 +237,15 @@ impl Picker {
                 self.cursor + 1,
                 self.items.len()
             ),
+            // The position is part of the title for the same reason as the two
+            // above: a wide terminal shows every block, but at the 40-column
+            // floor the blocks are two rows each and the list scrolls, so the
+            // title says where in it the reader is. Short, because the surface it
+            // is painted on is the narrow one where the position matters — and
+            // what the list holds is what its own rows say.
+            PickerKind::Glyphs => {
+                format!(" glyphs · line {}/{} ", self.cursor + 1, self.items.len())
+            }
         }
     }
 
@@ -248,7 +262,9 @@ impl Picker {
     pub fn hint(&self) -> &'static str {
         match self.kind {
             PickerKind::Model | PickerKind::Provider => " j/k · PgUp/PgDn · Enter · Esc cancel ",
-            PickerKind::Notes | PickerKind::Help => " j/k or PgUp/PgDn scrolls · Esc closes ",
+            PickerKind::Notes | PickerKind::Help | PickerKind::Glyphs => {
+                " j/k or PgUp/PgDn scrolls · Esc closes "
+            }
         }
     }
 }
@@ -1105,6 +1121,17 @@ impl App {
                 Some(notes.rows)
             }
             PickerKind::Help => Some(help_notice(width).lines().map(str::to_string).collect()),
+            // The preview is painted for the popup's own columns, so a resize
+            // repaints the example rows at the new width rather than clipping
+            // the old picture.
+            PickerKind::Glyphs => Some(
+                self.chat
+                    .symbols()
+                    .preview(width)
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+            ),
             PickerKind::Model | PickerKind::Provider => None,
         };
         let Some(rows) = rows else {
@@ -3754,6 +3781,19 @@ impl App {
             Command::Quit => self.request_quit(),
             Command::Help => self.open_help_picker(),
             Command::Notes => self.open_notes_picker(),
+            // The argument switches the rung and the popup shows the table it
+            // switched to: a human who types `ascii` because their font mangles
+            // the glyphs wants to *see* the ascii table, not to be told it is
+            // on. The ack is a bar line, because the switch is a view like
+            // `Ctrl-O` — the popup already says what the marks are, and a
+            // report in the transcript would outlive the session it belongs to.
+            Command::Glyphs(rung) => {
+                if let Some(symbols) = rung {
+                    self.chat.set_symbols(symbols);
+                    self.say(format!("glyphs: {} · this session", symbols.rung().word()));
+                }
+                self.open_glyphs_picker();
+            }
             Command::Compact => self.compact_focused(),
             Command::Provider(None) => self.open_provider_picker(),
             Command::Provider(Some(name)) => self.apply_provider(&name),
@@ -4152,6 +4192,33 @@ impl App {
         });
     }
 
+    /// `/glyphs`: the mark each tool wears, as this terminal will paint it — the
+    /// human's font check, in the readable list `/notes` opens.
+    ///
+    /// The rows are [`crate::app::symbols::Symbols::preview`]'s, painted for the
+    /// columns this popup gives a row (`screen::picker_text_width`, the same
+    /// measure [`Self::rewrap_picker`] uses on a resize): the example is a real
+    /// call row, so it is drawn for the width it is shown at.
+    fn open_glyphs_picker(&mut self) {
+        let width = screen::picker_text_width(self.term_width);
+        let items = self
+            .chat
+            .symbols()
+            .preview(width)
+            .lines()
+            .map(|line| PickerItem {
+                id: None,
+                label: line.to_string(),
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Glyphs,
+            items,
+            cursor: 0,
+            agent: None,
+        });
+    }
+
     fn open_provider_picker(&mut self) {
         let items: Vec<PickerItem> = Provider::ALL
             .iter()
@@ -4320,7 +4387,7 @@ impl App {
             PickerKind::Provider => self.apply_provider(id),
             // Nothing to apply: the list is a reading, and `key_picker` closes it
             // on Enter exactly as it does on Esc.
-            PickerKind::Notes | PickerKind::Help => {}
+            PickerKind::Notes | PickerKind::Help | PickerKind::Glyphs => {}
         }
     }
 
@@ -16376,6 +16443,89 @@ mod tests {
             app.tree.node(AgentId(1)).unwrap().phase,
             Phase::Done,
             "no phase is claimed for work nobody is doing"
+        );
+    }
+
+    /// `/glyphs` is the font check: the table opens as a reading list, one row
+    /// per tool, and the argument moves the rung the panes paint through — for
+    /// this session, acknowledged on the bar, and with the table it switched to
+    /// already open.
+    #[test]
+    fn glyphs_shows_the_table_and_moves_the_rung() {
+        let (mut app, _rx) = test_app("glyphs-list");
+
+        run(&mut app, "/glyphs");
+        let picker = app.picker.as_ref().expect("glyphs opens a list");
+        assert_eq!(picker.kind, PickerKind::Glyphs);
+        assert_eq!(picker.cursor, 0, "the table opens at its first tool");
+        // One block per tool: a head row, and — where the popup is narrow
+        // enough that the example stacks — the outcome's own row under it. The
+        // blocks are told by their heads, the rows that name a tool.
+        let rows = labels(&picker.items);
+        let heads: Vec<&&str> = rows
+            .iter()
+            .filter(|row| !row.trim_start().is_empty() && !row.starts_with(' '))
+            .collect();
+        assert_eq!(
+            heads.len(),
+            mush_core::tools::ToolName::ALL.len(),
+            "one block per tool: {rows:?}"
+        );
+        for (head, tool) in heads.iter().zip(mush_core::tools::ToolName::ALL) {
+            assert!(
+                head.contains(tool.as_str()),
+                "{}'s block: {head:?}",
+                tool.as_str()
+            );
+        }
+        assert!(
+            picker.items.iter().all(|item| item.id.is_none()),
+            "nothing here is a choice"
+        );
+        app.picker = None;
+
+        // The word moves the rung, and the table shows the rung it moved to: an
+        // example row that wears the ascii mark is a row the pane would paint
+        // that way.
+        run(&mut app, "/glyphs ascii");
+        assert_eq!(app.chat.symbols(), symbols::Symbols::ASCII);
+        assert_eq!(text_of(&app), "glyphs: ascii · this session");
+        let rows = labels(&app.picker.as_ref().expect("the ascii table").items);
+        assert!(
+            rows.iter().any(|row| row.contains("$ run_command")),
+            "the ascii mark, in the table's own row: {rows:?}"
+        );
+
+        run(&mut app, "/glyphs symbols");
+        assert_eq!(app.chat.symbols(), symbols::Symbols::SYMBOLS);
+        assert_eq!(text_of(&app), "glyphs: symbols · this session");
+        let rows = labels(&app.picker.as_ref().expect("the symbols table").items);
+        assert!(
+            rows.iter().any(|row| row.contains("❯ run_command")),
+            "the symbol mark, in the table's own row: {rows:?}"
+        );
+    }
+
+    /// A word the table does not know is refused with the two it takes: a typo
+    /// answered by silence is a switch the human thinks they made.
+    #[test]
+    fn glyphs_refuses_a_rung_it_does_not_know() {
+        let (mut app, _rx) = test_app("glyphs-typo");
+        let before = app.chat.symbols();
+        // Through the box, the way a human types it: the refusal is parsed by
+        // `parse_command` inside `send_message`, and it lands on the bar.
+        app.chat.insert("/glyphs emoji");
+        app.send_message();
+
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("emoji") && line.contains("ascii") && line.contains("symbols"),
+            "the refusal names the word and the rungs: {line:?}"
+        );
+        assert_eq!(app.chat.symbols(), before, "nothing was switched");
+        assert!(
+            app.picker.is_none(),
+            "and no table was opened: a refusal is not a reading"
         );
     }
 

@@ -303,6 +303,7 @@ stale:
     /context [N|auto]            say the window's size and road, state one, or auto for the table
     /compact                     fold the focused agent's conversation into a summary
     /notes                       read every note about the focused agent, in full
+    /glyphs [ascii|symbols]      show the mark each tool wears, or paint them in ascii
     /help                        list the keys and these commands
     /quit                        leave mush
 ```
