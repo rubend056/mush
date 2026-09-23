@@ -299,8 +299,9 @@ pub struct Painted {
 /// lives in `ui.rs` with every other colour, so a frame says only which rows
 /// wear it — and a test can read which rows the mode is on without a terminal.
 pub struct SelectRows {
-    /// Every painted row of the cursor's own stop — a line's rows, or the `…`
-    /// the elided tail is.
+    /// Every painted row the cursor wears: a line's rows, the `…` the elided
+    /// tail is, or — for a stop the view paints no row for — the nearest
+    /// painted row of that stop's own message (finding D14).
     pub cursor: Vec<usize>,
     /// Every painted row whose stop the selection covers.
     pub selected: Vec<usize>,
@@ -773,74 +774,29 @@ fn last_text(chunk: &Chunk) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-/// Which row of a window the cursor is painted on: the cursor's own stop's
-/// first row, or — for a line the fold hid — the tail's `…`, the row the pane
-/// paints for it. `None` is "this window does not show the cursor", which is
-/// what makes the frame place the window again.
+/// The rows a window paints the mode on: the row the cursor stands on — the
+/// one the frame's own lookup found in this window — and every painted row
+/// whose stop the selection covers.
 ///
-/// The nearest painted row of the cursor's own message is the last answer: a
-/// source line the view paints no row for — a reply's fence line, inside a
-/// block that has a body — is still a stop the key road can stand on, and a
-/// stop with no row must paint *somewhere* or the frame reads "the cursor is
-/// here" as "there is no cursor": the mode's title promised `Enter copies`
-/// over a pane with no cursor in it (finding D14). The copy is unaffected — it
-/// reads the stop, not the row — so a cursor on a fence line copies the fence
-/// line while sitting on the message's nearest words.
-///
-/// `cut` is the message whose rows the window's height cut short of its text: a
-/// cut message cannot answer for a hidden line, because the cursor's stop may be
-/// under the cut rather than behind the fold.
-fn cursor_row(
-    rows: &[Option<(usize, Stop)>],
-    cursor: (usize, Stop),
-    cut: Option<usize>,
-) -> Option<usize> {
-    if let Some(at) = rows.iter().position(|row| *row == Some(cursor)) {
-        return Some(at);
-    }
-    if cut == Some(cursor.0) {
-        return None;
-    }
-    rows.iter()
-        .rposition(
-            |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop <= cursor.1),
-        )
-        .or_else(|| {
-            rows.iter().position(
-                |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop >= cursor.1),
-            )
-        })
-}
-
-/// Whether the cursor sits above everything a window shows. A window with no
-/// text row in it at all has nothing to be above, and reads as below — the
-/// bottom anchoring is the one that ends up showing the cursor.
-fn cursor_above(body: &Body, cursor: (usize, Stop)) -> bool {
-    match body.rows.iter().flatten().next() {
-        Some(&first) => cursor < first,
-        None => false,
-    }
-}
-
-/// The rows a window paints the mode on: the cursor's own stop, and every
-/// painted row whose stop the selection covers.
-///
-/// `cursor` is the caller's clamp of the mode's own, not `select.cursor`: the
-/// row the pane paints is the row the window was placed for.
+/// `at` is that row, [`Chat::select_body`]'s answer for this window: the
+/// placement already decided which stop the cursor is on, and a second lookup
+/// here could answer with a neighbouring one, painting the cursor on a row the
+/// copy does not name.
 fn select_rows(
     rows: &[Option<(usize, Stop)>],
     select: &Selecting,
     cursor: (usize, Stop),
-    cut: Option<usize>,
+    at: usize,
 ) -> Option<SelectRows> {
-    let at = cursor_row(rows, cursor, cut)?;
+    // The row the placement found is a stop's own row; a window with no such
+    // row paints no cursor at all, which the caller spells as no `at`.
+    let tag = rows[at]?;
     // Every row of the cursor's own stop, not just the one the lookup landed
     // on: a wrapped line is one stop, and every row of it is the cursor.
-    let tag = rows[at];
     let painted: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| **row == tag)
+        .filter(|(_, row)| row.is_some_and(|row| row == tag))
         .map(|(at, _)| at)
         .collect();
     let selected = match select.anchor {
@@ -864,6 +820,16 @@ fn select_rows(
         cursor: painted,
         selected,
     })
+}
+
+/// Whether the cursor sits above everything a window shows. A window with no
+/// text row in it at all has nothing to be above, and reads as below — the
+/// bottom anchoring is the one that ends up showing the cursor.
+fn cursor_above(body: &Body, cursor: (usize, Stop)) -> bool {
+    match body.rows.iter().flatten().next() {
+        Some(&first) => cursor < first,
+        None => false,
+    }
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -2161,7 +2127,7 @@ impl Chat {
         }
         let cursor = self.clamped_cursor(pane.agent);
         let mode = select.zip(cursor);
-        let (mut body, cut) = match mode {
+        let (mut body, cursor_at) = match mode {
             Some((select, cursor)) => self.select_body(
                 select,
                 cursor,
@@ -2175,9 +2141,13 @@ impl Chat {
             ),
         };
         // Read before the foot is appended: the mode's rows are transcript
-        // rows, and the foot never carries the cursor.
-        let select_rows =
-            mode.and_then(|(select, cursor)| select_rows(&body.rows, select, cursor, cut));
+        // rows, and the foot never carries the cursor. The row the cursor
+        // stands on is the one the placement decided (`select_body`), so the
+        // paint and the copy cannot disagree about which stop it is.
+        let select_rows = match (mode, cursor_at) {
+            (Some((select, cursor)), Some(at)) => select_rows(&body.rows, select, cursor, at),
+            _ => None,
+        };
         body.lines.extend(foot.lines);
         let lines = body.lines;
 
@@ -2239,7 +2209,8 @@ impl Chat {
     }
 
     /// The window the select mode's cursor is shown through, placed so the
-    /// cursor is on screen.
+    /// cursor is on screen — and the row of that window the cursor is painted
+    /// on, `None` when even a freshly placed window has no row to paint it on.
     ///
     /// The pane's own reading ([`Reading`]) is not touched: the mode is a
     /// reading of its own, and leaving it puts the pane back where the human
@@ -2264,22 +2235,94 @@ impl Chat {
         let start = select.top.get();
         let start = (start.0.min(transcript.len() - 1), start.1);
         let (body, cut) = self.window_from(on, width, height, start);
-        if cursor_row(&body.rows, cursor, cut).is_some() {
-            return (body, cut);
+        if let Some(at) = self.cursor_row(&body, cursor, cut, start, on, width) {
+            return (body, Some(at));
         }
         // The window the state carries no longer shows the cursor: the terminal
-        // was resized, the transcript moved under it, or the cursor's
-        // own stop is behind a block's fold. Put it where the pane can hold it
-        // — the cursor's stop at the top when it is above the window, at the
-        // bottom when it is below — and leave the placement where the next
-        // frame finds it.
+        // was resized, the transcript moved under it, or the cursor stepped to
+        // a stop of the message the window's own top sits in — above the
+        // window's first row, which no window that starts lower can show. Put
+        // it where the pane can hold it — the cursor's stop at the top when it
+        // is above the window, at the bottom when it is below — and leave the
+        // placement where the next frame finds it.
         let start = if cursor_above(&body, cursor) {
             self.top_at_cursor(on, width, cursor)
         } else {
             self.top_at_bottom(on, width, height, cursor)
         };
         select.top.set(start);
-        self.window_from(on, width, height, start)
+        let (body, cut) = self.window_from(on, width, height, start);
+        let at = self.cursor_row(&body, cursor, cut, start, on, width);
+        (body, at)
+    }
+
+    /// Which row of a window the cursor is painted on: the cursor's own stop's
+    /// first row where the window took it, or — for a stop the message paints
+    /// no row for at all — the nearest painted row of the cursor's own message.
+    /// `None` is "this window does not show the cursor", which is what makes
+    /// the frame place the window again.
+    ///
+    /// A stop's own row is a fact about the whole message, and the window is
+    /// only a slice of it: `place` is where the pane would put the cursor's
+    /// stop — [`Self::top_at_cursor`]'s row, its own first row or the nearest
+    /// painted stop before it, or the message's first row. A window whose top
+    /// begins after that place is not showing the cursor, whatever row it
+    /// carries: after any placement the window's first rows are the cursor's
+    /// own message, so a step up *inside* that message finds no row at or
+    /// before the cursor — but does find the top row, a *neighbouring* stop's
+    /// row. Answering with it froze the pane, the cursor painted on a line the
+    /// copy did not name — and `Enter` copies the *stop* ([`Self::copy`])
+    /// while the pane paints the row, so it handed the human a line they were
+    /// never shown. Down the mirror road the cut closes the hole: a cursor
+    /// below the window's last row lies in the message the height cut
+    /// ([`Self::window_from`]), and `cut` refuses to answer for it.
+    ///
+    /// A stop the message paints no row for at all — a reply's fence line,
+    /// inside a block that has a body — is the exception the fallback below is
+    /// for (finding D14): it has no row to be outside the window, so it paints
+    /// on the nearest painted row of its own message. The copy is unaffected —
+    /// it reads the stop, not the row — so a cursor on a fence line copies the
+    /// fence line while sitting on the message's nearest words.
+    ///
+    /// `cut` is the message whose rows the window's height cut short of its
+    /// text: a cut message cannot answer for a hidden line, because the
+    /// cursor's stop may be under the cut rather than behind the fold.
+    fn cursor_row(
+        &self,
+        body: &Body,
+        cursor: (usize, Stop),
+        cut: Option<usize>,
+        top: (usize, usize),
+        on: AgentId,
+        width: usize,
+    ) -> Option<usize> {
+        // The window took the cursor's own row: the answer almost every press
+        // asks for, and one that needs no second render of the message.
+        if let Some(at) = body.rows.iter().position(|row| *row == Some(cursor)) {
+            return Some(at);
+        }
+        // A cut message cannot answer for a hidden line (above).
+        if cut == Some(cursor.0) {
+            return None;
+        }
+        // Where the pane places the cursor's stop: its own first row, or — a
+        // stop the message paints no row for — the nearest painted stop before
+        // it, or the message's first row.
+        let whole = self.chunk(on, cursor.0, width);
+        let place = first_row(&whole.rows, cursor.0, cursor.1).unwrap_or(0);
+        if top.0 > cursor.0 || (top.0 == cursor.0 && top.1 > place) {
+            return None;
+        }
+        body.rows
+            .iter()
+            .rposition(|row| {
+                matches!(row, Some((message, stop)) if *message == cursor.0 && *stop <= cursor.1)
+            })
+            .or_else(|| {
+                body.rows.iter().position(|row| {
+                    matches!(row, Some((message, stop)) if *message == cursor.0 && *stop >= cursor.1)
+                })
+            })
     }
 
     /// The transcript's rows in a window: from `start` — a message, and how many
@@ -7209,5 +7252,199 @@ mod tests {
         );
         assert!(!stops.tail, "no `…` paints, so there is no tail stop");
         assert_eq!(stops.span(Stop::Line(0)), (0, 0), "it covers its own line");
+    }
+
+    /// The transcript both selection walks below read: six replies, taller
+    /// than the pane they are walked in, whose every source line opens and
+    /// closes with a token naming it — and one line long enough to wrap over
+    /// several rows at the walk's width, so a stop that is more than one
+    /// painted row is walked too.
+    fn walk_lines() -> Vec<String> {
+        (0..6)
+            .map(|n| {
+                (0..3)
+                    .map(|k| {
+                        let wrap = if n == 2 && k == 1 {
+                            format!(" {} ", "wrap ".repeat(20).trim())
+                        } else {
+                            " ".to_string()
+                        };
+                        format!("m{n}l{k}{wrap}z{n}l{k}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect()
+    }
+
+    /// A cursor walking up the conversation keeps its own row on the pane:
+    /// every step up and down a transcript taller than the pane paints the
+    /// cursor on its own stop's rows — the words that stop stands on, first and
+    /// last — and scrolls the window exactly when the step leaves it.
+    ///
+    /// Before this the frame asked the window for "the nearest stop at or
+    /// before the cursor" and, finding none — after any placement the window's
+    /// first rows are the cursor's own message, all of them *below* a step up —
+    /// answered with the window's top row, a neighbouring stop's row: the pane
+    /// froze, the cursor was painted on a line the copy did not name, and
+    /// `Enter` then handed the human a line the pane never showed them.
+    /// Measured on six three-line replies in a 40×8 pane: 8 of the 17 steps up
+    /// painted the wrong row (press 7 sat on message 3's line 1 while the pane
+    /// painted line 2) and the frozen window cost the next step down too,
+    /// while down the mirror road the window re-placed whenever a step left
+    /// it.
+    #[test]
+    fn a_cursor_walking_up_keeps_its_own_row_on_the_pane() {
+        let on = AgentId::ROOT;
+        let texts = walk_lines();
+        let mut chat = Chat::bare();
+        for text in &texts {
+            chat.push_message(on, Message::assistant(text.clone()));
+        }
+        assert!(chat.start_select(on).is_none(), "the mode is on");
+        let pane = pane(on);
+        let (width, height) = (40, 8);
+        // The frame `Ctrl-Y` paints before the first key: the mode's window is
+        // placed by a paint, not by the key that opens it.
+        chat.painted(&pane, width, height);
+        // Every source line, newest first: the order the walk up visits.
+        let stops: Vec<(usize, Stop)> = (0..texts.len())
+            .rev()
+            .flat_map(|m| (0..3).rev().map(move |k| (m, Stop::Line(k))))
+            .collect();
+
+        // One press, and what the pane shows before and after it: the cursor's
+        // own stop, the row(s) it is painted on, and the window that paint
+        // left. The copy — the stop `Enter` takes — is read beside the paint.
+        // The pane is painted before the press as well: a press is seen through
+        // the frame that follows it, but the window it must move is the one the
+        // previous frame left.
+        let press = |chat: &mut Chat, step: i64| {
+            let before = chat.painted(&pane, width, height);
+            let cursor_before = chat.select.as_ref().expect("the mode is on").cursor;
+            let top_before = chat.select.as_ref().expect("the mode is on").top.get();
+            let before_select = before.select.as_ref().expect("the mode paints");
+            let before_rows = shown(&before.lines);
+            chat.select_apply(on, SelectKey::Move(step));
+            let cursor = chat.select.as_ref().expect("the mode is on").cursor;
+            let painted = chat.painted(&pane, width, height);
+            let select = painted.select.as_ref().expect("the mode paints");
+            let rows = shown(&painted.lines);
+            let (m, k) = match cursor {
+                (m, Stop::Line(k)) => (m, k),
+                (_, Stop::Tail) => panic!("no block of this transcript is capped"),
+            };
+            let line = texts[m].split('\n').nth(k).expect("a source line");
+            let first = line.split(' ').next().unwrap();
+            let last = line.rsplit(' ').next().unwrap();
+            assert!(
+                rows[select.cursor[0]].contains(first),
+                "the cursor {cursor:?} is painted on its own stop: {rows:?}"
+            );
+            assert!(
+                rows[*select.cursor.last().unwrap()].contains(last),
+                "and every row of its stop, to the stop's last word: {rows:?}"
+            );
+            assert_eq!(
+                chat.copy(on, cursor).text,
+                line,
+                "the copy names the stop the paint is on"
+            );
+            let top = chat.select.as_ref().expect("the mode is on").top.get();
+            if step < 0 {
+                assert!(
+                    top <= top_before,
+                    "up: the window never moves down ({top_before:?} → {top:?})"
+                );
+                // The cursor's stop began at the pane's top row: nothing above
+                // it is on the pane, so the step it took must have scrolled.
+                if before_select.cursor[0] == 0 && cursor != cursor_before {
+                    assert!(
+                        top < top_before,
+                        "a step off the window's top row scrolls it ({} → {}, {cursor_before:?} → {cursor:?})",
+                        top_before.0, top_before.1
+                    );
+                }
+            } else {
+                assert!(
+                    top >= top_before,
+                    "down: the window never moves up ({top_before:?} → {top:?})"
+                );
+                // And the mirror: the cursor's stop ended on the pane's last
+                // row, so the stop below it is off the pane and the step must
+                // have scrolled.
+                if before_select.cursor.last() == Some(&(before_rows.len() - 1))
+                    && cursor != cursor_before
+                {
+                    assert!(
+                        top > top_before,
+                        "a step off the window's last row scrolls it ({top_before:?} → {top:?}, {cursor_before:?} → {cursor:?})"
+                    );
+                }
+            }
+            cursor
+        };
+
+        // Up the whole transcript, one press each: every stop, newest first,
+        // and the pane showing it.
+        let mut seen = Vec::new();
+        for _ in 0..stops.len() - 1 {
+            seen.push(press(&mut chat, -1));
+        }
+        assert_eq!(seen, stops[1..], "every stop, once, newest first");
+
+        // And back down: the mirror walk, which the report said followed the
+        // cursor — this pins that it still does, and that it agrees with the
+        // way up about where every stop is.
+        let mut seen = Vec::new();
+        for _ in 0..stops.len() - 1 {
+            seen.push(press(&mut chat, 1));
+        }
+        let down: Vec<(usize, Stop)> = stops.iter().rev().copied().skip(1).collect();
+        assert_eq!(seen, down, "every stop, once, oldest first");
+    }
+
+    /// `Enter` copies the line the pane painted the cursor on: every step of
+    /// the walk up, painted and then copied for real, holds the clipboard with
+    /// the words of the row the human saw — which the frozen window could not
+    /// (press 7 painted message 3's line 2 while the copy took line 1).
+    #[test]
+    fn enter_copies_the_line_the_pane_painted_the_cursor_on() {
+        let on = AgentId::ROOT;
+        let texts = walk_lines();
+        let steps: usize = texts.iter().map(|text| text.split('\n').count()).sum();
+        for press in 1..steps {
+            let mut chat = Chat::bare();
+            for text in &texts {
+                chat.push_message(on, Message::assistant(text.clone()));
+            }
+            assert!(chat.start_select(on).is_none(), "the mode is on");
+            let pane = pane(on);
+            // Each press, then the frame it gets — the order the human sees.
+            let mut painted_row = String::new();
+            for _ in 0..press {
+                chat.select_apply(on, SelectKey::Move(-1));
+                let painted = chat.painted(&pane, 40, 8);
+                let select = painted.select.as_ref().expect("the mode paints");
+                painted_row = shown(&painted.lines)[select.cursor[0]].clone();
+            }
+            let cursor = chat.select.as_ref().expect("the mode is on").cursor;
+            let (m, k) = match cursor {
+                (m, Stop::Line(k)) => (m, k),
+                (_, Stop::Tail) => panic!("no block of this transcript is capped"),
+            };
+            let line = texts[m].split('\n').nth(k).expect("a source line");
+            assert!(
+                painted_row.contains(line.split(' ').next().unwrap()),
+                "press {press}: the pane paints the cursor on its own stop {cursor:?}: {painted_row:?}"
+            );
+            let copied = chat
+                .select_apply(on, SelectKey::Copy)
+                .expect("Enter copies");
+            assert_eq!(
+                copied.text, line,
+                "press {press}: Enter copies the line the pane painted, {painted_row:?}"
+            );
+        }
     }
 }
