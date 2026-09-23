@@ -1606,11 +1606,20 @@ impl Chat {
         self.select.is_some()
     }
 
+    /// The agent whose pane the mode stands over, if it is on — the one read of
+    /// the mode's subject, for a caller that has to tell "the mode already
+    /// names the pane the human reads" from "the pane moved under it"
+    /// (finding D18's focus change).
+    pub fn selecting_agent(&self) -> Option<AgentId> {
+        self.select.as_ref().map(|select| select.agent)
+    }
+
     /// Leave the select mode without copying anything. The other road out is
     /// `Esc` (which every caller can reach through [`Chat::select_apply`]), and
-    /// this one is for a key that is not the mode's: `Tab` moves the focus, and
-    /// a mode that kept the keyboard after the human moved on would be the one
-    /// modal mush could not get out of with `Tab`.
+    /// this one is for a change the mode does not own: `Tab` moves the focus
+    /// and an attach client's `focus` moves the pane, and a mode that kept the
+    /// keyboard — or a cursor — over a pane nobody is reading would be a modal
+    /// with no way out a human can see (finding D18).
     pub fn cancel_select(&mut self) {
         self.select = None;
     }
@@ -1666,7 +1675,11 @@ impl Chat {
     /// What the select mode's keys do — the one place they run.
     ///
     /// `Some(copied)` is `Enter`: the copy the caller hands the clipboard, and
-    /// the mode left behind with it.
+    /// the mode left behind with it. `None` is a key that changed the state and
+    /// nothing else — and, for `Copy`, a copy that did not happen: the mode is
+    /// left because the pane it names has no line left to stand on, so the
+    /// caller says so rather than letting the selection vanish in silence
+    /// (`App::select_key` owns the bar's line, finding D18).
     pub fn select_apply(&mut self, on: AgentId, key: SelectKey) -> Option<Copied> {
         let Some(cursor) = self.clamped_cursor(on) else {
             // The transcript under the mode has no line left to stand on.

@@ -2859,6 +2859,13 @@ impl App {
     /// Focus `agent` exactly as `Enter` on its row does: point the tree cursor
     /// at it and run the same path the key does, so the pane, the bar and the
     /// keyboard all move together.
+    ///
+    /// A focus that moves the pane under an open select mode drops the mode and
+    /// says so: the mode names an agent, and one left standing over another
+    /// agent's pane has no cursor on what the human now reads — its `Enter`
+    /// would copy nothing, silently (finding D18). The human's own `Tab` road
+    /// cancels the mode the same way and says nothing, because there the human
+    /// pressed the key that moved the pane and the badge names the new one.
     fn attach_focus(&mut self, agent: u64) -> attach::Reply {
         let id = AgentId(agent);
         // One question, one answer: `point_cursor_at` asks the same "is #N in
@@ -2869,7 +2876,20 @@ impl App {
         if !self.tree.point_cursor_at(id) {
             return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent {id}")));
         }
+        let was = self.tree.focused;
         self.focus_cursor_row();
+        // The mode is the old pane's, and the client that moved the pane did
+        // not press the key that does it: the bar has to say why the mode is
+        // gone. `focus_cursor_row` said the new brief a moment ago; the loss is
+        // the newer fact, so this line takes the bar.
+        if was != id {
+            if let Some(agent) = self.chat.selecting_agent() {
+                if agent != id {
+                    self.chat.cancel_select();
+                    self.say(format!("selection dropped — the pane moved to agent {id}"));
+                }
+            }
+        }
         attach::Reply::Ok(serde_json::json!({}))
     }
 
@@ -3858,7 +3878,10 @@ impl App {
     /// The mode belongs to the conversation the chat pane shows, so the agent
     /// here is [`Tree::focused`] — the same agent every other chat key is about.
     /// A pane with nothing to stand on says so in the bar rather than opening a
-    /// cursor over nothing.
+    /// cursor over nothing, and so does an `Enter` whose copy did not happen:
+    /// [`Chat::select_apply`]'s `None` is a mode left with no line under it, and
+    /// a silent `Enter` was half of finding D18 (the focus-change half is
+    /// [`Self::attach_focus`]'s).
     fn select_key(&mut self, key: SelectKey) {
         let on = self.tree.focused;
         match key {
@@ -3872,11 +3895,13 @@ impl App {
                     }
                 }
             }
-            SelectKey::Copy => {
-                if let Some(copied) = self.chat.select_apply(on, SelectKey::Copy) {
-                    self.copy_text(copied);
-                }
-            }
+            SelectKey::Copy => match self.chat.select_apply(on, SelectKey::Copy) {
+                Some(copied) => self.copy_text(copied),
+                // The mode was left with nothing to copy — the pane under it has
+                // no line left to stand on — and that is the one thing the chat
+                // cannot say: the bar is the app's surface (finding D18).
+                None => self.say("nothing to copy — the selection is gone"),
+            },
             key => {
                 self.chat.select_apply(on, key);
             }
@@ -17108,6 +17133,42 @@ mod tests {
             &attach_request(4, attach::Op::Focus { agent: 9 }),
         ));
         assert_eq!(error.kind, "bad_request");
+    }
+
+    /// The select mode names an agent, so a focus that moves the pane under it
+    /// must not leave the mode standing over a pane the human no longer reads:
+    /// `Enter` would copy nothing, silently (finding D18 — the client's `Focus`
+    /// op changed the pane with no `cancel_select`). The mode either follows
+    /// the pane or leaves it and says so; never a mode with no cursor and no
+    /// line.
+    #[test]
+    fn a_focus_change_under_the_select_mode_either_follows_it_or_says_it_left() {
+        let (mut app, _rx) = test_app("select-focus");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        spawn_agent(&mut app, 1, 0, 1, "lexer", None);
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on the root's pane");
+
+        // Another client moves the pane to the child.
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Focus { agent: 1 }),
+        ));
+        assert_eq!(app.tree.focused, AgentId(1), "the pane moved");
+
+        match app.chat.selecting_agent() {
+            // The mode followed the pane: it stands over the agent the human
+            // now reads, and there is nothing to say.
+            Some(agent) => assert_eq!(agent, AgentId(1), "the mode follows the pane"),
+            // Or it left with the pane, and the bar carries the line that says
+            // so — the selection is not eaten in silence.
+            None => assert!(
+                text_of(&app).contains("selection dropped"),
+                "the loss is said in the bar: {:?}",
+                text_of(&app)
+            ),
+        }
     }
 
     /// A client's op is not the human's own key. The warning a `Ctrl-Q` armed
