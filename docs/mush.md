@@ -791,9 +791,10 @@ everything on it was and nothing about *whose* it was.
   of thirty hues. Canonicalizing first makes `cd work` and `cd work/.` one window
   in one colour; a path that does not resolve (a `--print-config` on a workspace
   that does not exist yet) is hashed as it was typed.
-- **Chrome wears the hue, content does not.** Seven sites take the accent: the
+- **Chrome wears the hue, content does not.** Nine sites take the accent: the
   focused borders, the picker's frame and its selected row, the message prompt,
-  the bar's badge, the selected agent row, and an activity line. The alert red,
+  the bar's badge, the selected agent row, an activity line, and the select
+  mode's cursor band and its selection. The alert red,
   the notice yellow, the dim gray and the body gray stay fixed — *what happened*
   reads the same in every window, and only *whose window this is* changes.
 - **The thirty are separated perceptually, not by name.** Sampled around the hue
