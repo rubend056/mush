@@ -358,11 +358,17 @@ enum Reading {
 }
 
 impl Reading {
-    /// The held window's `(offset, up_to)`, if the transcript still has it: a
-    /// fold or a shorter restored session can leave a reading pointing past the
-    /// end, and a position the transcript no longer has is not a position — the
-    /// pane is at the bottom again. One rule, so the pane's title and its body
-    /// cannot disagree about which transcripts this reading may be read from.
+    /// The held window's `(offset, up_to)`, if the transcript still has it.
+    ///
+    /// [`Chat::replace_transcript`] drops the reading with the transcript it
+    /// was taken in, so a hold cannot outlive that transcript — a fold used to
+    /// leave one behind, and a growth back past the old `up_to` resurrected a
+    /// window belonging to a conversation that no longer existed (finding
+    /// D15). This bound is the backstop under that rule: a transcript shorter
+    /// than the one the window was taken in — a road nobody has written, or a
+    /// state a test built — is not a position, and the pane reads as at the
+    /// bottom again. One rule, so the pane's title and its body cannot
+    /// disagree about which transcripts this reading may be read from.
     fn held(self, messages: usize) -> Option<(usize, usize)> {
         match self {
             Reading::Holding { offset, up_to } if up_to <= messages => Some((offset, up_to)),
@@ -1138,9 +1144,21 @@ impl Chat {
     /// the one road that replaces a transcript, so this is where the mode is
     /// dropped — clamped at paint time as well, for every road that cannot know
     /// it took rows away ([`Chat::painted`]).
+    ///
+    /// The reading goes too, for the same reason one step out: a held window
+    /// is a position in *this* transcript, and its `up_to` is a count of the
+    /// messages that transcript had when the human scrolled away. Left behind,
+    /// it came back from the dead the moment the replacement grew back past
+    /// that count — a window belonging to a conversation that no longer exists,
+    /// which the pane's title then read as a live position (finding D15). A
+    /// fold *is* a new transcript, and a pane reads a new transcript from the
+    /// bottom.
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
         let prior = self.revision(agent);
         self.spoken.remove(&agent);
+        // A hold is a position in the transcript that just went, and a fold is
+        // a new transcript: the pane reads it from the bottom (finding D15).
+        self.reading.remove(&agent);
         self.pending = None;
         if self
             .select
@@ -4235,6 +4253,59 @@ mod tests {
         chat.start_select(AgentId::ROOT);
         chat.replace_transcript(AgentId(1), vec![Message::user("the child's line")]);
         assert!(chat.selecting(), "the mode is over the root, not the child");
+    }
+
+    /// A fold is a new transcript, and a held window belonged to the old one:
+    /// the pane is back at the bottom when the fold lands, and — the half that
+    /// used to fail — growth back past the old length does not resurrect the
+    /// hold. A position in a conversation that no longer exists is not a
+    /// position (finding D15).
+    #[test]
+    fn a_fold_puts_every_pane_back_at_the_bottom() {
+        let mut chat = Chat::bare();
+        for i in 0..10 {
+            chat.push_message(AgentId::ROOT, Message::assistant(format!("line {i}")));
+        }
+        // A second conversation, scrolled too: a fold of one is not the other's
+        // to move.
+        for i in 0..6 {
+            chat.push_message(AgentId(1), Message::assistant(format!("child {i}")));
+        }
+        chat.scroll_by(AgentId::ROOT, 3);
+        chat.scroll_by(AgentId(1), 2);
+        let root = pane(AgentId::ROOT);
+        let child = pane(AgentId(1));
+        assert!(
+            chat.painted(&root, 40, 6)
+                .title
+                .contains("scrolled ↑3 rows"),
+            "the root is holding a window"
+        );
+
+        // The fold: `[user(summary)]` replaces the root's ten lines.
+        chat.replace_transcript(AgentId::ROOT, vec![Message::user("a summary")]);
+        assert_eq!(
+            chat.painted(&root, 40, 6).title,
+            " mush ",
+            "the pane is at the bottom again"
+        );
+
+        // Growth back past the old `up_to` — the resurrection the finding read
+        // as `scrolled ↑3 rows · PgDn` after a fold.
+        for i in 0..11 {
+            chat.push_message(AgentId::ROOT, Message::assistant(format!("new {i}")));
+        }
+        assert_eq!(
+            chat.painted(&root, 40, 6).title,
+            " mush ",
+            "the hold does not come back with the lines"
+        );
+        assert!(
+            chat.painted(&child, 40, 6)
+                .title
+                .contains("scrolled ↑2 rows"),
+            "and the child's reading is not the root's fold's to drop"
+        );
     }
 
     /// The frame clamps the mode's cursor exactly as the key road does: a state
