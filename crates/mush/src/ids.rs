@@ -25,6 +25,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use mush_core::git::MAX_AGENT_ID;
+
 /// Which agent, in the tree.
 ///
 /// Ids used to be bare `u64`s, shared with branch names (`mush/7`) and with the
@@ -125,7 +127,8 @@ impl Default for Ids {
 }
 
 impl Ids {
-    /// The next agent id: a number a failed spawn gave back, or a fresh one.
+    /// The next agent id: a number a failed spawn gave back, or a fresh one —
+    /// or `None` when the id space has no id left to draw.
     ///
     /// The pool is popped first so a retry after a refusal is consecutive —
     /// nothing was created under the lost number, so nothing can collide with
@@ -133,17 +136,32 @@ impl Ids {
     /// ([`Ids::lose_agent`] pushes nothing else and the counter only grows), and
     /// a number the repository has named since is retired by
     /// [`Ids::reserve_agents`] rather than handed out: draw and retire take the
-    /// same lock, so neither can happen inside the other.
-    pub fn next_agent(&self) -> AgentId {
+    /// same lock, so neither can happen inside the other. That is also why the
+    /// pool is asked before the space is judged spent: a lost number is one the
+    /// counter has already passed, so it is inside the id space even while the
+    /// counter itself stands above it.
+    ///
+    /// `None` is the spent id space, and it is the rule rather than a failure:
+    /// the counter stands above [`MAX_AGENT_ID`], where a fresh draw would hand
+    /// out an id no `mush/<id>` branch can be read back from
+    /// ([`mush_core::git::worktree_id`]) and whose own floor, one past it, has no
+    /// room for the draw after that — `+ 1` at a floor of `u64::MAX` overflows,
+    /// which is an `attempt to add with overflow` panic in a debug build and a
+    /// wrap onto the root's own id `0` in release (finding IN2). A counter that
+    /// can never draw again is the honest answer to a repository that named
+    /// every id: [`Ids::reserve_agents`] puts it there, the caller refuses the
+    /// spawn and says so.
+    pub fn next_agent(&self) -> Option<AgentId> {
         let mut agents = self.agents();
-        match agents.lost.pop() {
-            Some(id) => AgentId(id),
-            None => {
-                let id = agents.counter;
-                agents.counter += 1;
-                AgentId(id)
-            }
+        if let Some(id) = agents.lost.pop() {
+            return Some(AgentId(id));
         }
+        if agents.counter > MAX_AGENT_ID {
+            return None;
+        }
+        let id = agents.counter;
+        agents.counter += 1;
+        Some(AgentId(id))
     }
 
     /// Give a number back: the spawn it was drawn for failed before git could
@@ -180,6 +198,11 @@ impl Ids {
     /// the wrong one (finding B1). Numbers still in the lost pool that fall
     /// below the new floor are dropped: they are numbers with no record *here*,
     /// but the repository has since named them, which is the invariant's line.
+    ///
+    /// A floor of [`MAX_AGENT_ID`] is still a drawable id; one above it is the
+    /// spent space — the counter stands past the last id the repository could
+    /// name, and [`Ids::next_agent`] then answers `None` instead of a number no
+    /// `mush/<id>` branch can be read back from.
     pub fn reserve_agents(&self, floor: u64) {
         let mut agents = self.agents();
         agents.counter = agents.counter.max(floor);
@@ -243,13 +266,13 @@ mod tests {
     #[test]
     fn the_counters_start_above_the_root_and_apart_from_each_other() {
         let ids = Ids::default();
-        assert_eq!(ids.next_agent(), AgentId(1));
-        assert_eq!(ids.next_agent(), AgentId(2));
+        assert_eq!(ids.next_agent(), Some(AgentId(1)));
+        assert_eq!(ids.next_agent(), Some(AgentId(2)));
         assert_eq!(ids.next_job(), JobId(1), "the job space starts at 1 too");
         assert_eq!(ids.next_job(), JobId(2));
         assert_eq!(
             ids.next_agent(),
-            AgentId(3),
+            Some(AgentId(3)),
             "drawing jobs does not move the agent counter"
         );
     }
@@ -259,11 +282,15 @@ mod tests {
     #[test]
     fn a_lost_number_is_the_next_one_handed_out() {
         let ids = Ids::default();
-        let burned = ids.next_agent();
+        let burned = ids.next_agent().expect("the space is fresh");
         assert_eq!(burned, AgentId(1));
         ids.lose_agent(burned);
-        assert_eq!(ids.next_agent(), AgentId(1), "the retry is consecutive");
-        assert_eq!(ids.next_agent(), AgentId(2));
+        assert_eq!(
+            ids.next_agent(),
+            Some(AgentId(1)),
+            "the retry is consecutive"
+        );
+        assert_eq!(ids.next_agent(), Some(AgentId(2)));
     }
 
     /// The pool full, the oldest forgotten, the newest drawn first: nine
@@ -273,12 +300,14 @@ mod tests {
     fn a_pool_full_names_which_lost_number_is_the_gap() {
         let ids = Ids::default();
         for n in 1..=9 {
-            assert_eq!(ids.next_agent(), AgentId(n), "draw #{n}");
+            assert_eq!(ids.next_agent(), Some(AgentId(n)), "draw #{n}");
         }
         for n in 1..=9 {
             ids.lose_agent(AgentId(n));
         }
-        let drawn: Vec<AgentId> = (0..9).map(|_| ids.next_agent()).collect();
+        let drawn: Vec<AgentId> = (0..9)
+            .map(|_| ids.next_agent().expect("the space is fresh"))
+            .collect();
         let expected: Vec<AgentId> = [9, 8, 7, 6, 5, 4, 3, 2, 10]
             .into_iter()
             .map(AgentId)
@@ -294,11 +323,15 @@ mod tests {
     #[test]
     fn a_floor_retires_lost_numbers_below_it() {
         let ids = Ids::default();
-        let given = ids.next_agent();
+        let given = ids.next_agent().expect("the space is fresh");
         ids.lose_agent(given);
         ids.reserve_agents(9);
         assert_eq!(ids.agents_floor(), 9);
-        assert_eq!(ids.next_agent(), AgentId(9), "the lost #1 is not reused");
+        assert_eq!(
+            ids.next_agent(),
+            Some(AgentId(9)),
+            "the lost #1 is not reused"
+        );
         ids.reserve_agents(3);
         assert_eq!(
             ids.agents_floor(),
@@ -310,12 +343,43 @@ mod tests {
         // retire and the draw are one lock apart, not two.
         let ids = Ids::default();
         for _ in 0..5 {
-            ids.next_agent();
+            let _ = ids.next_agent();
         }
         ids.lose_agent(AgentId(5));
         ids.reserve_agents(4);
         assert_eq!(ids.agents_floor(), 6);
-        assert_eq!(ids.next_agent(), AgentId(5), "the pool is still a pool");
+        assert_eq!(
+            ids.next_agent(),
+            Some(AgentId(5)),
+            "the pool is still a pool"
+        );
+    }
+
+    /// The id space ends at [`MAX_AGENT_ID`]: a floor there is the last id the
+    /// counter can hand out and still count from, and a floor above it is the
+    /// spent space — `None`, not a panic and not a name no `mush/<id>` branch
+    /// can be read back from (finding IN2). `Ids::default()` with a floor of
+    /// `u64::MAX - 1` drew `#18446744073709551614`, left the counter at
+    /// `u64::MAX`, and the next draw's `+ 1` was `attempt to add with overflow`.
+    #[test]
+    fn a_draw_with_no_room_above_its_id_answers_none() {
+        let ids = Ids::default();
+        ids.reserve_agents(MAX_AGENT_ID);
+        assert_eq!(
+            ids.next_agent(),
+            Some(AgentId(MAX_AGENT_ID)),
+            "the last holdable id is still drawn"
+        );
+        assert_eq!(ids.next_agent(), None, "and the id space above it is spent");
+
+        let ids = Ids::default();
+        ids.reserve_agents(MAX_AGENT_ID + 1);
+        assert_eq!(
+            ids.next_agent(),
+            None,
+            "a floor past the last holdable id leaves nothing to draw"
+        );
+        assert_eq!(ids.agents_floor(), MAX_AGENT_ID + 1, "without panicking");
     }
 
     /// The job floor is a floor too: the floor is the next number out, and a

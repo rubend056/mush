@@ -1790,7 +1790,7 @@ fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> V
 /// out to be a coincidence costs one skipped number; a missed name costs the
 /// wrong command stopped. A name at the top of the space is skipped — there is
 /// no floor above `u64::MAX`, the same refusal the agent space makes for a
-/// stored id at the ceiling (finding C9).
+/// stored id with no room to count above it (finding C9, IN2).
 fn raise_job_floor(ids: &Ids, messages: &[Message]) {
     let highest = messages
         .iter()
@@ -4682,6 +4682,30 @@ fn too_many_worktrees(held: &[u64]) -> String {
     )
 }
 
+/// The refusal a spawn gets when the id space itself is spent: every id the
+/// counter could hand out is named by something the repository already holds.
+///
+/// [`Ids::next_agent`] answers `None` once the counter stands above
+/// [`git::MAX_AGENT_ID`], and [`Ids::reserve_agents`] puts it there for every id
+/// a branch or a stored row names: the last holdable id is `MAX_AGENT_ID` —
+/// `mush/18446744073709551613` — and it is a restored session row or a leftover
+/// branch that names it. An id above that has no `mush/<id>` branch
+/// [`git::worktree_id`] can read back and no floor the next draw can count
+/// from, so there is no number left to hand a child. The remedy is the one that
+/// clears the name: delete that branch, or the row that holds that id.
+fn the_id_space_is_spent() -> String {
+    let last = git::MAX_AGENT_ID;
+    let branch = git::branch_name(last);
+    format!(
+        "cannot spawn: there is no agent id left to draw. The counter stands past the last \
+         id the space can hold (#{last}), named by a restored session row or a leftover \
+         `{branch}` branch; an id above it has no `mush/<id>` branch mush can read back \
+         and no floor the next draw can count from, so no number can be handed to a \
+         child. Drop the row or branch that names it — `git branch -D {branch}`, or the \
+         row with that id in `.mush/session.json` — then spawn again.",
+    )
+}
+
 /// Give the number back after a failed `worktree add`, or keep it spent —
 /// decided by what git actually made, never by the error text (finding F10).
 ///
@@ -4859,7 +4883,9 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         }
     }
 
-    let id = ctx.ids.next_agent();
+    let Some(id) = ctx.ids.next_agent() else {
+        return Err(the_id_space_is_spent());
+    };
     let (child_ws, branch) = match named {
         // A worktree on `mush/<id>`, forked from the base. A base is a promise
         // about history: if git cannot make the worktree, the delegation fails
