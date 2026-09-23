@@ -1505,10 +1505,19 @@ impl AgentTree {
     /// The focus and the cursor are put back on a node that is really there:
     /// reaping used to leave them on a ghost, so the pane stayed titled
     /// `agent #4` while typing reported that the agent was gone (finding B11).
+    ///
+    /// The cursor is a *node*, not the index it sat at: [`Self::past_history`]
+    /// drops the oldest rows, which are the rows *above* the cursor, so a cursor
+    /// held by index silently slides onto a different agent with no keystroke —
+    /// 51 finished children, ten `j`s and a reap moved it from `#10` to `#11`
+    /// (finding D7). The id the cursor named before the retain is the thing to
+    /// point it back at ([`Self::point_cursor_at`]), and the clamp in
+    /// [`Self::repair_focus`] is only for the case that agent went too.
     pub fn reap(&mut self, gone: &[AgentId]) {
         if gone.is_empty() {
             return;
         }
+        let named = self.cursor_id();
         self.agents.retain(|node| !gone.contains(&node.id));
         for id in gone {
             // Dropping the last sender ends the actor: an idle agent whose
@@ -1517,7 +1526,12 @@ impl AgentTree {
             self.agent_cancel.remove(id);
             self.agent_stats.remove(id);
         }
-        self.repair_focus();
+        // Point the cursor back at the agent it named, whenever that agent is
+        // still here; the clamp is the fallback for a cursor whose agent went
+        // with the reap, not the rule.
+        if !named.is_some_and(|id| self.point_cursor_at(id)) {
+            self.repair_focus();
+        }
     }
 
     /// Point the focus and the cursor at nodes that exist.
@@ -2568,6 +2582,35 @@ mod tests {
         assert_eq!(tree.cursor(), tree.agents.len().saturating_sub(1));
         assert!(!tree.agent_tx.contains_key(&gone));
         assert!(!tree.agent_stats.contains_key(&gone));
+    }
+
+    /// The cursor names an agent, not a row index: [`AgentTree::past_history`]
+    /// drops the *oldest* rows — the ones above the cursor — so a reap that kept
+    /// the index would silently move the selection to a different agent with no
+    /// keystroke (finding D7).
+    ///
+    /// The audit's probe: fifty-one finished children, ten `j`s and a reap read
+    /// `cursor index=10 before=Some(AgentId(10)) after=Some(AgentId(11))`.
+    #[test]
+    fn reaping_keeps_the_cursor_on_the_agent_it_named() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=51).map(|id| finished(&mut tree, id)).collect();
+        for _ in 0..10 {
+            tree.move_cursor(1);
+        }
+        let before = tree.cursor_id();
+        assert_eq!(before, Some(AgentId(10)), "ten rows down from the root");
+
+        let gone = tree.past_history();
+        assert_eq!(gone, vec![AgentId(1)], "the row above the cursor goes");
+        tree.reap(&gone);
+
+        assert_eq!(
+            tree.cursor_id(),
+            before,
+            "the cursor still names the agent it named: before={before:?} after={:?}",
+            tree.cursor_id()
+        );
     }
 
     /// A finished child of the root: at rest, with a result its parent has read
