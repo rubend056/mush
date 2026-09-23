@@ -26,13 +26,17 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::text::fit_row;
 
 use crate::app::{
-    AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
+    elide, AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
 };
 use crate::theme::Theme;
 
 /// The idle bar hint, when there is nothing to report. The commands it names
 /// are checked against `app::commands::COMMANDS` by a test there, so the bar
 /// cannot advertise a command the parser does not have (finding B2).
+///
+/// It is clauses joined by ` · `, and the painter paints as many of them as
+/// fit the row it has (`idle_hint`), each clause whole: a hint that loses its
+/// tail to the renderer mid-word is not the sentence the keys do (PM2).
 pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 
 pub(crate) fn dim() -> Style {
@@ -463,9 +467,15 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
         Focus::Agents => "agents",
         Focus::Chat => "chat",
     };
+    // The idle hint is the one word on this row that can be wider than the
+    // row: it gets the columns the badge and the space after it leave (PM2).
+    let idle;
     let (message, style) = match &pane.word {
         Some((rank, text)) => (text.as_str(), rank_style(*rank, theme)),
-        None => (HINT, dim()),
+        None => {
+            idle = idle_hint(pane.area.width.saturating_sub(badge.len() as u16 + 3) as usize);
+            (idle.as_str(), dim())
+        }
     };
     let line = Line::from(vec![
         Span::styled(
@@ -483,6 +493,21 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
             rows[1],
         );
     }
+}
+
+/// The idle hint, cut to the columns the bar's badge leaves it.
+///
+/// [`HINT`]'s clauses are dropped whole from the right by [`elide`] — the one
+/// rule the panes' titles and the facts line are cut by (finding D9) — because
+/// a hint cut mid-word names no key at all: at the 40-column floor the old
+/// ` agents Tab cycles panes · /help lis` lost its tail to the renderer, and
+/// the clause that fits (`Tab cycles panes`) is the honest line. A terminal
+/// wide enough for the whole sentence keeps every clause; the sample frame on
+/// the front page is painted at 100 columns and is one (PM2).
+fn idle_hint(columns: usize) -> String {
+    let cells: Vec<String> = HINT.split(" · ").map(str::to_string).collect();
+    let floor = cells[0].clone();
+    elide(&cells, " · ", "", &floor, columns)
 }
 
 #[cfg(test)]
@@ -521,6 +546,38 @@ pub(crate) mod tests {
     /// reached the frame rather than what text did.
     fn style_at(buffer: &Buffer, x: u16, y: u16) -> Style {
         buffer[(x, y)].style()
+    }
+
+    /// The record disagreed with itself about this: `docs/audits/tui.md:898`
+    /// read ratatui 0.29's `Buffer::set_stringn` as filtering graphemes
+    /// holding controls, while `33409d4` had measured an escape reaching the
+    /// terminal. The one-line experiment settles it, and the answer is that
+    /// the crate does **not** filter: painting `Span::raw("\u{1b}[2J")` at
+    /// 10×1 leaves the ESC, the `[`, the `2` and the `J` in four cells of the
+    /// buffer (`crossterm`'s backend writes `cell.symbol()` verbatim, so these
+    /// bytes reach the terminal as a frame wipe). That is why every surface
+    /// that paints a string mush did not write defangs it at the paint
+    /// boundary (PM1/IN5).
+    #[test]
+    fn a_raw_span_paints_a_control_byte_verbatim() {
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::raw("\u{1b}[2Jx"))),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<String> = (0..4u16)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert_eq!(
+            symbols,
+            vec!["\u{1b}", "[", "2", "J"],
+            "ratatui 0.29's `Buffer::set_stringn` paints a control byte into its cell"
+        );
     }
 
     /// A popup with no inner room — a terminal too narrow or too short for a

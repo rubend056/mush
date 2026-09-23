@@ -123,12 +123,22 @@ fn inner(area: Rect) -> Rect {
 /// there is no room to spend on the rest. The count of *everything* attached is
 /// the title's, not that row's, so an abbreviated list never claims to be the
 /// whole one.
-fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
+///
+/// `columns` is the field's own width: the `▣ ` mark is taken out of it and the
+/// rest is [`image_label`]'s budget, because a row wider than the field is what
+/// the renderer clips — and a clipped row loses the size that names the picture
+/// (PM4).
+fn attachment_rows(images: &[Image], cap: usize, columns: u16) -> Vec<String> {
     let cap = cap.min(MAX_ATTACHMENT_ROWS);
     if cap == 0 {
         return Vec::new();
     }
-    let label = |image: &Image| format!("▣ {}", image_label(image));
+    let label = |image: &Image| {
+        format!(
+            "▣ {}",
+            image_label(image, columns.saturating_sub(2) as usize)
+        )
+    };
     if images.len() <= cap {
         return images.iter().map(label).collect();
     }
@@ -140,6 +150,10 @@ fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
 /// The box's content rows for the room it was granted: the attachment rows that
 /// fit above the draft, and how many rows are left for the text.
 ///
+/// `field_width` is the field's own width, passed through to [`attachment_rows`]
+/// so an attachment row is built for the columns it is painted in — the box's
+/// field is the same width however many rows the layout grants it (PM4).
+///
 /// The one owner of "how many rows the content has" when the box is painted.
 /// [`App::input_rows`] asks the layout for the same count from the other side —
 /// the draft's lines, the attachments and the two border rows — and the two
@@ -149,8 +163,12 @@ fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
 /// `text_rows = field_height - attachments.len()` is true by construction. A row
 /// the box does not have is a row the message being typed would be pushed out
 /// of (finding D5).
-fn content_rows(field_height: u16, images: &[Image]) -> (Vec<String>, usize) {
-    let attachments = attachment_rows(images, (field_height as usize).saturating_sub(1));
+fn content_rows(field_height: u16, field_width: u16, images: &[Image]) -> (Vec<String>, usize) {
+    let attachments = attachment_rows(
+        images,
+        (field_height as usize).saturating_sub(1),
+        field_width,
+    );
     let text_rows = (field_height as usize).saturating_sub(attachments.len());
     (attachments, text_rows)
 }
@@ -322,7 +340,9 @@ pub struct InputPane {
     /// cannot be read off them (`▣ +2 more` counts what is left, not the whole);
     /// the number lives once, beside the rows it is already arithmetic over.
     pub attachment_count: usize,
-    /// The lines the box shows, already windowed around the cursor.
+    /// The lines the box shows, already windowed around the cursor and
+    /// [`mush_core::text::sanitize`]d — the box itself keeps the human's own
+    /// bytes, because a send must send exactly what was typed (PM1/IN5).
     pub lines: Vec<String>,
     /// The line the cursor is on, in `lines`.
     pub cursor_row: usize,
@@ -754,7 +774,8 @@ impl App {
             // it caps the attachment rows to the room the box really has, one
             // row kept for the text, so the split below cannot hand the draft
             // the row the attachments took (finding D5).
-            let (attachments, text_rows) = content_rows(field.height, self.chat.attachments());
+            let (attachments, text_rows) =
+                content_rows(field.height, field.width, self.chat.attachments());
             let (lines, cursor_row, column) = self.chat.input().view(text_rows, columns);
             InputPane {
                 prompt,
@@ -892,7 +913,13 @@ fn facts_line(app: &App, width: usize) -> String {
     } else {
         root
     };
-    let mut cells = vec![format!(" ⌂ {shown}")];
+    // The workspace path is the one part of this line an outside hand wrote —
+    // `mkdir $'\e[2J'` is legal — and the painter paints the facts whole, so
+    // the cell is defanged here, where the frame's word is built, exactly as
+    // `App::set_status` defangs the bar's own word (PM1/IN5). The rest of the
+    // line is mush's: the git cell is a ref name git itself forbids controls
+    // in, the label is sanitized where it is built and the meter is numbers.
+    let mut cells = vec![format!(" ⌂ {}", sanitize(&shown))];
     if let Some(git) = &app.git {
         cells.push(git_cell(git, app.git_age()));
     }
@@ -903,21 +930,22 @@ fn facts_line(app: &App, width: usize) -> String {
 }
 
 /// Drop cells from the right until the line fits: one rule for every line that
-/// is built this way — the two panes' titles and the facts under them — and the
-/// one home of it (finding D9).
+/// is built this way — the two panes' titles, the facts under them, and the
+/// bar's idle hint — and the one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
-/// is a count that is not the count. The first cell is never given up, and
-/// `floor` is what is painted when even it does not fit: the pane keeps its own
-/// name, and the facts line keeps the `⌂` cell that says which tree the screen
-/// is about. `prefix` opens every kept line, so the separator *inside* the line
+/// is a count that is not the count, and a hint cut mid-word names no key. The
+/// first cell is never given up, and `floor` is what is painted when even it
+/// does not fit: the pane keeps its own name, the facts line keeps the `⌂` cell
+/// that says which tree the screen is about, and the hint keeps its first
+/// clause. `prefix` opens every kept line, so the separator *inside* the line
 /// (` · `, ` │ `) and the one joining it to what precedes are each said once.
 ///
 /// The conversation pane's title is built by the same rule rather than painted
 /// as it stands: `Chat::painted` hands its clauses here, so the chat's title
 /// cannot be the one title on screen a painter cuts mid-word at the border
 /// (finding D11).
-pub(super) fn elide(
+pub(crate) fn elide(
     cells: &[String],
     separator: &str,
     prefix: &str,

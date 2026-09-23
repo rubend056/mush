@@ -28,6 +28,9 @@ pub use chat::{Chat, Pane, Rank, SelectRows};
 #[cfg(test)]
 pub use chat::Painted;
 pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
+// The one rule that drops a cell whole when a line does not fit: the bar's
+// idle hint is built and cut in the painter, which takes it from here (PM2).
+pub(crate) use screen::elide;
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn};
 
@@ -211,11 +214,15 @@ impl Picker {
     /// rather than to the painter because it is the same fact as the title: what
     /// this list is for. A long list is paged the same way the transcript is,
     /// so `PgUp`/`PgDn` are named beside `j`/`k`.
+    ///
+    /// The sentence is 38 columns because the popup's inner row is 38 at the
+    /// 40-column floor (`picker_width(40)` is `PICKER_MIN_WIDTH`, less the two
+    /// border columns) and the painter paints it whole: the old 44-column
+    /// spelling lost the tail to the renderer at that size, and the tail is
+    /// what says `Esc` cancels (PM2).
     pub fn hint(&self) -> &'static str {
         match self.kind {
-            PickerKind::Model | PickerKind::Provider => {
-                " j/k or PgUp/PgDn · Enter pick · Esc cancel "
-            }
+            PickerKind::Model | PickerKind::Provider => " j/k · PgUp/PgDn · Enter · Esc cancel ",
             PickerKind::Notes | PickerKind::Help => " j/k or PgUp/PgDn scrolls · Esc closes ",
         }
     }
@@ -251,15 +258,33 @@ pub fn tokens_label(tokens: usize) -> String {
 /// two surfaces are describing two different things. The format is the mime
 /// without its `image/` head, exactly as a shed payload's placeholder spells it.
 /// The path goes through [`mush_core::text::sanitize`], like every other row a
-/// name reaches: these rows are painted raw, and a file name is the one part of
-/// this label an outside hand wrote.
-pub fn image_label(image: &Image) -> String {
+/// name reaches: these rows are handed to the renderer as the label builds
+/// them, and a file name is the one part of the label an outside hand wrote.
+///
+/// `columns` is the room the row has for the label, its own `▣` mark already
+/// taken out. The name is what gives when the label does not fit: the format
+/// and the size are the facts the row exists to say — two screenshots taken a
+/// second apart differ only in the name's tail, and a row that loses its size
+/// says nothing about which picture it is — so the name is shortened with
+/// [`mush_core::text::truncate`] (the house rule, its `…` included) to what the
+/// tail leaves, and the tail is painted whole whenever any columns are left for
+/// it. A row too narrow even for the tail gets the house rule over the whole
+/// label, because no rule can keep a size in columns that are not there.
+/// `usize::MAX` is a caller saying it has no row budget — the bar's sentences,
+/// which are painted as sentences and clipped, if at all, as one (PM4).
+pub fn image_label(image: &Image, columns: usize) -> String {
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
-    format!(
-        "{} ({format} · {})",
-        mush_core::text::sanitize(&image.path),
-        size_label(image.bytes.len())
-    )
+    let tail = format!(" ({format} · {})", size_label(image.bytes.len()));
+    let name = mush_core::text::sanitize(&image.path);
+    let tail_columns = unicode_width::UnicodeWidthStr::width(tail.as_str());
+    if columns <= tail_columns {
+        return mush_core::text::truncate(&format!("{name}{tail}"), columns);
+    }
+    let name_columns = columns - tail_columns;
+    if unicode_width::UnicodeWidthStr::width(name.as_str()) <= name_columns {
+        return format!("{name}{tail}");
+    }
+    format!("{}{tail}", mush_core::text::truncate(&name, name_columns))
 }
 
 /// The line an image gets when the model is not documented to accept image
@@ -4776,7 +4801,10 @@ impl App {
             }
         };
         let image = images.pop().expect("one image in, one image out");
-        let label = image_label(&image);
+        // A sentence, not a row: the bar paints its word whole and clips a
+        // sentence longer than the terminal as one, so there is no column
+        // budget for the label here (`usize::MAX`).
+        let label = image_label(&image, usize::MAX);
         let path = image.path.clone();
         // What this picture costs, weighed the one way the budget weighs a
         // picture: pixels when its header named them, bytes when it did not
@@ -7083,8 +7111,8 @@ mod tests {
 
         /// Every rule a frame must keep whatever it says: nothing painted
         /// outside a pane, every pane's own frame intact, the bar keeping its
-        /// row, and every line a pane was handed fitting the pane it is painted
-        /// in.
+        /// row, and every line and attachment row a pane was handed fitting
+        /// the pane it is painted in.
         fn assert_shape(&self, case: &str, width: u16, height: u16) {
             let at = format!("{case} at {width}×{height}");
             let Screen::Panes(panes) = &self.screen else {
@@ -7225,6 +7253,16 @@ mod tests {
                         prompt + unicode_width::UnicodeWidthStr::width(line.as_str())
                             <= field.width as usize,
                         "{at}: a message-box line is wider than its pane: {line:?}"
+                    );
+                }
+                // The attachment rows are painted whole, above the prompt: they
+                // have no prompt prefix to pay for, and a row wider than the
+                // field is what the renderer clips silently — how a long file
+                // name loses the size that names the picture (PM4).
+                for row in &input.attachments {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(row.as_str()) <= field.width as usize,
+                        "{at}: a message-box attachment row is wider than its pane: {row:?}"
                     );
                 }
             }
@@ -9531,6 +9569,79 @@ mod tests {
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
             "a paste is not a send"
+        );
+    }
+
+    /// PM1/IN5's first site: the message box stores the human's own bytes — a
+    /// send must send exactly what was typed, and the select-mode copy reads
+    /// its source — but the terminal acts on what it is shown. A paste that
+    /// kept a terminal's colours, and an attach client's `edit`, both carry
+    /// escape sequences into the draft; the painted row is the safe copy. The
+    /// measurement that makes this a leak and not a cosmetic gap is
+    /// `ui::tests`'s raw-span probe: `Buffer::set_stringn` paints an ESC
+    /// verbatim.
+    #[test]
+    fn the_message_box_paints_a_hostile_draft_defanged() {
+        // The paste road: line endings normalised, and nothing else.
+        let (mut app, _rx) = test_app("hostile-paste");
+        app.update(Msg::Paste(HOSTILE.into()));
+        assert_eq!(
+            app.chat.input().text(),
+            HOSTILE.replace('\r', "\n"),
+            "the box stores the human's own bytes; the painter defangs its copy"
+        );
+        let pasted = shot(&mut app, 120, 32);
+        assert_no_command("a hostile paste in the message box", &pasted);
+        assert!(
+            pasted.text().contains("escaped"),
+            "the words still read: {}",
+            pasted.text()
+        );
+
+        // The attach client's road: `mush edit` reaches the same box through
+        // `App::handle_attach`, and the draft is exactly the bytes the client
+        // sent.
+        let base = app.chat.revision(AgentId::ROOT);
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                2,
+                attach::Op::Edit {
+                    agent: 0,
+                    base,
+                    text: HOSTILE.to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert_eq!(
+            app.chat.input().text(),
+            HOSTILE,
+            "the box stores the client's bytes too"
+        );
+        let edited = shot(&mut app, 120, 32);
+        assert_no_command("an attach client's edit in the message box", &edited);
+        assert!(
+            edited.text().contains("escaped"),
+            "the words still read: {}",
+            edited.text()
+        );
+    }
+
+    /// PM1/IN5's second site: the bar's `⌂ <root>` cell is built from the
+    /// workspace path, which an outside hand wrote (`mkdir $'\e[2J'` is legal),
+    /// and the bar paints the facts whole. The cell is defanged at the same
+    /// boundary the bar's own word is (`App::set_status`), and the path still
+    /// reads: the escape goes, the words around it stay.
+    #[test]
+    fn the_bar_paints_a_hostile_workspace_path_defanged() {
+        let (mut app, _rx) = test_app(&format!("hostile-root-{HOSTILE}"));
+        let shot = shot(&mut app, 120, 32);
+        assert_no_command("a workspace path holding an escape", &shot);
+        assert!(
+            shot.text().contains("escaped"),
+            "the path still reads: {}",
+            shot.text()
         );
     }
 
@@ -13056,6 +13167,61 @@ mod tests {
         assert!(
             frame.contains("/help"),
             "the bar's fallback names where the commands are: {frame}"
+        );
+    }
+
+    /// PM2: at the 40-column floor two fixed sentences overflowed the rows
+    /// they are painted in — the picker's hint (44 columns into the popup's
+    /// 38-column inner row) and the bar's idle line (` agents `, a space and a
+    /// 62-column hint into 40) — and the renderer cut each tail mid-word:
+    /// `…Enter pick · Esc c` and ` agents Tab cycles panes · /help lis`. No
+    /// test read either tail. The picker's sentence now fits 38 whole, Esc's
+    /// own verb included; the bar's idle hint is cut by the house rule, clause
+    /// by clause, so 40 columns paint `Tab cycles panes` — never a half-clause
+    /// — and the sample frame's 100 columns still paint every clause.
+    #[test]
+    fn the_hints_paint_what_fits_at_the_40_column_floor() {
+        // The picker's hint: the popup's last inner row at the floor is the
+        // 38-column sentence itself, tail and all.
+        let (mut app, _rx) = test_app("floor-picker-hint");
+        app.models = vec![
+            http::Model {
+                id: "test-model".to_string(),
+                context: Some(500_000),
+            },
+            http::Model {
+                id: "deepseek-chat".to_string(),
+                context: Some(128_000),
+            },
+        ];
+        app.open_model_picker();
+        let popup = shot(&mut app, 40, 10);
+        assert!(
+            popup
+                .text()
+                .contains(" j/k · PgUp/PgDn · Enter · Esc cancel "),
+            "the picker's whole hint fits its row: {}",
+            popup.text()
+        );
+
+        // The bar's idle row, same floor: clauses go whole. The focus is the
+        // chat pane, so the badge is ` chat ` (the agents badge is two columns
+        // wider, and the first clause fits under either).
+        let (mut app, _rx) = test_app("floor-bar-hint");
+        let floor = shot(&mut app, 40, 10);
+        assert_eq!(
+            floor.rows().last().cloned().unwrap_or_default(),
+            " chat  Tab cycles panes",
+            "40 columns paint the clauses that fit, never half of one"
+        );
+
+        // A wide bar is unchanged: the sample frame's 100 columns paint the
+        // whole sentence the front page's block carries.
+        let wide = shot(&mut app, 100, 28);
+        assert!(
+            wide.text().contains("Ctrl-P picks a model"),
+            "every clause is back on a wide bar: {}",
+            wide.text()
         );
     }
 
@@ -16894,7 +17060,7 @@ mod tests {
             words: vec![
                 " models · Enter picks ",
                 "• test-model · 500k",
-                "j/k or PgUp/PgDn",
+                "j/k · PgUp/PgDn",
             ],
             roomy: vec!["deepseek-chat · 128k"],
             absent: Vec::new(),
@@ -17466,7 +17632,7 @@ mod tests {
                 "the current model is marked at {width}×{height}: {text}"
             );
             assert!(
-                text.contains("j/k or PgUp/PgDn"),
+                text.contains("j/k · PgUp/PgDn"),
                 "and the keys are named at {width}×{height}: {text}"
             );
             shot.assert_shape("an open /model picker", width, height);
@@ -19692,6 +19858,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// PM4: `▣ name (mime · size)` was painted whole, so past the pane the
+    /// renderer cut the name mid-word and the size — the one fact two
+    /// screenshots taken a second apart differ in — was gone: at 80×24 the
+    /// transcript read `  ▣ Screenshot from 2024-01-01 12-00-00.png (png` and
+    /// stopped. The label is now shortened to the columns its row really has:
+    /// the name truncates by the house rule (`text::truncate`, its `…`), the
+    /// format and the size are painted whole, and `assert_shape` reads every
+    /// attachment row against the field it is painted in — the blind spot the
+    /// sweep never covered.
+    #[test]
+    fn an_image_row_truncates_its_name_and_keeps_its_size() {
+        let name = "Screenshot from 2024-01-01 12-00-00.png";
+        let (mut app, _rx) = test_app("image-row-fits");
+        let_the_model_see(&mut app);
+        // The file is really there, with the bytes the image carries: the send
+        // road reads it back to check the attachment is the file it names, and
+        // a message that cannot carry its picture is refused, not painted.
+        std::fs::write(app.ws.root().join(name), png(1_500_000)).unwrap();
+        app.chat.attach(Image {
+            path: name.to_string(),
+            mime: "image/png".to_string(),
+            bytes: png(1_500_000),
+            pixels: None,
+        });
+
+        // The box's own row at the 40-column floor: `▣ ` leaves 36 of the
+        // 38-column field, the tail takes 15, and the name gets the rest. The
+        // floor needs the twelve rows D5's frame names: a ten-row terminal
+        // gives the box one content row, and the text's row comes first.
+        let boxed = shot(&mut app, 40, 12);
+        boxed.assert_shape("an attachment at the floor", 40, 12);
+        assert!(
+            boxed.text().contains("… (png · 1.5 MB)"),
+            "the box cuts the name and keeps the size: {}",
+            boxed.text()
+        );
+
+        // Sent, the transcript names it by the same rule at the pane's width.
+        app.chat.insert("look");
+        app.send_message();
+        let wide = shot(&mut app, 80, 24);
+        wide.assert_shape("a sent picture at 80×24", 80, 24);
+        assert!(
+            wide.text().contains("… (png · 1.5 MB)"),
+            "the transcript cuts the name and keeps the size: {}",
+            wide.text()
+        );
     }
 
     /// The same for a `read` answer: the transcript's lines and their indices,
