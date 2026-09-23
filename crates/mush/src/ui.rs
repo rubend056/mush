@@ -773,6 +773,9 @@ mod tests {
             .map(|(at, glyph)| AgentRow {
                 id: AgentId(at as u64),
                 depth: at,
+                // The fixture's four rows hang under the root or nowhere; the
+                // severed-parent mark is `screen.rs`'s own test's business.
+                parent_gone: false,
                 glyph,
                 focused: false,
                 waiting: at,
