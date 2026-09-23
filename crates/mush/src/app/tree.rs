@@ -230,8 +230,9 @@ pub enum Compacting {
     Parked,
     /// The summarize call is on the wire, because the human asked (`/compact`).
     Requested,
-    /// The summarize call is on the wire, because the history is three
-    /// quarters of the window: nobody asked, and the reason is the history.
+    /// The summarize call is on the wire, because the history is past
+    /// [`mush_core::transcript::compaction_trigger`]: nobody asked, and the
+    /// reason is the history.
     NearlyFull,
 }
 
