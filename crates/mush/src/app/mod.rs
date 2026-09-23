@@ -12364,6 +12364,108 @@ mod tests {
         }
     }
 
+    /// D13: the two-pane chat split is one derivation, so zen hands the message
+    /// box the very rows the two-pane layout gave it — even at the compact
+    /// sizes, where the agents strip sits above the chat and the old zen Chat
+    /// arm re-split the taller frame. A four-line draft asks the split for six
+    /// rows: at 40×12 the two-pane column is eight rows high and lends the box
+    /// five of them (the transcript keeps its three), while a fresh split over
+    /// the eleven-row zen frame handed the box six — one row down and one row
+    /// taller. At 40×10 the column cannot hold the box's ask and the
+    /// transcript's floor, so the box is the three rows left over; the zen arm
+    /// handed it six.
+    #[test]
+    fn zen_keeps_the_boxes_rows_at_every_size() {
+        let (mut app, _rx) = test_app("zen-box-rows");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        // Four draft lines: the box asks for six rows, so the split's answer
+        // is not the arithmetic a box would derive alone.
+        app.update(Msg::Paste("one\ntwo\nthree\nfour".into()));
+        assert_eq!(
+            app.chat.input().line_count(),
+            4,
+            "the draft the split reads"
+        );
+        for (width, height) in [(40u16, 12u16), (40, 10), (60, 17), (79, 24)] {
+            let at = format!("{width}×{height}");
+            let two = pane_rects(&mut app, width, height);
+            assert!(two.agents.width > 0, "{at}: the two-pane frame to measure");
+            assert!(two.input.height > 0, "{at}: the two-pane box to measure");
+
+            // Chat focused: the box keeps the two-pane rows, widened to the
+            // frame, and the transcript takes what is above it.
+            ctrl(&mut app, 'f');
+            let zen = pane_rects(&mut app, width, height);
+            assert_eq!(
+                zen.agents,
+                Rect::new(0, 0, 0, 0),
+                "{at}: the agents pane is a zero rect"
+            );
+            assert_eq!(
+                (zen.input.y, zen.input.height),
+                (two.input.y, two.input.height),
+                "{at}: the box keeps the two-pane rows"
+            );
+            assert_eq!(zen.input.x, 0, "{at}: the box takes the frame's width");
+            assert_eq!(
+                zen.input.width, width,
+                "{at}: the box takes the frame's width"
+            );
+            assert_eq!(
+                zen.transcript.x, 0,
+                "{at}: the transcript starts at the left"
+            );
+            assert_eq!(zen.transcript.width, width, "{at}: and spans the frame");
+            assert_eq!(zen.transcript.y, 0, "{at}: and starts at the top");
+            assert_eq!(
+                zen.transcript.bottom(),
+                zen.input.y,
+                "{at}: the transcript sits on its box"
+            );
+            assert_eq!(
+                zen.transcript.height + zen.input.height,
+                zen.bar.y,
+                "{at}: the transcript and the box tile the frame above the bar"
+            );
+            assert!(zen.transcript_painted, "{at}: the transcript still paints");
+            ctrl(&mut app, 'f');
+
+            // Agents focused: the tree takes everything above the box, and the
+            // box is the very box the two-pane layout had.
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Agents, "{at}: Tab moves the keyboard");
+            ctrl(&mut app, 'f');
+            let tree = pane_rects(&mut app, width, height);
+            assert_eq!(
+                (tree.input.y, tree.input.height),
+                (two.input.y, two.input.height),
+                "{at}: the box keeps the two-pane rows"
+            );
+            assert_eq!(tree.input.x, 0, "{at}: the box takes the frame's width");
+            assert_eq!(
+                tree.input.width, width,
+                "{at}: the box takes the frame's width"
+            );
+            assert_eq!(tree.agents.y, 0, "{at}: the tree starts at the top");
+            assert_eq!(
+                tree.agents.bottom(),
+                tree.input.y,
+                "{at}: the tree sits on the box"
+            );
+            assert_eq!(
+                tree.agents.height + tree.input.height,
+                tree.bar.y,
+                "{at}: the tree and the box tile the frame above the bar"
+            );
+            assert_eq!(tree.transcript.height, 0, "{at}: no transcript is painted");
+            assert!(!tree.transcript_painted, "{at}: so `transcript` is `None`");
+            ctrl(&mut app, 'f');
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Chat, "{at}: back where the size began");
+        }
+    }
+
     /// With zen on, the layout reads the focus — the fact `Tab` already cycles
     /// — so the pane cycle is the whole of "which pane is full-screen".
     #[test]

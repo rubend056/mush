@@ -398,45 +398,63 @@ impl App {
             (columns[0], columns[1], rows[1])
         };
 
+        // The chat column's split, once: the transcript above the message box.
+        // Both zen arms read these same rows, so the box cannot move when the
+        // tree gives up its rows (finding D13).
+        let chat_split =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
+                .split(chat_area);
+
         // The zen view ([`App::zen`]): the focused pane takes what the two
         // panes shared, because the terminal's own drag — mush deliberately
         // does not capture the mouse (finding K3) — takes a rectangle of cells,
         // and at 80 columns that rectangle starts in the agents pane. The
-        // two-pane layout above is the source of every row this hands over, so
-        // the pane that keeps its place keeps exactly the rows it had.
+        // two-pane layout above is the source of every row this hands over —
+        // the chat column's split and the message box's rows included, so the
+        // box keeps exactly the rows it had (finding D13).
         let (agents_area, chat) = match (self.zen, self.focus) {
-            (false, _) => (agents_area, self.chat_pane(chat_area)),
+            (false, _) => (
+                agents_area,
+                self.chat_pane_with(chat_split[0], chat_split[1]),
+            ),
             // The chat takes the rows above the bar whole — what the agents
             // pane and the chat had between them — and the agents pane becomes
-            // a zero rect, so nothing can paint in it.
-            (true, Focus::Chat) => (
-                Rect::new(area.x, area.y, 0, 0),
-                self.chat_pane(Rect::new(
-                    area.x,
-                    area.y,
-                    area.width,
-                    bar_area.y.saturating_sub(area.y),
-                )),
-            ),
-            // The message box keeps the rows the two-pane layout gave it — its
-            // own split, not a re-derivation — and takes the width; the tree
-            // gets everything above it.
-            (true, Focus::Agents) => {
-                let split =
-                    Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
-                        .split(chat_area);
+            // a zero rect, so nothing can paint in it. The box keeps the rows
+            // the two-pane split gave it, widened to the frame, and the
+            // transcript is what remains above it.
+            (true, Focus::Chat) => {
                 let box_area = Rect {
                     x: area.x,
                     width: area.width,
-                    ..split[1]
+                    ..chat_split[1]
                 };
                 (
-                    Rect::new(
-                        area.x,
-                        area.y,
-                        area.width,
-                        box_area.y.saturating_sub(area.y),
+                    Rect::new(area.x, area.y, 0, 0),
+                    self.chat_pane_with(
+                        Rect {
+                            y: area.y,
+                            height: box_area.y.saturating_sub(area.y),
+                            ..box_area
+                        },
+                        box_area,
                     ),
+                )
+            }
+            // The message box keeps the rows the two-pane layout gave it — the
+            // split above, not a re-derivation — and takes the width; the tree
+            // gets everything above it.
+            (true, Focus::Agents) => {
+                let box_area = Rect {
+                    x: area.x,
+                    width: area.width,
+                    ..chat_split[1]
+                };
+                (
+                    Rect {
+                        y: area.y,
+                        height: box_area.y.saturating_sub(area.y),
+                        ..box_area
+                    },
                     self.chat_box(box_area),
                 )
             }
@@ -619,13 +637,6 @@ impl App {
         }
     }
 
-    /// The chat column: the transcript `Chat` renders and the message box.
-    fn chat_pane(&self, area: Rect) -> ChatPane {
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
-            .split(area);
-        self.chat_pane_with(rows[0], rows[1])
-    }
-
     /// The rows the message box asks the layout for: the draft's lines, capped
     /// so the pane keeps the screen, plus the attachment rows and the box's two
     /// border rows. The box grows with the message — a multi-line draft has to
@@ -640,9 +651,9 @@ impl App {
     /// never the part that is left out (finding D5). The two derivations agree
     /// whenever the ask is granted.
     ///
-    /// One derivation, because two layouts read it: the split above, and the
-    /// zen view, which has to hand the box exactly the rows this gives it so
-    /// the box does not move when the tree takes the screen.
+    /// One derivation, because the split is the one place the box's rows come
+    /// from: the zen views hand the box exactly the rows this gives it, so the
+    /// box does not move when the tree takes the screen.
     pub(super) fn input_rows(&self) -> u16 {
         let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
         let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
@@ -665,7 +676,7 @@ impl App {
     }
 
     /// What the chat column paints, from the two rects it is made of: the
-    /// transcript at `transcript_area` and the box at `input_area`. [`Self::chat_pane`]
+    /// transcript at `transcript_area` and the box at `input_area`. `App::screen`
     /// splits a column into the two; [`Self::chat_box`] hands over the box
     /// alone.
     fn chat_pane_with(&self, transcript_area: Rect, input_area: Rect) -> ChatPane {
