@@ -213,8 +213,11 @@ is the stable facts, cut from the right when the terminal is narrow:
 `HEAD`, and the meter is the run's own numbers:
 `ctx 12k/430.5k (fold 387.4k) ~500k` weighs the conversation against the history
 budget the run trims and folds at, where the fold's trigger sits inside it, and
-the window itself — the `~` says the window was assumed rather than stated,
-`full` marks the budget and `over` one byte past it.
+the window itself: the one-column mark names the road the number came by — `~`
+assumed from mush's model table, `≈` advertised by the endpoint's model list,
+`≤` named by the endpoint in a refusal, and no mark when you stated it yourself
+(`--print-config` and `/context` name the road in words). `full` marks the
+budget and `over` one byte past it.
 
 Terminals narrower than 80 columns (or shorter than 20 rows) get a
 **compact** layout: the agent strip on top, chat below. Below 40×10 mush says
