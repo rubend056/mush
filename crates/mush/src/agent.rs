@@ -1979,9 +1979,12 @@ fn actor_main(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
 /// F13).
 ///
 /// The rule is the prompt's own sentence — "without one the child works in this
-/// workspace, and only one such child may run at a time" — and it is a fact
-/// about a *directory*: the books are per-parent, and a grandchild is never in
-/// its grandparent's `shared` set. The root spawns shared A, A's run ends while
+/// workspace, where only one shared child may run at a time — the directory's
+/// live writers, tree-wide, not only the children your own books name: a
+/// grandchild working here counts, a child whose run has ended does not, and
+/// your own run is exempt" — and it is a fact about a *directory*: the books
+/// are per-parent, and a grandchild is never in its grandparent's `shared` set.
+/// The root spawns shared A, A's run ends while
 /// *its* shared child B — in the same checkout by construction — is still
 /// running, and the root is free to spawn shared C into it: two writers, and
 /// the guard that says "already runs in this shared workspace" holding a book
@@ -4574,14 +4577,17 @@ fn exec_tool(
 /// The refusal an isolated spawn gets when the cap is full, naming what to
 /// clear.
 ///
-/// It says exactly what was measured: `unlandable` asks every worktree against
-/// `HEAD`, so a nested child merged only into its parent's branch is counted
-/// here, and the sentence names that case instead of claiming each branch is
-/// unmerged — the model cannot tell the real unlandable worktree from the
-/// counted landable one, and the old wording sent it to merge a branch that was
-/// already merged (finding F7). The remedy is the one that works for both:
-/// bring the branch's work to `HEAD` (which is what the sweep measures), or
-/// remove the checkout and delete the branch.
+/// It says what was measured: `unlandable` asks every worktree a tree has
+/// published against that node's own base and fork, and one no tree names — a
+/// leftover, a restored agent with no base — against `HEAD` with no fork
+/// (finding F7). A nested child merged only into its parent's branch therefore
+/// counts here only while the tree has not named its node, and the sentence
+/// names that residue instead of claiming each branch is unmerged — the model
+/// cannot tell the real unlandable worktree from the counted landable one, and
+/// the old wording sent it to merge a branch that was already merged. The
+/// remedy is the one that works under either question: bring the branch's work
+/// to the base its node is measured against (for one no tree names, `HEAD`),
+/// or remove the checkout and delete the branch.
 fn too_many_worktrees(held: &[u64]) -> String {
     /// How many worktrees the refusal names before it counts the rest: the four
     /// fit a tool result's line, and the model needs the shape, not the roster.
@@ -4600,12 +4606,14 @@ fn too_many_worktrees(held: &[u64]) -> String {
     };
     format!(
         "cannot spawn: {} isolated worktrees already exist and none of them is landable \
-         against HEAD (the limit is {}) — each is dirty, or its branch holds commits HEAD does \
-         not have, and a nested child merged only into its parent's branch counts here: \
-         {named}{more}. \
-         Land or drop one first: bring its branch's work to this repository's HEAD (merge it), \
-         or remove the checkout and delete the branch (`git worktree remove --force \
-         .mush/wt/<id>` and `git branch -d mush/<id>`).",
+         (the limit is {}). Each worktree a tree has published is measured against that \
+         node's own base and fork, and one no tree names — a leftover, a restored agent \
+         with no base — against HEAD with no fork; each is dirty, or its branch holds \
+         commits its base does not have, and a nested child merged only into its parent's \
+         branch counts here only while the tree has not named its node: {named}{more}. \
+         Land or drop one first: bring a branch's work to the base it is measured against \
+         (merge it), or remove the checkout and delete the branch (`git worktree remove \
+         --force .mush/wt/<id>` and `git branch -d mush/<id>`).",
         held.len(),
         git::MAX_WORKTREES
     )
@@ -4765,12 +4773,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // fatal a moment later with the number already spent and a gap on the screen
     // that nothing explains (finding H17); this is the same refusal, planned,
     // naming what to clear. Only an isolated spawn pays it (a shared child makes
-    // no worktree), and it counts worktrees that are not landable *against
-    // `HEAD`*, so one whose work reached `HEAD` — already leaving on its own —
-    // never refuses anyone (finding H10). A nested child merged only into its
-    // parent's branch is over-counted here, and the refusal says so (finding
-    // F7): the sweep's own question needs each node's base and fork, which live
-    // in the UI's tree.
+    // no worktree), and it counts worktrees that are not landable by the sweep's
+    // own question: every worktree a tree has published is measured against
+    // that node's own base and fork, and one no tree names against `HEAD` with
+    // no fork — so work already in `HEAD`, already leaving on its own, never
+    // refuses anyone (finding H10), and a nested child merged only into its
+    // parent's branch is counted only while the tree has not named its node
+    // (finding F7).
     if isolated {
         let held = git::unlandable(&ctx.root);
         if held.len() >= git::MAX_WORKTREES {
@@ -15791,7 +15800,7 @@ mod tests {
         // text in the transcript is what the *second* call is answered with.
         let scripted = Arc::new(
             Scripted::new()
-                .when(|asked: &Asked| asked.saw("none of them is landable against HEAD"))
+                .when(|asked: &Asked| asked.saw("none of them is landable"))
                 .says("the spawn was refused")
                 .calls(vec![tool_call(
                     "c0",
@@ -15826,9 +15835,7 @@ mod tests {
             .into_iter()
             .find_map(|(_, event)| match event {
                 AgentEvent::Message(message)
-                    if message
-                        .text()
-                        .contains("none of them is landable against HEAD") =>
+                    if message.text().contains("none of them is landable") =>
                 {
                     Some(message.text().to_string())
                 }
@@ -15844,11 +15851,14 @@ mod tests {
         assert!(refusal.contains("git branch -d mush/<id>"), "{refusal}");
         // The question that was asked, and the case it over-counts: a nested
         // child merged only into its parent's branch is landable by the sweep
-        // and counted here, so the refusal must not call it unmerged (finding
-        // F7). The old wording said "each holds an unmerged branch" about
-        // worktrees the sweep would take.
+        // and counted here only while the tree has not named its node, so the
+        // refusal must not call it unmerged (finding F7). The old wording said
+        // "each holds an unmerged branch" about worktrees the sweep would take.
         assert!(
-            refusal.contains("a nested child merged only into its parent's branch counts here"),
+            refusal.contains(
+                "a nested child merged only into its parent's branch counts here only while the \
+                 tree has not named its node"
+            ),
             "the refusal names which question was asked: {refusal}"
         );
         assert!(

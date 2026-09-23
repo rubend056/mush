@@ -268,7 +268,10 @@ pub struct AgentRow {
     /// tree (a leftover worktree): those are top-level by construction, not by
     /// a link the history window cut, and a root child is a root child.
     pub parent_gone: bool,
-    /// `·`, `◐`, `✓`, `✗`, `⊘`, `≡` — derived from the node's own phase.
+    /// `·`, `◐`, `✓`, `✗`, `⊘`, `≡`, `⚠`, `⧗` — derived from the node's own
+    /// phase, never stored ([`phase_glyph`] owns the rule): `⚠` marks a run cut
+    /// off mid-flight — not a stop and not a failure — and `⧗` a run parked in
+    /// a `wait`, not a run in flight.
     pub glyph: &'static str,
     /// The tree's focused agent: the row wearing `▶`.
     pub focused: bool,

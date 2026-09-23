@@ -56,9 +56,11 @@ must carry every fact, file, and the exact deliverable; title is optional — th
 the tree — and without one the row derives a handle from the brief.\n\
 - base gives the child its own worktree and branch forked from that ref, resolved in this agent's own \
 workspace — `HEAD` is this agent's own HEAD, not the application root's — so siblings with bases run in \
-parallel; without one the child works in this workspace, and only one such child may run at a time. \
-Decide up front, or wait for the running one first. (The check can only fail after the brief \
-exists, so decide before writing it.)\n\
+parallel; without one the child works in this workspace, where only one shared child may run at a \
+time — the directory's live writers, tree-wide, not only the children your own books name: a grandchild \
+working here counts, a child whose run has ended does not, and your own run is exempt. Decide up front, \
+or wait for the running one first. (The check can only fail after the brief exists, so decide before \
+writing it.)\n\
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: \
 split by what is independent, not by how long you think it takes.\n\
 - Delegate the work itself — the edits, the tests, the chases — and keep the overview: lookups a \
@@ -573,6 +575,35 @@ mod tests {
     fn only_a_delegating_subagent_reads_the_delegation_policy() {
         assert!(subagent_prompt("/tmp/ws", 1, false, true).contains("Delegation:"));
         assert!(!subagent_prompt("/tmp/ws", 3, false, false).contains("Delegation:"));
+    }
+
+    /// The shared-workspace rule the model reads is the guard's own, not a
+    /// narrowing of it: `agent::Writers` and the spawn admission count the
+    /// *directory's* live writers tree-wide, with only a delegated shared child
+    /// booked and the spawner's own run filtered out (finding F13). Who is
+    /// counted, what "live" means, the directory rather than the parent's
+    /// books, and the exemption are four facts the sentence owes, because a
+    /// model that reads the old one believes its grandchild's write is not
+    /// there.
+    #[test]
+    fn the_delegation_policy_states_the_directorys_live_writers() {
+        for owed in [
+            "only one shared child may run at a time",
+            "the directory's live writers, tree-wide",
+            "not only the children your own books name",
+            "a grandchild working here counts",
+            "a child whose run has ended does not",
+            "your own run is exempt",
+        ] {
+            assert!(
+                DELEGATION.contains(owed),
+                "the policy owes `{owed}`: {DELEGATION}"
+            );
+        }
+        assert!(
+            !DELEGATION.contains("only one such child"),
+            "the old narrowing is gone, not merely qualified: {DELEGATION}"
+        );
     }
 
     /// The root is the one agent whose work is the picture and the person, and
