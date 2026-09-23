@@ -564,7 +564,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   the spawn road the tree's base/fork pairs — `App` holds them
   (`AgentNode::branch`, `fork`), the spawn road is an actor thread with no handle
   on it, and the fix is a handle or a pre-computed set of pairs handed to
-  `spawn_tool`, not a second count beside `unlandable`.
+  `spawn_tool`, not a second count beside `unlandable`. **✅ closed by `ef2cf7b`
+  (§8.90):** the tree publishes each node's base and fork into
+  `git::WorktreeFacts` on every `App::refresh_git` walk, and the cap asks the
+  sweep's own question — the audit's own
+  `a_nested_child_merged_into_its_parent_is_not_counted` now stages it, and
+  `a_nested_merge_reads_merged_and_never_claims_head` pins the wiring; the
+  sentences that still told the old story were `3fbdebb` (§8.98) and `e07da52`
+  (§8.100).
 - **H55** — ⬜ open, F13's other half, named and left by `d7f12a2` (§8.83): the
   guard counts every live writer of a directory now, but the sentence that
   promises the rule — `mush-core/src/prompt.rs:58`'s "only one such child may run
@@ -572,14 +579,20 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `agent.rs:1806` and the manual's `README.md:154`/`docs/mush.md:895`. The exact
   sentence says the rule counts writers in the directory and that a shared child
   may still delegate into the tree its own run is in; `prompt.rs` is the human's
-  file.
+  file. **✅ closed:** the manual's two halves were repaired by §8.88 (`20c30a7`,
+  `e5f67a1`) and the code's sentence by `bfbf681` (§8.98) — the delegation policy
+  now says the directory's live writers, tree-wide, the spawner exempt, and
+  `agent::Writers`'s doc quote moved with it.
 - **H56** — ⬜ open, B12's second half, named and left by `fe83f8a` (§8.83): the
   deserializer is as loose as its doc, but a reply that still does not parse ends
   the run with `could not parse model response` (`agent.rs`'s
   `ModelError::Malformed` arm) where the audit asks for a refusal the model can
   answer — the shape the `ModelError::Status` arm already gives a 400. Belongs in
   `agent.rs`'s request-error classification, with the acceptance test that a
-  malformed reply is answered rather than fatal.
+  malformed reply is answered rather than fatal. **✅ closed by `235c085`
+  (§8.89):** a malformed reply is a line in the transcript the next request is
+  built from, the model answers again, and `MALFORMED_ROUNDS = 1` bounds it —
+  two in a row end the run after `MALFORMED_ROUNDS + 1` asks.
 - **H57** — ✅ decided by `d8ae94d` (§8.83), recorded because the audit proposed
   the opposite: A16's `forgotten` set is gone and the absence of a book *is* the
   tombstone; the audit's "drop a tombstone once no in-flight report can name it"
@@ -614,7 +627,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   from folding at all — and the 8 MiB number cannot be read from its one home
   (`jobs::CMD_OUTPUT_LIMIT`) because `mush` depends on `mush-core` and not the
   reverse. Owed to the pass that owns `prompt.rs` and `agent.rs`: spend the
-  reserve, move the constant, or split the schemas per road.
+  reserve, move the constant, or split the schemas per road. **Re-measured at
+  `e73ed85`:** `schemas_fit_the_budget_reserve` prints `root schemas: 5995
+  bytes` — F14's `Optional. ` took 10 of the 15 bytes of headroom (§8.89), and
+  the row's 5,985 was §8.84's reading.
 - **H61** — ✅ a design boundary stated by `6e7dac4` (§8.82): `/context auto`
   gives up *this workspace's* statement (the session layer's) and
   `Config::forget_context` drops the road before `rederive_context`; a window
@@ -640,7 +656,15 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   with every test run; a larger reading given for this row (25,541 directories,
   375 pids, ≈4.3 GiB) could not be reproduced at this base. The fix belongs in
   the tests' scratch-root helpers — one `Scratch` type whose `Drop` removes the
-  root, or one helper they all call — and a child is being sent for it.
+  root, or one helper they all call — and a child is being sent for it. **✅
+  closed by #138 (`7c026ec` + `2202f7f` + `9bf3d28`, §8.99):** all 61
+  `temp_dir()` sites route through `mush_core::scratch::Scratch`, whose `Drop`
+  removes the root while a failing test unwinds, and a once-per-process sweep
+  reaps the roots of pids that are gone — one `cargo test --workspace` left 297
+  roots before and 0 after, and the sweep removed 27,577 older dead-pid roots
+  plus 2,535 stray files. The leftovers the fix names are H70 and H73–H75; the
+  shape the sweep's rule does not read (`mush-lock-<pid>-<label>`) was swept by
+  the root, 3,868 directories, 12 left, `/tmp` 471 MB → 439 MB.
 - **H64** — ⬜ open, the code half of H55, re-read and left by #123's pass (§8.88):
   `crates/mush-core/src/prompt.rs:58` still says "without one the child works in
   this workspace, and only one such child may run at a time", while the rule
@@ -652,7 +676,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   so what H55 owes now is the code alone: the prompt's sentence, the doc at
   `agent.rs:1806`, and the refusal at `agent.rs:4507` ("already runs in this
   shared workspace, and only one shared child may run at a time") all quote the
-  per-parent claim as the rule. `prompt.rs` is the human's file.
+  per-parent claim as the rule. `prompt.rs` is the human's file. **✅ closed for the
+  two sentences this list owns — `prompt.rs`'s policy and `agent.rs`'s
+  `Writers` doc — by `bfbf681` (§8.98),** which names the directory's live
+  writers, tree-wide, the spawner exempt, and moved the doc quote with it. The
+  third site was not part of that commit: the spawn refusal at `agent.rs:4783`
+  still reads “already runs in this shared workspace, and only one shared child
+  may run at a time” — it names the workspace's writers rather than a parent's
+  children, and it is left as it stood.
 - **H65** — ⬜ open, the doc `retrying` carries, re-read by #123 and left (§8.88):
   `crates/mush/src/model.rs:303`'s "resolving a host has no timeout (docs/mush.md
   §8)" is false since the wire phases were bounded — `http::resolve_bounded`
@@ -661,18 +692,28 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `Watch::spend` — and the same doc's "costs milliseconds" (`model.rs:301`) is
   false of the case it names: a refused dial pays `RETRY_BACKOFF` 500 ms and then
   1 000 ms (`model.rs:260`), the 1.5 s sum `model.rs`'s own test asserts
-  (`RETRY_BACKOFF + RETRY_BACKOFF * 2`, `:1170`).
+  (`RETRY_BACKOFF + RETRY_BACKOFF * 2`, `:1170`). **✅ closed by `65d0944`
+  (§8.91):** the paragraph now says three dials plus 500 ms and 1 s, and that
+  nothing in the call is unbounded — the lookup is a phase of the attempt whose
+  wait ends at the smaller of `RESOLVE_TIMEOUT` and the deadline left.
 - **H66** — ⬜ open, one sentence in code: `crates/mush/src/http.rs:3005`'s "the
   cap that is a quarter of it" (in `live_endpoint_accepts_the_shipped_reply_cap`'s
   comment) where `Config::reply_cap` divides by `REPLY_SHARE_DIVISOR = 8`
   (`mush-core/src/config.rs:69`) and `REPLY_SHARE_WORDS` spells "an eighth of the
   window" (`:75`). §123 corrected the two documents that said a quarter
-  (`fc31aff`, §8.88); the code's own comment still says it.
+  (`fc31aff`, §8.88); the code's own comment still says it. **⬜ still open at
+  `e73ed85`, re-pointed:** the sentence is now `crates/mush/src/http.rs:3064`
+  (`live_endpoint_accepts_the_shipped_reply_cap`'s comment, “and the cap that is
+  a quarter of it”), `REPLY_SHARE_DIVISOR` is 8, and `REPLY_SHARE_WORDS` spells
+  “an eighth of the window”. `grep -n quarter crates/mush/src/http.rs` finds
+  only that line, and no commit in the window touched it.
 - **H67** — ⬜ open, one spelling written twice: `crates/mush/src/app/mod.rs:4265`
   builds the copy refusal as `"cannot copy {from} into {}/.mush/paste: {e}"`
   inline, where `workspace::PASTE_REL` (`mush-core/src/workspace.rs:1844`, read by
   `paste_dir`/`paste_rel` and by every message about a paste) is the one spelling
-  (R44, §8.72).
+  (R44, §8.72). **✅ closed by `159978f` (§8.90):** the carry's refusal
+  interpolates `PASTE_REL` now, and `grep -rn "into {}/\.mush/paste\|into
+  \.mush/paste" crates/` answers 0 where it answered 2.
 - **H68** — ⬜ open, two sentences in `crates/mush/src/jobs.rs`, re-read by #123
   and left (§8.88): `STATUS_WINDOW`'s doc (`:104`) says "Spent on the windows
   rather than on the list, so no job is ever dropped from a status for being
@@ -683,7 +724,11 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   flag") reads as an either/or over a body (`:487`) that stores `stop` first and
   then takes the handle. The same line is §8.86's A23 residual — "Stop it and
   everything it started" is the process group mush gave the command, and a
-  command that left it is outside cleanup's reach (`d4c596c`, §8.83).
+  command that left it is outside cleanup's reach (`d4c596c`, §8.83). **✅ closed
+  by `9f5a925` and `bdff581` (§8.91):** `STATUS_WINDOW`'s doc now says it bounds
+  the output per row while `MAX_JOBS` plus `JOB_HISTORY` bound the list and the
+  ninth ending evicts the first, and `Live::kill`'s doc says the order — the flag
+  first, then the kill through the gripped handle — and why.
 - **H69** — ⬜ open, the module doc's own list: `crates/mush/src/theme.rs:7`
   names the accent sites as "the focused border, the picker's frame and selection,
   the message prompt, the bar's badge, the selected agent row and an activity
@@ -691,7 +736,59 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `theme.accent()` (the cursor's row as the hue's characters on `Black`, the
   selection's rows as `Black` on the hue), so the count is nine, as the manual's
   decision log now says (`bff3e2a`, §8.88). The list is the last surface that
-  stops at seven.
+  stops at seven. **✅ closed by `f948120` (§8.91) and `1a50837` (§8.93):**
+  `theme.rs`'s module doc and `ui.rs`'s both state the one rule the nine sites
+  share — the hue *points*, never *reports* — and list all nine, so the count
+  lives in the code that owns it and the manual's nine can no longer drift.
+
+- **H70** — ⬜ open, the census's blind shape, named by `7c026ec` (§8.99):
+  `scripts/census.py` counts `crates/mush-core/src/scratch.rs` as **prod** — 146
+  code lines at `e73ed85` (485 total) — because the module is gated by the
+  `test-support` feature rather than `#[cfg(test)]`, and a `#[cfg(test)] mod` is
+  the only gate the script reads. The file is test support a product build never
+  compiles (no `Scratch::new` symbol in `target/debug/mush`), so a wave's prod
+  column is 146 lines larger than the code it ships. Belongs in `census.py`
+  (which could read the `test-support` gate, or the feature's own entry in
+  `Cargo.toml`) or in how `mush-core/src/lib.rs` declares the module.
+- **H71** — ⬜ open, a number the tree outgrew, named by `7dadf47` (§8.100): ten
+  fixtures in `agent.rs` spell the real system prompt as
+  `Message::system("s".repeat(3_247))` — lines 9427, 9625, 9714, 9760, 9827,
+  9850, 9866, 9879, 10496 and 16736 at `e73ed85` — while the prompt `bfbf681`
+  measured is **3,725** bytes; the audit's 3,247 is two growths old. The floor
+  test now measures instead of spelling, and these ten are the other readers of
+  the old count. The fix belongs there: build the fixture's system message from
+  the length `prompt::system_prompt` answers, or from one shared constant.
+- **H72** — ⬜ open, the last shape-read provenance, named by `10e2fc7`
+  (§8.100): `app/chat.rs`'s `unrecorded` still reads two writers' provenance off
+  their sentence's shape — `report`/`report_tail` (a child's `#1 done: …`, a
+  job's `#c2 stopped: …`) and `FOLDED` (“Context compacted”, the fold's carried
+  summary) — while `Message::mush` is the mark the loop guard, both instructions
+  and the failed-commit line now carry, and the failed-commit line's own head
+  (`Work::UNCOMMITTED_HEAD`) was removed for exactly this reason: a head is the
+  sentence deciding its own provenance, the rule finding F3 removed. Those
+  writers can take `Message::mush` too and the two shape reads retire; the
+  restarted-steering line is the one case that cannot (`unrecorded`'s doc says
+  so: nothing in the file says the words were a parent's).
+- **H73** — ⬜ open, the product's legacies, named by `2202f7f` (§8.99): the
+  `mush-cmd-*` files whose pid is not in the field the scratch sweep reads are
+  skipped by name (“the product reaps its own scratch”), and the product's
+  `machine::reap_dead_scratch` reads the first field after `mush-cmd-` — so a
+  legacy name such as `mush-cmd-out-legacy-<pid>` has no readable pid and is in
+  neither sweep's reach. Belongs in `machine.rs`'s reaper, which owns the
+  prefix; a name to reap is `mush-cmd-<pid>-…`, and the legacy shapes are known.
+- **H74** — ⬜ open, the sweep's one blind direction, recorded by `2202f7f`
+  (§8.99): a dead test's pid held by an unrelated process reads as alive, so
+  that root is left where it is — the harmless direction, and the one the
+  product's own reaper takes, but an entry that survives forever if the pid is
+  reused each time. No cheap reading can tell a reused pid from a live suite,
+  which is why it is recorded rather than fixed.
+- **H75** — ⬜ open, the one entry a lone run leaves, recorded by `2202f7f`
+  (§8.99): `cargo test -p mush` alone ends with one `mush-user-config-<pid>`
+  config store, because a `static` holds that root for the binary's life and its
+  guard cannot drop before the process ends. It is named for the dead pid a
+  later run's sweep reaps (the full workspace run's second binary does it); what
+  is owed is a `static` whose value can outlive the root, or a sweep at exit
+  that this workspace has no hook for.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -4631,6 +4728,30 @@ closed: the row whose parent the history window reaped now wears `⚮` and no
 longer passes for a root child (§8.87). The counts above remain the snapshot at
 `7338d81`; no finding's status moved.
 
+**Addendum, 23 September 2026 — this sheet now speaks for `e73ed85`, master's
+tip at the time of writing.** `python3 scripts/census.py` at that base prints
+**TOTAL 92,391 · blank 5,241 · comment 26,054 · tests 40,659 · prod 20,437**
+(against `df115bc`'s 87,068 that is +5,323: prod +1,337, tests +2,203, comments
++1,541, blank +242; the root's own reading at `0dbd822` was 90,844, not re-run
+here). The counts above remain the snapshot at `7338d81`; what moved since is
+this: **103 fixed, 1 partial (A19), 0 open.** Every one of the nine open minors
+is closed, each by the section that carries it — A13 by `9152a32` (§8.90), A14
+by `94bdcd6` (§8.89), A15 by `ddc7cd4` (§8.90), A18 by `50c53ef` + `0ba9796`
+(§8.89, §8.97), A21 by `1ca9517` (§8.89), A22 by `cc6b4b5` (§8.89), C7 by
+`db58164` (§8.90), F3 by `3c774b6` + `af9aade` (§8.90, §8.94), and F17 by
+`f787be0` (§8.89) with its voice laid by `38f4bc4` and `10e2fc7` (§8.97,
+§8.100) — and three of the four partials are closed as well: B12 by `235c085`
+(§8.89), F7 by `ef2cf7b` (§8.90) with its two sentences by `3fbdebb` (§8.98)
+and `e07da52` (§8.100), and F13 by the guard half that closed earlier plus
+`bfbf681` (§8.98) and the manual halves §8.88 repaired. **A19 is still 🔄
+partial:** its `retrying` paragraph — the one the audit's “no timeout” bullet
+was about — is corrected by `65d0944` (§8.91), while the repeated dropped-images
+notice, `SHED_RESULT_NOTE`'s doc and `wait({"on": null})`'s refusal still stand
+where the row names them. The wave's nine sections are §8.89–§8.100, the
+human's rulings are §8.101 and the suite's flakes are §8.102; the new ledger
+rows are H70–H75, and H54, H55, H56, H60, H63 and H64–H69 were closed on their
+own rows.
+
 ### agent-and-wire (`docs/audits/agent-and-wire.md`)
 
 | # | severity | the defect | status at `7338d81` |
@@ -7859,3 +7980,1390 @@ the method.
 +292, comments +118, blank +27**, and it is entirely #119's row and its pins:
 the pass edits no `.rs`, and neither do the two record commits between the two
 merges.
+
+---
+
+## 8.89 The actor's last findings — the fold keeps the mailbox, the ending is filed, the reply can be answered (#120, `94bdcd6`, `50c53ef`, `1ca9517`, `cc6b4b5`, `f787be0`, `235c085`, `4136fc3`, `841fa88`, merged `ad8c62a`)
+
+The A audit's last four findings, two halves the audits named for other files, and
+the one road into the terminal that was still raw. Eight commits; the branch also
+carried the merges of `mush/129` and `mush/130` (`d72236c`, `aac4d98`).
+
+**An idle fold leaves the mailbox to the idle loop (`94bdcd6`; A14).**
+`compact_history` drained the mailbox whatever the fold belonged to. The folder
+is documented as folding commands into the *current run*, and an idle fold has
+none: it then replaced the transcript with `[system, summary]`, so a command that
+meant “start a run” — the words a human typed, a child's completion, a job's
+report — travelled inside the summarize request and was erased with the
+transcript it landed in. `drain_mailbox` returns nothing, so the `Fold::Run` the
+command carried was never seen and the idle loop's next act was a blocking
+`recv`. Measured on the probe (throwaway tests, deleted): with `Nudge("carry
+on")` already in the mailbox and `compact_requested` set, `compact_now` made one
+call — the summarize request's messages were `["you are mush", "say something",
+"first answer", "carry on", COMPACT_INSTRUCTION]` — and the mailbox was empty
+afterwards. End to end, `Compact` + `Nudge` queued together at rest: 1 run in 5 s
+(the nudge never answered), 1 fold. After, the nudge stays in the mailbox (or,
+end to end, a second run starts and the model's last request holds “carry on”);
+the fold still happens, and its request no longer holds words it was about to
+destroy. The drain now sits inside `if in_run` (`agent.rs:3732`), and what a Stop
+behind a `/compact` loses is nothing: a fold from rest travels to the UI with its
+own cancel flag (`Compacting { cancel }`), so `Ctrl-C` reaches the request
+directly, and the Stop itself is folded, as every idle Stop is, when the loop
+reads it next. Pinned by `an_idle_fold_leaves_a_parked_command_in_the_mailbox`
+and `a_compact_and_a_nudge_queued_together_start_the_run_the_nudge_asked_for`.
+
+**A revived child's dropped-turns note lands after its brief (`50c53ef`; A18's
+actor half).** `revive` handed `adopted` the copy the UI holds — the conversation
+without a system prompt, and with the dropped-turns note where the UI appends
+what it is told (the end). `place_dropped_note` puts a carried note back at index
+2 *of the list it is given*, and index 2 is the note's place — after the system
+prompt and the opening task — only when the prompt heads that list. The root's
+copy carries its prompt, which is why the placement was right only there: a
+child's revived transcript was `[system, brief, m1, note, …]`. Measured on the
+probe (a throwaway revert of the fix, deleted): the revived child's list opened
+`[system, brief, "reading", NOTE, …]` before and `[system, brief, NOTE,
+"reading", …]` after — index 3 → index 2. The note's place is a fact about the
+request, so both hand-over roads now give `adopted` the request-shaped list.
+Pinned by `a_revived_childs_note_comes_back_after_its_brief` — the test #135
+later had to make survive the session file. **Recorded, not changed:** the
+*pane's* own copy (`Chat::transcript(id)`) still held the note where the append
+put it, because `AgentEvent::Message` appends and the pane's record is
+deliberately never trimmed; repairing it means teaching `Chat::push_message` (or
+`unrecorded`'s placement) to put a dropped note back on the append, and the
+sentence the commit left for the sibling holding `app/chat.rs` was “a
+dropped-turns note is placed where the transcript's front is, not where the line
+arrived” — which is `0ba9796` (§8.97).
+
+**A gone workspace refuses the actor, it does not panic on the UI thread
+(`1ca9517`; A21).** `root_actor` and `revive` both did
+`Workspace::new(&…).expect("workspace root must exist")`. `Workspace::new` is
+`fs::canonicalize`, which fails for a path that is gone, and both callers run on
+the UI thread — `root_actor` from `App::new_chat` (`Ctrl-N`), `revive` from
+`App::deliver_to_actor` (the human's message to a parked child) and
+`App::restore_agents` — so a panic there takes mush down with the terminal
+unrestored. The realistic road is the race the audit could not stage (a sibling's
+`git worktree remove` between `live_branch`'s check and the build, the repair
+mush's own refusal sentence tells a model to run) and a cwd removed by an agent's
+own `rm -rf`. Measured on the probes (throwaway reverts, deleted): before, both
+tests panic at the `expect` — `workspace root must exist: Os { code: 2, kind:
+NotFound, … }`, `agent.rs:1495` and `:1606`, on the thread that called it; after,
+both refuse: an `Error` event naming the directory that is gone, and a dead
+mailbox, so the caller's own send fails and its refusal sentence (`Ctrl-N`'s
+`root agent is gone`, or the deliverer's `no_actor_line`) is what the human
+reads. The refusal is the honest answer because the cause is not something the
+agent can work around: a `Workspace` is a canonicalized path, and there is
+nothing to resolve a tool's argument in. The two rows the sheet called
+*suspected* are now proven, and pinned by
+`a_root_actor_over_a_gone_workspace_refuses_and_files_it` and
+`a_revive_over_a_gone_workspace_is_refused_not_panicked`.
+
+**A restored conversation raises the job floor above the names it carries
+(`cc6b4b5`; A22).** Every process starts the job counter at 1 (`Ids::default`),
+while a restored transcript keeps the `#cN …` lines of the jobs it names: a
+`control stop #c1` after a restart addresses a different command than the line
+the model is reading about. Measured on the probes (throwaway, deleted): a
+revived copy naming `#c7` left the counter at `#c1` (the next draw was `#c1`, not
+`#c8`), and the root's adopted copy naming `#c9` left `#c1` (`#c10` wanted). The
+floor is read from the transcript, not stored in the session: the books are fresh
+after a restart and hold no jobs, so the conversation the model resumes from is
+the only surviving record of which names are spent. Both hand-over doors raise it
+— `revive` (a child's copy) and `absorb`'s `Adopt` (the root's) — before the
+actor can start a job of its own (`Ids::reserve_jobs`, `raise_job_floor`,
+`highest_job_named`). The scan is deliberately looser than the report grammar: a
+name the model quoted back from a `status` is a number a reader can see, so it
+counts too; a coincidence costs one skipped number, a missed name costs the wrong
+command stopped. A name at the top of the space is skipped, the same refusal the
+agent space makes for a stored id at the ceiling. Pinned by
+`a_restored_transcript_raises_the_job_floor_above_the_names_it_carries`,
+`an_adopted_root_conversation_raises_the_job_floor_too` and
+`the_job_counter_respects_a_floor_and_never_lowers_one`. The row's second
+suspected half is closed with the first: the transcript's names are now the
+floor, so the restored `#cN` lines and the counter cannot disagree.
+
+**A failed commit is a transcript line, not only a row tail (`f787be0`; F17).**
+`Work::status_line`'s doc claims the line is the transcript's status line, but it
+travelled as `AgentEvent::Status` alone: a row tail that `AgentTree::activity`
+refuses for an agent that is not running and the next run's `begin` clears —
+while the model sees `Work::Uncommitted` only if it calls `status`. A commit that
+failed (a lock, a conflict, a full disk) leaves real work in a worktree, and the
+one line saying so was easy for both the human and the parent to miss. Measured
+on the probe (throwaway, deleted): with a real repo holding a `.git/index.lock`,
+`commit_worktree` really fails, and before the fix the transcript held only
+`[system, "do the work"]`; after, the line is in the transcript, survives the
+next run, and travels in that run's request to the model. The `Status` stays: the
+row's tail is still told, from the same one home, so the row, the transcript and
+the listing agree. Only `Uncommitted` gets the message — the other two shapes are
+progress reports the row and the listing carry. Pinned by
+`a_failed_commit_is_a_transcript_line_that_outlives_the_next_run`.
+**Recorded, not changed:** the line reaches the pane as a `Message::user`, so its
+*voice* is `Chat::unrecorded`'s to decide — a child's pane painted it as the
+parent's line until `38f4bc4` (§8.97) and the mark `10e2fc7` (§8.100) — and the
+sentence the commit left is “mush's own work line is painted as mush (`·`), not
+as an agent that did not say it”.
+
+**An unreadable reply is a refusal the model can answer (`235c085`; B12's second
+half).** `ModelError::Malformed` (a 200 whose body does not parse into a reply)
+was returned as the run's error with the sentence `could not parse model
+response: …`, ending the run and losing the transcript, the tokens spent and the
+work in flight — the outcome `message.rs`'s own opening promise says the loose
+wire shapes exist to prevent. It is a refusal the model can answer instead: the
+ask stands, mush says the reply was not recorded (a line in the transcript the
+next request is built from, the same door `TRUNCATION_INSTRUCTION` takes), and
+the model answers again. Bounded at `MALFORMED_ROUNDS = 1`: a malformed body is
+the endpoint not speaking the protocol, not a model slip, so one retry covers the
+transient shape without billing the human for a server that is systematically
+broken. A reply that *is* read ends the run of them, like the cut-off counter.
+Measured on the probes (throwaway reverts of the fix, deleted): before, the first
+malformed reply ended the run with one ask — `"could not parse model response:
+expected value at line 1 column 1"`; after, the run survives it: 2 asks, the
+model's `carried on` is the result, and the human gets one Notice naming the
+parse failure. The bound: two malformed replies in a row end the run with the
+parse sentence after `MALFORMED_ROUNDS + 1` asks. Pinned by
+`a_malformed_reply_is_a_refusal_the_model_can_answer` and
+`a_malformed_reply_that_repeats_ends_the_run`. The row's first half — the
+loosened deserializer — was `fe83f8a` (§8.83); this is the half that made the
+looseness's failure survivable.
+
+**The spawn title is optional on every surface the model reads (`4136fc3`;
+F14's second half).** The audit said the spawn schema forces `title` on the model
+while the code treats it as optional. That half was already closed at this base —
+`required` has been `["brief"]` since `09c9446` (“prompt: the spawn schema's
+title is optional, and one line”), which landed after the audit's own base
+(`5889590`), and `spawn_tool` folds a title to one line with `first_line`
+(`74ad1de`). A throwaway probe against the real schema and the real helper agreed,
+and its before value is quoted rather than assumed:
+
+```
+required: ["brief"]
+title in required: false
+arg_string_opt({"brief":"b"}, "title") = Ok(None)
+```
+
+What was still wrong is the prose *around* the omission: the two surfaces a model
+reads before choosing the call did not say optional, and one of them said the
+opposite. The delegation policy wrote `spawn_agent(brief, title, base?)` — `base`
+marked optional with `?`, `title` unmarked — and the schema's sentence was “A 3
+word, one-line description of the brief.” Both now say the code's truth:
+`spawn_agent(brief, title?, base?)`, `title` optional, without one the row derives
+a handle from the brief, and the schema's `"Optional. A 3 word, one-line
+description of the brief."`. The schema reserve takes the `Optional. ` (10 bytes):
+root schemas measured 5,985 → 5,995 bytes against the `SCHEMA_TOKENS * 3` budget
+of 6,000, so the sentence fits without raising it. Measured at this base,
+`schemas_fit_the_budget_reserve` prints `root schemas: 5995 bytes`.
+`arg_string_opt`'s doc carried the disagreement in miniature: a title read as “no
+title” “drops the row's name”, but the row is never nameless —
+`AgentNode::title` derives a handle from the brief — so the sentence now names the
+real consequence: the name its caller chose is dropped and the row keeps its
+derived handle. Pinned by
+`the_spawn_schema_does_not_require_a_title_the_code_treats_as_optional`, which
+asserts `required` is *exactly* `["brief"]` so a field added tomorrow fails the
+test instead of becoming a silent requirement. **Recorded, not changed:** the
+record's own §8.13 prose still spells the call `spawn_agent(brief, title,
+base?)`; that sentence predates F14's catch-up, and the code's schema is the
+surface that matters to a model. Gates on the branch: `cargo test -p mush-core`
+(256 passed); `cargo test --workspace` (856 passed, one load-flake —
+`attach::tests::a_request_line_is_capped_and_a_client_is_reaped` lost a `/tmp`
+socket to a sibling and passes alone); `cargo clippy --all-targets -- -D
+warnings`; `cargo fmt --all -- --check`.
+
+**The attach CLI's refusal reaches the terminal defanged (`841fa88`).** `main`
+printed `run()`'s error raw — `eprintln!("mush: {error}")`. That text is not
+always prose this process chose: a `Cli` failure is a sentence the app made that
+`main` only *decoded off the attach socket* (`attach::decode`,
+`ReplyError::describe`), and the app's refusal vocabulary includes
+`blind_model_line`, which quotes `Config::model`. A model id is a name an endpoint
+chose (`/v1/models`, or the human's config file), and `Config::label` already
+defangs that same id for the facts line for exactly this reason. A model id
+carrying `ESC ]0;PWNED BEL`, a CSI or a bare `\r` therefore reached the terminal
+raw through the one road in the tree that did not go through
+`mush_core::text::sanitize` — the same class as finding C8's stdout printers, on
+the stderr side. Staged before the fix by splitting the line into `error_line`
+(which `main` prints) so stderr's bytes are readable from a test and feeding it
+the shape `blind_model_line` builds around the id:
+
+```
+before: line = "mush: bad_request: `\u{1b}]0;pwned\u{7}evil-model` is not a model mush knows to accept images — Ctrl-P picks one whose row documents vision"
+after:  line = "mush: bad_request: `evil-model` is not a model mush knows to accept images — Ctrl-P picks one whose row documents vision"
+```
+
+`error_line` now sanitizes through the one door every terminal-bound string in
+this tree goes through, and
+`an_endpoint_chosen_model_id_cannot_reach_the_terminal_raw` drives that actual
+printing helper with an OSC, a CSI and a bare `\r` in the id: no ESC, no BEL and
+no CR survives onto the line, and the id's visible words still read defanged
+(`evil-model`, `evil␍-model`). **Recorded, not changed:** the other three
+`eprintln!` roads in the file are left alone deliberately — their text is mush's
+own sentence plus an OS error, or an OS error and the human's own workspace path
+— nothing an endpoint chose.
+
+---
+
+## 8.90 The pane's roads — one read per label, one spelling per paste, one key check per door (#121, `159978f`, `ddc7cd4`, `9152a32`, `ef2cf7b`, `3c774b6`, `db58164`, `b153123`, merged `06ef1d4`)
+
+Seven commits on the pane's two roads and the gates a value passes: the label a
+frame reads, the paste path a sentence spells, the key and the URL a door checks,
+the worktree question the spawn cap asks, the note a trimmer moves — and the park
+that ends a thread's jobs.
+
+**A paste names the directory by its one spelling (`159978f`; H67).**
+`workspace::PASTE_REL` landed as the one spelling of `.mush/paste` — its own doc
+says a path spelled twice is a path that can disagree with itself — and two
+sentences about a copy still spelled the path out in full: the carry's refusal in
+`app/mod.rs` and `Workspace::pasted_image`'s in the module that defines the
+constant. Both interpolate `PASTE_REL` now. `grep -rn "into {}/\.mush/paste\|into
+\.mush/paste" crates/ | wc -l`: before 2, after 0. The bytes do not change (the old
+literals were the same string, which is how a second spelling starts); what
+changes is that the sentence and the directory can no longer disagree. Pinned by
+`a_refused_carry_names_the_paste_directory_by_its_one_spelling` — the old literal
+passes that pin too, because this commit deletes a second spelling rather than
+changing a byte the human reads.
+
+**Parking a child ends the thread and the jobs it started (`ddc7cd4`; A15).**
+`park_history` said parking “ends the thread and nothing else”, while the
+`Shutdown` it sends is `registry.kill_owned(actor.id)` and §5.6 says a job dies
+with its agent. The sentence is the false half; the behaviour is the documented
+one, so the doc now says it — the thread and the jobs it started end, the node,
+the id and the transcript stay. The reachable window is narrower than the old
+sentence implied: `parkable` keeps a child whose books show work in flight
+(`may_park`'s `in_flight_with` reads the same registry the rows do), so a live
+job keeps its child's thread. A probe over ten finished
+children with a fake running job owned by #2 printed
+`parkable with #2's job live: [AgentId(1)]`, `after park_history: #1 got
+Shutdown=true kills=0`, `after the Shutdown itself: kills=1`: the pass refuses
+the child whose books show the job, and the message a park sends is what kills.
+So what a park can end is the work the tree has not recorded yet — an actor woken
+by a message the same tick cannot see, which started a run before the `Shutdown`
+behind it in its own mailbox was read. Pinned by
+`parking_a_child_ends_the_jobs_it_started`: ten finished children, #2 holding a
+revived actor (the road a woken child takes, `App::deliver_to_actor`) and a live
+fake job; the park reclaims #1 and sends #2 nothing; the `Shutdown` itself ends
+#2's job (`machine.kills() == 1`).
+
+**A tool call's label is read once, not once per frame (`9152a32`; A13).**
+`tool_label` called `summarize_args` — a full `serde_json::from_str` of the call's
+arguments — from `render_message`, per visible call, per frame. The argument JSON
+is unbounded (H45/H46 removed the caps on `write_file`'s `content` and
+`edit_file`'s `new_string`) while the label shows at most 60 columns. Throwaway
+probe, debug build, `{"path":"a.txt","content":"…"}`:
+
+```
+summarize_args:                       20 KB 172.6µs · 200 KB 1.07ms · 2 MB 7.31ms
+frame, 2 MB call on screen, before:   6.73ms 7.19ms 7.06ms 7.49ms
+frame, 2 MB call on screen, after:    12.99ms 37µs 17µs 16µs
+```
+
+The first frame that shows the call takes the read; no later frame does. (The
+audit measured the same shape: 171µs / 1.17ms / 9.68ms.) The argument text cannot
+change once the call is recorded, so the reading is stored beside the transcript
+it belongs to (`Chat::summaries`), keyed like `spoken` — the agent, then the
+line's index, then the call's place in the batch — and dropped on the same three
+roads: `replace_transcript`, `forget`, `clear`. The stored value is cut to
+`LABEL_ARGS`, the most any pane can show, and a second cut to the pane's own
+budget is the same cut the whole value would have taken, so the bytes a frame
+paints do not change. Pinned by
+`a_tool_calls_arguments_are_read_once_not_once_per_frame`: a 1 MB call paints its
+path, the arguments are then changed behind the pane (a state no transcript road
+writes — the only way to tell a re-read from a stored reading) and the same frame
+comes back; `replace_transcript` answers the same index with the new call's own
+path.
+
+**The spawn cap counts the sweep's own question (`ef2cf7b`; F7's arithmetic
+half).** `unlandable` asked each worktree against `HEAD` with no fork revision,
+while the sweep asks each node against the branch its own parent holds and with
+the fork it was created at (`App::reclaim_worktrees` → `reclaimable`). For a
+nested child merged only into its parent's branch — an ordinary depth-2
+delegation — the two answers differ, and the cap refused a spawn over a worktree
+the sweep would take. The audit's probe, restaged:
+
+```
+cap without the tree's facts (HEAD, no fork): [1, 2]
+cap with the tree's facts (base, fork):       [1]
+the sweep's own question:                     Landable(Merged)
+```
+
+The facts are the tree's — `App::fork_base` derives each node's base, and the
+node carries its fork — and the actor that asks the cap (`agent::spawn_tool`)
+holds no tree handle, so they are published into a process-wide book keyed by the
+canonical root (`git::WorktreeFacts`, the shape `agent::Writers` already has),
+written by every `App::refresh_git` walk and dropped when the app goes (the guard
+is the publication's lifetime). A worktree no tree names — a leftover on disk, an
+agent restored without a base — is still asked against `HEAD` with no fork, which
+is the conservative side and the reason the refusal still says which question its
+number came from. Pinned by `a_nested_child_merged_into_its_parent_is_not_counted`
+(the audit's own name) and, at the app level,
+`a_nested_merge_reads_merged_and_never_claims_head`, which asserts the walk's
+published pairs and `git::unlandable(&root) == [1]` while both checkouts are
+still on disk. **Recorded, not changed, and closed later in this wave: the
+sentences.** `too_many_worktrees` and its text still said every worktree was
+asked against `HEAD` (fixed by `3fbdebb`, §8.98 and `e07da52`, §8.100), and
+`README.md:154`/`docs/mush.md:895`'s “only one such child may run at a time” was
+the other audit half (`bfbf681`, §8.98).
+
+**The dropped-turns note is told by provenance, not by its text (`3c774b6`;
+F3).** `is_dropped_note` compared `message.text()` to `DROPPED_TURNS_NOTE`, so a
+human's line, a parent's brief or a nudge that was word for word the sentence was
+taken for the note: `trim_history` removed it from where it sat and
+`insert_dropped_note` re-inserted it at index 2. The throwaway probe (the audit's
+own two shapes, a 10,000-byte budget) measured, before the fix:
+
+```
+F3  before: ["system:you are mush", "user:The oldest turns of ", "assistant:working", "user:carry on"]
+F3  after:  ["system:you are mush", "assistant:working", "user:The oldest turns of ", "user:carry on"]
+```
+
+— the human's line moved past the assistant message — and the batch shape
+`[system, user(NOTE), assistant(calls), tool, user]` read `["system",
+"assistant", "user", "tool", "user"]` *after* a trim: a `user` message between
+an assistant's call and its result, the shape a strict server rejects. After the
+fix the four-message transcript is byte for byte unchanged and the batch keeps its
+roles (`["system", "user", "assistant", "tool", "user"]`). `Message` grows
+`#[serde(skip)] pub note: bool`, the one place a message says “mush's note” rather
+than “someone's line”; it is set only by `Message::note`, whose text is still
+`DROPPED_TURNS_NOTE` (the sentence stays exactly what the model reads), and
+`is_dropped_note` now reads the flag. The two writers (`trim_history`,
+`insert_dropped_note`) and `place_dropped_note` build the note with the
+constructor. Pinned by
+`transcript::tests::a_user_line_that_quotes_the_note_is_not_the_note`. The
+commit also fixed the last reader of the old rule: `unrecorded` in `chat.rs`
+listed the note among the lines “mush writes with a shape”; it now says *marked*
+— and states the residual at the place a reader would ask about it: a note
+restored from a file comes back as a plain user line wearing the human's voice,
+and the rule that would place it by its sentence is the one this commit removed.
+That residual is `af9aade` (§8.94), and the pane half `0ba9796` (§8.97).
+
+**A key with a control character is refused at every door (`db58164`; C7).** The
+key is the other field a request head is written from raw — `write_request`
+pushed `Authorization: Bearer {key}` — and no door checked what may be in it:
+`env_nonempty` filtered empty strings only, the home key went in as it was
+written, and `/key` trimmed the argument's edges only, so an interior newline
+from a paste stayed. Staged with a throwaway probe. Before, every door stored
+`sk-inject-0123456789\r\nX-Injected-By-Key: yes` (environment, home config,
+`/key`), and a request built from that key reached the wire as a head the value
+had a hand in — the probe's in-memory connection recorded one injected header
+line. After, the same value through every door is refused by name:
+
+```
+MUSH_API_KEY -> Err("MUSH_API_KEY contains a control character (\r) — check the value")
+home config  -> Err("home config's api_key contains a control character (\r) — check the value — /home/rubend/.config/mush/config.json")
+/key         -> Err(Usage("/key contains a control character (\r) — check the value"))
+session      -> the door does not exist: `Session` has no `api_key` field
+```
+
+One door, `checked_key`, does the checking, in the shape `checked_url` gives the
+endpoint (D19, `4f7793c`): refused by name, with the offending character as its
+*escape* (`\r`) rather than echoed as itself — the refusal is a line mush prints,
+and a secret's bytes must not reach a terminal or a log either. `MUSH_API_KEY`
+reads it through `parse_key_env`; the lenient reader drops a bad key the way it
+drops a bad URL, and a value that trims to nothing is no key. `http.rs` is not a
+door: `write_request` keeps writing the key it is handed; the wire's new test
+pins the shape a checked key produces — exactly one CRLF after the bearer token.
+Pinned by `a_key_with_a_control_character_is_refused_by_every_door`,
+`a_key_with_a_control_character_is_refused_by_name` and
+`a_checked_key_writes_exactly_one_crlf_after_the_bearer_token`.
+
+**A URL with a control character is refused where it is typed (`b153123`; D19's
+TUI half).** Every other road checked its endpoint, but `parse_command`'s `/url`
+arm still accepted any non-empty text (`argument.to_string()`). A URL with a
+control character was then refused *without a sentence of its own*:
+`Config::set_base_url` dropped it and the ack named the endpoint actually in
+force — which is the endpoint the next request uses, so the human read a success
+they did not get. Staged with a throwaway probe that temporarily put the old arm
+back:
+
+```
+before  PROBE /url -> Ok(Url("http://h:1\r\nX: y"))
+after   PROBE /url -> Err(Usage("/url contains a control character (\r) — check the value"))
+```
+
+The arm now routes through `mush_core::config::checked_url(argument, "/url")` and
+returns `CommandError::Usage(error)` on `Err`, so the refusal is the same sentence
+`--url` and `MUSH_URL` give, spoken where the human typed it. The parser's trim
+and `checked_url`'s are one door now, so `/url http://h:1/` carries `http://h:1` —
+the endpoint `set_base_url` would have stored anyway. Pinned by
+`a_url_with_a_control_character_is_refused_by_name`, while
+`every_command_in_the_table_parses` still passes on the table's own `/url 1` row.
+
+---
+
+## 8.91 The sentences the tree outgrew — the bounded lookup, the window that evicts, the flag before the kill, the nine hue sites (#133, `65d0944`, `9f5a925`, `bdff581`, `f948120`, merged `a261a18`)
+
+Four sentences whose facts had moved under them, each re-derived from the code
+that holds it. They are H65, H68 and H69 of the open queue, and this wave's
+answer to the pass §8.88 sent to whoever owns those files.
+
+**A refused connect costs 1.5 s, and the lookup is bounded too (`65d0944`;
+H65).** `retrying`'s worst-case paragraph claimed two things the code does not.
+The one unbounded step was not unbounded: commit `1dbea62` (§8.75) made the name
+lookup a phase of the attempt like the connect and the write, and
+`http::resolve_bounded` (`http.rs:970`) ends its wait at the smaller of its own
+`RESOLVE_TIMEOUT` (10 s, `:954`) and what is left of the call's deadline — a
+ceiling, not a schedule. And a refused connect is not milliseconds:
+`RETRY_BACKOFF` is 500 ms (`model.rs:260`) and `wait` doubles it per attempt
+(`RETRY_BACKOFF * 2u32.pow(tries - 1)`), so a refused connect pays 500 ms then
+1 s before the third dial, the 1.5 s sum the model's own test already asserted
+(`clock.elapsed() == RETRY_BACKOFF + RETRY_BACKOFF * 2`,
+`an_unsent_request_is_retried_until_the_model_answers`). The paragraph now reads:
+
+> so one ask against an endpoint that refuses to connect costs, at worst, three
+dials plus the two backoffs `RETRY_BACKOFF` and twice that (500 ms then 1 s),
+while one against an endpoint that accepts and stalls costs its deadline, not a
+multiple of it. Nothing in the call is unbounded, the name lookup included: it is
+a phase of the attempt like the connect and the write, and `http.rs`'s
+`resolve_bounded` ends its wait at the smaller of its own `RESOLVE_TIMEOUT`
+(10 s) and what is left of the call's deadline — a ceiling, not a schedule
+(finding A19).
+
+**A status is windowed by `STATUS_WINDOW`, never lengthened by it (`9f5a925`;
+H68's first sentence).** `STATUS_WINDOW`'s doc closed with a claim about the
+*list* under a const that bounds the windows: “Spent on the windows rather than
+on the list, so no job is ever dropped from a status for being old.” The first
+half is true — `status_for` divides the one budget among the jobs it has,
+`per_job = (STATUS_WINDOW / mine.len()).min(JOB_TAIL)` — but the second is false:
+a finished job *is* dropped for being old. The true split, read from the two
+users: what bounds a row's age is `JOB_HISTORY = 8` — `finish` ends every job's
+record and then runs `while … filter(|record| !record.running()).count() >
+JOB_HISTORY`, removing the oldest ended record, so the ninth ending evicts the
+first; what bounds the list's length is `MAX_JOBS` (8) at admission for the
+running half and `JOB_HISTORY` for the ended half, 16 rows; and what
+`STATUS_WINDOW` bounds is how much output each of those rows carries, and nothing
+about which rows are on the list. The doc now says that, naming `MAX_JOBS`,
+`JOB_HISTORY` and `Registry::finish`. **Recorded, not changed:** no test drives
+the eviction — `a_status_is_one_bounded_result_however_many_jobs_there_are`
+stages exactly `MAX_JOBS` ended plus `MAX_JOBS` running, so the ninth ending is
+pinned by nothing.
+
+**`Live::kill` sets the reason first, then lands the kill (`bdff581`; H68's
+second sentence).** The doc described the body as one act that skips the flag:
+“Killing is idempotent and goes through the handle rather than the flag”. The
+body does both, flag first: `self.stop.store(true, Ordering::SeqCst);` then
+`if let Ok(mut job) = self.job.lock() { job.kill(); }`. The order is the fact: the
+flag is what `watch` reads at the top of its loop and again after the poll (`if
+live.stop.load(..) { break JobOutcome::Stopped }`), and the comment there says
+why — “A kill that landed between the poll and the flag is what the flag is for:
+report it as a stop rather than as the command's own end”. `Live::stopped` is the
+same answer for a foreground call. The kill that ends the process group lands
+elsewhere in the sense that matters — `machine.rs`'s `Running::kill`, through the
+`Job` handle — but it is called *here*, synchronously, not left to the watcher's
+next poll: on `Ctrl-N` and on quit the groups must be gone before the call
+returns. Pinned by nothing new; the doc is the change, and the two sentences are
+two commits because they are two facts.
+
+**Every accent site, by the rule that yields them (`f948120`; H69's first
+half).** The module doc listed seven of the accent's nine sites and missed the two
+`ui.rs`'s `select_painted` paints: the cursor band
+(`Style::default().fg(theme.accent()).bg(Color::Black)`, `ui.rs:286`) and the
+selection (`.fg(Color::Black).bg(theme.accent())`, `:289`) of the transcript's
+select mode. Reading every `theme.accent()` painting call in the tree gives
+exactly these nine sites, all in `ui.rs`:
+
+```
+:39   border() — the focused pane's border
+:52   rank_style() — an activity line
+:124  draw_agents() — the selected agent row (a band while the tree has the keyboard;
+      :126, the hue as ink while the chat does)
+:286  select_painted() — the select mode's cursor band
+:289  select_painted() — the select mode's selection
+:352  draw_chat() — the message prompt
+:408  draw_picker() — the picker's frame
+:422  draw_picker() — the picker's selected row
+:452  draw_status() — the bar's badge
+```
+
+The manual already counted nine (`docs/mush.md` §4.5, “Chrome wears the hue”),
+but the code is the source of truth here. The sites share one rule, which is what
+the doc now states instead of a bare list, so the two cannot drift apart again:
+every accent site *points* — at whose window this is, or at where the keyboard is
+— and none *reports* what happened. The other half of H69 is `1a50837` (§8.93),
+`ui.rs`'s own copy of the list.
+
+---
+
+## 8.92 A walk of the whole filesystem is refused at the one door (#131, `b382af1`, `1d80273`, merged `9be1a9a`)
+
+The human reported it, and it was not hypothetical: a sibling agent's
+reconnaissance ran `find /` as a detached job and thrashed this machine's disk for
+as long as the job was allowed to live. The ask was a gate that sees `find /` even
+with a `cd` or anything else before it. Two commits: the decision, and the door.
+
+**The refusal is a pure function of the command text (`b382af1`).**
+`whole_disk::refusal(command, cwd)` reads the line the way a shell would, so every
+shape can be pinned without spawning anything. It splits on the shell's
+separators (`;`, `&&`, `||`, `|`, `&`, newlines, unquoted parens) and examines
+every piece, with quoting respected and a `#` comment or a heredoc body treated as
+what it is (not a command); tracks the effective cwd across `cd` pieces, lexically
+(`cd /tmp/x/../..` is `/`, `cd ..` from a known dir is its parent, `cd` with no
+argument is `$HOME` and therefore unknown); skips what only decorates a command
+(`sudo`, `nice`, `ionice`, `env` and its assignments, `timeout N`, `command`,
+`exec`, `nohup`, `stdbuf`, plain assignments and leading keywords), options and
+all, so `sudo nice find /` is the same fact as `find /` — and reads the two
+wrappers that move the directory their command runs in, `env -C DIR` and
+`sudo -D`/`--chdir DIR`, as such, so `env -C / find` is `cd / && find`; reads a
+nested shell's `-c` script one level down (`sh -c`, `bash -c`, `busybox sh -c`)
+with a copy of the cwd, and reads `busybox find /` as `find /`; and reads a
+walker's paths the way the walker does (a per-command option table, a leading
+pattern for `grep`/`rg`/`fd`, the cwd when no path is given) and refuses when a
+root normalizes to `/`. `find` is the target; `du`, `ls -R`, `grep -r`, `rg`,
+`tree` and `fd` share the rule in the same table because their roots are read the
+same way. Allowed, and pinned as controls: `find .`, `find src`, `find /tmp/thing`,
+`cd /tmp && find .`, `ls /`, `grep foo /etc/hosts`, `fd /` (a pattern). The refusal
+sentence names what was refused, why, the road that works (`find . -name …`,
+`search`/`list_files`) and what the guard actually is — a text guard, not a
+sandbox — because a “never allowed” claim this scan cannot make would be a lie.
+
+**What it refuses to guess, and what it does not catch.** Two cases are
+deliberately *not* guessed at, and they are why an unknown cwd or an unknown
+operand allows a bare walker: `cd` with no argument, `cd ~`, `cd -` and any `cd`
+whose argument carries an expansion land where the reading cannot see — an
+unknown cwd is not provably `/`, so an honest `cd && find` that never went near
+the root stays allowed; and a path operand carrying `~`, `$` or a backtick is
+unknown for the same reason, so `find "$DIR"` passes. The module docs say what
+it does not catch, in the same paragraph that says it is not a sandbox: `f""ind
+/`, a root spelled through a variable (`find "$ROOT"`), `eval`, `xargs`, a walker
+started from inside `find -exec` or `fd -x`, an alias or shell function only the
+human's profile knows, a build script that itself runs `find /`, and an inner
+shell nested one level deeper than the single `-c` script scanned here.
+**Documented over-refusals:** the heredoc reading errs the other way when the
+`<<` does not begin its own word — `cat<<EOF` is one word, so its body is read as
+commands, and a `find /` written in it is refused (`a_heredoc_body_is_data` pins
+the allowed forms and the refused `cat<<EOF` form beside them); and the rule reads
+the cwd, so a workspace opened at `/` has no walker whose default root is not `/`
+— the module doc's “no path operand at all while the effective cwd is `/`” is the
+rule, and `find .` in a mush opened at `/` is refused with the rest.
+
+**The refusal is wired into the one door every command comes through
+(`1d80273`).** `whole_disk::refusal` is called at `Shell::spawn` — the one place
+every command mush starts comes through, a `run_command`, a `detach: true` job
+and a handover alike — before anything exists: no scratch file, no child. The
+refusal is that spawn's `Err(sentence)`, the road a spawn failure already travels
+to the model as the command's own result (`error: …`), so no argument and no tool
+road can skip the gate. `agent.rs` is untouched. Measured through the real
+`Shell`, before → after:
+
+```
+before  `cd / && find / -maxdepth 0` → End::Exited(0), printed `/`
+after   `cd / && find / -maxdepth 0` → Err("refusing a walk of the whole
+        filesystem rooted at `/`: …"), and the output file it would have
+        written does not exist — no shell ran
+```
+
+`-maxdepth 0` is the honest stand-in for the measurement: the command line is the
+shape in question and nothing walks the disk. Pinned by
+`machine::tests::the_shell_refuses_a_walk_of_the_whole_filesystem`, whose control
+runs the same shape rooted in the workspace (`find .` → exit 0, prints `.`), and
+by `whole_disk::tests::a_find_over_the_whole_filesystem_is_refused` with the eight
+other facts beside it (the other walkers, the wrappers, the cwd tracking, the
+nested shells, the unknown cwd and operand, the heredoc bodies, the controls that
+stay allowed, and the sentence itself).
+
+---
+
+## 8.93 The row's count of children in flight is gone, and the hue list is whole (#134, `466994f`, `1a50837`, merged `3cb1186`)
+
+**The row's `⏸N` count is removed (`466994f`).** The human read ` ⏸1` on a
+row as *paused*. It meant “N of this row's own children have a run in flight” —
+a mark about the children, painted on the parent — and it is removed for two
+reasons. **(a)** The glyph points one way and its number another: mush has no
+pause (a stop is `⊘`, a parked run is `⧗`, a run in flight is `◐`), so `⏸`
+appeared exactly once on the whole screen, saying something it does not say.
+**(b)** The fact has two other homes already — the children's own rows say they
+are running, and the title's `N waiting` clause counts the agents at rest with
+work out — and those are two *different* facts (`⏸N` was per-parent children,
+`N waiting` is tree-wide napping agents), so side by side under one glyph they
+taught the reader to conflate them. The title's clause stays: it names its
+number in words and is about the agents. Measured at 80×24, one fixture (root
+idle, #1 done over the working #2), before and after:
+
+```
+before                                    after
+│   ✓ #1 ⏸1 watch  done      │            │   ✓ #1 watch  done         │
+│     ◐ #2  thinking 0s      │            │     ◐ #2  thinking 0s      │
+```
+
+The prose half of the change, because a sentence that outlived its fact is
+unfinished work: `AgentRow::waiting` and the `busy_counts()` walk that filled it
+are gone from `App::rows`/`App::row`; the wire's `children_working` (the `agents`
+command's column, the attach roster) keeps its value, read from the same
+`AgentTree::busy_counts` derivation the title and `tree_line` read; the five
+sentences that justified the title's `waiting` clause *by* the row mark
+(`screen.rs`'s `title_cells` and `agent_count_cells`, `tree.rs`'s `Roster` and
+`roster`, `mod.rs`'s `tree_line`) now give the reason that survives — a napping
+agent's own row wears its resting glyph above the working children's rows, so
+the tree's shape says it. `every_row_mark_is_one_column`'s mark list loses `⏸`;
+`a_working_agent_with_working_children_is_not_drawn_paused` now reads the
+children's own `◐` rows and the title's `3 working`; the parent-gone state test
+reads #5's resting row over #6's running one; the sweep's “parked on children”
+state pins `· #0`, `2 working` and the bar's sentence. Pinned as the fact by
+`a_parents_row_no_longer_counts_the_children_in_flight` (`screen.rs`): at 200×50
+no row carries `⏸`, #5's row is `   ✓ #5 watch  done`, #6's is `     ◐ #6 probe
+thinking 0s`, and the title still reads ` agents · 1 working · 1 waiting `.
+
+**The human's ruling on `⚮`'s ink.** The `⚮` the row wears when its parent is
+gone (§8.87) paints in the row's ordinary ink, and the human ruled that it wears
+**no** ink of its own: they had read it as a selection mark, and a mark that
+means “the link is severed” must not borrow the keyboard's “this is selected”.
+The accent work the ruling cancelled was an ink half — the mark was to be painted
+in the theme's hue like the focused cursor's row — and no line of it landed: the
+ruling arrived before the commit did. What stands is the row mark as §8.87
+painted it, pinned as painted by its own cell-level tests, and the accent's nine
+sites are the ones §8.91 and the next paragraph count.
+
+**The module doc lists every hue site the file paints (`1a50837`; H69's second
+half).** The doc's list of what wears the accent had drifted from the code it
+heads: it named the focused border, the selected row, the picker's frame, the
+message prompt, the bar's badge and an activity line, and missed the picker's
+selected row and the two sites `select_painted` paints — the transcript select
+mode's cursor band (the hue as ink on `Black`) and its selection (`Black` on the
+hue). Reading every `theme.accent()` painting call in the file gives exactly nine
+sites, and they share one rule: the hue *points* — at whose window this is, or at
+where the keyboard is — and never *reports* what happened. The doc now states
+that rule and the whole list in the module's own words, agreeing with `theme.rs`'s
+module doc without copying it (`f948120`). Prose only: a doc list has no test of
+its own, and the sites it names are pinned where they are painted —
+`a_themed_frame_paints_the_hue` (the picker's frame and its selected row),
+`the_select_mode_paints_its_cursor_and_its_selection_on_their_own_cells` (the two
+`select_painted` marks), and
+`the_agents_cursor_is_a_band_only_while_the_pane_has_the_keyboard` (the tree's
+row). With both halves landed, H69 is closed.
+
+---
+
+## 8.94 The note's provenance survives the session file (#135, `8546382`, `af9aade`, merged `036f138`)
+
+**A doc link stops naming its target twice (`8546382`).** The `cmd_cap` doc wrote
+`[`trim_target`](crate::transcript::trim_target)` while `trim_target` is imported
+in this module, so the label resolves on its own and rustdoc's
+`redundant_explicit_links` refuses the doubled target under `-D warnings`. One
+label, `[`trim_target`]`, is the change — found by the doc gate §8.95 is about.
+
+**The note's provenance survives the file (`af9aade`).** The dropped-turns note
+is told from a human's identical line by `Message::note`'s flag (finding F3,
+`3c774b6`), and the flag was `#[serde(skip)]` — so a transcript read back from
+`.mush/session.json` held its note as a plain user line: the trimmer counted it
+as a turn, the pane painted it in the human's voice, and `place_dropped_note`
+early-returned instead of moving the line to the request's index 2, which is the
+rule A18 added. Now the flag survives the file, and nothing else changes:
+`Message.note` is `#[serde(default)]`, so the field is read from a file (a reply,
+a wire message and a file written before the field existed all read `false`);
+`Message`'s hand-written serializer keeps the *wire* form (the flag never leaves
+mush's own readers, so what an endpoint reads is byte for byte what it read
+before); and `serialize_stored_messages` is the stored shape — the same one body,
+plus `"note": true` on the one message that carries it — with `Session` putting
+both its transcripts (the root's and each child's) through it. Only the `true` is
+written, so a message without a note is byte for byte what it was. Measured
+before, `cargo test -p mush --bin mush
+agent::tests::a_revived_childs_note_comes_back_after_its_brief` read the note's
+sentence where the brief's line belonged; what the file carried on master
+(`Session::save` went through `Message`'s own serializer, which never named the
+flag) was
+`{"role":"user","content":"The oldest turns of this conversation …"}`; after the
+same save it is `{…,"note":true}`, and the test passes with its carried copy
+built by a real `Session` round trip rather than by prose. A restored note is the
+note again: index 2, mush's voice
+(`a_restored_note_reads_as_mushs_line_and_a_lookalike_does_not`). No test pinned the stored shape by loosening it: no literal
+JSON expectation changed, and the session shape gains one additive field on the
+note line alone.
+
+**The merge-interaction lesson, entered the way the record enters findings.**
+The merge of #120 and #121 in this window broke exactly one test, and the one it
+broke was `a_revived_childs_note_comes_back_after_its_brief`: #120's `50c53ef` had
+built the test on the note's *place*, and #121's `3c774b6` had changed the note's
+identity from its text to `Message::note`'s flag — a well-formed change, pinned
+by its own tests, that made the flag the only provenance and left it
+`#[serde(skip)]`. Individually green, the pair was red because a fact's home was
+decided by one branch and the fact's reader by the other; the test's name was the
+only place the two met. The record enters this because it is the class the blind
+audits exist for, one level up: a wave's tests prove its own road, and the merge
+is the first place the roads meet. The fix was not to move the test but to make
+the fact survive the road (`af9aade`), and the pins now cover the round trip, the
+wire's byte-identity, and the restored lookalike —
+`a_session_round_trip_keeps_the_notes_provenance`,
+`the_notes_provenance_stays_off_the_wire_and_travels_in_the_file`, and the
+restored half of `a_user_line_that_quotes_the_note_is_not_the_note`.
+
+---
+
+## 8.95 The code's own manual resolves — every doc link names an item a reader can follow (#137, `80c4d91`, `07f550a`, `aaa2888`, merged `12538a1`)
+
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` exited
+101 at this window's start: 42 errors in `mush-core` and 7 in `mush`. The three
+commits take it to exit 0 with no warning, and they are the reason the command is
+now part of the root's gate (§8.101). No `#[allow]` was added and no item's
+visibility was widened to please a doc: a link is repaired or its name stays in
+the sentence as code.
+
+**A private target is named, not linked (`80c4d91`; the 42 in `mush-core`).**
+Every error was the same lint and none was a name rustdoc could not find: a
+public item's doc pointed at a target a reader outside the module cannot name, so
+the link resolves only under `--document-private-items` and breaks without it.
+Giving the helper `pub` would change the API to please a doc, and an `#[allow]`
+would hide the next real one; the change is `[`X`]` to `` `X` `` at the 42 sites,
+with the two lines that carried two links each fixed in both entries. Grouped by
+cause: `workspace.rs` (27 links) — the private methods `real_path`, `whole_read`,
+`image_at`, `name_for_model`, `write_pasted_image`, `prune_pastes`,
+`store_file_refusal` and `entry_for_write`, the private functions `over_read_cap`
+and `not_utf8`, the private consts `SKIP_DIRS` and `MATCH_LINE_CAP`, and the
+`pub(crate)` const `BACKUP_TRIES` (a public doc linking a crate-private const is
+the same broken promise); `message.rs` (7) — `arguments_from_wire`,
+`id_from_wire` twice, `assign_tool_call_ids`, `Message::content_parts` twice and
+`placeholder`; `config.rs` (3) — `REPLY_SHARE_DIVISOR`, `Config::request_reserve`
+and `Config::on_the_providers_own_endpoint`; `git.rs` (2) — `published_facts` and
+`WorktreeFacts`; `session.rs` (2) — `cannot_keep`, twice; `transcript.rs` (1) —
+`drop_orphan_results`. Nothing was renamed and nothing was gone, so no sentence
+was rewritten. Measured after: `RUSTDOCFLAGS="-D warnings" cargo doc -p
+mush-core --no-deps --document-private-items` exits 0, and no file above is named
+in any error.
+
+**A link names the item that exists, not its old owner (`07f550a`; four in
+`mush`).** None of these targets was private, and none was gone: each exists
+under a name the sentence no longer had, so the link is repaired rather than
+dropped. Rustdoc's own words, before: `unresolved link to `is_forgotten`` twice
+(`agent.rs:1176`, `:4230`) — it is a private method of `ActorState`, so both sites
+now name `ActorState::is_forgotten`; `unresolved link to `Stop::span``
+(`chat.rs:412`) — `span` is a method of `Stops`, so the doc now names
+`Stops::span`; and `unresolved link to `Tree::focused`` (`app/mod.rs:4164`) —
+the tree type is `AgentTree` and there is no `Tree` in scope, so the sentence
+names `AgentTree::focused`. The sentences keep their words; `app/mod.rs`'s
+paragraph was re-wrapped because the corrected type name is five characters
+longer.
+
+**A link gives the path its module does not import (`aaa2888`; the last three).**
+`chat.rs` imports only `crate::agent::summarize_args` and `signals.rs` imports
+nothing from the app, so the first segment of each path names no item there: the
+variant `AgentEvent::SystemPrompt` is real and so is `App::signal_quit`, but the
+doc's own scope failed. Both links keep their short label and carry the path, the
+form the tree already uses for the same reason
+(`[`AgentEvent::SystemPrompt`](crate::agent::AgentEvent::SystemPrompt)` twice and
+`[`App::signal_quit`](crate::app::App::signal_quit)`), and no `use` was added for
+a doc's sake. Measured before → after for the whole command: exit 101 with
+7 errors in `mush` (42 in `mush-core`, fixed by `80c4d91`) → exit 0, no warnings,
+`Finished `dev` profile … in 5.92s`. The command is a gate now, and this record's
+own run at `e73ed85` exits 0 (§8.102).
+
+---
+
+## 8.96 The manual is the contract and a map — its facts are printed from the code, its mechanisms are pointers (#136, `03703db`, `7b514e3`, `3ef46b6`, `97cd8cf`, `ca05b8a`, `f30891e`, `1ef41fe`, `aa0398d`, `9e40a9e`, merged `0dbd822`)
+
+The human's ruling on documentation is the reason this wave exists, and it is
+quoted in their words: *“cut the manual's restatements to a pointer please where
+possible”*, and *“perhaps we could generate the docs from the code … that way the
+code stays its own manual”*. The root read it back as one rule, which the commit
+that rewrote the manual wrote at the top of the file and the next wave inherits:
+**the facts a machine can print are generated, the sentences are written, and the
+reasons stay in the code** — what a human does and sees is in the manual, a
+mechanism is a pointer, and anything the code can print is a generated block.
+The ruling is the human's; the number below and the claims in the bodies are
+reproduced at this base.
+
+**Five generated blocks.** `help_table()` — what `mush --help`'s KEYS block and
+the in-app `/help` print — is rendered into `docs/mush.md` and `README.md`
+(`03703db`); `table()` — the command list, provider placeholder filled in — the
+same (`7b514e3`); the row marks block is one painted row per phase glyph and per
+flag `agent_line` can add, rendered by `agent_line` itself at a fixed width
+(`3ef46b6`); and the sample frame is a `Screen` value painted by `ui::draw` into
+a real ratatui `TestBackend` at 100×28, its cells read back as text — the
+README's (`97cd8cf`) and the manual's §4.5 (`ca05b8a`; one row per phase and per
+mark: a park, a stop, a cut off, a fold, an unread result, two owed reads, an
+orphan, a job). Every block is delimited by `<!-- generated: <name> (blessed by
+…) -->` … `<!-- /generated: <name> -->` headers naming the check that owns it,
+and an ordinary test compares the whole region — the blessing line, the fenced
+table and the whitespace — byte for byte with what the code prints:
+`the_keys_block_matches_the_code`, `the_commands_block_matches_the_code`,
+`the_marks_block_matches_the_code`, `the_readme_frame_matches_the_code` and
+`the_manual_frame_matches_the_code`. A wave that adds a binding, a command, a
+mark or a painter fails its check until the block is regenerated with the
+command the header itself names:
+
+```
+MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush <the check's own path>
+```
+
+The block machinery (`ui::tests::doc_block`) lives in `ui.rs`'s test module
+because that module is reachable from `app::keys` and `app::commands` while the
+reverse is not, and it holds one mutex so two checks sharing `docs/mush.md`
+cannot lose each other's block. The `Screen` fixtures are built in
+`app::commands`'s test module, not in `ui.rs`'s — a message box's `InputPane` is
+only nameable inside `app` — and the frame's title is elided by `screen::elide`
+and its footer truncated by the same calls the pane makes, so a generated frame
+cannot show a title or a line the pane would have cut.
+
+**The manual is the contract and a map (`f30891e`, `1ef41fe`).** `docs/mush.md`
+was 1,501 lines of design doc — the decision and the mechanism of every subsystem,
+restated beside the code that owns them — and the pass cut it to the contract plus
+a map: 1,501 → 1,154 lines at this base, of which 117 are the four generated
+blocks, so **1,037 are hand-written** (measured: `wc -l docs/mush.md`, and the
+blocks counted between their own headers). The README went 365 → 432 total lines,
+of which 117 are generated, so its hand-written prose went **365 → 315**. Section
+by section, cut to a pointer: §1's H31 story becomes the two facts (a lock
+refuses reads; a shell cannot carry an image) plus `tools.rs` and `workspace.rs`;
+§2's editor-shaped argument and input-channel explanation become the contract,
+the caps' arithmetic and reasons become `Config::cmd_cap` and the cap constants,
+and the workspace-confinement rule gains the sentence it owed since #131 — the
+`/`-walk guard is named, with `whole_disk::refusal` and `Shell::spawn`; §3's
+prompt-construction argument becomes the block names, image weighing, dimension
+parsing and stored-bytes shedding point at `message.rs` and `workspace.rs`, and
+the history budget's 9/10 trigger, 4/5 watermark, 5,000-token margin and the
+fold's cache argument point at `config.rs`, `transcript.rs` and
+`agent.rs::fold_request_fits`; §4's key and command tables are the generated
+blocks, defanging and the markdown view point at `text.rs`; §4.5's ten-defect
+audit history points at this file, the hue's hash and colour arithmetic at
+`theme.rs`, the notices' lifetimes at `chat.rs`, the vendor list at
+`provider.rs`; §5's flag-by-flag rationale becomes the flag list, the session
+debounce stays a fact whose number is `SESSION_DEBOUNCE`, the config fields point
+at `userconfig.rs`; §5.5/§5.6's depth and fan-out numbers become `MAX_DEPTH` and
+`MAX_AGENTS`; §6's no-tokio argument points at `docs/refactor.md`; §8's phase
+deadlines point at `http.rs`'s constants; §9–§12's milestone plan becomes a
+done/next list and the decision log points at the doc comments beside the code.
+The pointers are real: `prompt.rs`, `tools::TOOL_NAMES`, `trim_target`,
+`compaction_trigger`, `App::status`, `chat::Rank` and `Theme::resolve` all appear
+in the manual at this base. The README keeps the contract too: its tools' notes,
+row marks, window sources and retry arithmetic are pointers or generated blocks,
+and the two stale sentences the tree outgrew are fixed here —
+`spawn_agent(brief, title?, base?)`, and the `⏸N` sentence whose mark `466994f`
+removed — while the reason that survives is stated: a running agent with children
+out wears no count of them, because the children's own rows say they run and the
+pane title's `N waiting` counts the agents at rest with work out.
+
+**The two pointers the wave added afterwards.** `aa0398d`: the `⚮` sentence kept
+the fact (“a parent the history window has reaped”) but not the pointer §0
+promises every mechanism, so it now names `CHILD_HISTORY` (`app/tree.rs`) — how
+many children a parent keeps before the oldest are dropped and their rows lose
+their parent. `9e40a9e`: the caps and the 8 K window name the code that holds
+them. Both are one fact per commit, and a pointer that names something that
+exists. **Recorded, not changed:** `docs/refactor.md` §11's older census heads and
+the decision log's history are left as the documents wrote them; this record's
+§8.88 still
+speaks for `df115bc`, and the manual's hand-written share is the number this
+section measured rather than a target.
+
+---
+
+## 8.97 The pane's voices — mush's own line, the note at the front, the popup's clock (#139, `38f4bc4`, `0ba9796`, `c0b86bf`, merged `15930c7`)
+
+Three lays of the two halves §8.89 left standing, and the test that stopped
+racing a clock.
+
+**A failed commit's line is painted in mush's voice (`38f4bc4`; the F17
+residual).** `report_work` keeps a failed commit's line as a transcript message
+as well as a row tail (finding F17), because the work may be sitting unlanded in
+a worktree and the model is the hand that can repair it. The line reaches the
+pane as a `user` message — that half was right — but `unrecorded` read it as
+somebody's words: on a child's transcript it is a line the pane cannot place, and
+the one speaker left is another agent, so mush's own report about its own act
+painted as `parent ›`. On the root's transcript it painted as an agent too, never
+as mush's. Measured (a 60-column child pane holding [the brief, the model's
+reply, the line]; probe deleted), before → after:
+
+```
+["brief › the brief", "", "mush › working", "",
+ "parent › could not commit the worktree: /repo/.mush/wt/1 is",
+ "         no longer a worktree"]
+
+["brief › the brief", "", "mush › working", "",
+ "· could not commit the worktree: /repo/.mush/wt/1 is no",
+ "  longer a worktree"]
+```
+
+The wire is untouched: the sentence is still the one `Work::status_line`
+writes, and it still travels in the request. The shape is the sentence's head,
+spelled once beside its writer (`Work::UNCOMMITTED_HEAD`) and read by
+`unrecorded` — the head is the only provenance that survives the session file,
+since a restored transcript is painted from what its lines themselves say. Pinned
+by `a_failed_commits_line_is_painted_in_mushs_voice`: a child's pane, the root's,
+and a copy restored from the session file. **Recorded, not changed:** a head is
+still the sentence deciding its own provenance — the rule finding F3 removed —
+and the next commit of this window (the same file, in its own wave, `10e2fc7`
+§8.100) retires it for `Message::mush`; the record reads the two together, which
+is why this commit is entered as the F17 residual's *shape* being fixed.
+
+**A dropped-turns note is placed where the transcript's front is (`0ba9796`;
+A18's pane half).** `trim_history` puts the note after the system prompt and the
+opening task — the request's order — but the pane's copy learned the sentence
+through `AgentEvent::Message`, which appends, so the note sat at the end of the
+pane's record: the newest thing said rather than a statement about what the front
+lost. The pane and the request must read the same transcript. Measured (probe
+deleted), before → after, a child's copy and a root's:
+
+```
+child: ["the brief", "reading", "more", "done", NOTE]      -> ["the brief", NOTE, "reading", "more", "done"]
+root:  ["do the work", "working", "keep going", NOTE]     -> ["do the work", NOTE, "working", "keep going"]
+```
+
+The place is the request's own rule, named once: `place_dropped_note` reads the
+*front* off the list it is given — the system prompt when one heads it, then the
+opening task — so the request's list (two messages of front) and the pane's copy
+(the task and no prompt: a pane never paints the prompt) both get the note after
+the front without a second spelling of the index. That is why the pane's note
+sits at 1 where the request's sits at 2, and the test that pins it says so:
+`Chat::push_message` calls the derivation on the append and moves the caches an
+insert shifts (the recorded voices, the select cursor, a held reading's count),
+and `Chat::replace_transcript` calls it on a copy that arrives whole, so a file
+from an older version is normalized too. The wire is unchanged: the request's
+order was already right. Pinned by
+`a_dropped_turns_note_lands_after_the_brief_and_before_the_oldest_kept_turn` (a
+child's road, the root's, a restored copy, a passed steering line's voice, and
+the request's order equal to the pane's) and by
+`place_dropped_note_reads_the_front_off_the_list` in `mush-core`. The `.last()`
+test that A18's half had left was fixed in #141 (`4c6e791`, §8.100).
+
+**The popup test stops comparing two readings of the clock (`c0b86bf`; a fixed
+flake).** `a_resized_popup_is_rewrapped_not_clipped` compares the labels of two
+paints — the resize's re-wrap and a reopen — and each label carries the age its
+note is led with, built as `short_age(Duration::from_secs(now - notice.at))` from
+`session::now_secs()`. The two paints read that integer at two instants, so a
+second boundary falling between them flips `0s ·` to `1s ·` and the assertion
+fails with every wrapped row identical. Measured alone before this commit: 1
+failure in 300 runs, the same rows reported as
+`left: ["0s · the run failed while folding", …]` against
+`right: ["1s · the run failed while folding", …]`. The fix is in the test, not in
+the popup, and the reason is what a popup *is*: `App::rewrap_picker` rebuilds
+the rows from their source so “the popup a resize paints is the popup a reopen
+at that size paints” — a resize really is a reopen, and its ages are read afresh
+exactly as a reopen's are; freezing the age at open would make a resize stop
+being a reopen, and it would not even make this assertion clock-free (a reopen
+reads the clock at its own instant). The age is a reading of the wall clock; the
+layout is what the frame is about. So the comparison strips each note's `0s · `
+lead and keeps every row that is the report's own text — head rows' marks and
+words, continuation rows' indents — which is the fact the test pins: a resize
+re-wraps the popup rather than clipping it or re-wrapping the rows it had.
+Measured after: 1000 runs of this test alone, 0 failures. The test's doc now
+carries the mechanism, the clock read, and the 1-in-300 measurement.
+
+---
+
+## 8.98 The last stale sentences — the directory's writers, eight glyphs, the cap's question, an empty URL (#140, `bfbf681`, `cdb85b6`, `3fbdebb`, `9b82eca`, merged `0d31620`)
+
+Four sentences the tree had outgrown, none of them a behaviour change, all four
+of them sentences a reader — the model, the human, or the next wave — would have
+believed.
+
+**The one-shared-child sentence names the directory's writers (`bfbf681`; F13,
+H55 and H64).** The delegation policy told the model “only one such child may
+run at a time” about a spawn without a base, while the guard the code enforces is
+about the *directory's* live writers, tree-wide, and exempts the spawner itself
+(finding F13). A model that read the old sentence believed a grandchild writing
+in the same checkout was not there. Before (DELEGATION, 1,444 bytes):
+
+> parallel; without one the child works in this workspace, and only one such
+child may run at a time. Decide up front, or wait for the running one first.
+
+After (DELEGATION, 1,635 bytes; +191):
+
+> parallel; without one the child works in this workspace, where only one shared
+child may run at a time — the directory's live writers, tree-wide, not only the
+children your own books name: a grandchild working here counts, a child whose run
+has ended does not, and your own run is exempt. Decide up front, or wait for the
+running one first.
+
+The four facts are the admission's own (`agent::spawn_tool`, `agent::Writers`):
+only a delegated *shared* child books itself (`Actor::shared_child`), the key is
+the canonical workspace root, the guard lives as long as the run (`WriterGuard`)
+so an ended run does not count, `others(root, id)` filters the spawner's own run
+out, and the writers a parent's own books name are judged there rather than in
+the directory book. The byte counts are measured with a probe (deleted before the
+commit): DELEGATION 1,444 → 1,635 (+191); `system_prompt("/tmp/ws")` 3,534 →
+3,725; a delegating child's prompt 3,186 → 3,377; a leaf's prompt 1,740
+unchanged (a leaf has no delegation policy). No byte budget test moved:
+`schemas_fit_the_budget_reserve` measures the schemas, not the prose. The sentence
+is also `agent::Writers`'s doc quote, so the quote moved with it — which is
+H64's second site and H55's code half; the third site, the spawn refusal's “only
+one shared child may run at a time” (`agent.rs:4783`), was written before the
+prompt's old wording and still stands, but it names the workspace's writers
+rather than a parent's children and was not part of this commit. Pinned by
+`the_delegation_policy_states_the_directorys_live_writers`.
+
+**The row's glyph doc lists all eight marks `phase_glyph` returns (`cdb85b6`).**
+`AgentRow::glyph`'s doc listed six glyphs — `·`, `◐`, `✓`, `✗`, `⊘`, `≡` — while
+`phase_glyph` returns two more, and the row paints all eight. It now reads
+`·`, `◐`, `✓`, `✗`, `⊘`, `≡`, `⚠`, `⧗`, derived from the node's own phase, never
+stored ([`phase_glyph`] owns the rule): `⚠` marks a run cut off mid-flight — not
+a stop and not a failure — and `⧗` a run parked in a `wait`, not a run in
+flight. The two meanings are the ones `phase_glyph`'s own doc gives: a cut-off
+run cannot borrow `⊘` (a stop is the human's doing and the actor resumes again)
+or `✗` (nothing the model or the endpoint did failed), and a `wait` is the one
+`Phase::Activity` that is not computing anything — the reason `⧗` replaced `◐`
+for it (finding U14). No behaviour changes: the field is `phase_glyph(&node.phase)`
+at the only construction site, and `glyphs_are_truthful` plus
+`every_row_mark_is_one_column` already pin the function.
+
+**The worktree cap's prose names the question each worktree was asked
+(`3fbdebb`; F7's successor).** `git::unlandable` (`ef2cf7b`) asks every worktree
+a tree has published against that node's own base and fork, and only one no tree
+names — a leftover, a restored agent with no base — against `HEAD` with no fork.
+`too_many_worktrees` still said every worktree was asked “against `HEAD`”, and
+its refusal text still stated the nested-child over-count as the rule rather than
+the unnamed residue; the cap's call-site comment said the same stale things. Doc,
+refusal text and comment now name the two questions:
+
+```
+before  … none of them is landable against HEAD … a nested child merged only
+        into its parent's branch counts here: … bring its branch's work to this
+        repository's HEAD (merge it), or remove the checkout and delete the branch.
+after   … none of them is landable … Each worktree a tree has published is
+        measured against that node's own base and fork, and one no tree names —
+        a leftover, a restored agent with no base — against HEAD with no fork; …
+        a nested child merged only into its parent's branch counts here only
+        while the tree has not named its node … bring a branch's work to the base
+        it is measured against (merge it), or remove the checkout and delete the
+        branch.
+```
+
+The test that pins the wording
+(`the_worktree_cap_refuses_a_spawn_before_the_id_is_taken`) asserted the clause
+`none of them is landable against HEAD` in its scripted matcher and in its result
+filter, which is the fact that changed: both now match `none of them is
+landable`, and its nested-child assertion quotes the “only while the tree has not
+named its node” clause. The count/limit assertion, the named worktree
+(`#1 (.mush/wt/1)`), the two commands and the `!contains("unmerged")` assertion
+are unchanged and still true.
+
+**A URL of only spaces is not an endpoint (`9b82eca`).** `checked_url` trims
+before it decides, and a value that is *only* space trimmed to the empty string,
+which the door then took as the endpoint: `MUSH_URL="   "` looked set and built
+every request line at the path, instead of falling back to the provider's default
+the way an absent variable does (noticed while the control-character refusal was
+added, finding D19/C7's family):
+
+```
+before  $ MUSH_URL="   " mush --print-config /tmp/x   → endpoint … ; $? = 0
+        parsed Config: from_env_layer -> base_url ""; parse_url_env("   ") ->
+        Ok(""); --url "   " -> ""; the /url writer -> ""; a home base_url of
+        "   " -> ""; a session's -> ("", [])
+after   $ MUSH_URL="   " mush --print-config /tmp/x
+        mush: MUSH_URL is empty after trimming — check the value ; $? = 1
+        parsed Config: from_env_layer -> the provider's default; parse_url_env("   ") ->
+        Err(…); --url "   " -> refused by name; the /url writer and a session keep
+        the endpoint in force; a home base_url of "   " -> refused
+```
+
+The refusal lives at the one door every road that states an endpoint goes
+through, because the module's own rule is that a value a human stated but got
+wrong is reported by name rather than silently becoming some other endpoint. The
+lenient read (`Config::from_env`) has no human to answer, so it drops the value
+and falls back to the provider's default, exactly as it does for a malformed URL;
+the control-character refusal is untouched, and no other door (key, context,
+provider) moved. Pinned by `a_url_of_only_spaces_is_not_an_endpoint`, beside the
+control-character test.
+
+---
+
+## 8.99 The test scratch dies with its guard, and the dead pids' litter is swept (#138, `7c026ec`, `2202f7f`, `9bf3d28`, merged `7644cb0`)
+
+H63's fix, and the sweep that paid the debt older runs had left. Three commits:
+the type, its sweep, and the fixture that two suites were fighting over.
+
+**A scratch root lives and dies with the guard that owns it (`7c026ec`; H63).**
+A test's files live under `/tmp/mush-<label>-<pid>`, and the tests removed that
+root only in their first act — before creating it — never after: a build whose
+tests once existed under that name left the last one behind, and a test that
+failed left everything it made. Measured at the ref, running the suite's own test
+binaries directly (so a sibling worktree's runs are not counted in): `mush`'s
+binary left 267 root directories, `mush-core`'s 30 — **297 per `cargo test
+--workspace`**, one per label, none reaped. `mush_core::scratch::Scratch` owns
+the root, and `Drop` is the point: it runs while a failing test unwinds, where a
+`remove_dir_all` at the end of the test never runs. A helper that makes the root
+itself — `test_app`, `test_actor`, the `Workspace` and `PathBuf` fixtures — hands
+the value back inside `Held<T>`, a value and its guard in one, so the call sites
+read the same and the root outlives whatever was built on it; a helper whose root
+the test itself holds returns a bare `Scratch` instead. A label is refused while
+a second live guard claims it: two tests sharing one root would have the first
+`Drop` delete the other's files, a flake that names nothing — the module is
+behind a `test-support` feature rather than `#[cfg(test)]` because `cfg(test)` is
+set for a crate's own test binary, not for a dependent's, and a product build
+compiles none of it (checked: no `sweep_dead_roots` or `Scratch::new` symbol in
+`target/debug/mush`). All **61** `temp_dir()` sites in the two crates' tests route
+through it; the two sites left in `machine.rs` are that file's reaper fixture and
+the product's own reaper, not test roots. The one label collision —
+`mush-attach-idle-<pid>` written by two tests in the one binary — is split, and
+the clipboard fixtures take role prefixes. Pinned by
+`a_scratch_root_is_named_after_its_test_and_its_process`,
+`a_dropped_guard_takes_its_root_with_it`, and — for the failure this type exists
+for — `a_guard_removes_its_root_while_a_failing_test_unwinds`, which raises a
+real assertion failure inside `catch_unwind`: `Err` is the unwind, the root is
+checked to exist at the panic, and only the guard's `Drop` can have removed it
+afterwards. A passing test would not prove that path: its removal runs at the end
+of the body, not during a panic.
+
+**A sweep reaps the scratch of pids that are gone (`2202f7f`).** `Drop` covers a
+failing test, not a killed one: a `Ctrl-C`ed or `SIGKILL`ed `cargo test` runs no
+destructor at all, and the files it made stay where they were, named after its
+now-dead pid. The first guard a process makes sweeps the temp directory for
+entries whose trailing pid is not alive — once per process (`Once`), at a place
+that always happens, where an “at exit” hook does not exist in this workspace (no
+`unsafe`, and a killed process has no exit anyway). An entry named
+`mush-<label>-<pid>` is a candidate whether it is a directory (a scratch root) or
+a file (the litter of an older build, which wrote its fixture straight into the
+temp directory: `mush-test-outside-<name>-<pid>.png`,
+`mush-clipboard-<name>-<pid>`), and the pid is read the same way in both — the
+last field of the name, before a trailing file extension. A name with no pid in
+that field is not guessed at, `mush-cmd-*` is skipped by name whatever follows
+(the product reaps its own scratch), and a symlink is left alone. On a system
+with no `/proc` the sweep does nothing rather than guess. Never a live pid:
+several worktrees run their suites on this machine at the same time, and a live
+pid's files are somebody's running test. A pid a dead test once held that an
+unrelated process now holds reads as alive, which leaves one entry behind — the
+harmless direction, and the one the product's own reaper takes
+(`machine::reap_dead_scratch`). Measured. One full `cargo test --workspace` at
+the ref left the 297 roots above; with the guard and the sweep, running the same
+two binaries directly leaves 0 in `mush-core` and, in `mush`, the one
+`mush-user-config-<pid>` store a `static` holds for the binary's life — itself
+named for the dead pid that a later run's sweep reaps. The full workspace run
+measured here left 0 new entries: the binaries run one after the other, and the
+second's first use swept the first's store. The sweep also removed the **27,577**
+dead-pid roots older runs had left (`/tmp` went from 33,717 `mush-*` entries to
+6,733, the rest being live sibling suites'). The file half came after that
+measurement: one focused run swept **2,535** stray dead-pid files — 2,099 `.png`
+and 436 plain, ~500 MB that nothing else reaped — and `/tmp` went from 969 MB to
+471 MB (`mush-*` entries 6,440 → 3,913; what is left is live sibling suites and
+the `mush-lock-<pid>-<label>` roots the next paragraph is about). A deliberately
+failing test (`theme::tests::two_spellings_of_one_directory_are_one_hue` with one
+failing assertion added for the probe, removed after): **1 root left before, 0
+after**. Pinned by `a_sweep_removes_a_dead_pids_root_and_leaves_a_live_one` (the
+dead half a child of the test, waited for; the live half the test's own pid),
+`a_sweep_removes_a_dead_pids_stray_file_and_leaves_a_live_one`,
+`a_sweep_leaves_a_name_it_cannot_read_a_pid_out_of`, and
+`a_sweep_does_not_touch_the_products_scratch_files`.
+
+**The one shape the sweep's rule does not read, swept by the root (`7644cb0`'s
+merge window).** The lock tests' roots were once named
+`mush-lock-<pid>-<label>` — the pid in the *leading* field — and the sweep reads
+the trailing one, so those are left where they are. The root swept them by hand
+at the wave's end, every pid verified dead: **3,868 directories**, 12 left,
+`/tmp` 471 MB → 439 MB. The whole wave's litter, read by the root across the
+child's work, took `/tmp` from ~5.3 GB to 471 MB (the root's reading; the
+commit's own before → after for its sweep is the 969 → 471 MB above). At this
+base `du -sh /tmp` reads **439 MB**, and `ls -d /tmp/mush-lock-*` counts 21
+pid-leading directories from 3 dead pids — legacy leftovers of the old shape,
+since `lock::tests::root` now names its root through `Scratch`
+(`mush-lock-<label>-<pid>`), which the sweep *can* read. **Recorded as open
+rows:** `scripts/census.py` counts `scratch.rs` as prod (146 lines at
+`e73ed85`) because the module is feature-gated, not `#[cfg(test)]`-gated; the
+legacy `mush-cmd-*` files with no readable pid are the product reaper's to sweep
+(the scratch sweep skips them by name); the pid-reuse race — a dead test's pid
+now held by an unrelated process — leaves one entry behind; and a lone
+`cargo test -p mush` leaves one config store. They are H70 and H73–H75 in the
+open queue, below.
+
+**The reaper's fixture is scoped to its own process (`9bf3d28`; a fixed flake).**
+`a_start_reaps_a_dead_mushs_scratch` wrote fixed names under `/tmp` and removed
+them at the end. With a sibling worktree's suite running the same test, one
+copy's cleanup deleted the other's files between their write and their assert —
+the legacy `mush-cmd-out-legacy` name especially, which no reaper removes and
+which every suite wrote by hand. Measured at the ref: two concurrent copies of
+the test failed in **9 of 15 pairs**, every failure on `assert!(paths[4].exists(),
+"a name without a pid is not guessed at")`. Every name now carries the test
+process's own pid in the second field — the old shape included, where it only
+marks the separation — so no two suites' fixtures are the same paths. The pid the
+reaper reads stays the first field after `mush-cmd-`, so what the test pins is
+unchanged: a dead pid's pair is reaped, a live pid's pair and a name without a
+readable pid are not. Measured after: **0 of 15** concurrent pairs fail.
+
+---
+
+## 8.100 One marker says mush wrote the line, and the tests stop spelling what they can measure (#141, `10e2fc7`, `4c6e791`, `e07da52`, `7dadf47`, merged `e73ed85`)
+
+**Mush's out-of-band lines carry a mark, not a head apiece (`10e2fc7`).** The
+loop guard's warning before a resumed run, `MALFORMED_INSTRUCTION` and
+`TRUNCATION_INSTRUCTION` travel `push_line` as `user` messages — the shape a
+request reads them in — and the pane had only the sentence to go on:
+`unrecorded` fell back to the human and `elsewhere` to the parent, so a child's
+pane read its parent's voice for words no parent said. Measured before, on a
+child's pane and on the root's alike:
+
+```
+parent › Your previous run was stopped as a loop: …
+parent › mush could not read the endpoint's last reply, …
+parent › Your previous reply was cut off by the endpoint's length limit, …
+```
+
+A head per sentence was the other road — the failed commit's line took it in
+`38f4bc4` — and it is not one home too many so much as the wrong home: a head is
+still the sentence deciding its own provenance, which is the rule finding F3
+removed. A human who types those words word for word would keep being painted as
+mush, and the reader would hold a prefix per writer to keep in step with each
+writer's sentence. So the mark goes on the shape the actor hands over:
+`Message::mush`, one flag beside `Message::note`, set by the one constructor that
+says mush wrote the line — `agent::push_mush_line`. The failed commit's line
+moves to it too and `Work::UNCOMMITTED_HEAD` goes: the reader has one rule for
+every line mush writes, and the sentence's words — its head and git's error
+alike — are nothing to it. The four writers are the loop-stop line, the
+malformed-reply instruction, the truncation instruction and the failed-commit
+report, and each one's test asserts the pushed line carries the mark. The wire
+does not change: the flag is skipped on the request path (a core test pins the
+bytes against `Message::user`), so the model reads the same sentences. The
+session file keeps it, like the note's (`serialize_stored_messages`), because a
+restart has no other road to the mark. After, on a child's and the root's pane:
+`· Your previous run was stopped as a loop: …`, `· mush could not read the
+endpoint's last reply, …`, `· Your previous reply was cut off by the endpoint's
+length limit, …`. Reader pinned by
+`mushs_out_of_band_lines_are_painted_in_mushs_voice` (the three lines marked, an
+unmarked lookalike staying the parent's, live and restored) and the core round
+trip. **Recorded, not changed:** the child/job report grammar (`app/chat.rs`'s
+`report`, `report_tail`) and the fold's carried summary (`FOLDED`, “Context
+compacted”) are still read off the sentence's shape; the writers that produce
+them can take `Message::mush` too, and the two shape reads retire — the last open
+item of this class, H72 in the queue below.
+
+**The dropped-note test states the index the note lands at (`4c6e791`).**
+`the_dropped_turns_note_reaches_the_pane_and_the_session` asserted the note with
+`.last()` — as the newest line — which was only right because the copy it built
+held nothing else. Since `0ba9796` the note lands after the transcript's front,
+not at its end: `place_dropped_note` reads the front off the list — the system
+prompt if one heads it, then the opening task; the pane's copy has no prompt, so
+its note sits at index 1. Measured: an empty copy lands the note at index 0
+(`[The oldest turns…]`), so `.last()` and `[0]` happened to be the same
+assertion; a copy with an opening task in it lands `[(0, "do the task"), (1,
+note), (2, "working"), (3, "and carry on")]`. The copy now opens with a task and
+carries a turn and a newest line, and the assertions say what the test pins: the
+note reaches the pane at the index after the front — index 1, task at 0 — with
+the sentence the model was given; it reads as mush's line (the note's flag, what
+`unrecorded` paints `· ` from, not its words); the newest line stays the newest;
+and the session snapshot resumes with the note, flag and place alike.
+
+**The worktree cap's doc names the question the cap really asks (`e07da52`).**
+`MAX_WORKTREES`'s doc still told the old story: it counted checkouts “not
+landable against `HEAD` — the question `unlandable` can ask from here”, and its
+second paragraph said the sweep's own question could not be asked at all, because
+each node's base and fork “live in the UI's tree, which the spawn road cannot
+reach”. Finding F7's arithmetic landed as `ef2cf7b`, so both sentences are false
+of the code beside them: `unlandable` asks every worktree a tree has published
+against that node's own base and fork (`git::WorktreeFacts`), and one no tree
+names against `HEAD` with no fork — the two questions the tests pin both ways
+(`the_cap_counts_the_worktrees_that_are_not_landable`,
+`a_nested_child_merged_into_its_parent_is_not_counted`). The doc now says what
+the code does: the cap counts checkouts that are not landable by the sweep's own
+question, so work already merged, and a nested child merged into the branch its
+node names, never spends a slot. The superseded paragraph becomes the fact that
+closed the gap — the tree publishes its nodes' answers into `WorktreeFacts` on
+every git read, replaced whole and cleared when the guard drops — with the
+unnamed worktree still asked the conservative question and a refusal still saying
+which of the two its number came from.
+
+**The prompt's byte count is measured, not written (`7dadf47`).** The floor
+test's doc said “the system prompt alone (3,247 bytes) outweighs the whole
+1,536-byte budget”. The claim still holds; the number does not — it was the
+audit's count and the prompt has grown twice since (3,534, then 3,725 after the
+shared-writer sentence). Measured now: `system_prompt("/tmp/ws")` is **3,725
+bytes** against the 1,024-token window's 1,536-byte budget. Chosen: measure it in
+the test and leave the byte count out of the prose, rather than drop the
+parenthetical and leave the claim unpinned. A count written in prose is a
+sentence with no reader — this is the second time that one rotted — while the
+assertion below it fails the moment the claim stops being true: a prompt that
+shrank under the budget would make the doc's sentence false, and the test would
+say so first. The budget itself is untouched; the ten fixtures in `agent.rs`
+that spell the same old number (`Message::system("s".repeat(3_247))`) are H71 in
+the queue below.
+
+---
+
+## 8.101 The human's rulings this wave, and the gate that stopped hiding its failures
+
+**The orphan row stays at the top level, wearing `⚮`.** The ruling on §8.87's
+mark: a row whose parent the history window reaped keeps its place at the top
+level and its `⚮`, because *“it is the most honest and avoids a lot of other edge
+cases we couldn't possibly think of yet”*. The alternative the record had weighed
+— dropping the subtree with the parent — is refused, and `past_history`'s rule is
+unchanged: the window drops the oldest children, and what it drops is the parent
+link, not the row. So the mark stays the one place the tree says the nesting is
+broken, `AgentNode::depth` stays where the agent was spawned, and no row is
+hidden to keep the order tidy. The refusal has a cost the record names: a subtree
+dropped whole would have been self-consistent (no orphan ever exists), and the
+ruling chooses the honest inconsistency — a marked row — over a rule whose edge
+cases the human did not want to have to think through.
+
+**The `⚮` mark wears no ink.** Stated where the mark was discussed (§8.93): the
+human had read `⚮` as a selection mark, and ruled that it must wear no ink of its
+own — the accent's nine sites are the ones that *point* at whose window this is
+or where the keyboard is, and a severed-parent note is neither. The ink half was
+cancelled before a line landed; what stands is the row mark as §8.87 painted it,
+and the accent's list is the nine sites §8.91 and §8.93 count.
+
+**Documentation: generate the facts a machine can print, write the sentences,
+point at the code for the reasons.** The ruling is §8.96's, and the human's two
+sentences — *“cut the manual's restatements to a pointer please where possible”*
+and *“perhaps we could generate the docs from the code … that way the code stays
+its own manual”* — are that wave's whole brief. The root read them back as one
+rule and the manual's own top now carries it: a fact the code can print is a
+generated block checked by a test, a sentence a human reads is written, and a
+mechanism is a pointer at the module that owns it.
+
+**The gate runs under `set -o pipefail`, and the mistake that made it a rule.**
+The root's process change this wave: every gate command is run with `set -o
+pipefail`, because a pipe hides the exit status of everything but its last
+command. The mistake it caught: a `RUSTDOCFLAGS="-D warnings" cargo doc … |
+tail` reported the tail's success while the rustdoc run had already failed —
+**44 rustdoc errors** scrolled past unseen and the gate stayed green for an hour
+before the log was read (the root's account; §8.95 is the wave that took the
+same command from 49 errors to 0). With `pipefail` the pipeline's status is the
+failing command's, so the same command cannot report a pass it did not get. The
+record notes the shape rather than the incident only: every gate in this campaign
+is a pipeline — `… | tail`, the pty scenarios' captured output — and a gate that
+reads a tail without the exit status is a gate that lies in exactly the case it
+exists for.
+
+---
+
+## 8.102 The suite's flakes at `e73ed85`, and this record's gates
+
+**The list, re-read and added to at this base.** A flake is a test that fails
+without a defect behind it, and the record keeps them in one place so no wave
+spends a run telling one from a real failure. At `e73ed85`:
+
+- `agent::tests::the_worktree_cap_refuses_a_spawn_before_the_id_is_taken` —
+  **⬜ open, the wave's load flake.** The root saw it fail 2 of 5 runs alone
+  under load. It creates all 70 `git::MAX_WORKTREES` as real worktrees before it
+  starts the run it asserts on, and it waits on the test module's own `WAIT`
+  (5 s) with the machine already loaded by its own setup — so a loaded box can
+  outlast the wait before a defect exists. Never chase it.
+- `app::tests::a_resized_popup_is_rewrapped_not_clipped` — **✅ fixed in #139
+  (`c0b86bf`, §8.97).** It compared two readings of the wall clock (the note's
+  `0s`/`1s` lead read once at the resize's paint and again at the reopen's),
+  failing 1 in 300 runs alone; the comparison now strips the age lead, and
+  1,000 runs alone failed 0 times. It is off the list — no one should re-add it.
+- `machine::tests::a_start_reaps_a_dead_mushs_scratch` — **✅ fixed in #138
+  (`9bf3d28`, §8.99).** Two concurrent copies of the test wrote the same `/tmp`
+  names and one copy's cleanup deleted the other's fixture files (9 of 15 pairs
+  failed before; 0 of 15 after, every name now carrying its own process's pid).
+  Off the list.
+- `attach::tests::a_request_line_is_capped_and_a_client_is_reaped` — **named by
+  #120's own gate (`4136fc3`, §8.89)**, which recorded that it “lost a /tmp
+  socket to a sibling and passes alone”; carried here as that gate carried it
+  and not re-read.
+- `model::tests::a_cut_off_body_on_a_real_wire_is_final_and_asked_once` —
+  **observed red once at this base, under the loaded workspace suite**: it
+expected `the reply ended inside its chunked body` and got `Connection reset by
+  peer (os error 104)` — the test's own loopback endpoint losing its race under
+  another suite's load, since the test passes alone (0.4 s) and the same suite's
+  next run is green. Named here rather than chased; it is the same class as the
+  standing wall-clock shape below.
+
+**The standing shapes, unchanged.**
+`a_frame_fits_in_a_60fps_budget_on_a_long_transcript` is `#[ignore]`d because the
+16 ms budget needs an idle box (H6); the
+lock refusal's `open`/`flock` failure (ENOSPC/EMFILE) is an environment failure a
+bool assertion mis-blames on the lock (H58's residual); and the loaded-suite
+class H28 closed on its code side still stands on its timing side.
+
+**This record's gates at `e73ed85`.** On a clean tree (`docs/findings.md`'s
+append is the only change), every pipeline under `set -o pipefail`:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets -- -D warnings` — pass.
+- `cargo build --workspace` — pass.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` —
+  pass, exit 0 — #137's command, now a gate (§8.95, §8.101).
+- `cargo test --workspace` — red once (888 passed, 1 failed, 4 ignored) on the
+  real-wire flake above; `cargo test --workspace --no-fail-fast` — 889 passed +
+  282 passed, 4 ignored, 0 failed. The first run's failure aborted before
+  `mush-core`'s binary, which is why the second was run whole.
+- `python3 scripts/census.py` — **TOTAL 92,391 · blank 5,241 · comment 26,054 ·
+  tests 40,659 · prod 20,437** (§8.52's addendum carries the delta).
+- The three endpoint-free pty scenarios, one at a time, each in its own fixture
+  directory under `/tmp` — `python3 scripts/smoke.py target/debug/mush
+  /tmp/mush-142-resize --resize`, `… --cancel`, `… --sigterm` — pass.
+- And the schema measurement §8.89 quotes was taken through the code's own test:
+  `cargo test -p mush-core schemas_fit_the_budget_reserve -- --nocapture` prints
+  `root schemas: 5995 bytes`.
+
+The record changes no line under `crates/`: every number above is a command's
+output, and the sections are the commits' own bodies re-read at this base.
+
