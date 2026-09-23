@@ -423,6 +423,12 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// here, while the word `HEAD` is not (finding F9). Nothing about whose `HEAD`
 /// a base meant can be decided at this door.
 ///
+/// Whether the repository has a commit *at all* is asked before the base is
+/// used: a child needs a fork revision, and the repository that has none must
+/// refuse with the sentence written for that state rather than with git's own
+/// about whatever name was handed in (finding F16). The answer is one process,
+/// asked once, for both roads — with and without a base.
+///
 /// `dir` is the caller's workspace, and may be any directory *inside* a
 /// repository: git's own questions are answered from there and the checkout is
 /// made under it, so `mush crates/mush` gets `.mush/wt/<id>` below its own
@@ -447,14 +453,22 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
         Err(error) if error == GIT_UNAVAILABLE => return Err(error),
         Err(_) => return Err("not a git repository".to_string()),
     }
-    match (base, has_commits(dir)) {
-        (None, Some(false)) => {
+    // The question is "can a branch be made here at all", and its answer does
+    // not depend on which base was asked for: an isolated child needs *a*
+    // commit to fork from. The match this replaces asked it only when `base`
+    // was `None` — the one arm the production road never takes, because
+    // `spawn_tool` resolves the name first and always passes `Some` — and
+    // evaluated it in the other case only to throw the answer away (finding
+    // F16). Asking once, first, makes the sentence written for this case the
+    // one a human reads.
+    match has_commits(dir) {
+        Some(false) => {
             return Err("the repo has no commits yet — commit first or drop isolated".to_string())
         }
         // A missing git is not a missing commit, and saying so would send a
         // human looking for a `git commit` they cannot run either.
-        (None, None) => return Err(GIT_UNAVAILABLE.to_string()),
-        _ => {}
+        None => return Err(GIT_UNAVAILABLE.to_string()),
+        Some(true) => {}
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
@@ -1233,10 +1247,46 @@ mod tests {
             worktree_add(&unborn, 7, None).unwrap_err(),
             "the repo has no commits yet — commit first or drop isolated"
         );
-        // With a base branch named, the refusal is git's own.
-        assert!(worktree_add(&unborn, 7, Some("HEAD")).is_err());
+        // With a base revision named, the refusal is the same: the
+        // repository's question outranks the base's name, so the human reads
+        // the sentence written for this case and not git's own about the
+        // revision (finding F16).
+        assert_eq!(
+            worktree_add(&unborn, 7, Some("HEAD")).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
         let _ = fs::remove_dir_all(&unborn);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A repository with no commit refuses *a base spawn too* with the sentence
+    /// written for it, and spends no process on resolving a base that could not
+    /// exist: the gate is the repository's own state, asked before git is made
+    /// to look at the name (finding F16). The production road
+    /// (`spawn_tool`) still resolves the name before calling here, which is the
+    /// residual this fix cannot reach from `git.rs` alone.
+    #[test]
+    fn a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason() {
+        let unborn =
+            std::env::temp_dir().join(format!("mush-git-unborn-base-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&unborn);
+        fs::create_dir_all(&unborn).unwrap();
+        run(&unborn, &["init", "-q"]).unwrap();
+        assert_eq!(has_commits(&unborn), Some(false));
+
+        assert_eq!(
+            worktree_add(&unborn, 9, Some("HEAD")).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
+        assert_eq!(
+            worktree_add(&unborn, 9, None).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
+        assert!(
+            !unborn.join(".mush").exists(),
+            "and nothing was made before the refusal"
+        );
+        let _ = fs::remove_dir_all(&unborn);
     }
 
     /// A put-away commit carries its own identity and its own answer to
