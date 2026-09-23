@@ -597,7 +597,7 @@ ledger that outlives it; the review subsection each row came from is where the
 evidence's commit is named, and a price re-set by a later review says so (the
 sixth review, after the `Screen` rewrite, re-priced `D9` and `R9`).
 
-The census the reviews read, and the tree this ledger anchors to, measured at
+The census the reviews read — the tree this ledger then anchored to — measured at
 `b8d8baa`: 42 394 lines (prod 11 543, tests 17 943, comments 10 153) — from the
 `960e073` baseline it was seeded with, 41 416 (prod 11 800, tests 17 299, comments
 9 635; `findings.md` §8.19), so prod −257 / tests +644 / comments +518.
@@ -609,9 +609,13 @@ The four blind passes below (the seventh through tenth reviews) read production
 code only, each in its own currency: 2 644 code lines in the pane and the text it
 wraps, ~4 600 production lines in the store's fifteen files, 4 865 non-test code
 lines in the actor's nine, 4 800 code lines in the app and its panes. The tree
-those rows were checked against at entry, and this ledger's new anchor, measured
-at `38d0438`: 79 208 lines — prod 18 232, tests 34 663, comments 21 708, blank 4 605
-(`scripts/census.py`). The `b8d8baa` sentence above is left as it stands: it is
+those rows were checked against at entry, measured at `38d0438`: 79 208 lines —
+prod 18 232, tests 34 663, comments 21 708, blank 4 605 (`scripts/census.py`).
+That sentence is kept as it stood: it is the census the four passes' rows were
+checked against at entry, not a number to be overwritten. This ledger's anchor is
+now `7338d81`: 86 623 lines — prod 19 092, tests 38 164, comments 24 395, blank
+4 972 (`scripts/census.py`) — prod +860 / tests +3 501 / comments +2 687 / blank
++367 over `38d0438`. The `b8d8baa` sentence above is left as it stands: it is
 the census the reviews before these read, not a number to be overwritten, and the
 rows below say where a later wave re-priced one of them (`1e07c2e`).
 
