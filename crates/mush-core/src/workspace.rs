@@ -899,6 +899,19 @@ impl Workspace {
     /// string that cannot match. The range is named once, in the trailing
     /// sentence.
     ///
+    /// The window's lines are a *reader's* lines: [`str::lines`] drops the
+    /// `\r` of a CRLF ending, so what is copied out of a CRLF file's window is
+    /// a line's text, never its bytes. That is said rather than hidden — a file
+    /// whose lines all end with CRLF gets a sentence saying so, and [`edit`]
+    /// refuses an edit whose strings hold a line break or a `\r` in such a
+    /// file: a single-line edit lands byte for byte, and the road for anything
+    /// across lines is `run_command` (`sed -i`, `perl -pi`) or `write_file`
+    /// (finding B7). The two used to be silent and disagreed — a copied
+    /// multi-line `old_string` could never match, and a one-line edit that did
+    /// match inserted LF lines into the CRLF file.
+    ///
+    /// [`edit`]: crate::tools::edit_text
+    ///
     /// The cap is the same whole-read cap as everywhere else ([`READ_FILE_CAP`],
     /// checked from the stat by [`Self::whole_read`] before a byte is read): this
     /// road cannot get past it, and the refusal is [`over_read_cap`]'s one
@@ -957,6 +970,14 @@ impl Workspace {
         }
         let last = offset + shown.len() - 1;
         let mut out = shown.join("\n");
+        if text::is_crlf(&text) {
+            out.push_str(
+                "\n[mush: the file's lines end with CRLF — the \\r is not shown in a line; an \
+                 edit whose old_string or new_string holds a line break or a \\r is refused, a \
+                 line's own text still edits exactly, and run_command (`sed -i`, `perl -pi`) or \
+                 write_file is the road for anything across lines]",
+            );
+        }
         if part {
             out.push_str(&format!(
                 "\n[mush: line {offset} of {total} is longer than the {cap}-byte cap — shown in \
@@ -3481,6 +3502,74 @@ mod tests {
         let long = "x".repeat(64 * 1024);
         ws.write_file("long.txt", &long).unwrap();
         assert_eq!(ws.read_file("long.txt").unwrap(), long);
+    }
+
+    /// A CRLF file's window and its edit road tell one story: the window says
+    /// the file's lines end with CRLF, because a line's *text* is not the
+    /// file's bytes when an ending is there; an edit inside one line lands and
+    /// leaves every ending alone; and an edit that spells a line break — the
+    /// copy that could never match, or the `new_string` that would insert LF
+    /// lines — is refused in words, naming the endings and the road that
+    /// changes them (finding B7).
+    #[test]
+    fn a_crlf_file_is_read_and_edited_consistently() {
+        let ws = temp_workspace("crlf-edit");
+        fs::write(ws.root().join("win.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+        let window = ws.read_window("win.txt", 1, 10, 4_000).unwrap();
+        assert!(
+            window.contains("CRLF"),
+            "the read says the file's line endings: {window:?}"
+        );
+
+        // A line's own text — what the window shows — is exactly what the edit
+        // road matches, and the file's other endings are untouched.
+        let edited = crate::tools::edit_text(
+            &ws.read_file("win.txt").unwrap(),
+            "gamma",
+            "delta",
+            false,
+            "win.txt",
+        )
+        .unwrap();
+        assert_eq!(edited, "alpha\r\nbeta\r\ndelta\r\n");
+        ws.write_file("win.txt", &edited).unwrap();
+        assert_eq!(
+            fs::read(ws.root().join("win.txt")).unwrap(),
+            b"alpha\r\nbeta\r\ndelta\r\n",
+            "the one-line edit left every CRLF standing"
+        );
+
+        // The copy the window used to invite: two of its lines, which is an
+        // `old_string` the file's bytes can never hold. The refusal names the
+        // line endings and the road that still does the work.
+        let refused = crate::tools::edit_text(&edited, "alpha\nbeta", "one\ntwo", false, "win.txt")
+            .unwrap_err();
+        assert!(refused.contains("CRLF"), "{refused}");
+        assert!(refused.contains("run_command"), "{refused}");
+
+        // And the one-line edit whose `new_string` would insert LF lines into
+        // the CRLF file is refused for the same reason, as is an edit that
+        // spells the ending itself.
+        for (old, new) in [("alpha", "A\nB"), ("alpha\r", "x"), ("alpha", "x\r")] {
+            let refused = crate::tools::edit_text(&edited, old, new, false, "win.txt").unwrap_err();
+            assert!(refused.contains("CRLF"), "{old:?} -> {new:?}: {refused}");
+        }
+
+        // The read still says so after the edit, and the window of a *mixed*
+        // file says nothing: its bytes can be edited exactly, and are.
+        assert!(ws
+            .read_window("win.txt", 1, 10, 4_000)
+            .unwrap()
+            .contains("CRLF"));
+        fs::write(ws.root().join("mixed.txt"), "a\nb\r\nc\n").unwrap();
+        let mixed = ws.read_window("mixed.txt", 1, 10, 4_000).unwrap();
+        assert!(!mixed.contains("CRLF"), "{mixed}");
+        assert_eq!(
+            crate::tools::edit_text("a\nb\r\nc\n", "a\nb", "A\nB", false, "mixed.txt").unwrap(),
+            "A\nB\r\nc\n"
+        );
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// The edit road's decode is strict: a non-UTF-8 file is refused with the

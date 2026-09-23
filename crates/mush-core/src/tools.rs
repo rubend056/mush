@@ -9,6 +9,8 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::text;
+
 /// Every tool the model may call.
 ///
 /// Ten, and the count has a history worth keeping. Six of them were a *cut*:
@@ -238,6 +240,21 @@ pub fn edits_arg(args: &Value) -> Result<Vec<Edit>, String> {
 /// when `replace_all` is set, which is the same promise a batch entry's flag
 /// makes. Refusing to guess is the point — a missing or ambiguous match is an
 /// error the model can correct, and a wrong edit is impossible.
+///
+/// A file whose lines all end with CRLF is edited by its own bytes or not at
+/// all. [`Workspace::read_window`] does not show the `\r` (it is an ending, not
+/// a line's text), so an edit that spells a line break — or a `\r` — cannot be
+/// trusted to be the file's own ending: a bare-LF `old_string` copied from the
+/// window could never match, and a `new_string` holding one would land LF lines
+/// inside a CRLF file, which `git diff` shows as a whole-file change the next
+/// time anything normalizes the endings. So an edit whose `old` or `new` holds
+/// `\n` or `\r` is refused in words on such a file, naming the endings and the
+/// roads that can do the work (`run_command`, `write_file`); an edit that stays
+/// inside a line lands byte for byte and touches no ending (finding B7). A
+/// *mixed* file is not a CRLF file and is left to the byte-exact rule — see
+/// [`crate::text::is_crlf`].
+///
+/// [`Workspace::read_window`]: crate::workspace::Workspace::read_window
 pub fn edit_text(
     current: &str,
     old: &str,
@@ -286,6 +303,18 @@ fn apply_one(
     };
     if old.is_empty() {
         return Err(format!("{at}old_string must not be empty"));
+    }
+    // Why a CRLF file refuses a line-crossing edit is [`edit_text`]'s doc; the
+    // check is here because this is where `current` and both strings are in
+    // hand. It comes before the match count so the model is told the real
+    // reason instead of "old_string not found" — a bare-LF `old` can never
+    // match a file that has none (finding B7).
+    if text::is_crlf(current) && (old.contains(['\n', '\r']) || new.contains(['\n', '\r'])) {
+        return Err(format!(
+            "{at}{rel}'s lines end with CRLF — an old_string or new_string holding a line break \
+             or a \\r cannot be applied; a line's own text edits exactly, and run_command \
+             (`sed -i`, `perl -pi`) or write_file is the road for anything across lines"
+        ));
     }
     match current.matches(old).count() {
         0 => Err(format!("{at}old_string not found in {rel}")),

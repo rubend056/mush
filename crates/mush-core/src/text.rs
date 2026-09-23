@@ -56,6 +56,27 @@ fn invisible(ch: char) -> bool {
     ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Whether `text` holds a `\n` that is not the second byte of a `\r\n`.
+fn has_bare_lf(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(index, &byte)| byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+}
+
+/// Whether `text`'s lines all end with CRLF and there is at least one: a CRLF
+/// file.
+///
+/// A *mixed* file (one bare LF anywhere) is not one: an edit into it can be
+/// byte-exact, and calling it a CRLF file would refuse work the bytes allow.
+/// The two roads that must not guess are the window, which says a CRLF file's
+/// ending out loud, and the edit, which refuses an edit that would insert an
+/// ending the file does not use (finding B7).
+pub fn is_crlf(text: &str) -> bool {
+    text.contains("\r\n") && !has_bare_lf(text)
+}
+
 /// Consume one escape sequence, whole.
 ///
 /// `ESC` introduces CSI (`ESC [ parameters intermediates final`), OSC (`ESC ] …
