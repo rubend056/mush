@@ -36,9 +36,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// every phase of it is bounded by the smaller of its own ceiling and what is
 /// left, so a stalled lookup, connect or write cannot extend it either.
 const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one socket read waits before the reader checks for a cancellation.
-/// Short enough that a Stop lands promptly, long enough that a silent endpoint
-/// costs a handful of wake-ups per second, not a spin.
+/// How long one socket read waits before the watch is consulted — and, since a
+/// stalled handshake write cannot be told from a read waiting for the peer's
+/// next flight, the slice the TLS handshake is driven in. Short enough that a
+/// Stop lands promptly, long enough that a silent endpoint costs a handful of
+/// wake-ups per second, not a spin.
 const READ_SLICE: Duration = Duration::from_millis(200);
 /// The ceiling on one blocked write: a request body is small, and a write that
 /// blocks this long is a dead endpoint. A *ceiling*, not a schedule — the write
@@ -622,8 +624,9 @@ fn flush_bounded(out: &mut dyn ReadWrite, watch: &Watch) -> io::Result<()> {
 /// everything an attempt does — the name lookup, the connect, the write, every
 /// read — must fit inside what it was handed. So each phase takes the *smaller*
 /// of its own ceiling ([`CONNECT_TIMEOUT`], [`WRITE_TIMEOUT`],
-/// [`RESOLVE_TIMEOUT`]; [`READ_SLICE`] is polled between reads inside the
-/// deadline) and [`left`](Self::left), and a phase that runs out of the budget
+/// [`RESOLVE_TIMEOUT`]; [`READ_SLICE`] is polled between reads, and between the
+/// TLS handshake's slices, inside the deadline) and [`left`](Self::left), and a
+/// phase that runs out of the budget
 /// says so through [`spend`](Self::spend) — the sentence the deadline itself
 /// uses, so `model.rs` classifies it as the deadline it already is and never as
 /// a wire failure it may ask again. A phase that kept its own schedule instead
@@ -750,10 +753,11 @@ fn is_timeout(error: &io::Error) -> bool {
 /// in a moment instead of being retried around the signal.
 ///
 /// `watch` is the call behind the operation — the request's reads and writes,
-/// the connect, and the name-lookup wait all carry it, so a Stop or a spent
-/// deadline is returned as itself rather than retried after. Only a call with
-/// no request behind it at all passes `None`: the lookup that runs on the
-/// resolver's own thread, where there is no flag to read.
+/// the connect and its TLS handshake, and the name-lookup wait all carry it —
+/// so a Stop or a spent deadline is returned as itself rather than retried
+/// after. Only a call with no request behind it at all passes `None`: the
+/// lookup that runs on the resolver's own thread, where there is no flag to
+/// read.
 fn retrying_interrupted<T>(
     watch: Option<&Watch>,
     mut operation: impl FnMut() -> io::Result<T>,
@@ -894,11 +898,13 @@ fn body_too_large() -> io::Error {
 
 /// Connect to the endpoint. Every step here is bounded by the *call's* deadline
 /// before its own ceiling: the name lookup by [`RESOLVE_TIMEOUT`], the TCP
-/// connect by [`CONNECT_TIMEOUT`], the TLS handshake by what is left, and every
-/// read by [`READ_SLICE`] with the watch between the slices. [`Watch`] owns the
-/// deadline the phases share, and a phase that runs out of it answers in the
-/// watch's own voice — never as a wire failure (finding A19; finding A2's one
-/// deadline).
+/// connect by [`CONNECT_TIMEOUT`], and the reads and the TLS handshake by
+/// [`READ_SLICE`] with the watch between the slices — the handshake's only
+/// ceiling is what is left of the call, because a stalled handshake write and a
+/// read waiting for the peer cannot be told apart (see [`tls_connect`]).
+/// [`Watch`] owns the deadline the phases share, and a phase that runs out of it
+/// answers in the watch's own voice — never as a wire failure (finding A19;
+/// finding A2's one deadline).
 fn connect(host: &str, port: u16, tls: bool, watch: &Watch<'_>) -> io::Result<Box<dyn ReadWrite>> {
     let mut last_error = None;
     // The lookup is the call's first phase: `resolve_bounded` ends its wait at
@@ -941,21 +947,26 @@ fn connect(host: &str, port: u16, tls: bool, watch: &Watch<'_>) -> io::Result<Bo
         if left.is_zero() {
             return Err(watch.spend());
         }
-        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(left)))?;
         if tls {
-            // A TLS handshake is a conversation, not a read, so during setup it
-            // gets the whole remainder; only the reads after it get the short
-            // slice that lets a cancellation land while the model thinks. A
-            // handshake that spends the remainder is the call being over.
-            stream.set_read_timeout(Some(left))?;
-            let stream = match tls_connect(host, stream) {
-                Ok(stream) => stream,
-                Err(error) if is_timeout(&error) => return Err(watch.spend()),
-                Err(error) => return Err(error),
-            };
+            // A TLS handshake is a conversation, not a read: a write stalled
+            // mid-handshake cannot be told from a read waiting for the peer's
+            // next flight, so the phase gets no separate [`WRITE_TIMEOUT`]
+            // ceiling of its own. Both directions are sliced at [`READ_SLICE`],
+            // with the watch asked between slices ([`tls_connect`]), which
+            // makes what is left of the call the phase's only ceiling: a Stop
+            // lands within one slice, and a timeout is either a slice or the
+            // deadline itself — never the write ceiling spoken in the
+            // deadline's voice.
+            stream.set_read_timeout(Some(READ_SLICE))?;
+            stream.set_write_timeout(Some(READ_SLICE))?;
+            let stream = tls_connect(host, stream, watch)?;
+            // The reads that follow still wake every slice; the request's own
+            // writes take their bound per syscall from the write phase, so the
+            // handshake's slice is not a ceiling the request inherits.
             stream.sock.set_read_timeout(Some(READ_SLICE))?;
             return Ok(Box::new(stream));
         }
+        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(left)))?;
         stream.set_read_timeout(Some(READ_SLICE))?;
         return Ok(Box::new(stream));
     }
@@ -1042,9 +1053,21 @@ fn resolve_bounded(
 /// Wrap a TCP connection in TLS for `https://` endpoints, verifying against
 /// the standard web PKI roots. The handshake is driven here so request errors
 /// surface before any body is written.
+///
+/// It is driven in [`READ_SLICE`] slices, with both socket timeouts at that
+/// slice for the phase ([`connect`] sets them), and the watch asked before
+/// every attempt. A handshake gets no separate [`WRITE_TIMEOUT`] ceiling of its
+/// own — a write stalled mid-handshake cannot be told from a read waiting for
+/// the peer's next flight — so the phase's own ceiling is what is left of the
+/// call, the watch owns it, and a Stop lands within one slice (audit IN11). A
+/// timeout is therefore either a slice ending, asked again because rustls keeps
+/// the handshake state when `complete_io` answers the underlying `WouldBlock`,
+/// or the deadline itself, which the watch answers as its own. Never is it
+/// [`WRITE_TIMEOUT`] spoken in the deadline's voice, as the old single arm did.
 fn tls_connect(
     host: &str,
     tcp: TcpStream,
+    watch: &Watch<'_>,
 ) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1060,8 +1083,22 @@ fn tls_connect(
     // This drives the handshake, both directions of it. A signal landing in the
     // middle of one leaves rustls exactly where it was, so the way to finish it
     // is to ask again — and the way to lose a healthy endpoint is to report
-    // `EINTR` as a bad TLS host instead.
-    retrying_interrupted(None, || stream.flush())?; // completes the handshake
+    // `EINTR` as a bad TLS host instead. A slice ending in a read or write
+    // timeout leaves that same state: ask again while the call has room, and
+    // let the watch end the phase when it has none — a Stop lands within one
+    // slice, and a spent deadline answers in the deadline's own voice.
+    loop {
+        watch.check()?;
+        match retrying_interrupted(Some(watch), || stream.flush()) {
+            Ok(()) => break,
+            Err(error) if is_timeout(&error) => {
+                if watch.at_deadline() {
+                    return Err(watch.spend());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
     Ok(stream)
 }
 
@@ -1485,6 +1522,49 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(250),
             "returned before the cancel was asked for: {elapsed:?}"
+        );
+    }
+
+    /// A Stop has to reach a TLS handshake too. The handshake used to carry no
+    /// watch and to run with the socket's read timeout set to the whole
+    /// remaining call, so the flag was consulted only when that timeout fired —
+    /// up to the ten-minute deadline. The phase is sliced at [`READ_SLICE`]
+    /// now, with the watch asked between slices, so a Stop lands within a slice
+    /// and the call answers `request cancelled` (audit IN11).
+    #[test]
+    fn a_cancelled_tls_handshake_stops_within_a_slice() {
+        use std::net::TcpListener;
+
+        // A peer that accepts the TCP connection and then says nothing: the
+        // ClientHello goes out and no ServerHello ever comes back.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((connection, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(connection);
+            }
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let watch = Watch::new(Some(&cancel), Duration::from_secs(3), clock::system());
+        let started = Instant::now();
+        let error = match connect("127.0.0.1", port, true, &watch) {
+            Ok(_) => panic!("a silent peer is not a finished handshake"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert_eq!(error.to_string(), "request cancelled", "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the Stop waited out the socket's own timeout: {elapsed:?}"
         );
     }
 
