@@ -5,9 +5,14 @@
 //! "does not panic" (refactor B17).
 //!
 //! Every colour lives here, and every colour is one of two kinds. The *chrome*
-//! — the focused border, the selected row, the picker's frame, the message
-//! prompt, the bar's badge and an activity line — wears the workspace's
-//! [`Theme`] accent, so two windows are told apart at a glance.
+//! wears the workspace's [`Theme`] accent — so two windows are told apart at a
+//! glance — and the hue only ever *points*: at whose window this is, or at
+//! where the keyboard is, never at what happened. This is the whole list: the
+//! focused border, the bar's badge, the message prompt, the picker's frame,
+//! the selected row of whichever list is acting for the keyboard (the agent
+//! tree's — a band while that pane has the keyboard, the hue as the row's own
+//! ink while the chat does — and the picker's), the transcript select mode's
+//! cursor band and its selection, and an activity line.
 //! The *content* — dimmed text, the alert red, the floor notice's yellow, the
 //! body gray — stays fixed: a failure reads the same in every workspace.
 
