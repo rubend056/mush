@@ -265,6 +265,9 @@ pub struct Session {
     /// A context window the human stated for this workspace (`/context`, or a
     /// `MUSH_CONTEXT` at the time). Derived windows are never stored: they are
     /// re-read from the endpoint, so a stale guess cannot outlive its cause.
+    /// `/context auto` is the road back from a stored statement: the window
+    /// re-derives from the model table, the next save writes this field away,
+    /// and a restart reads no statement at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
     pub messages: Vec<Message>,

@@ -654,6 +654,22 @@ impl Config {
         self.context_source = WindowSource::Stated;
     }
 
+    /// Forget the window the human stated, and derive one again: `/context
+    /// auto`'s write, and the road back from a statement a workspace would
+    /// otherwise carry forever.
+    ///
+    /// The road is dropped to [`WindowSource::Table`] *before*
+    /// [`Self::rederive_context`] is asked for a number: it leaves a window the
+    /// human stated alone — a model change must not overrule one — so the
+    /// statement has to be given up first, not after. Nothing else is owed for
+    /// the forgetting to stick: the session stores a window only while
+    /// [`Self::context_explicit`] is true, so the next save drops the field and
+    /// a restart derives the same number again.
+    pub fn forget_context(&mut self) {
+        self.context_source = WindowSource::Table;
+        self.rederive_context();
+    }
+
     /// The one cap on the text a tool result may carry — a command's output, a
     /// file read, a listing, a search. It scales with the window like a read
     /// did: the room a cut leaves between its stopping point and the ceiling

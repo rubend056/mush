@@ -3186,6 +3186,23 @@ impl App {
                     self.cfg().context_source.words()
                 ));
             }
+            Command::Context(ContextArg::Auto) => {
+                // Drop the statement and derive a window again; the order is
+                // `forget_context`'s, and it matters — `rederive_context`
+                // leaves a window the human stated alone.
+                self.cell.edit(|cfg| cfg.forget_context());
+                // The *stored* statement has to go with it, or the next start
+                // would read the number back as a statement — the trap this
+                // command is the road back from. The snapshot writes `context`
+                // only while the road is Stated ([`Self::session_snapshot`]),
+                // so the flush is what writes the field away.
+                self.flush_session();
+                self.say(format!(
+                    "{} · {} — the statement is forgotten",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
+            }
         }
         // A command is a transition the human drove: whatever they asked for
         // may have changed the workspace, and the bar they read next should
@@ -13416,6 +13433,52 @@ mod tests {
             resolved.context_explicit(),
             "a stored statement is a statement, not a guess"
         );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/context auto` is the road back from the trap: a workspace that
+    /// remembers a number forever. The statement is dropped, the window
+    /// re-derives from the model table, and the *stored* statement goes with
+    /// it — the session writes `context` only while the road is Stated, so the
+    /// next start derives the table's window instead of reading the number back
+    /// as a statement.
+    #[test]
+    fn context_auto_returns_the_workspace_to_the_derived_window_and_forgets_the_statement() {
+        let root = dir("context-auto");
+        let (mut app, _writer) = app_writing(&root);
+        run(&mut app, "/context 32000");
+        assert_eq!(
+            Session::load(&root).expect("the statement flushed").context,
+            Some(32_000),
+            "the trap the auto road is walked back from"
+        );
+
+        run(&mut app, "/context auto");
+
+        assert_eq!(
+            app.cfg().context_tokens,
+            8_192,
+            "the model has no documented window, so the table's fallback stands"
+        );
+        assert_eq!(app.cfg().context_source, WindowSource::Table);
+        assert_eq!(
+            text_of(&app),
+            "ctx ~8.2k · assumed from mush's model table — the statement is forgotten"
+        );
+
+        let stored = Session::load(&root).expect("the forgetting flushed");
+        assert_eq!(
+            stored.context, None,
+            "the stored statement is gone, not left to be re-applied"
+        );
+        let resolved = resolved_from_session(&stored);
+        assert_eq!(resolved.context_tokens, 8_192, "a restart derives it again");
+        assert!(
+            !resolved.context_explicit(),
+            "and reads no statement into the fresh process"
+        );
+        assert_eq!(resolved.context_source, WindowSource::Table);
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
     }

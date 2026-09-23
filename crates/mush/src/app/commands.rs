@@ -25,7 +25,7 @@
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
-//! | `/context [N]` | optional, a positive count | say the window and its road, or state one |
+//! | `/context [N|auto]` | optional | say the window and its road, state one, or re-derive |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read every note about the focused agent |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
@@ -82,6 +82,9 @@ pub enum ContextArg {
     /// number reader `--context`, `MUSH_CONTEXT` and this command share, so
     /// one typo cannot be answered two ways by three doors.
     State(usize),
+    /// `auto`: drop this workspace's statement, and derive the window from the
+    /// model table again.
+    Auto,
 }
 
 /// Why a typed line is not a command to run.
@@ -168,8 +171,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "/context",
         aliases: &[],
-        args: "[N]",
-        help: "say the window's size and road, or state one for this workspace",
+        args: "[N|auto]",
+        help: "say the window's size and road, state one, or auto for the table",
     },
     Spec {
         name: "/compact",
@@ -266,6 +269,11 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/model" => Command::Model,
         "/models" => Command::Models,
         "/context" if argument.is_empty() => Command::Context(ContextArg::Report),
+        // `auto` is a word rather than a number, read letter-blind the way
+        // `--thinking on` and `/provider` read theirs, so `AUTO` is the same
+        // ask; a word mush does not know falls to the number reader's refusal
+        // (which names the road) instead of being guessed at.
+        "/context" if argument.eq_ignore_ascii_case("auto") => Command::Context(ContextArg::Auto),
         // The number is read by the one reader `--context` and `MUSH_CONTEXT`
         // use: a value that does not read is refused with the sentence naming
         // the road that carried it, and the arm carries out a typed value
@@ -458,6 +466,15 @@ mod tests {
         assert_eq!(
             parse_command("/context 32768"),
             Ok(Command::Context(ContextArg::State(32_768)))
+        );
+        assert_eq!(
+            parse_command("/context auto"),
+            Ok(Command::Context(ContextArg::Auto))
+        );
+        assert_eq!(
+            parse_command("/context AUTO"),
+            Ok(Command::Context(ContextArg::Auto)),
+            "a word is read letter-blind, as /provider's and --thinking's are"
         );
     }
 
