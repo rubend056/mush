@@ -15512,9 +15512,10 @@ mod tests {
     }
 
     /// The indent a row wears is the nesting the pane *paints*, not the depth
-    /// the agent was spawned at: [`AgentTree::rows`] has always ordered a
-    /// parentless row at the top level, so a child whose parent was reaped must
-    /// not keep an indent over a row it no longer sits under (finding D9).
+    /// the agent was spawned at: [`AgentTree::rows`] hangs a row whose parent
+    /// is gone under its nearest surviving ancestor, so a child whose parent
+    /// was reaped must not keep an indent over a row it no longer sits under
+    /// (finding D9).
     ///
     /// The audit's probe read `"│     ✓ #2 2  done"` — five columns of indent
     /// with no `#1` row anywhere above it — where the painted order had one
@@ -15556,8 +15557,8 @@ mod tests {
         );
         let orphaned = row(&mut app);
         assert!(
-            orphaned.starts_with(" ✓ #2 ⚮ 2  done"),
-            "a row whose parent is gone is painted at the top level and says so: {orphaned:?}"
+            orphaned.starts_with("   ✓ #2 ⚮ 2  done"),
+            "a row whose parent is gone is painted under the root and says so: {orphaned:?}"
         );
     }
 

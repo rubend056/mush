@@ -422,7 +422,7 @@ pub struct AgentNode {
     /// Where this agent was *spawned*: the depth its system prompt is written
     /// against, and the `MAX_DEPTH` spawn limit reads it (`agent.rs`). It is not
     /// the indent its row wears — a node whose parent is no longer in the tree
-    /// is painted as a top-level row, and the indent comes from
+    /// hangs under its nearest surviving ancestor, and the indent comes from
     /// [`AgentTree::painted_depth`] (finding D9).
     pub depth: usize,
     pub brief: String,
@@ -695,6 +695,17 @@ pub struct AgentTree {
     /// its owner's jobs from the one registry (so the badge cannot disagree
     /// with the machine), and quitting kills them through it.
     jobs: Arc<jobs::Registry>,
+    /// Each id the tree has forgotten ↦ the id it hung under — kept only while
+    /// a surviving row's chain still needs it.
+    ///
+    /// [`Self::reap`] drops a node whole, so without this a grandchild whose
+    /// parent was dropped could never be placed under its still-living
+    /// grandparent: the link that says where the forgotten node sat is that
+    /// node's own `parent`, and the node is gone. Exactly that one link is
+    /// kept, nothing else about the forgotten — and [`Self::prune_forgotten`]
+    /// rebuilds the needed set from the surviving rows' own chains, so this map
+    /// cannot grow without bound.
+    forgotten: HashMap<AgentId, AgentId>,
 }
 
 impl AgentTree {
@@ -748,6 +759,7 @@ impl AgentTree {
             live,
             conversation,
             jobs,
+            forgotten: HashMap::new(),
         };
         tree.agents.push(AgentNode {
             id: AgentId::ROOT,
@@ -1362,8 +1374,10 @@ impl AgentTree {
     /// Nothing kept hangs under any of these rows ([`Self::reapable`]), so a row
     /// that goes never takes a reader with it. Its own eligible children do
     /// stay — a node does not inherit its parent's age — and a link to a parent
-    /// that is not in the tree is a top-level row in the painted order
-    /// ([`Self::rows`]), so a forgotten parent can never hide a child.
+    /// that is not in the tree hangs under the row's nearest surviving ancestor
+    /// ([`Self::rows`]), so a forgotten parent can never hide a child. What this
+    /// window drops is the *link*, never the row: the memory
+    /// ([`Self::forgotten`]) is what lets a surviving row keep its place.
     pub fn past_history(&self) -> Vec<AgentId> {
         let jobs_live = self.live_job_count() > 0;
         // One walk for the whole question "is anything below this node owed
@@ -1559,6 +1573,10 @@ impl AgentTree {
     /// reaping used to leave them on a ghost, so the pane stayed titled
     /// `agent #4` while typing reported that the agent was gone (finding B11).
     ///
+    /// The link each dropped node hung under is remembered ([`Self::forgotten`])
+    /// for exactly as long as a surviving row's chain walks through it, so a
+    /// grandchild can still hang under the grandparent the tree kept.
+    ///
     /// The cursor is a *node*, not the index it sat at: [`Self::past_history`]
     /// drops the oldest rows, which are the rows *above* the cursor, so a cursor
     /// held by index silently slides onto a different agent with no keystroke —
@@ -1571,7 +1589,25 @@ impl AgentTree {
             return;
         }
         let named = self.cursor_id();
+        // The link each dropped node hung under, captured before the retain:
+        // the nodes are gone after it, and a surviving row whose chain runs
+        // through one of them needs the link to land on a row
+        // ([`Self::nearest_surviving_ancestor`]).
+        let dropped: Vec<(AgentId, Option<AgentId>)> = self
+            .agents
+            .iter()
+            .filter(|node| gone.contains(&node.id))
+            .map(|node| (node.id, node.parent))
+            .collect();
         self.agents.retain(|node| !gone.contains(&node.id));
+        for (id, parent) in dropped {
+            if let Some(parent) = parent {
+                self.forgotten.insert(id, parent);
+            }
+        }
+        // Only the links a surviving row's chain still walks are worth keeping:
+        // this is a road to a row, not an archive of everything dropped.
+        self.prune_forgotten();
         for id in gone {
             // Dropping the last sender ends the actor: an idle agent whose
             // mailbox is gone has nothing left to wait for.
@@ -1587,6 +1623,34 @@ impl AgentTree {
         }
     }
 
+    /// Keep only the forgotten links a surviving row's chain still walks
+    /// through, so [`Self::forgotten`] cannot grow with every id the window has
+    /// ever dropped.
+    ///
+    /// Rebuilt, not trimmed: the ids to keep are exactly the ones some
+    /// surviving node's dangling chain passes through, walked the way
+    /// [`Self::nearest_surviving_ancestor`] walks it — and bounded the same way,
+    /// so a stored link that points back up its own line cannot make this a
+    /// hung frame either.
+    fn prune_forgotten(&mut self) {
+        let mut needed: HashSet<AgentId> = HashSet::new();
+        for node in &self.agents {
+            let mut link = node.parent;
+            for _ in 0..=self.agents.len() {
+                let Some(id) = link else { break };
+                if self.has(id) {
+                    break;
+                }
+                let Some(parent) = self.forgotten.get(&id).copied() else {
+                    break;
+                };
+                needed.insert(id);
+                link = Some(parent);
+            }
+        }
+        self.forgotten.retain(|id, _| needed.contains(id));
+    }
+
     /// Point the focus and the cursor at nodes that exist.
     pub fn repair_focus(&mut self) {
         if !self.has(self.focused) {
@@ -1596,15 +1660,18 @@ impl AgentTree {
     }
 
     /// The tree's rows, in the order the pane paints them: pre-order over the
-    /// parent links, so every child sits directly under its parent — above that
-    /// parent's later siblings — and its own children under it (finding U4).
+    /// *painted* parent links ([`Self::painted_parent`]), so every child sits
+    /// directly under its parent — above that parent's later siblings — and its
+    /// own children under it (finding U4).
     ///
     /// Derived on read rather than stored beside `agents`: that vector is spawn
     /// order (it is the order things happened, and the order a stored session
     /// keeps), and a second copy of "the order" is one more thing that can
-    /// disagree with the tree the human is looking at. A node whose parent is
-    /// not in the tree — a leftover worktree, an agent whose parent was reaped
-    /// — is a top-level row, so a broken link can never hide an agent.
+    /// disagree with the tree the human is looking at. The root is the only
+    /// seed — it is the one node [`Self::painted_parent`] answers `None` for —
+    /// and every other row hangs under its nearest surviving ancestor, in spawn
+    /// order among that ancestor's children. A broken link therefore neither
+    /// hides an agent nor puts a second top-level actor beside the root.
     ///
     /// The walk marks a node painted by its *place* in `agents`, never by its
     /// id: a stored session can hold two rows of one id (the restore's refusal
@@ -1616,7 +1683,7 @@ impl AgentTree {
         let mut rows = Vec::with_capacity(self.agents.len());
         let mut seen = vec![false; self.agents.len()];
         for (index, node) in self.agents.iter().enumerate() {
-            if self.parent_in_tree(node).is_none() {
+            if self.painted_parent(node).is_none() {
                 self.grow(index, &mut rows, &mut seen);
             }
         }
@@ -1643,21 +1710,56 @@ impl AgentTree {
         self.rows().len()
     }
 
-    /// The parent this node hangs under, when that parent is still in the tree.
-    fn parent_in_tree(&self, node: &AgentNode) -> Option<AgentId> {
-        node.parent.filter(|parent| self.has(*parent))
+    /// The row this node hangs under in the painted tree: the nearest ancestor
+    /// the tree still holds, and the root when none of the node's own do.
+    ///
+    /// The root itself is the one actor with nothing to hang under, so it is
+    /// the one node [`Self::rows`] seeds its walk with.
+    fn painted_parent(&self, node: &AgentNode) -> Option<AgentId> {
+        if node.id == AgentId::ROOT {
+            return None;
+        }
+        Some(
+            self.nearest_surviving_ancestor(node)
+                .unwrap_or(AgentId::ROOT),
+        )
+    }
+
+    /// The nearest ancestor of this node that is still in the tree: the stored
+    /// parent when the tree holds it, and otherwise the parent *of* the ids the
+    /// window forgot, walked through [`Self::forgotten`] until a link lands on
+    /// a row.
+    ///
+    /// `None` when the walk runs out of links — a stored session's dangling
+    /// chain with nothing remembered of it — which [`Self::painted_parent`]
+    /// answers by handing the row to the root.
+    fn nearest_surviving_ancestor(&self, node: &AgentNode) -> Option<AgentId> {
+        let mut link = node.parent;
+        // A chain of ancestors cannot be longer than the tree it walks; a
+        // stored session can hold a link that points back up its own line
+        // (nothing here builds one), and the bound is what makes that cost a
+        // wrong row, not a hung frame.
+        for _ in 0..=self.agents.len() {
+            let id = link?;
+            if self.has(id) {
+                return Some(id);
+            }
+            link = self.forgotten.get(&id).copied();
+        }
+        None
     }
 
     /// Whether this node's parent is *gone*: `parent` names an id the tree no
-    /// longer holds, so the row hangs at the painted top level while its
-    /// stored link points at nothing.
+    /// longer holds, so the stored link points at nothing while the row hangs
+    /// under its nearest surviving ancestor ([`Self::painted_parent`]).
     ///
     /// This is the fact the row's `⚮` says (`AgentRow::parent_gone`,
-    /// `ui::agent_line`), and it is the one shape a human cannot read off the
-    /// pane: [`Self::rows`] has always ordered a parentless node as a top-level
-    /// row, and after D9 its indent is the top level's too, which is exactly
-    /// what a child of the root wears — so a reaped parent left its children
-    /// sitting among the root's own children, passed off as those.
+    /// `ui::agent_line`), and the mark and the row's dim ink are the two halves
+    /// of it: the row is placed where the tree can still reach — under its
+    /// nearest surviving ancestor, at that ancestor's depth plus one, in its
+    /// chronological place among that ancestor's children — so the nesting the
+    /// order paints is a nesting that really exists, and this flag says the
+    /// stored link behind the row is not the one it wears.
     ///
     /// `parent` being `None` is deliberately not this fact: the root and a
     /// leftover worktree found on disk never had a parent in this tree, so
@@ -1670,33 +1772,47 @@ impl AgentTree {
         node.parent.is_some_and(|parent| !self.has(parent))
     }
 
-    /// The depth this node's row is *painted* at: zero for a row whose parent
-    /// is not in the tree — a leftover worktree, an agent whose parent the
-    /// history window forgot — and one more than its painted parent's
-    /// otherwise.
+    /// The depth this node's row is *painted* at: zero for the root, the one
+    /// row with no parent to hang under, and one more than its painted parent's
+    /// otherwise. A row whose stored parent the tree no longer holds hangs
+    /// under its nearest surviving ancestor ([`Self::painted_parent`]), so a
+    /// leftover worktree and a forgotten row whose nearest survivor is the root
+    /// both answer 1.
     ///
     /// [`AgentNode::depth`] is where the agent was *spawned*, and it stays that
     /// because the actor's system prompt and the spawn limit read it
-    /// (`agent.rs`). But [`Self::rows`] has always ordered a parentless row at
-    /// the top level, so the indent has to be derived from the painted chain
-    /// too: an orphan that kept its stored depth was painted five columns in
-    /// over a `#1` row that was not on screen, while the row above it sat at
-    /// the top level — the painted order and the painted indent two spellings
-    /// of the nesting (finding D9).
+    /// (`agent.rs`). But [`Self::rows`] orders the rows by the painted chain, so
+    /// the indent has to be derived from that chain too: an orphan that kept its
+    /// stored depth was painted five columns in over a `#1` row that was not on
+    /// screen (finding D9).
     ///
-    /// The walk is up the same parent links [`Self::rows`] orders by, and spawn
-    /// depth is bounded by `MAX_DEPTH = 3`, so asking this per row is cheap.
+    /// The walk is up the same links [`Self::rows`] orders by, and spawn depth
+    /// is bounded by `MAX_DEPTH = 3`, so asking this per row is cheap; the
+    /// bound below is for a stored link that points back up its own line, which
+    /// nothing here builds.
     pub fn painted_depth(&self, node: &AgentNode) -> usize {
-        match self.parent_in_tree(node) {
-            None => 0,
-            Some(parent) => self
-                .node(parent)
-                .map_or(0, |parent| self.painted_depth(parent) + 1),
+        let mut depth = 0;
+        let mut at = self.painted_parent(node);
+        for _ in 0..self.agents.len() {
+            match at {
+                None => break,
+                Some(id) => {
+                    depth += 1;
+                    at = self.node(id).and_then(|parent| self.painted_parent(parent));
+                }
+            }
         }
+        depth
     }
 
     /// `agents[index]` and then its subtree, in spawn order among siblings —
     /// the order a later brother appears after the earlier one's whole family.
+    ///
+    /// The subtree is the *painted* one: a candidate is grown here when its
+    /// painted parent ([`Self::painted_parent`]) is this node, so a row whose
+    /// stored parent the window forgot rides its nearest surviving ancestor's
+    /// family instead of falling to the end of the pane behind the root's
+    /// younger children.
     ///
     /// Recursion and cycles are cut by *place*, not by id: a node already
     /// painted is skipped wherever it is reached from, and two nodes that share
@@ -1709,7 +1825,7 @@ impl AgentTree {
         let node = &self.agents[index];
         rows.push(node);
         for (child, candidate) in self.agents.iter().enumerate() {
-            if candidate.parent == Some(node.id) {
+            if self.painted_parent(candidate) == Some(node.id) {
                 self.grow(child, rows, seen);
             }
         }
@@ -2467,7 +2583,7 @@ mod tests {
     /// parent here — and a parent that *is* in the tree, the root included, is
     /// a parent like any other. Staged the way the history window makes it: a
     /// reaped parent whose child is still in the tree, with the stored depth
-    /// untouched and the painted one at the top level.
+    /// untouched and the painted one under the root.
     #[test]
     fn a_reaped_parent_is_a_parent_gone() {
         let mut tree = AgentTree::bare();
@@ -2509,8 +2625,148 @@ mod tests {
         assert_eq!(probe.depth, 2, "the stored depth is where it was spawned");
         assert_eq!(
             tree.painted_depth(probe),
-            0,
-            "and the row is still painted at the top level (D9)"
+            1,
+            "and the row hangs under the root, its nearest surviving ancestor"
+        );
+    }
+
+    /// The rule the painted order and the painted indent both read: a row whose
+    /// stored parent the tree has forgotten hangs under its *nearest surviving
+    /// ancestor* — the stored parent when the tree holds it, otherwise the
+    /// parent of the ids the window forgot, walked until a link lands on a row
+    /// — and never at a second top level beside the root.
+    #[test]
+    fn a_row_whose_parent_is_gone_hangs_under_its_nearest_surviving_ancestor() {
+        // The nested case: root → #1 → #2 → #3, and the window forgets #3's
+        // own parent #2 — not its grandparent #1. #3 must land under #1, two
+        // levels in, and not under the root.
+        let mut tree = AgentTree::bare();
+        let _one = spawn(&mut tree, 1, 0, 1);
+        let _two = spawn(&mut tree, 2, 1, 2);
+        let _three = spawn(&mut tree, 3, 2, 3);
+        tree.reap(&[AgentId(2)]);
+
+        let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3],
+            "#3 stays under #1, the nearest ancestor the tree still holds"
+        );
+        let three = tree.node(AgentId(3)).unwrap();
+        assert!(tree.parent_gone(three), "#3's own stored parent is gone");
+        assert_eq!(tree.painted_depth(three), 2, "one level in under #1");
+        assert_eq!(three.depth, 3, "the stored depth is where it was spawned");
+
+        // The flat case: #2's parent is a root child the window forgot, so
+        // its nearest surviving ancestor is the root and the row is a root
+        // child — depth 1, wearing the mark.
+        let mut tree = AgentTree::bare();
+        let _child = spawn(&mut tree, 1, 0, 1);
+        let _probe = spawn(&mut tree, 2, 1, 2);
+        tree.reap(&[AgentId(1)]);
+
+        let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(ids, vec![0, 2]);
+        let probe = tree.node(AgentId(2)).unwrap();
+        assert!(tree.parent_gone(probe));
+        assert_eq!(
+            tree.painted_depth(probe),
+            1,
+            "the root is its nearest surviving ancestor"
+        );
+        assert_eq!(probe.depth, 2, "the stored depth is where it was spawned");
+
+        // A leftover worktree and a dangling link are not the same fact, and
+        // they hang in the same place: the root. The leftover never had a
+        // parent in this tree (`parent_gone` false, no `⚮`); #4's stored
+        // parent #9 was never in the tree at all, so the link dangles and the
+        // row is marked.
+        let mut tree = AgentTree::bare();
+        let _root_child = spawn(&mut tree, 1, 0, 1);
+        tree.register(leftover(3));
+        let _dangling = spawn(&mut tree, 4, 9, 2);
+
+        let painted: Vec<(u64, usize)> = tree
+            .rows()
+            .iter()
+            .map(|node| (node.id.0, tree.painted_depth(node)))
+            .collect();
+        assert_eq!(
+            painted,
+            vec![(0, 0), (1, 1), (3, 1), (4, 1)],
+            "a leftover and a dangling link both hang under the root"
+        );
+        assert!(
+            !tree.parent_gone(tree.node(AgentId(3)).unwrap()),
+            "a leftover never had a parent here to lose"
+        );
+        assert!(
+            tree.parent_gone(tree.node(AgentId(4)).unwrap()),
+            "#4's stored parent was never in the tree"
+        );
+    }
+
+    /// The human's own pane: three forgotten parents with their surviving
+    /// children, and the root's younger children behind them. Every forgotten
+    /// row hangs under its nearest surviving ancestor — the root — in spawn
+    /// order among the root's children, so the block keeps its chronological
+    /// place *before* the younger children instead of falling to the end of
+    /// the pane.
+    #[test]
+    fn a_forgotten_family_keeps_its_chronological_place_among_the_root_children() {
+        let mut tree = AgentTree::bare();
+        // Spawn order, which is not tree order: the three forgotten parents
+        // come first, their children in between, the root's younger children
+        // last. The mailboxes are kept for the test's span, the way
+        // `reaping_keeps_the_cursor_on_the_agent_it_named` keeps its own.
+        let _mailboxes: Vec<_> = [
+            (99u64, 0u64, 1usize),
+            (100, 0, 1),
+            (101, 0, 1),
+            (103, 99, 2),
+            (104, 99, 2),
+            (105, 100, 2),
+            (106, 100, 2),
+            (107, 101, 2),
+            (108, 100, 2),
+            (109, 100, 2),
+            (110, 107, 3),
+            (111, 0, 1),
+            (149, 0, 1),
+            (150, 0, 1),
+            (151, 0, 1),
+            (152, 0, 1),
+            (153, 0, 1),
+        ]
+        .into_iter()
+        .map(|(id, parent, depth)| spawn(&mut tree, id, parent, depth))
+        .collect();
+
+        tree.reap(&[AgentId(99), AgentId(100), AgentId(101)]);
+
+        let rows = tree.rows();
+        let ids: Vec<u64> = rows.iter().map(|node| node.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 103, 104, 105, 106, 107, 110, 108, 109, 111, 149, 150, 151, 152, 153],
+            "the forgotten family is behind the root, before the younger children"
+        );
+        let depths: Vec<usize> = rows.iter().map(|node| tree.painted_depth(node)).collect();
+        assert_eq!(
+            depths,
+            vec![0, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1],
+            "#110 rides #107's row; every other forgotten row is a root child"
+        );
+        let marked: Vec<u64> = rows
+            .iter()
+            .filter(|node| tree.parent_gone(node))
+            .map(|node| node.id.0)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![103, 104, 105, 106, 107, 108, 109],
+            "the rows whose stored parent the window forgot, and only those: \
+             #110's own parent #107 is still a row, so it wears no mark"
         );
     }
 

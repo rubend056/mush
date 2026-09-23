@@ -261,12 +261,15 @@ pub struct AgentRow {
     /// How many `  ` indents the row is drawn with.
     pub depth: usize,
     /// This row's parent is gone: `parent` names an id the tree no longer
-    /// holds, so the row is a top-level row by order (and by indent, D9) and
-    /// says so with `⚮` (`ui::agent_line`).
+    /// holds, so the row hangs under its nearest surviving ancestor (the root
+    /// when none of its own survive), at that ancestor's depth plus one, and
+    /// says so with `⚮` and with `ui`'s dim ink — the two halves of the one
+    /// fact that the stored link was cut (`ui::agent_line`, `ui::draw_agents`).
     ///
     /// `false` for the root and for a node that never had a parent in this
-    /// tree (a leftover worktree): those are top-level by construction, not by
-    /// a link the history window cut, and a root child is a root child.
+    /// tree (a leftover worktree): those hang under the root by construction,
+    /// not by a link the history window cut, and a leftover is not dimmed
+    /// because nothing about it was lost.
     pub parent_gone: bool,
     /// `·`, `◐`, `✓`, `✗`, `⊘`, `≡`, `⚠`, `⧗` — derived from the node's own
     /// phase, never stored ([`phase_glyph`] owns the rule): `⚠` marks a run cut
@@ -599,9 +602,10 @@ impl App {
     /// One row.
     ///
     /// The indent is the tree's *painted* depth, not [`AgentNode::depth`]: a
-    /// node whose parent is not in the tree is a top-level row in `rows()`'s
-    /// order, and its indent has to be the same nesting the order paints
-    /// (finding D9).
+    /// node whose parent is not in the tree hangs under its nearest surviving
+    /// ancestor in `rows()`'s order, and its indent has to be the same nesting
+    /// the order paints (finding D9) — dim, with `⚮`, because the stored link
+    /// is not the one it wears.
     fn row(&self, node: &AgentNode) -> AgentRow {
         // `glyph · id` is this agent's own phase alone: the old row derived the
         // glyph from "has live children", so a busy agent wore `⏸` and its own
@@ -1864,12 +1868,14 @@ mod tests {
         assert_eq!(git_cell(&detached, None), "detached");
     }
 
-    /// A row whose parent the history window reaped was painted as if it hung
-    /// under the root: `AgentTree::rows` orders a parentless node at the top
-    /// level and (after D9) indents it there, which is exactly the shape a root
-    /// child wears — the human's own frame read `✓ #58 Adversarial write-road …`
-    /// among the root's current children, claiming a parent it does not have.
-    /// The row says its parent is gone instead.
+    /// A row whose parent the history window reaped used to be painted as if
+    /// it hung under the root: `AgentTree::rows` ordered a parentless node at
+    /// the top level and (after D9) indented it there, which is exactly the
+    /// shape a root child wears — the human's own frame read `✓ #58 Adversarial
+    /// write-road …` among the root's current children, claiming a parent it
+    /// does not have. The row now hangs under its nearest surviving ancestor —
+    /// the root in this shape — in its chronological place, and says its parent
+    /// is gone instead.
     ///
     /// The reap is the window's own road, not a shape poked into the tree:
     /// `past_history` drops the oldest children over `CHILD_HISTORY` and a node
@@ -1932,13 +1938,14 @@ mod tests {
         );
         app.reap_history();
 
-        // After the reap: the parent is gone, the probe is a top-level row by
-        // D9's rule, and the row says why it is there.
+        // After the reap: the parent is gone, the probe hangs under the root in
+        // its chronological place — before the root's younger children — and
+        // the row says why it is there.
         let after = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
         assert_eq!(
             row_for(&after, 2),
-            " ✓ #2 ⚮ probe  done",
-            "the reaped parent is said, at the top level the order paints"
+            "   ✓ #2 ⚮ probe  done",
+            "the reaped parent is said, under the root the rule hands the row to"
         );
         assert!(
             after[0].contains('▲'),
@@ -1978,11 +1985,13 @@ mod tests {
     /// Every state a marked row can also wear, and every state that must not
     /// carry the mark: `⚮` is about the parent alone.
     ///
-    /// #2..#5 hang under #1 and are orphaned together by one reap, each with a
+    /// #2..#5 were spawned under #1 and are orphaned together by one reap —
+    /// the root is now their nearest surviving ancestor — each with a
     /// different own state — a finished probe, a stopped run (`⊘`), a landed
     /// worktree, and a napping parent whose child is in flight; #6 is that
     /// child and #7 a root child, both with a parent in the tree; #8 is a
-    /// leftover worktree, top-level by construction rather than by a lost link;
+    /// leftover worktree, hanging under the root by construction rather than by
+    /// a lost link;
     /// the root is never marked. Read at the 80×24 floor and on a roomy pane, in
     /// the pane's two focus states and the four themes, so the mark is a fact
     /// about the row and not about the frame around it.
