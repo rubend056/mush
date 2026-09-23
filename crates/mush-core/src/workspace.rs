@@ -1176,12 +1176,24 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Every file under `rel` (default the workspace root), workspace-relative
-    /// and sorted, with the first `limit`, whether there were more, and how
-    /// many files the walk found whose name cannot travel on the model's road
-    /// (`Self::name_for_model`). Build and VCS directories are skipped
-    /// (`SKIP_DIRS`); a symlinked directory is not followed, so a listing
-    /// cannot leave the workspace.
+    /// Every file under `rel` (default the workspace root), workspace-relative,
+    /// in the order `Self::walk` reaches them, with the first `limit`,
+    /// whether there were more, and how many of the names it reached cannot
+    /// travel on the model's road (`Self::name_for_model`). Build and VCS
+    /// directories are skipped (`SKIP_DIRS`) and so is the workspace's worktree
+    /// directory (`Self::is_worktree_path`); a symlinked directory is not
+    /// followed, so a listing cannot leave the workspace.
+    ///
+    /// The cap ends the walk where it lands rather than cutting a whole answer
+    /// at the end: `list_files("")` used to visit every file under the root,
+    /// allocate every name and sort them all, to print the first four hundred —
+    /// the cost was the tree's, not the answer's (finding IN9), where
+    /// [`Self::search`] has always stopped its walk at its own cap. The order
+    /// of the answer is then the walk's own — each directory's files in name
+    /// order, its subdirectories after them, depth-first — not a global sort's:
+    /// the two cannot both hold, because a global sort is exactly what needs
+    /// the whole tree. `Self::walk` reads each directory in name order, so
+    /// the place the cap stops the walk is deterministic.
     ///
     /// That claim is why the name is checked for real before the walk
     /// (`Self::real_path`): `out -> /tmp/elsewhere` is a name inside the root
@@ -1195,7 +1207,9 @@ impl Workspace {
     /// `resolve` would trim names a different file — both are counted instead
     /// of reported, and the tool layer says how many and where they can be
     /// reached (finding B9). The listing's own shape must not make a file
-    /// unreachable, or hand one over that is not there.
+    /// unreachable, or hand one over that is not there. The count stops with
+    /// the walk: a file the cap never reached is counted by the cap's own note
+    /// ("the first N files") rather than guessed at past it.
     pub fn list_files(
         &self,
         rel: &str,
@@ -1209,16 +1223,24 @@ impl Workspace {
         if fs::symlink_metadata(&start).is_err() {
             return Err(format!("no such path: `{rel}`"));
         }
-        let mut found = Vec::new();
+        let mut found: Vec<String> = Vec::new();
         let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
             match self.name_for_model(path) {
-                Some(name) => found.push(name),
-                None => unnamed += 1,
+                Some(name) => {
+                    found.push(name);
+                    // The cap ends the walk where it lands. The name that made
+                    // the list one over the cap is the whole answer to "were
+                    // there more"; walking the rest would be the tree's cost,
+                    // not the answer's.
+                    found.len() <= limit
+                }
+                None => {
+                    unnamed += 1;
+                    true
+                }
             }
-            true
         });
-        found.sort();
         let truncated = found.len() > limit;
         found.truncate(limit);
         Ok((found, truncated, unnamed))
@@ -2404,6 +2426,45 @@ mod tests {
         child.write_file("own.rs", "fn own2() {}\n").unwrap();
         let (own, _, _) = child.list_files("", 100).unwrap();
         assert_eq!(own, vec!["own.rs".to_string()]);
+    }
+
+    /// The listing's cap ends the walk where it lands instead of walking and
+    /// sorting the whole subtree first (finding IN9). The walk reaches the
+    /// root's files in name order and *then* descends into the root's
+    /// directories, so the order it produces is not a global sort's: a global
+    /// sort puts `a/z.txt` before `z.txt` (`'.' < '/'`), and a listing cut
+    /// *after* that sort answered `[a.txt, a/z.txt]` — the whole tree walked,
+    /// every name allocated and sorted, to print two names, where `search` had
+    /// always stopped its walk at its own cap. The cap now stops this walk at
+    /// the third name.
+    #[test]
+    fn a_listing_cap_stops_the_walk_instead_of_the_sort() {
+        let ws = temp_workspace("list-cap");
+        fs::write(ws.root().join("a.txt"), "a\n").unwrap();
+        fs::write(ws.root().join("z.txt"), "z\n").unwrap();
+        fs::create_dir_all(ws.root().join("a")).unwrap();
+        fs::write(ws.root().join("a/z.txt"), "inner\n").unwrap();
+
+        let (listed, truncated, _) = ws.list_files("", 2).unwrap();
+        assert_eq!(
+            listed,
+            vec!["a.txt".to_string(), "z.txt".to_string()],
+            "the cap cuts the walk's own order, where it stopped"
+        );
+        assert!(truncated, "there was a third file the cap cut");
+
+        // With room for all three, the answer is the walk's order end to end:
+        // the global sort is the whole-tree cost the cap exists to avoid.
+        let (all, truncated, _) = ws.list_files("", 10).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                "a.txt".to_string(),
+                "z.txt".to_string(),
+                "a/z.txt".to_string()
+            ]
+        );
+        assert!(!truncated);
     }
 
     #[test]

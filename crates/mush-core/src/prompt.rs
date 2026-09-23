@@ -221,8 +221,8 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::ListFiles,
-            "List workspace files under a path, one per line and sorted; build and VCS directories \
-             are skipped. Default the workspace root.",
+            "List workspace files under a path, one per line; build and VCS directories \
+             are skipped, and the cap ends the walk.",
             json!({
                 "type": "object",
                 "properties": {
