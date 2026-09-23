@@ -312,7 +312,11 @@ fn blind_model_line(model: &str) -> String {
 /// a hundred of them pass every token bound the window has while the box holds
 /// 200 MB of bytes and the copies in `.mush/paste/` grow by the same. What the
 /// box is made of is bytes, so bytes are what the box counts: eight files of
-/// the size the transport already lets one be is the queue a message may hold.
+/// the size the transport already lets one be is the queue a message may hold —
+/// and it is why the conversation's own byte cap
+/// ([`mush_core::message::IMAGE_BYTES_KEPT`], half this bound) never truncates
+/// the newest message's pictures: a paste larger than that cap must still reach
+/// the model whole.
 const BOX_IMAGE_BYTES: usize = (mush_core::workspace::IMAGE_FILE_CAP * 8) as usize;
 
 /// A byte count the way a glance wants it: `900 B`, `340 KB`, `1.2 MB`. One

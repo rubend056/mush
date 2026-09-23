@@ -3,6 +3,8 @@
 //! These are intentionally loose (`Option` everywhere, `#[serde(default)]`) so
 //! that the many "OpenAI-compatible" servers out there all round-trip cleanly.
 
+use std::borrow::Cow;
+
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -324,6 +326,72 @@ impl Image {
     }
 }
 
+/// How many bytes of picture payload a conversation keeps, besides the newest
+/// message's own.
+///
+/// The unit is bytes because the thing bounded is memory, and a picture's
+/// window price is not its size: a 100×100 png weighing 2 MB costs fourteen
+/// tokens ([`Image::weight`]), so a hundred of them pass every token bound the
+/// window has while the process holds 200 MB of payload. Four of the files the
+/// transport already caps one at ([`crate::workspace::IMAGE_FILE_CAP`]) is the
+/// working set a pane's scrollback is worth keeping; past it
+/// [`retain_image_bytes`] gives a picture's payload up and keeps its path,
+/// which is what reads the picture again.
+pub const IMAGE_BYTES_KEPT: usize = 8 * 1024 * 1024;
+
+/// Give up the picture payloads a conversation cannot keep: the newest
+/// pictures keep theirs while they fit `cap`, and an older picture keeps
+/// everything but its bytes.
+///
+/// The walk goes from the newest message back, and within a message from its
+/// newest picture back. A picture keeps its payload while its [`Image::size`]
+/// fits what the cap has left, and every picture that does not fit gives its
+/// payload up ([`Image::give_up_payload`]) — its path, mime, size and pixels
+/// stay. The newest message's own pictures are never given up, whatever they
+/// weigh: the box accepts eight of the transport's 2 MiB files in one message,
+/// so a paste larger than `cap` must still reach the model whole, and the peak
+/// a conversation holds is therefore the newest message plus `cap`.
+///
+/// This is the one rule for both places a conversation's bytes live: the
+/// pane's record, on every line appended to it, and the actor's own history,
+/// before it builds a request. A picture whose payload is gone is spelled on
+/// the wire as the `placeholder` sentence — never an empty `data:` URL — so
+/// the model is told the bytes are gone and which file reads them again.
+///
+/// The cost, and the reason the value was ruled rather than derived: giving a
+/// picture's payload up rewrites what the request says at that message, and an
+/// endpoint that cached the request's prefix re-prefills the tail from there.
+/// With 2 MiB screenshots this cap keeps about four pictures behind the newest
+/// message, so the changed point sits about four pictures back — the ruling's
+/// estimate is a re-prefill about every fourth new picture. The shape weighed
+/// beside it and set aside is one constant away: keep to a 32 MiB ceiling and
+/// shed back down to this cap in one pass, which changes the request about
+/// every twelfth new picture for a 32 MiB bound but moves the changed point
+/// much further back when it does. The human chose the flat cap.
+///
+/// It is not a wire bound, and it never keeps a picture out of a request that
+/// could carry it: only payloads a conversation has already given up are
+/// missing from a request, and a request whose body is past the transport's
+/// ceiling is refused with its own line (`MAX_REQUEST_BYTES`, in the agent) —
+/// never silently shrunk here.
+pub fn retain_image_bytes(messages: &mut [Message], cap: usize) {
+    let mut kept = 0usize;
+    let newest = messages.len().saturating_sub(1);
+    for (index, message) in messages.iter_mut().enumerate().rev() {
+        if index == newest {
+            continue;
+        }
+        for picture in message.images.iter_mut().rev() {
+            let size = picture.size();
+            if size.saturating_add(kept) <= cap {
+                kept = kept.saturating_add(size);
+            } else {
+                picture.give_up_payload();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Message {
     /// The speaker. `serde(default)`, because a reply that omits it is still a
@@ -629,22 +697,40 @@ impl Message {
     }
 
     /// The `content` a message with images goes out as: the text first (omitted
-    /// when there is none), then one `image_url` part per image, each holding a
-    /// `data:` URL. This is the vision form of the spec, and the only way an
-    /// image rides in a request: [`ChatRequest`] knows nothing about it.
+    /// when there is none), then one part per image — an `image_url` part
+    /// holding a `data:` URL, or, for a picture whose payload was given up
+    /// ([`Image::give_up_payload`], [`retain_image_bytes`]), the same
+    /// `placeholder` sentence [`Message::drop_images`] writes, as a text part.
+    /// This is the vision form of the spec, and the only way an image rides in
+    /// a request: [`ChatRequest`] knows nothing about it.
+    ///
+    /// A picture with no payload is never an empty `data:` URL: the endpoint
+    /// would read a broken picture, and the model is owed the one fact that
+    /// matters — the bytes were dropped to save room, and the path names the
+    /// file that reads them again.
     fn content_parts(&self) -> Vec<ContentPart<'_>> {
         let mut parts = Vec::with_capacity(self.images.len() + 1);
         if !self.text().is_empty() {
             parts.push(ContentPart {
                 kind: "text",
-                text: Some(self.text()),
+                text: Some(Cow::Borrowed(self.text())),
                 url: None,
             });
         }
-        parts.extend(self.images.iter().map(|image| ContentPart {
-            kind: "image_url",
-            text: None,
-            url: Some(data_url(image)),
+        parts.extend(self.images.iter().map(|image| {
+            if image.bytes.is_empty() {
+                ContentPart {
+                    kind: "text",
+                    text: Some(Cow::Owned(placeholder(image))),
+                    url: None,
+                }
+            } else {
+                ContentPart {
+                    kind: "image_url",
+                    text: None,
+                    url: Some(data_url(image)),
+                }
+            }
         }));
         parts
     }
@@ -669,6 +755,12 @@ impl Message {
     /// Idempotent on purpose: a message that already lost its images has
     /// nothing left to shed, so re-saving a loaded session cannot stack a
     /// second placeholder on the first one's text.
+    ///
+    /// A payload can leave a live message without the image: the byte cap
+    /// ([`retain_image_bytes`]) gives it up and the entry stays — the pane's
+    /// `▣` row still names the picture and reads its [`Image::size`] — where
+    /// the wire spells it as this same sentence (`Message::content_parts`).
+    /// This method is what removes the entry itself.
     pub fn drop_images(&mut self) {
         if self.images.is_empty() {
             return;
@@ -721,7 +813,9 @@ impl Message {
 struct ContentPart<'a> {
     /// The part's `type`: `text` or `image_url`.
     kind: &'static str,
-    text: Option<&'a str>,
+    /// The part's text: borrowed from the message, or owned when it is a
+    /// `placeholder` sentence built for a picture whose payload is gone.
+    text: Option<Cow<'a, str>>,
     url: Option<String>,
 }
 
@@ -732,7 +826,7 @@ impl Serialize for ContentPart<'_> {
     {
         let mut part = serializer.serialize_struct("content_part", 2)?;
         part.serialize_field("type", self.kind)?;
-        if let Some(text) = self.text {
+        if let Some(text) = &self.text {
             part.serialize_field("text", text)?;
         }
         if let Some(url) = &self.url {
@@ -1608,6 +1702,157 @@ mod tests {
             prices,
             "and the price is not: the cap is bytes, the window is tokens"
         );
+    }
+
+    /// Every payload in a transcript, for the cap's tests: what a copy that has
+    /// not given anything up yet is holding.
+    fn payload_bytes(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| &message.images)
+            .map(|image| image.bytes.len())
+            .sum()
+    }
+
+    /// A picture of `bytes` bytes in its own message, for the cap's tests.
+    fn paste(path: &str, bytes: usize) -> Message {
+        Message::user_with_images(
+            format!("paste {path}"),
+            vec![Image::new(path, "image/png", vec![0x41; bytes], None)],
+        )
+    }
+
+    /// The cap's walk, one 2 MiB picture per message: the newest message's own
+    /// is on top of the cap, and the pictures behind it are kept newest-first
+    /// while they fit. Five payloads survive — the newest plus the four the cap
+    /// holds — and the sixth and oldest gives its payload up with its facts
+    /// intact.
+    #[test]
+    fn the_cap_keeps_the_newest_pictures_and_gives_up_the_older_ones() {
+        const PICTURE: usize = 2 * 1024 * 1024;
+        let mut messages: Vec<Message> = (0..6)
+            .map(|i| paste(&format!("shots/{i}.png"), PICTURE))
+            .collect();
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        assert_eq!(
+            payload_bytes(&messages),
+            IMAGE_BYTES_KEPT + PICTURE,
+            "the newest message's own picture plus the cap's worth"
+        );
+        assert!(
+            messages[0].images[0].bytes.is_empty(),
+            "the oldest payload is gone"
+        );
+        assert_eq!(messages[0].images[0].size(), PICTURE, "its size is not");
+        assert_eq!(messages[0].images[0].path, "shots/0.png", "nor is its path");
+        for message in &messages[1..] {
+            assert!(
+                !message.images[0].bytes.is_empty(),
+                "the newer payloads stay: {message:?}"
+            );
+        }
+    }
+
+    /// The newest message's own pictures are never given up, whatever they
+    /// weigh: the box accepts 8 × 2 MiB in one message, and a paste larger than
+    /// the cap still reaches the model whole.
+    #[test]
+    fn the_newest_messages_pictures_are_never_given_up() {
+        let pictures: Vec<Image> = (0..3)
+            .map(|i| {
+                Image::new(
+                    format!("shots/{i}.png"),
+                    "image/png",
+                    vec![0x41; 4 * 1024 * 1024],
+                    None,
+                )
+            })
+            .collect();
+        let mut messages = vec![Message::user_with_images("look", pictures)];
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        assert_eq!(
+            payload_bytes(&messages),
+            12 * 1024 * 1024,
+            "12 MiB in one message, past the cap and whole"
+        );
+    }
+
+    /// The walk is per picture, not per message: a message that straddles the
+    /// cap keeps the newest of its own pictures and gives up the older ones.
+    #[test]
+    fn a_message_that_straddles_the_cap_keeps_its_newest_pictures() {
+        const PICTURE: usize = 4 * 1024 * 1024;
+        let straddling = Message::user_with_images(
+            "three wide",
+            (0..3)
+                .map(|i| {
+                    Image::new(
+                        format!("shots/{i}.png"),
+                        "image/png",
+                        vec![0x41; PICTURE],
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        let mut messages = vec![
+            Message::user("older words"),
+            straddling,
+            paste("shots/newest.png", 1_024),
+        ];
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        let kept: Vec<usize> = messages[1]
+            .images
+            .iter()
+            .map(|image| image.bytes.len())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![0, PICTURE, PICTURE],
+            "the newest two of its pictures fit; the oldest gives up"
+        );
+    }
+
+    /// What the model sees for a picture past the cap is the sentence the tree
+    /// already writes when bytes cannot travel — `Message::drop_images`'s own
+    /// line, word for word — as a text part, and never an empty `data:` URL.
+    /// The path in it is what reads the file again.
+    #[test]
+    fn a_picture_past_the_cap_reads_as_the_placeholder_on_the_wire() {
+        let mut messages = vec![
+            paste("shots/big.png", 2 * 1024 * 1024),
+            paste("shots/beside.png", 2 * 1024 * 1024),
+        ];
+        // A cap smaller than the older picture: the newest message's own stays,
+        // and the older one gives its payload up.
+        retain_image_bytes(&mut messages, 1_024);
+        assert!(messages[0].images[0].bytes.is_empty());
+
+        let wire = serde_json::to_string(&messages[0]).unwrap();
+        let mut shed = messages[0].clone();
+        shed.drop_images();
+        let sentence = shed
+            .text()
+            .lines()
+            .nth(1)
+            .expect("the line drop_images writes")
+            .to_string();
+        assert!(
+            wire.contains(&sentence),
+            "one wording, part for part: {wire}"
+        );
+        assert!(
+            sentence.contains("shots/big.png"),
+            "it names the file: {sentence}"
+        );
+        assert!(!wire.contains("data:"), "no empty data URL: {wire}");
+        assert!(!wire.contains("image_url"), "and no image part: {wire}");
     }
 
     /// A header can claim the largest size a pair of `u32`s can hold, and the

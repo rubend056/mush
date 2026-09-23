@@ -3235,6 +3235,15 @@ fn run_turns(
             return Err(CANCELLED.to_string());
         }
 
+        // The pictures a conversation keeps are bounded in bytes, not tokens
+        // ([`IMAGE_BYTES_KEPT`](mush_core::message::IMAGE_BYTES_KEPT), finding
+        // R1): the same rule the pane's record reads, applied to the actor's own
+        // history before anything weighs it or builds a request from it. A
+        // payload given up here is gone from this copy too — the pane's entry
+        // stays for its row — and the wire spells it as the placeholder sentence
+        // rather than an empty `data:` URL (`Message::content_parts`).
+        mush_core::message::retain_image_bytes(messages, mush_core::message::IMAGE_BYTES_KEPT);
+
         let cfg = actor.ctx.cfg.config()?;
 
         let budget = cfg.history_budget();

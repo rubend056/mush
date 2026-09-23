@@ -1144,6 +1144,18 @@ impl Chat {
         }
     }
 
+    /// [`Self::transcript`]'s mutable half, for the two hands the append road
+    /// has on it: the line itself and the byte cap's sweep over the payloads
+    /// (finding R1). A read does not go through here — `transcript` leaves an
+    /// unknown id alone, and this one makes an entry, which a read must not.
+    fn transcript_mut(&mut self, agent: AgentId) -> &mut Vec<Message> {
+        if agent == AgentId::ROOT {
+            &mut self.root
+        } else {
+            self.agents.entry(agent).or_default()
+        }
+    }
+
     /// Append a line to an agent's transcript.
     ///
     /// This is the one place a line's *voice* is decided while it is known: a
@@ -1157,6 +1169,14 @@ impl Chat {
     /// spelling of that place, shared with the request). The messages it passes
     /// keep their text and their voices; only their indices change, so the
     /// caches keyed by index move with them ([`Self::shift_indices`]).
+    ///
+    /// And it is where the record's picture payloads are bounded: the byte cap
+    /// ([`mush_core::message::IMAGE_BYTES_KEPT`]) gives up the payloads of the
+    /// oldest pictures (finding R1) while every entry — its path, its
+    /// [`Image::size`], its pixels — stays, for the pane's `▣` row to paint
+    /// and the next request to spell. The actor's own history reads the same
+    /// rule before it builds a request, so what the pane holds and what travels
+    /// are bounded by one fact.
     pub fn push_message(&mut self, agent: AgentId, message: Message) {
         let prior = self.revision(agent);
         let note = transcript::is_dropped_note(&message);
@@ -1173,11 +1193,7 @@ impl Chat {
                 self.spoken.entry(agent).or_default().insert(index, voice);
             }
         }
-        let messages = if agent == AgentId::ROOT {
-            &mut self.root
-        } else {
-            self.agents.entry(agent).or_default()
-        };
+        let messages = self.transcript_mut(agent);
         let arrived = messages.len();
         if !note {
             messages.push(message);
@@ -1194,6 +1210,17 @@ impl Chat {
                 .unwrap_or(arrived);
             self.shift_indices(agent, at, arrived);
         }
+
+        // The record's picture payloads are bounded as it grows (finding R1):
+        // past the byte cap the oldest payloads are given up, and every entry
+        // stays — a `▣` row still names the picture and reads its real size
+        // ([`Image::size`]). The actor's history reads the same rule before it
+        // builds a request, so the copy that travels is bounded by the fact the
+        // pane's copy is. A fresh borrow: the one above ends where the note's
+        // placement called `&mut self`.
+        let messages = self.transcript_mut(agent);
+        mush_core::message::retain_image_bytes(messages, mush_core::message::IMAGE_BYTES_KEPT);
+
         self.advance(agent, prior);
     }
 
@@ -4983,6 +5010,58 @@ mod tests {
             image_label(&picture, usize::MAX),
             before,
             "the row says the same size before and after"
+        );
+    }
+
+    /// The pane's record is bounded in bytes as it grows (finding R1): the
+    /// oldest payloads are given up once the newest pictures fill the cap, and
+    /// every row still reads its picture's real size. The numbers are one 2 MiB
+    /// picture per message: the newest message's own plus the cap's four
+    /// survive, and the sixth and oldest gives its payload up.
+    #[test]
+    fn the_pane_gives_up_old_payloads_and_still_names_their_size() {
+        const PICTURE: usize = 2 * 1024 * 1024;
+        let mut chat = Chat::bare();
+        let oldest = Image::new("shots/oldest.png", "image/png", vec![0u8; PICTURE], None);
+        let before = image_label(&oldest, usize::MAX);
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user_with_images("first", vec![oldest]),
+        );
+        for i in 0..5 {
+            chat.push_message(
+                AgentId::ROOT,
+                Message::user_with_images(
+                    format!("more {i}"),
+                    vec![Image::new(
+                        format!("shots/{i}.png"),
+                        "image/png",
+                        vec![0u8; PICTURE],
+                        None,
+                    )],
+                ),
+            );
+        }
+
+        let record = chat.transcript(AgentId::ROOT);
+        assert!(
+            record[0].images[0].bytes.is_empty(),
+            "the oldest payload is given up"
+        );
+        assert_eq!(
+            image_label(&record[0].images[0], usize::MAX),
+            before,
+            "and its row is the one it always was"
+        );
+        let retained: usize = record
+            .iter()
+            .flat_map(|message| &message.images)
+            .map(|image| image.bytes.len())
+            .sum();
+        assert_eq!(
+            retained,
+            mush_core::message::IMAGE_BYTES_KEPT + PICTURE,
+            "the newest message's own picture plus the cap's worth"
         );
     }
 
