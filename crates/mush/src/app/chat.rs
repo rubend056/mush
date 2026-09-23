@@ -3004,11 +3004,12 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// words look exactly like the human's own nudge, and nothing in the file says
 /// which they were. It reads as the human's until the process is new again —
 /// the alternative would be painting the human's question as somebody else's.
-/// A restored note is misread the same way and for the same reason: the flag
-/// that tells it ([`transcript::is_dropped_note`]) is not stored with the file,
-/// so the note comes back as a plain user line wearing the human's voice — its
-/// line still where the file put it, because nothing moves it. The other rule,
-/// matching its sentence, is exactly the one finding F3 removed.
+/// The note is not in that class: the flag that tells it
+/// ([`transcript::is_dropped_note`]) is stored with the file
+/// ([`Message::note`]), so a restored transcript's note is read as mush's here,
+/// exactly as it was before the restart. Matching its sentence, by contrast, is
+/// the one rule finding F3 removed: a line that is word for word the note but
+/// carries no flag stays the human's.
 fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
     let text = message.text();
     if report(text) || text.starts_with(FOLDED) || transcript::is_dropped_note(message) {
@@ -5261,6 +5262,44 @@ mod tests {
         assert!(
             rows.iter().any(|row| row == "you › a question of my own"),
             "and the human keeps their own: {rows:?}"
+        );
+    }
+
+    /// The note's voice survives the session file: the flag is what tells it
+    /// from a human's line ([`Message::note`]), and the file is what carries
+    /// the flag across a restart — so a note read back is painted in mush's
+    /// voice, while a human's line that is word for word the note, restored
+    /// through the same road, is still the human's.
+    #[test]
+    fn a_restored_note_reads_as_mushs_line_and_a_lookalike_does_not() {
+        let stored = mush_core::Session {
+            messages: vec![
+                Message::user("port the parser"),
+                Message::user(transcript::DROPPED_TURNS_NOTE),
+                Message::note(transcript::DROPPED_TURNS_NOTE),
+            ],
+            ..mush_core::Session::default()
+        };
+        let restored: mush_core::Session =
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+
+        let mut chat = Chat::bare();
+        chat.replace_transcript(AgentId::ROOT, restored.messages);
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("you › The oldest turns")),
+            "the human's lookalike keeps their voice: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("· The oldest turns")),
+            "and the note is mush's: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.starts_with("you ›")).count(),
+            2,
+            "the human's two lines and no more: {rows:?}"
         );
     }
 

@@ -451,10 +451,13 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) -> Option<Messag
 /// [`Message`], which appends, so the human's copy holds the note at the end —
 /// while the actor's list is what a request is built from, and a note *after*
 /// the newest message reads as the newest thing said rather than as a statement
-/// about the front of the transcript. A transcript with no note is left exactly
-/// as it is; one carrying several — which only this process can build, since
-/// the flag is never written to a file — is left with one, in the note's own
-/// place.
+/// about the front of the transcript. The note is told by [`is_dropped_note`]'s
+/// flag, and the flag is a fact a stored transcript keeps
+/// ([`Message::note`](crate::message::Message::note)), so a copy read back from
+/// `.mush/session.json` is placed by this rule rather than left wherever the
+/// file held it. A transcript with no note is left exactly as it is; one
+/// carrying several — a copy no trim has normalized, or a hand-edited file — is
+/// left with one, in the note's own place.
 pub fn place_dropped_note(messages: &mut Vec<Message>) {
     if !messages.iter().any(is_dropped_note) {
         return;
@@ -482,7 +485,10 @@ fn insert_dropped_note(messages: &mut Vec<Message>) {
 /// it out of its place and into index 2, past an assistant message or inside a
 /// tool-call batch. The two readers are the trimmer, whose arithmetic counts
 /// `user` lines as turn boundaries, and the pane, which paints the note in
-/// mush's voice rather than the human's.
+/// mush's voice rather than the human's. The flag is a fact the session file
+/// stores ([`Message::note`](crate::message::Message::note)), so both readers
+/// give a transcript restored from `.mush/session.json` the same answer they
+/// gave the process that wrote it.
 pub fn is_dropped_note(message: &Message) -> bool {
     message.note
 }
@@ -878,9 +884,9 @@ mod tests {
 
     /// The note's place is one spelling, shared by the trim that puts it there
     /// and the copy that puts it back: after the system prompt and the opening
-    /// task. A transcript with no note is untouched; one carrying several —
-    /// only a copy built in this process can, since the flag is never written
-    /// to a file — is left with one, in the note's own place.
+    /// task. A transcript with no note is untouched; one carrying several — a
+    /// copy no trim has normalized, or a hand-edited file — is left with one,
+    /// in the note's own place.
     #[test]
     fn place_dropped_note_puts_it_after_the_opening_task() {
         let mut untouched = vec![Message::system("you are mush"), Message::user("task")];
@@ -961,6 +967,52 @@ mod tests {
             "and so is the one left in place"
         );
         assert_eq!(note_count(&messages), 1);
+
+        // The same two lines through the session file, where the flag is the
+        // only thing that can tell them apart: the file writes it on the note
+        // alone, so the human's line comes back a human's line and stays where
+        // it stood, and only the note is moved to its place.
+        let stored = crate::session::Session {
+            messages: vec![
+                Message::system("you are mush"),
+                Message::user(DROPPED_TURNS_NOTE),
+                Message::assistant("working"),
+                Message::note(DROPPED_TURNS_NOTE),
+            ],
+            ..crate::session::Session::default()
+        };
+        let restored: crate::session::Session =
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+        let mut restored = restored.messages;
+        assert!(
+            !is_dropped_note(&restored[1]),
+            "a human's line came back a human's line"
+        );
+        assert!(
+            is_dropped_note(&restored[3]),
+            "and the note came back the note"
+        );
+        place_dropped_note(&mut restored);
+        assert_eq!(
+            restored[1].text(),
+            DROPPED_TURNS_NOTE,
+            "the human's line did not move"
+        );
+        assert_eq!(
+            restored[2].text(),
+            DROPPED_TURNS_NOTE,
+            "the note is back after the opening task"
+        );
+        assert_eq!(
+            restored[3].text(),
+            "working",
+            "and the turns kept their order"
+        );
+        assert_eq!(
+            note_count(&restored),
+            1,
+            "one note, the human's line beside it"
+        );
     }
 
     /// Nothing dropped means nothing said: a transcript that already fits is

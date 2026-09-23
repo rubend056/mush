@@ -221,7 +221,11 @@ pub struct AgentSession {
     /// read (finding H1).
     #[serde(default)]
     pub result_unread: bool,
-    #[serde(default)]
+    /// The child's transcript, stored the way the root's is: each message in
+    /// its wire form plus the note's flag
+    /// ([`crate::message::serialize_stored_messages`]), so a note read back
+    /// is read as the note rather than as the human's own line.
+    #[serde(default, serialize_with = "crate::message::serialize_stored_messages")]
     pub messages: Vec<Message>,
 }
 
@@ -270,6 +274,12 @@ pub struct Session {
     /// and a restart reads no statement at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
+    /// The root conversation, stored in the shape that keeps each message's
+    /// own facts: the wire form plus the note's flag
+    /// ([`crate::message::serialize_stored_messages`]), because a transcript
+    /// read back from here has to know which line is the note instead of
+    /// reading it as the human's.
+    #[serde(serialize_with = "crate::message::serialize_stored_messages")]
     pub messages: Vec<Message>,
     /// The subagents this conversation had, so their context outlives the
     /// process. Old sessions have none and still load.
@@ -858,6 +868,66 @@ mod tests {
             serde_json::from_str::<StoredLanded>(&spelled).unwrap(),
             StoredLanded::NothingCommitted
         );
+    }
+
+    /// The dropped-turns note's provenance is a fact the file has to keep: the
+    /// flag is what tells the note from a human's line that is word for word
+    /// the same sentence (finding F3), and a restart has no road back to it
+    /// other than the file — prose is exactly what must not be the test. The
+    /// flag is written on the note alone, so a human's identical line, and a
+    /// file written before the field existed, both read as what they are.
+    #[test]
+    fn a_session_round_trip_keeps_the_notes_provenance() {
+        use crate::transcript::{is_dropped_note, DROPPED_TURNS_NOTE};
+
+        let session = Session {
+            messages: vec![
+                Message::user("the opening task"),
+                Message::user(DROPPED_TURNS_NOTE),
+                Message::assistant("working"),
+                Message::note(DROPPED_TURNS_NOTE),
+            ],
+            agents: vec![AgentSession {
+                id: 1,
+                messages: vec![
+                    Message::user("the brief"),
+                    Message::note(DROPPED_TURNS_NOTE),
+                ],
+                ..AgentSession::default()
+            }],
+            ..Session::default()
+        };
+
+        let spelled = serde_json::to_string(&session).unwrap();
+        assert_eq!(
+            spelled.matches("\"note\":true").count(),
+            2,
+            "one flag on the one note in each transcript: {spelled}"
+        );
+        let restored: Session = serde_json::from_str(&spelled).unwrap();
+        assert!(
+            !is_dropped_note(&restored.messages[1]),
+            "the human's own line is still the human's"
+        );
+        assert!(
+            is_dropped_note(&restored.messages[3]),
+            "and the note is still the note"
+        );
+        assert!(
+            !is_dropped_note(&restored.agents[0].messages[0]),
+            "a child's brief that quotes the sentence is not the note"
+        );
+        assert!(
+            is_dropped_note(&restored.agents[0].messages[1]),
+            "and its note survives the same road"
+        );
+
+        // A file that predates the field names no flag, and its lines read as
+        // they did before it existed.
+        let before_the_field = r#"{"model":"m","provider":"custom","base_url":"",
+          "messages":[{"role":"user","content":"the opening task"}]}"#;
+        let loaded: Session = serde_json::from_str(before_the_field).unwrap();
+        assert!(!is_dropped_note(&loaded.messages[0]));
     }
 
     /// Old sessions have no context field; they must still load. So must the

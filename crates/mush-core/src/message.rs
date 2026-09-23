@@ -3,7 +3,7 @@
 //! These are intentionally loose (`Option` everywhere, `#[serde(default)]`) so
 //! that the many "OpenAI-compatible" servers out there all round-trip cleanly.
 
-use serde::ser::SerializeStruct;
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -316,14 +316,19 @@ pub struct Message {
     /// model is told, and the one caller hands over `DROPPED_TURNS_NOTE` for
     /// it.
     ///
-    /// Not a wire field and not a stored one: `serde(skip)` keeps the flag out
-    /// of every request and out of `.mush/session.json` ([`Message`]'s
-    /// hand-written serializer never names it), so `false` is what a
-    /// deserialized message gets. A transcript read back from a session
-    /// therefore holds its note as a plain `user` line — the trimmer counts it
-    /// as a turn and the pane paints it in the human's voice — and a human's
-    /// identical line in the same file is no longer mistaken for the note.
-    #[serde(skip)]
+    /// Not a wire field: the request an endpoint reads carries the sentence
+    /// and nothing about who wrote it, so [`Message`]'s own serializer never
+    /// names this flag. It *is* written to `.mush/session.json` and read back
+    /// ([`serialize_stored_messages`], the shape [`crate::session::Session`]
+    /// stores its transcripts in), because the one thing a restart cannot
+    /// rebuild is this flag: without it a restored transcript reads its note
+    /// as a plain `user` line — the trimmer counts it as a turn and the pane
+    /// paints it in the human's voice — and its line is no longer moved back
+    /// where the dropped turns were. `false` is what every other message reads
+    /// as, the wire and an older file included: `serde(default)` keeps the
+    /// field a fact about the note alone, so a human's line that is word for
+    /// word `DROPPED_TURNS_NOTE` is still the human's own.
+    #[serde(default)]
     pub note: bool,
 }
 
@@ -338,16 +343,72 @@ pub struct Message {
 /// the alternative — a second `Message`-shaped type — is exactly what the
 /// request path must not grow: [`ChatRequest`] takes `&[Message]` and never
 /// learns there are images.
+///
+/// This is the **wire** form: it is what the request path sends, so it names
+/// nothing the spec does not. The one field that is not the spec's — `note` —
+/// is written only by [`serialize_stored_messages`], the shape the session
+/// file stores.
 impl Serialize for Message {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        self.write(serializer, false)
+    }
+}
+
+/// One message in the shape `.mush/session.json` stores it: [`Message`]'s wire
+/// form, plus `note` when the flag is set.
+///
+/// Why the file must have it and the wire must not is
+/// [`Message::note`](Message::note)'s doc. Why not a session-level fact: the
+/// flag belongs to one message, and a boolean on the file would have to be
+/// matched back to a line — by prose, the one thing finding F3 forbids — while
+/// the message is where the flag already lives.
+///
+/// Only the `true` is written. A message without the flag is byte for byte what
+/// the wire form writes, so a session file stays readable by a mush that
+/// predates the field, and `#[serde(default)]` is what a file that predates it
+/// reads back as (`false`).
+pub fn serialize_stored_messages<S>(messages: &[Message], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(messages.len()))?;
+    for message in messages {
+        seq.serialize_element(&Stored(message))?;
+    }
+    seq.end()
+}
+
+/// One message in the stored shape [`serialize_stored_messages`] writes: a
+/// wrapper, not a second shape — it delegates to the one body below.
+struct Stored<'a>(&'a Message);
+
+impl Serialize for Stored<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.write(serializer, true)
+    }
+}
+
+impl Message {
+    /// The message's JSON: the wire form, and — with `stored`, when the flag is
+    /// set — the one field the session file adds to it. One body, because two
+    /// would be two spellings of the same shape to keep in step.
+    fn write<S>(&self, serializer: S, stored: bool) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let note = stored && self.note;
         let fields = 1
             + usize::from(self.content.is_some() || !self.images.is_empty())
             + usize::from(self.reasoning_content.is_some())
             + usize::from(self.tool_calls.is_some())
-            + usize::from(self.tool_call_id.is_some());
+            + usize::from(self.tool_call_id.is_some())
+            + usize::from(note);
         let mut message = serializer.serialize_struct("Message", fields)?;
         message.serialize_field("role", &self.role)?;
         if self.images.is_empty() {
@@ -365,6 +426,9 @@ impl Serialize for Message {
         }
         if let Some(id) = &self.tool_call_id {
             message.serialize_field("tool_call_id", id)?;
+        }
+        if note {
+            message.serialize_field("note", &true)?;
         }
         message.end()
     }
@@ -833,6 +897,35 @@ mod tests {
         assert_eq!(
             reply.choices[0].message.role, "",
             "a role the server did not send is not an ended run"
+        );
+    }
+
+    /// The note's flag is mush's own provenance, not a fact about the request:
+    /// what an endpoint reads is the sentence alone, exactly as a human's
+    /// identical line reads. The session file's shape is the one that carries
+    /// it ([`serialize_stored_messages`]), because a restart has no other road
+    /// back to the fact of which line is the note (finding F3).
+    #[test]
+    fn the_notes_provenance_stays_off_the_wire_and_travels_in_the_file() {
+        let sentence = "the oldest turns were dropped";
+        let note = Message::note(sentence);
+        assert_eq!(
+            serde_json::to_string(&note).unwrap(),
+            serde_json::to_string(&Message::user(sentence)).unwrap(),
+            "a request cannot tell the note from a human's identical line"
+        );
+
+        let mut bytes = Vec::new();
+        let mut serializer = serde_json::Serializer::new(&mut bytes);
+        serialize_stored_messages(&[note], &mut serializer).unwrap();
+        let stored = String::from_utf8(bytes).unwrap();
+        assert!(
+            stored.contains(r#""note":true"#),
+            "the file says which line is the note: {stored}"
+        );
+        assert!(
+            !stored.starts_with(r#"{"note""#),
+            "and stays a message: {stored}"
         );
     }
 

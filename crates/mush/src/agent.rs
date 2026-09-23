@@ -1745,17 +1745,20 @@ pub fn revive(
 /// then the copy it had, repaired — with the dropped-turns note back in the
 /// place the *request* gives it, after the system prompt and the opening task.
 ///
-/// The copy arrives in the UI's shape: the same conversation without a system
-/// prompt, and with the note where the UI appends what it is told — the end.
-/// [`place_dropped_note`] (through [`adopted`]) puts a carried note back at
-/// index 2 *of the list it is given*, and index 2 is the note's place only when
-/// the prompt heads that list. For the root it always does, because the UI's
-/// own copy of the root's conversation carries the prompt ([`AgentMsg::Run`]'s
-/// hand-over); a child's prompt is the one message a revival cannot bring back
-/// (it names a workspace that may have moved), so a note in a child's copy
-/// used to be placed one line into the conversation instead of after its brief
-/// (finding A18). One door for both roads: the whole request-shaped list —
-/// prompt included — goes through [`adopted`].
+/// The copy arrives without a system prompt — the one message a revival cannot
+/// bring back, because it names a workspace that may have moved — and with the
+/// note wherever the copy that built it left it: the UI appends what it is told,
+/// at the end, while a stored copy holds the line where its trim last put it
+/// (the flag says which line it is, and the file keeps the flag:
+/// [`Message::note`]). [`place_dropped_note`] (through [`adopted`]) puts a
+/// carried note back at index 2 *of the list it is given*, and index 2 is the
+/// note's place only when the prompt heads that list. For the root it always
+/// does, because the UI's own copy of the root's conversation carries the
+/// prompt ([`AgentMsg::Run`]'s hand-over); a child's prompt is the one message a
+/// revival cannot bring back, so a note in a child's copy used to be placed one
+/// line into the conversation instead of after its brief (finding A18). One door
+/// for both roads: the whole request-shaped list — prompt included — goes
+/// through [`adopted`].
 fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> Vec<Message> {
     if messages.is_empty() && !brief.is_empty() {
         return vec![prompt, Message::user(brief)];
@@ -2400,12 +2403,13 @@ fn fold_parked(
 /// travels in; one helper, so no door can repair differently from another.
 fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
     repair_tool_pairs(&mut messages);
-    // The copy can also carry the dropped-turns note, in the one place the UI
-    // puts what it is told: the end. The actor's list is what a request is
-    // built from, so the note goes back where the dropped turns were before
-    // anything reads it — the fold included, whose own request must carry the
-    // sentence where the model expects a statement about the transcript's
-    // front (`mush_core::transcript::place_dropped_note`).
+    // The copy can also carry the dropped-turns note — the UI puts what it is
+    // told at the end, a stored copy holds it where its own trim left it. The
+    // actor's list is what a request is built from, so the note goes back where
+    // the dropped turns were before anything reads it — the fold included,
+    // whose own request must carry the sentence where the model expects a
+    // statement about the transcript's front
+    // (`mush_core::transcript::place_dropped_note`).
     place_dropped_note(&mut messages);
     messages
 }
@@ -9488,25 +9492,42 @@ mod tests {
     /// The dropped-turns note's place is a fact about the *request*: after the
     /// system prompt and the opening task. A child's history is rebuilt
     /// without its prompt — the prompt names a workspace that may have moved —
-    /// while the UI's copy appends the note where it appends every line it is
-    /// told, at the end. Putting the note back at index 2 of *that* copy landed
-    /// it one line into the conversation; the root's copy carries its prompt,
-    /// which is why the placement was right only there (finding A18). Probed
-    /// before the fix: the revived child's list opened
-    /// `[system, brief, reading, note, …]`; after, the note is where the model
-    /// expects a statement about the transcript's front.
+    /// while the copy it resumes from can hold the note anywhere: the UI
+    /// appends what it is told, at the end, and a stored copy holds the line
+    /// where its trim last put it. Putting the note back at index 2 of a
+    /// prompt-less copy landed it one line into the conversation (finding A18);
+    /// the root's copy carries its prompt, which is why the placement was right
+    /// only there. A revival resumes from a copy read back out of the session
+    /// file, so the flag that says which line is the note has to survive that
+    /// file — a note that came back as a plain user line was not moved at all
+    /// (finding F3's residual). Finding A18's probe: the revived child's list
+    /// opened `[system, brief, reading, note, …]`.
     #[test]
     fn a_revived_childs_note_comes_back_after_its_brief() {
-        let note = Message::user(mush_core::transcript::DROPPED_TURNS_NOTE);
         let carried = vec![
             Message::user("the brief"),
             Message::assistant("reading"),
             Message::user("more"),
             Message::assistant("done"),
-            note.clone(),
+            Message::note(mush_core::transcript::DROPPED_TURNS_NOTE),
             Message::user("carry on"),
         ];
-        let transcript = revived_transcript(Message::system("the child's prompt"), "", carried);
+        // The copy arrives the way a restored one does: through the session
+        // file, the road that has to carry the note's provenance
+        // (`Message::note`).
+        let stored = mush_core::Session {
+            messages: carried,
+            ..mush_core::Session::default()
+        };
+        let spelled = serde_json::to_string(&stored).unwrap();
+        let restored: mush_core::Session = serde_json::from_str(&spelled).unwrap();
+        assert!(
+            mush_core::transcript::is_dropped_note(&restored.messages[4]),
+            "the file says which line is the note: {spelled}"
+        );
+
+        let transcript =
+            revived_transcript(Message::system("the child's prompt"), "", restored.messages);
         assert_eq!(transcript[0].role, "system", "the prompt heads the request");
         assert_eq!(transcript[1].text(), "the brief", "then the opening task");
         assert_eq!(
