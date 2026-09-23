@@ -718,6 +718,70 @@ impl App {
         app
     }
 
+    /// Decide which of a stored file's rows the tree can hold, and spend every
+    /// id the file names, before one of them is registered.
+    ///
+    /// A session file is hand-editable, and a repository can still commit one —
+    /// an ignore rule does not untrack a tracked file — so its rows are not
+    /// trusted. A stored id has to be a *child's*: nonzero (0 is
+    /// [`AgentId::ROOT`]), not already taken by the root or by a row accepted
+    /// before it, reachable from the root through the file's own parent links (a
+    /// dangling parent or a cycle has no chain to the root), and one the id
+    /// counter can be kept above — the floor [`AgentTree::reserve_agents`]
+    /// exists to keep (finding B1) — so a `u64::MAX` row, which has nothing
+    /// above it, is refused too. Trusting the file instead registered a `0` row
+    /// *as the root*: its transcript replaced the root's conversation on screen
+    /// and its mailbox replaced the root's actor, and a `u64::MAX` row panicked
+    /// the debug build at `agent.id + 1` (finding C9).
+    ///
+    /// Every row the file names raises the floor before it is judged — refused
+    /// rows included, because the repository may hold a `mush/<id>` branch or a
+    /// `.mush/wt/<id>` worktree whatever the row said. The reservation is
+    /// saturated, and skipped where it saturates: a row at the ceiling has no
+    /// floor above it, and pinning the counter there would hand the next draw a
+    /// number it cannot pass. One bad row is refused and reported; the rows
+    /// after it still restore, because a file is not all-or-nothing.
+    fn vet_stored_agents(
+        &mut self,
+        stored: Vec<session::AgentSession>,
+    ) -> (Vec<session::AgentSession>, Vec<String>) {
+        let file = self.ws.rel(&session::session_path(self.ws.root()));
+        // The ids whose parent chain reaches the root: the root's own, plus
+        // every row accepted below. A row whose parent is in here is a child the
+        // restore can attach; one whose parent is not would need its parent
+        // registered first, which the file's spawn order should have done.
+        let mut reachable: HashSet<u64> = HashSet::from([AgentId::ROOT.0]);
+        let mut accepted = Vec::new();
+        let mut refused = Vec::new();
+        for agent in stored {
+            let floor = agent.id.saturating_add(1);
+            if floor > agent.id {
+                self.tree.reserve_agents(floor);
+            }
+            let why = if agent.id == AgentId::ROOT.0 {
+                "it holds the root's id"
+            } else if agent.id == u64::MAX {
+                "the counter cannot be kept above its id"
+            } else if reachable.contains(&agent.id) {
+                "its id is already taken"
+            } else if !agent
+                .parent
+                .is_some_and(|parent| reachable.contains(&parent))
+            {
+                "its parent chain does not reach the root"
+            } else {
+                reachable.insert(agent.id);
+                accepted.push(agent);
+                continue;
+            };
+            refused.push(format!(
+                "could not restore agent #{} in {file} — {why}; the row was skipped",
+                agent.id
+            ));
+        }
+        (accepted, refused)
+    }
+
     /// Adopt the subagents of the previous conversation: their nodes, their
     /// transcripts, and — through `agent::revive` — a live actor each, so a
     /// follow-up message continues the agent instead of starting over.
@@ -727,6 +791,10 @@ impl App {
     fn restore_agents(&mut self, stored: Vec<session::AgentSession>) {
         if stored.is_empty() {
             return;
+        }
+        let (stored, refused) = self.vet_stored_agents(stored);
+        for line in refused {
+            self.session_unreadable(line);
         }
         let cfg = self.cell.handle();
         let ui_tx = self.ui_tx.clone();
@@ -1910,7 +1978,8 @@ impl App {
 
     /// The conversation this workspace was left holding could not be read, and
     /// the human has to hear it before they mistake the empty screen for an
-    /// empty workspace (finding S3).
+    /// empty workspace (finding S3). A stored *row* the restore refuses is said
+    /// through the same door for the same reason (finding C9).
     ///
     /// It takes the two homes a failure takes: the root pane's foot — wrapped
     /// to the pane, ranked `Alert`, read back whole by `/notes` — and the bar's
@@ -6132,6 +6201,163 @@ mod tests {
                 .send(AgentMsg::Nudge("one more thing".into()))
                 .is_ok(),
             "the restored actor must still be listening"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stored conversation whose root says `the root's own words` and whose
+    /// `agents` are `rows` — id, parent, brief, one message each.
+    fn stored_with_rows(rows: Vec<(u64, Option<u64>, &str, &str)>) -> Session {
+        Session {
+            model: "test-model".into(),
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            context: None,
+            messages: vec![Message::user("the root's own words")],
+            agents: rows
+                .into_iter()
+                .map(|(id, parent, brief, line)| session::AgentSession {
+                    id,
+                    parent,
+                    depth: 1,
+                    brief: brief.into(),
+                    title: None,
+                    branch: None,
+                    status: session::StoredStatus::Done,
+                    landed: None,
+                    leftover: false,
+                    summary: None,
+                    result_unread: false,
+                    messages: vec![Message::user(line)],
+                })
+                .collect(),
+            notices: Vec::new(),
+        }
+    }
+
+    /// A stored row's id is not trusted: `0` is the root's, and registering a
+    /// row under it made the row's transcript replace the root's conversation
+    /// and its mailbox replace the root's actor (finding C9). The row is
+    /// refused with one line naming the file and the row, and the root's own
+    /// conversation is untouched — while the row *after* it still restores.
+    #[test]
+    fn a_stored_root_id_cannot_replace_the_root() {
+        let root = repo("stored-root-id");
+        let stored = stored_with_rows(vec![
+            (0, Some(0), "impostor", "IMPOSTOR LINE"),
+            (1, Some(0), "a real child", "a real line"),
+        ]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "the impostor did not replace the root's transcript"
+        );
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT)[0].text(),
+            "the root's own words"
+        );
+        assert_eq!(
+            app.tree.agents.len(),
+            2,
+            "no row was registered under the root's id"
+        );
+        assert!(
+            app.tree.agents.iter().any(|node| node.id == AgentId(1)),
+            "the row after the refused one still came back"
+        );
+        let lines: Vec<String> = app
+            .chat
+            .stored_notices()
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("#0") && line.contains(".mush/session.json")),
+            "one line names the file and the row: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An id already taken is not handed to a second row: the first row keeps
+    /// its node and its transcript, the duplicate is refused and named, and the
+    /// counter ends above every id the file held (finding C9 / B1) so a later
+    /// child can collide with neither.
+    #[test]
+    fn a_duplicate_id_keeps_the_first_row() {
+        let root = repo("stored-duplicate-id");
+        let stored = stored_with_rows(vec![
+            (2, Some(0), "first", "the first row's line"),
+            (2, Some(0), "second", "the second row's line"),
+        ]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        let node = app
+            .tree
+            .agents
+            .iter()
+            .find(|node| node.id == AgentId(2))
+            .expect("the first row comes back");
+        assert_eq!(node.brief, "first");
+        assert_eq!(app.chat.transcript(AgentId(2)).len(), 1);
+        assert_eq!(
+            app.chat.transcript(AgentId(2))[0].text(),
+            "the first row's line"
+        );
+        assert_eq!(
+            app.tree.agents.len(),
+            2,
+            "the duplicate registered no second #2"
+        );
+        let lines: Vec<String> = app
+            .chat
+            .stored_notices()
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("#2") && line.contains(".mush/session.json")),
+            "the refused duplicate is named: {lines:?}"
+        );
+        assert!(
+            app.tree.handles().ids.agents_floor() > 2,
+            "the counter is above every id the file held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An id at the ceiling used to panic the debug build (`agent.id + 1` in
+    /// `reserve_agents`); the reservation now saturates, and the row is refused
+    /// as one no floor can be kept above (finding C9).
+    #[test]
+    fn a_u64_max_id_does_not_panic_the_restore() {
+        let root = repo("stored-max-id");
+        let stored = stored_with_rows(vec![(u64::MAX, Some(0), "at the ceiling", "IMPOSTOR LINE")]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT)[0].text(),
+            "the root's own words"
+        );
+        assert_eq!(
+            app.tree.agents.len(),
+            1,
+            "no row was registered at the ceiling"
+        );
+        let lines: Vec<String> = app
+            .chat
+            .stored_notices()
+            .iter()
+            .map(|notice| notice.text.clone())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line.contains("session.json")),
+            "the refused row is named: {lines:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
