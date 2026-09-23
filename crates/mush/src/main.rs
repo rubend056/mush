@@ -877,7 +877,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // that write is a whole-file replace on a minute's debounce, so the two
     // conversations would erase each other in turn. A refused start leaves the
     // store exactly as it found it (see `lock`).
-    let _lock = lock::acquire(workspace.root())?;
+    let lock = lock::acquire(workspace.root())?;
     // A mush that died without unwinding left its commands' scratch files in the
     // temp directory, with an orphan still writing into them and no watcher left
     // to cap it (finding E5). The names carry the pid that owned each pair, so a
@@ -938,8 +938,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let root = agent::spawn(cell.handle(), tx.clone(), workspace.root().to_path_buf());
     // The session goes out through its own thread: the UI thread hands a
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
-    // exit flush.
-    let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
+    // exit flush. The writer is handed the lock's identity, so a save after the
+    // lock's *name* was replaced — a tool cannot do it, the human's `mv` can —
+    // is refused rather than written into a store a second mush now owns.
+    let save = Arc::new(session_save::Writer::new(
+        workspace.root().to_path_buf(),
+        Some(lock.identity()),
+    ));
     let attach_root = workspace.root().to_path_buf();
     let mut app = App::new(workspace, cell, stored, root, tx.clone(), save);
     // The attach socket comes up before the first frame, so a client can
