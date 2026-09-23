@@ -4611,9 +4611,12 @@ impl App {
             } else {
                 // Several agents are busy and the focused one is not among
                 // them: stopping the wrong one silently would be worse than
-                // asking, so name the scope instead.
+                // asking, so name the road that stops one instead. It used to
+                // name `Enter`, which sends the box's draft in the chat pane
+                // and only shows a row's transcript in the tree — it stops
+                // nothing (finding D25).
                 self.say(format!(
-                    "{} agents running · Enter picks one to stop · Ctrl-X stops them all",
+                    "{} agents running · agents pane: c stops the row · Ctrl-X stops all",
                     busy.len()
                 ));
             }
@@ -13945,6 +13948,57 @@ mod tests {
         assert!(
             rows.join("\n").contains("cancelling."),
             "and the foot says the same word, dots and all: {rows:?}"
+        );
+    }
+
+    /// The line `Ctrl-C` answers with when several agents run and the focused
+    /// one does not: it must name a key that *stops*. It used to name `Enter`,
+    /// which sends the chat pane's draft (and only shows a tree row's
+    /// transcript) — following it with a draft in the box sent the message
+    /// instead of stopping anything (finding D25). The key named is the one the
+    /// key table routes to the tree's stop, so the sentence and the table
+    /// cannot drift.
+    #[test]
+    fn the_many_agents_line_names_a_key_that_stops() {
+        let (mut app, _rx) = test_app("many-agents-stop");
+        spawn_agent(&mut app, 1, 0, 1, "one", None);
+        spawn_agent(&mut app, 2, 0, 1, "two", None);
+        begin_run(&mut app, AgentId(1));
+        begin_run(&mut app, AgentId(2));
+        // The focused agent is neither of them, so Ctrl-C takes the several
+        // arm instead of stopping one.
+        ctrl(&mut app, 'c');
+
+        let line = text_of(&app).to_string();
+        assert!(!line.contains("Enter"), "Enter stops nothing: {line}");
+        // The key the line names is a row of the one key table, in the pane it
+        // is pressed in...
+        let cancel = keys::KEYS
+            .iter()
+            .find(|binding| binding.context == keys::Context::Agents && binding.keys == "c")
+            .expect("the agents pane's c row");
+        assert!(
+            line.contains(&format!("{} stops the row", cancel.keys)),
+            "the line names the table's key: {line}"
+        );
+        // ...and the table really routes it to the stop.
+        assert_eq!(
+            keys::key(
+                Focus::Agents,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            ),
+            keys::Intent::TreeCancel,
+            "the key the line names stops the row under the tree's cursor"
+        );
+        assert!(
+            line.contains("Ctrl-X stops all"),
+            "the all-agents brake is still named: {line}"
+        );
+        assert!(
+            line.chars().count() <= 73,
+            "one bar row once the badge takes its seven columns: {line}"
         );
     }
 
