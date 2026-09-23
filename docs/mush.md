@@ -469,7 +469,7 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
@@ -813,6 +813,7 @@ for the alert red, because a failure has to look the same wherever it is read.
   .mush/
     .gitignore     # contains a single line: *
     session.json   # the conversation, model, provider, endpoint, and stored failures
+    session.json.previous  # the conversation the last new chat cleared
     wt/            # isolated agents' git worktrees (when used)
 ```
 
@@ -875,10 +876,15 @@ needs to be added to the project's own `.gitignore`.
 `session.json` is written on its own thread. A streamed message only marks the
 conversation dirty, and the file is rewritten at most once a second — so a tool
 result costs the screen nothing — while a sent message, a command that changed
-what is stored, a compaction and a new chat (Ctrl-N) are written before they
-return, and quitting writes whatever is still only in memory. Quitting therefore
+what is stored, a compaction and a new chat (Ctrl-N's confirming press) are
+written before they return, and quitting writes whatever is still only in
+memory. Quitting therefore
 loses nothing, and a crash can cost at most the last second of a streamed reply.
-On startup the conversation resumes where it left off. Ctrl-N clears it.
+On startup the conversation resumes where it left off. Over a conversation with
+something in it, `Ctrl-N` clears in two steps: the first press says what would
+go and where it is kept (`.mush/session.json.previous`), and the second writes
+that copy and clears; an empty conversation clears on one press, and a copy that
+cannot be written refuses the key.
 
 It carries every subagent's transcript too, so a relaunch brings the tree back
 with its briefs and its context. It also carries each agent's last **failure**
@@ -921,11 +927,11 @@ the run restarts, so a result is never lost just because nobody called
 
 Two different messages end an agent's work, and the difference matters:
 `Stop` cancels the run in flight (Ctrl-C, `c` on a running row) and leaves the
-actor alive to be nudged again; `Shutdown` ends the actor (Ctrl-N, the new
-chat). An actor holds a handle to its own mailbox, so it can never infer that
-everyone else let go — it has to be told. Every event carries the conversation
-it belongs to, so an actor that is still finishing a request when the human
-starts a new chat cannot write into it.
+actor alive to be nudged again; `Shutdown` ends the actor (Ctrl-N, once the new
+chat is confirmed). An actor holds a handle to its own mailbox, so it can never
+infer that everyone else let go — it has to be told. Every event carries the
+conversation it belongs to, so an actor that is still finishing a request when
+the human starts a new chat cannot write into it.
 
 A `Stop` has two halves, because one of them cannot wait for a mailbox: the
 message reaches the actor, and the flag it sets is *shared with the UI* when the
