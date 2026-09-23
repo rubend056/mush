@@ -4220,11 +4220,20 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // shared child in the parent's checkout (finding A7, F12).
     let named = tools::arg_string_opt(args, "base")?;
     let base: Option<String> = match named.as_deref() {
-        Some(name) => Some(git::resolve(actor.ws.root(), name).ok_or_else(|| {
-            format!(
-                "unknown base `{name}`: no commit, branch or tag by that name in this agent's workspace"
-            )
-        })?),
+        Some(name) => {
+            // The repository's own state has the first word on whether a name
+            // can mean anything here: a fresh `git init` has no commit for any
+            // base to resolve to, so the sentence written for that state is the
+            // one to read — not git's own about the name a model happened to
+            // speak (finding F16's residual). The gate [`git::worktree_add`]
+            // asks, asked *before* the name so the refusal costs no resolve.
+            git::can_branch_from(actor.ws.root())?;
+            Some(git::resolve(actor.ws.root(), name).ok_or_else(|| {
+                format!(
+                    "unknown base `{name}`: no commit, branch or tag by that name in this agent's workspace"
+                )
+            })?)
+        }
         None => None,
     };
     let isolated = base.is_some();
@@ -17537,7 +17546,10 @@ mod tests {
 
     /// A named base is resolved to a commit before anything is created: a
     /// scratch workspace that is no repository at all refuses the call, and no
-    /// child is spawned on some other history (finding H7).
+    /// child is spawned on some other history (finding H7). The sentence is the
+    /// repository's own first word about the state — the same gate
+    /// [`git::worktree_add`] asks — because a name cannot be resolved in a
+    /// directory git cannot answer for either (finding F16).
     #[test]
     fn a_named_base_is_resolved_before_anything_is_created() {
         let (actor, _mailbox) = scripted_tools_actor(
@@ -17561,8 +17573,52 @@ mod tests {
         let ToolError::Failed(error) = error else {
             panic!("an unknown base is a failed call");
         };
-        assert!(error.contains("unknown base"), "{error}");
+        assert!(error.contains("not a git repository"), "{error}");
         assert!(state.children.is_empty(), "nothing may be spawned");
+    }
+
+    /// A repository with no commit refuses a base spawn with the sentence
+    /// written for *that* state. The production road used to resolve the name
+    /// first, so a fresh `git init` answered `unknown base \`main\`` — git's own
+    /// word about a name that could never resolve — and spent a process on the
+    /// question `worktree_add` asks again a moment later (finding F16's
+    /// residual; the git door already asks `has_commits` first).
+    #[test]
+    fn a_base_spawn_in_a_repo_without_commits_refuses_with_that_reason() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-unborn-base",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "unborn base", "base": "main" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("an unborn repository is a failed call");
+        };
+        assert_eq!(
+            why, "the repo has no commits yet — commit first or drop isolated",
+            "the repository's state outranks the name the model spoke"
+        );
+        assert!(state.children.is_empty(), "nothing may be spawned");
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "and nothing was created before the refusal"
+        );
+        // The refusal comes before the id is drawn: the retry after a human
+        // commits is consecutive.
+        assert_eq!(actor.ctx.ids.agents_floor(), 1, "no id was drawn");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A wrongly-typed `base` is refused, never read as "no base":
