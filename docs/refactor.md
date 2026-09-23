@@ -372,9 +372,10 @@ and `Job::{poll, written, output, kill}`; the real impl is the shell as it
 always was (own process group, output to scratch files), and `Scratch` moved
 into it — the `kill -9 -pgid` child that moved with it is gone: `3bb1a5b`
 signals the group in process through `kill_group` and `rustix`. `clock.rs`
-holds `Clock::{now, sleep}`, the
-system impl, and an advanceable fake; `wait_tool`'s 50 ms poll, `wait_bounded`'s
-10 ms poll and `Watch`'s deadline all read it through `AgentCtx`. `events.rs`
+holds `Clock::{now, sleep}`, the system impl, and an advanceable fake;
+`wait_tool`'s 50 ms poll and `wait_bounded`'s 10 ms poll read it through
+`AgentCtx`, while `Watch`'s deadline is handed `clock::system()` on the `http.rs`
+side — the exception `clock.rs` names. `events.rs`
 holds `Events::emit(id, event)`: the real sink is the UI channel with the
 conversation stamped on, and the fake records — which is what retires
 `mem::forget(ui_rx)` from the actor tests. B6 is closed on both ends: only a run
