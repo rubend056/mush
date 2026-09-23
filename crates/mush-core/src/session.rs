@@ -334,8 +334,10 @@ impl Session {
         // A serialization failure is an error like any other: the writer's
         // error channel two files away is where the human hears about it, and a
         // session replaced by `{}` would be a save reporting success.
+        // A new store is mush's own file ([`Fresh::Private`]): the write must
+        // not make the conversation group- and world-readable.
         let json = serde_json::to_vec_pretty(&self).map_err(std::io::Error::other)?;
-        crate::workspace::atomic_write(&path, &json)
+        crate::workspace::atomic_write(&path, &json, crate::workspace::Fresh::Private)
     }
 
     /// Replace every image payload in this conversation — the root transcript's

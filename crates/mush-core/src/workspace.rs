@@ -1,14 +1,15 @@
 //! Workspace filesystem access: safe paths, reads, listings, search, atomic
 //! writes.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::message::Image;
 use crate::session;
 use crate::text;
-use tempfile::NamedTempFile;
 
 /// Directories a walk never descends into: VCS metadata and build output, whose
 /// contents are never the workspace's work. Hidden names are *not* skipped —
@@ -341,6 +342,56 @@ impl Workspace {
         Ok(out)
     }
 
+    /// The real thing a workspace path names, for a road that is about to
+    /// touch it: [`Self::resolve`]'s lexical answer with its deepest existing
+    /// prefix canonicalized and checked against `self.root`.
+    ///
+    /// Lexical resolution is not enough once a link is in the tree. `resolve`
+    /// walks components and refuses `..`, so a path it accepts cannot climb
+    /// out — but `root/out -> /tmp/elsewhere` is a name *inside* the root
+    /// pointing outside it, and every road that then opened `out/secret.txt`
+    /// was reading or writing the file outside (a probe wrote
+    /// `out/written.txt` into `/tmp/elsewhere`), while the listing's own doc
+    /// promised no symlinked directory was followed. So the filesystem is
+    /// asked instead: the deepest prefix that exists is `canonicalize`d —
+    /// every link in it resolved — and a result that is not under the root is
+    /// a refusal naming the escape. A tail that does not exist yet is appended
+    /// unresolved, because a name that is not there cannot be a link.
+    ///
+    /// A link that stays inside is not an escape and is not refused: it is the
+    /// file the model named, and the returned real path is where a write
+    /// through it lands (see [`atomic_write`]) while the link stays a link.
+    fn real_path(&self, path: &Path, rel: &str) -> Result<PathBuf, String> {
+        let mut tail: Vec<OsString> = Vec::new();
+        let mut probe = path.to_path_buf();
+        loop {
+            match fs::canonicalize(&probe) {
+                Ok(real) => {
+                    if !real.starts_with(&self.root) {
+                        return Err(format!(
+                            "{rel} resolves to {}, outside the workspace — refusing to touch it",
+                            real.display()
+                        ));
+                    }
+                    let mut out = real;
+                    for part in tail.iter().rev() {
+                        out.push(part);
+                    }
+                    return Ok(out);
+                }
+                Err(_) => {
+                    let (Some(name), Some(parent)) =
+                        (probe.file_name().map(OsString::from), probe.parent())
+                    else {
+                        return Err(format!("cannot resolve {rel}"));
+                    };
+                    tail.push(name);
+                    probe = parent.to_path_buf();
+                }
+            }
+        }
+    }
+
     /// Workspace-relative display path for an absolute path.
     pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -355,6 +406,8 @@ impl Workspace {
     /// a device may never end at all. The metadata answers what the path *is*
     /// before anything is opened, the same shape of check [`Self::image_at`]
     /// makes, so the two roads cannot disagree about which paths can be read.
+    /// The name is resolved for real first ([`Self::real_path`]), because a
+    /// link the root contains must not make this read a file outside it.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
     /// with a sentence of its own — then the six-tool cut took the file tools
@@ -363,7 +416,7 @@ impl Workspace {
     /// [`Self::read_image`]) because the shell cannot serve them behind a
     /// machine lock, so the cut lives there and this stays the whole-file read.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
-        let path = self.resolve(rel)?;
+        let path = self.real_path(&self.resolve(rel)?, rel)?;
         let meta = fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
         if !meta.is_file() {
             return Err(format!("{rel} is not a regular file — cannot read it"));
@@ -388,9 +441,13 @@ impl Workspace {
     ///
     /// Past [`IMAGE_FILE_CAP`] the refusal names the downscale, because an
     /// image that big cannot be made to fit any other way — `offset`/`limit`
-    /// are lines and an image has none.
+    /// are lines and an image has none. The name is resolved for real first
+    /// ([`Self::real_path`]) so a link inside the root cannot make the model's
+    /// read open a picture outside it; the human's paste road reaches
+    /// [`Self::image_at`] without this check, because the human already has
+    /// the file and is the one naming it.
     pub fn read_image(&self, rel: &str) -> Result<Option<Image>, String> {
-        let path = self.resolve(rel)?;
+        let path = self.real_path(&self.resolve(rel)?, rel)?;
         self.image_at(&path, rel)
     }
 
@@ -750,7 +807,7 @@ impl Workspace {
         limit: usize,
         cap: usize,
     ) -> Result<String, String> {
-        let path = self.resolve(rel)?;
+        let path = self.real_path(&self.resolve(rel)?, rel)?;
         if let Ok(meta) = fs::metadata(&path) {
             if meta.len() > READ_FILE_CAP {
                 return Err(format!(
@@ -822,8 +879,16 @@ impl Workspace {
     /// and sorted, with the first `limit` and whether there were more. Build and
     /// VCS directories are skipped ([`SKIP_DIRS`]); a symlinked directory is not
     /// followed, so a listing cannot leave the workspace.
+    ///
+    /// That claim is why the name is checked for real before the walk
+    /// ([`Self::real_path`]): `out -> /tmp/elsewhere` is a name inside the root
+    /// whose listing used to be the outside directory's. The walk itself still
+    /// runs on the name the model gave, so a link to a *file* inside the root
+    /// answers about that file under the name it was asked about, while a link
+    /// to a directory is left alone like every other symlinked directory.
     pub fn list_files(&self, rel: &str, limit: usize) -> Result<(Vec<String>, bool), String> {
         let start = self.resolve(rel)?;
+        self.real_path(&start, rel)?;
         // "Empty" and "not there" are different facts, and a listing that
         // answers `no files` for a path that does not exist is a lie the model
         // cannot see through.
@@ -854,6 +919,11 @@ impl Workspace {
     /// What it skipped is counted and travels back with the matches
     /// ([`Matches::skipped`]): a search that says "no match" while it never
     /// opened a file is a false negative a model will act on.
+    ///
+    /// Like the listing, the name is checked for real before the walk
+    /// ([`Self::real_path`]): a link inside the root cannot make the search
+    /// read files outside it, and the files it does read are the ones under
+    /// the name the model gave.
     pub fn search(
         &self,
         pattern: &str,
@@ -865,6 +935,7 @@ impl Workspace {
             return Err("`pattern` must not be empty".to_string());
         }
         let start = self.resolve(rel)?;
+        self.real_path(&start, rel)?;
         if fs::symlink_metadata(&start).is_err() {
             return Err(format!("no such path: `{rel}`"));
         }
@@ -927,13 +998,37 @@ impl Workspace {
     /// symlinked directories — calling `visit` until it answers `false`. A
     /// `start` that is itself a file visits that one file, so "list this path"
     /// and "search this path" answer about the file the model named instead of
-    /// claiming there is nothing there.
+    /// claiming there is nothing there. The start's own type is asked with
+    /// `symlink_metadata`, like every child's is: `is_file` would follow a
+    /// symlink and make the *start* the one symlinked directory the walk
+    /// follows. A symlinked start that resolves to a *file* is still answered
+    /// about — naming a file is a question about that file — while a symlinked
+    /// directory is left alone exactly as it would be a level down, and
+    /// "a symlinked directory is not followed" is then true of the start too.
+    /// (The roads that call this check the name with [`Self::real_path`] first,
+    /// so a link that leaves the root never reaches here.)
     ///
     /// One walker for the listing and the search: a second one is a second
     /// answer to "what is a workspace file", and the two drift.
     fn walk(&self, start: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
-        if start.is_file() {
+        let Ok(kind) = fs::symlink_metadata(start) else {
+            return;
+        };
+        let kind = if kind.file_type().is_symlink() {
+            // `metadata`, not `symlink_metadata`, only to tell a link to a file
+            // (answer about it) from a link to anything else (do not follow).
+            match fs::metadata(start) {
+                Ok(target) if target.is_file() => target,
+                _ => return,
+            }
+        } else {
+            kind
+        };
+        if kind.is_file() {
             visit(start);
+            return;
+        }
+        if !kind.is_dir() {
             return;
         }
         let mut stack = vec![start.to_path_buf()];
@@ -986,16 +1081,42 @@ impl Workspace {
     }
 
     /// Atomically create or replace a file, creating parent directories.
+    ///
+    /// The name is resolved to what it really is before anything is made (see
+    /// [`Self::real_path`]): a write through a symlink lands in the file the
+    /// link points at and the link stays a link, while a name whose real path
+    /// leaves the root is refused rather than followed. What the name *is*
+    /// decides the rest: a socket, a FIFO or a device is refused rather than
+    /// renamed over ([`entry_for_write`]), and a file with no owner-write bit
+    /// is refused with the mode it has, so a `0444` file the human marked
+    /// read-only is a sentence the model can read instead of an override it
+    /// cannot see. The mode refusal lives here, at the model's door, and not in
+    /// [`atomic_write`], which `session::save` and the human's own
+    /// `config.json` writer also use: they may replace a file whatever its
+    /// mode, but a model may not. The type refusal is shared with
+    /// [`atomic_write`], because a rename over a socket destroys it whatever
+    /// door it came through.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
-        let path = self.resolve(rel)?;
+        let path = self.real_path(&self.resolve(rel)?, rel)?;
         if path == self.root {
             return Err("refusing to write to the workspace root".to_string());
         }
-        if let Some(parent) = path.parent() {
+        let entry = entry_for_write(&path, rel)?;
+        if let Ok(meta) = fs::metadata(&entry) {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o200 == 0 {
+                return Err(format!(
+                    "{rel} is mode {mode:04o} — it has no owner-write bit, and mush will not \
+                     override that: `chmod u+w {rel}` first"
+                ));
+            }
+        }
+        if let Some(parent) = entry.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", self.rel(parent)))?;
         }
-        atomic_write(&path, content.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))
+        atomic_write(&entry, content.as_bytes(), Fresh::Box)
+            .map_err(|e| format!("cannot write {rel}: {e}"))
     }
 }
 
@@ -1310,14 +1431,161 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
     )
 }
 
+/// Who a *new* file is made for, when [`atomic_write`] has no mode to keep.
+///
+/// An existing target's mode is copied across the rename whatever this says;
+/// this decides only what a name that did not exist comes out as. The two
+/// values are the two facts a write road knows about its file:
+///
+/// - [`Fresh::Box`] — a workspace file, which belongs to the box: `0o666` with
+///   the human's umask applied by the kernel at creation, the way `>`, `vim`
+///   and `git` make one. The umask is the human's own decision about new files
+///   and no safe way to read it exists (`umask(2)` is both a process-wide write
+///   and unsafe, and this tree forbids `unsafe`), so spelling `0o644` here
+///   would be a second guess at a number the kernel already knows — and a wrong
+///   one on a box that chose `002` or `077`.
+/// - [`Fresh::Private`] — mush's own store: the session file and the
+///   key-bearing home `config.json`, which hold the whole conversation and the
+///   human's secrets. `0o600`, because a human's `022` umask is about the files
+///   the box shares and must not hand mush's private ones to the group.
+///
+/// One decision in one place: the difference is this match and the reason
+/// beside it, never two copies of `0666 & !umask`.
+pub enum Fresh {
+    Box,
+    Private,
+}
+
+impl Fresh {
+    /// The mode a new file is *created* with. The kernel still applies the
+    /// human's umask to it — which is the point for [`Fresh::Box`]: `0o666`
+    /// becomes `0o644` under the usual `022` and `0o600` under a `077`.
+    /// [`Fresh::Private`]'s `0o600` has no group or other bits for an umask to
+    /// take, so mush's own stores come out `0600` whatever the human chose.
+    fn mode(self) -> u32 {
+        match self {
+            Fresh::Box => 0o666,
+            Fresh::Private => 0o600,
+        }
+    }
+}
+
 /// Write via a same-directory temp file plus `rename`, so readers never observe
 /// a half-written file and a crash cannot corrupt the original.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
+///
+/// The name is resolved to what it really is first ([`entry_for_write`]): a
+/// symlink is written through and stays a link, and a socket, a FIFO or a
+/// device is refused rather than destroyed. That guard lives here beside the
+/// rename as well as at [`Workspace::write_file`], so a caller that does not
+/// pass through the tool's door (`session::save`, the human's own
+/// `config.json`) cannot rename over a socket either.
+///
+/// The mode is a fact of the file, not of this function. `tempfile`'s scratch
+/// file is `0600` by default and the rename would carry that onto the target,
+/// so an existing target's mode is copied onto the temp file before the rename
+/// (finding B1: an executable script stopped being executable, and `git`
+/// recorded the mode change); a name that did not exist is made the way
+/// `fresh` says. A hard-linked twin is the one fact this cannot keep: `rename`
+/// replaces the *name*, so the other name keeps the old bytes and the two stop
+/// being one inode. The fork is the price of the rename's atomicity, and this
+/// road will not trade that away for it — a copy-then-truncate would leave a
+/// reader able to see a half-written file, which is the promise above — so the
+/// fork is documented here and pinned by `a_hard_link_forks_under_the_rename`.
+pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
+    let entry = entry_for_write(path, &path.display().to_string()).map_err(invalid)?;
+    let dir = entry.parent().unwrap_or_else(|| Path::new("."));
+    let existing = fs::metadata(&entry)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o7777);
+    let mut tmp = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(
+            existing.unwrap_or_else(|| fresh.mode()),
+        ))
+        .tempfile_in(dir)?;
     tmp.write_all(bytes)?;
-    tmp.persist(path).map_err(|error| error.error)?;
+    // A mode the file already had is copied exactly, not created through the
+    // umask: the umask decides *new* modes, and this one is not new.
+    if let Some(mode) = existing {
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    tmp.persist(&entry).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// What a write to `path` must land on, or why it cannot: the file the name
+/// really is.
+///
+/// A write is a `rename`, and a `rename` replaces the *name*, so the name is
+/// asked what it is first. A symlink is resolved to its final target — the
+/// whole chain, because that is where the write belongs: the model edited the
+/// file the name points at, and a rename over the link would delete the link
+/// and leave that file untouched.
+/// A socket, a FIFO or a device is refused, because it is not content: renaming
+/// a regular file over the workspace's own `.mush/mush.sock` unlinks the attach
+/// socket and every `mush read`/`agents`/`edit` in that directory answers "no
+/// mush is running" until mush restarts (finding B3), and a FIFO or a device
+/// is the same destruction. A symlink to nothing is refused too: following it
+/// would make a file at a path no caller checked, so the reader is told to make
+/// the target first.
+///
+/// `name` is the caller's spelling of the path — the workspace-relative `rel`
+/// at the tool's door, the path itself for a caller with no root — because the
+/// refusal is read by a model or a human, not by `readlink`.
+fn entry_for_write(path: &Path, name: &str) -> Result<PathBuf, String> {
+    let Ok(kind) = fs::symlink_metadata(path) else {
+        return Ok(path.to_path_buf());
+    };
+    if kind.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if kind.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|error| format!("(unreadable: {error})"));
+        return match fs::canonicalize(path) {
+            Ok(real) => match fs::symlink_metadata(&real) {
+                Ok(real_kind) if real_kind.is_file() => Ok(real),
+                _ => Err(format!(
+                    "{name} is a symlink to {target} — which is not a regular file; refusing to \
+                     write through it"
+                )),
+            },
+            Err(_) => Err(format!(
+                "{name} is a symlink to {target}, which does not exist — refusing to replace \
+                 the link; create the target first"
+            )),
+        };
+    }
+    Err(format!(
+        "{name} is a {} — refusing to replace it",
+        what_it_is(&kind)
+    ))
+}
+
+/// The type name a refusal sentence gives for a name that is not a file: the
+/// words a model can act on, and the reason the write is refused at all.
+fn what_it_is(kind: &fs::Metadata) -> &'static str {
+    let kind = kind.file_type();
+    if kind.is_dir() {
+        "directory"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_fifo() {
+        "FIFO"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "device"
+    } else {
+        "file that is not a regular file"
+    }
+}
+
+/// [`entry_for_write`]'s refusal as an IO error: the kind that says "the name
+/// is wrong", not "the disk is". The callers inside a workspace wrap it in the
+/// sentence their model reads, and the callers outside one (`session::save`,
+/// the home `config.json`) report it through their own error channel.
+fn invalid(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]
@@ -1329,6 +1597,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Workspace::new(&dir).unwrap()
+    }
+
+    /// A path's permission bits as a human reads them (`0755`): the low twelve,
+    /// without the file-type bits `Permissions::mode` also carries.
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
     /// A picture file *outside* every test workspace — the paste road's own
@@ -2335,6 +2609,238 @@ mod tests {
             refused.contains("notes.txt is not a regular file"),
             "and a directory is not read either: {refused}"
         );
+    }
+
+    /// A write changes the bytes and nothing else: the mode is a fact of the
+    /// file, not of the temp file the rename carries it from. This is finding
+    /// B1's whole failure — every `write_file` rebuilt the inode at `0600`, so a
+    /// `0755` script stopped running and `git` recorded the mode change — and
+    /// the two edges the repair draws: a new file is made the way the box makes
+    /// one (`0666 & !umask`, measured against `fs::write`'s own file rather
+    /// than spelled as `0644`), and a file with no owner-write bit is a refusal
+    /// the model can read, naming the mode it found.
+    #[test]
+    fn a_write_keeps_the_files_mode() {
+        let ws = temp_workspace("write-mode");
+        let run = ws.root().join("run.sh");
+        let data = ws.root().join("data.txt");
+        fs::write(&run, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&data, "a\n").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+
+        ws.write_file("run.sh", "#!/bin/sh\necho hi\n").unwrap();
+        ws.write_file("data.txt", "b\n").unwrap();
+        assert_eq!(mode_of(&run), 0o755, "the executable bit survives");
+        assert_eq!(mode_of(&data), 0o644, "group and other readability survive");
+
+        // A new file is the box's, not mush's: `fs::write` makes one out of the
+        // same `0666 & !umask`, so the oracle is measured here, not spelled.
+        fs::write(ws.root().join("oracle.txt"), "x\n").unwrap();
+        ws.write_file("new.txt", "y\n").unwrap();
+        assert_eq!(
+            mode_of(&ws.root().join("new.txt")),
+            mode_of(&ws.root().join("oracle.txt")),
+            "a new file is the way the rest of the box makes one"
+        );
+
+        // The read-only bit is not overridden: the door refuses, names the mode
+        // and leaves the file as it was.
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o444)).unwrap();
+        let refused = ws.write_file("run.sh", "replaced\n").unwrap_err();
+        assert!(refused.contains("0444"), "the mode is named: {refused}");
+        assert!(refused.contains("owner-write"), "{refused}");
+        assert_eq!(fs::read_to_string(&run).unwrap(), "#!/bin/sh\necho hi\n");
+        assert_eq!(mode_of(&run), 0o444);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The other half of [`Fresh`]: a store mush writes for itself — the
+    /// session, the key-bearing home config — is not the box's file, so a new
+    /// one is `0600` whatever the human's umask says. `atomic_write` is the one
+    /// road both audiences travel, and this pins the one decision they differ
+    /// on; the session and userconfig tests pin their own road's call.
+    #[test]
+    fn a_private_store_is_made_0600() {
+        let ws = temp_workspace("fresh-private");
+        let path = ws.root().join("session.json");
+        atomic_write(&path, b"{}", Fresh::Private).unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "mush's own file is the owner's alone"
+        );
+
+        // An existing file keeps whatever it has, private or not: `Fresh`
+        // decides new files only, and a mode a file already has is not the
+        // umask's business.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write(&path, b"{\"a\":1}", Fresh::Private).unwrap();
+        assert_eq!(mode_of(&path), 0o640);
+        assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The one fact a rename cannot keep, pinned as the fact it is: a hard link
+    /// is another *name* for the inode, and `rename` replaces the name — so the
+    /// two names fork, the other keeps the old bytes, and they stop being one
+    /// inode. This is accepted, not fixed: the alternative, copying into the
+    /// existing inode, would give up the atomic rename that promises a reader
+    /// never sees a half-written file, and [`atomic_write`]'s doc says so. A
+    /// *symlink* is the case a rename can and does follow
+    /// (`an_edit_follows_a_symlink_to_its_target`, in the TUI crate's tests).
+    #[test]
+    fn a_hard_link_forks_under_the_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let ws = temp_workspace("hard-link");
+        let left = ws.root().join("left.txt");
+        let right = ws.root().join("right.txt");
+        fs::write(&left, "one\n").unwrap();
+        fs::hard_link(&left, &right).unwrap();
+
+        ws.write_file("left.txt", "two\n").unwrap();
+        assert_eq!(fs::read_to_string(&left).unwrap(), "two\n");
+        assert_eq!(
+            fs::read_to_string(&right).unwrap(),
+            "one\n",
+            "the twin keeps the old bytes"
+        );
+        let a = fs::metadata(&left).unwrap();
+        let b = fs::metadata(&right).unwrap();
+        assert_ne!(a.ino(), b.ino(), "and the two names fork");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A name that is not a file is not content, and a rename replaces the name
+    /// whatever it is: the workspace's own attach socket dies this way (finding
+    /// B3 — every `mush read`/`agents`/`edit` in that directory answered "no
+    /// mush is running" until mush restarted) and a FIFO goes the same way.
+    /// Both doors refuse, naming the type: the tool's `write_file` and the
+    /// `atomic_write` that `session::save` and the home config use, because a
+    /// caller that does not pass through the tool's door must not rename over
+    /// one either.
+    #[test]
+    fn a_write_will_not_replace_a_socket_or_a_fifo() {
+        use std::os::unix::net::UnixListener;
+
+        let ws = temp_workspace("write-type");
+        fs::create_dir_all(ws.root().join(".mush")).unwrap();
+        let sock = ws.root().join(".mush/mush.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let refused = ws
+            .write_file(".mush/mush.sock", "not a socket any more\n")
+            .unwrap_err();
+        assert!(refused.contains("socket"), "the type is named: {refused}");
+        assert!(fs::symlink_metadata(&sock).unwrap().file_type().is_socket());
+        assert!(
+            atomic_write(&sock, b"x", Fresh::Box).is_err(),
+            "the guard is kept beside the rename too"
+        );
+        // A socket's inode is not the fact that matters: a client must still be
+        // able to connect, because that is what mush's attach road does.
+        std::os::unix::net::UnixStream::connect(&sock)
+            .expect("the attach socket must still accept a client");
+
+        let fifo = ws.root().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this test needs `mkfifo` to build the shape it pins"
+        );
+        let refused = ws.write_file("pipe", "content\n").unwrap_err();
+        assert!(refused.contains("FIFO"), "the type is named: {refused}");
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+
+        // And an ordinary file and a brand-new name still write.
+        ws.write_file("plain.txt", "a\n").unwrap();
+        ws.write_file("fresh.txt", "b\n").unwrap();
+        assert_eq!(ws.read_file("fresh.txt").unwrap(), "b\n");
+        drop(listener);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// Every road that touches the filesystem asks what really lies under a
+    /// name (finding B4): `resolve` is lexical, so a link the root *contains*
+    /// used to carry reads, writes, listings and searches out of the workspace
+    /// (`write_file("out/written.txt")` landed in the link's directory). The
+    /// outside directory is the proof of the refusal, and the positive twin
+    /// rides in the same test: a link to a file *inside* the root still reads,
+    /// a write through it lands in the target and keeps the link a link, and a
+    /// symlinked directory is not followed — the listing's own claim, which its
+    /// start used to break.
+    #[test]
+    fn a_link_inside_the_root_cannot_leave_it() {
+        use std::os::unix::fs::symlink;
+
+        let outside = std::env::temp_dir().join(format!(
+            "mush-test-root-link-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        fs::write(outside.join("secret.txt"), "SEKRIT\n").unwrap();
+        fs::write(outside.join("sub/deep.txt"), "DEEP\n").unwrap();
+
+        let ws = temp_workspace("root-link");
+        symlink(&outside, ws.root().join("out")).unwrap();
+        symlink(&outside, ws.root().join("sub-out")).unwrap();
+        fs::write(ws.root().join("inside.txt"), "INSIDE\n").unwrap();
+        symlink(ws.root().join("inside.txt"), ws.root().join("link.txt")).unwrap();
+
+        let mut refusals = vec![
+            ws.read_file("out/secret.txt").unwrap_err(),
+            ws.write_file("out/written.txt", "ESCAPED\n").unwrap_err(),
+            ws.list_files("out", 100).unwrap_err(),
+        ];
+        // `Matches` carries no `Debug`, so the search's refusal is matched out
+        // by hand rather than unwrapped.
+        refusals.push(match ws.search("DEEP", "out", false, 100) {
+            Err(refused) => refused,
+            Ok(found) => panic!(
+                "a search through a link out of the root must be refused, not run: {:?}",
+                found.matches
+            ),
+        });
+        for refused in refusals {
+            assert!(
+                refused.contains("outside the workspace"),
+                "names the escape: {refused}"
+            );
+        }
+        assert!(
+            !outside.join("written.txt").exists(),
+            "nothing landed outside"
+        );
+        let listed = ws.list_files("", 100).unwrap().0;
+        assert!(
+            !listed.iter().any(|file| file.contains("secret")),
+            "a symlinked child directory is still not followed: {listed:?}"
+        );
+
+        // The positive twin: a link to a file inside the root keeps working.
+        assert_eq!(ws.read_file("link.txt").unwrap(), "INSIDE\n");
+        assert_eq!(
+            ws.list_files("link.txt", 10).unwrap().0,
+            vec!["link.txt".to_string()],
+            "naming a link to a file answers about that file, under its name"
+        );
+        ws.write_file("link.txt", "EDITED\n").unwrap();
+        assert!(
+            fs::symlink_metadata(ws.root().join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the write went through the link and left it a link"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.root().join("inside.txt")).unwrap(),
+            "EDITED\n"
+        );
+
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// A file far past the cap is refused from what the stat said, not by being

@@ -9174,6 +9174,47 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// An edit through a symlink lands in the file the link points at, and the
+    /// link stays a link: `read_file` follows the link, so a rename over the
+    /// link itself would leave the model's change in a new file beside it while
+    /// the file the model believes it edited kept its old bytes — silently
+    /// (finding B2). The hard-linked twin is the one case the rename cannot
+    /// keep; it is documented in [`mush_core::workspace::atomic_write`] and
+    /// pinned by `a_hard_link_forks_under_the_rename`, and it is deliberately
+    /// not this test's fact.
+    #[test]
+    fn an_edit_follows_a_symlink_to_its_target() {
+        let (actor, _mailbox) = test_actor("edit-symlink");
+        let ws = &actor.ws;
+        fs::create_dir_all(ws.root().join("real")).unwrap();
+        fs::write(ws.root().join("real/config"), "a = 1\n").unwrap();
+        std::os::unix::fs::symlink(ws.root().join("real/config"), ws.root().join("link")).unwrap();
+
+        let edited = edit_tool(
+            ws,
+            &json!({
+                "path": "link",
+                "edits": { "old_string": "a = 1", "new_string": "a = 2" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(edited, "edited link");
+        assert!(
+            fs::symlink_metadata(ws.root().join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link stays a link"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.root().join("real/config")).unwrap(),
+            "a = 2\n",
+            "the edit landed in the target"
+        );
+        assert_eq!(ws.read_file("link").unwrap(), "a = 2\n");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
     /// `status` with nothing behind it: the registry answers `None` rather than
     /// a sentinel line the caller compares with a string, and the listing is the
     /// one sentence a model can act on. The sentinel was a count spelled as
