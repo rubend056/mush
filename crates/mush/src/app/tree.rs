@@ -901,12 +901,22 @@ impl AgentTree {
     /// refusing a nudge that would recreate the reclaimed path as a plain
     /// directory (finding S1). `landed` is stored, so a restart comes back with
     /// the same row rather than reviving an agent whose worktree is gone.
+    ///
+    /// The stat goes with the branch it described: `agent_stats` holds a
+    /// `+3−1` of the *branch's* diff, the row paints it beside the branch name
+    /// and the pane title sums every value in the map, so a reclaimed worktree
+    /// that kept its entry left the row saying `+3−1` and the title summing a
+    /// branch that is gone — the fresh map is installed before the sweep
+    /// decides, which is the defect the audit's probe caught (finding D8). One
+    /// removal, because the tree owns the map: the row and the title are two
+    /// readers of the same key.
     pub fn mark_reclaimed(&mut self, id: AgentId, landed: Landed) {
         if let Some(node) = self.node_mut(id) {
             node.landed = Some(landed);
             node.branch = None;
             node.kept = None;
         }
+        self.agent_stats.remove(&id);
     }
 
     /// What the last reclamation sweep found at this agent's worktree: the reason
@@ -2610,6 +2620,50 @@ mod tests {
             before,
             "the cursor still names the agent it named: before={before:?} after={:?}",
             tree.cursor_id()
+        );
+    }
+
+    /// A reclaimed worktree's stat described a branch that no longer exists:
+    /// the row kept painting `+3−1` and the pane title kept summing it, because
+    /// the stat stayed in `agent_stats` after [`AgentTree::mark_reclaimed`]
+    /// cleared the branch (finding D8).
+    ///
+    /// The audit's probe — a fresh stat map installed before the sweep decides,
+    /// so the worktree the same `adopt_git` reclaims leaves its figure behind —
+    /// read `["│   ✓ #1 port  mush/1 +3−1  did it     │"]` before and
+    /// `["│   ✓ #1 port  +3−1  did it            │"]` after.
+    #[test]
+    fn a_reclaimed_worktree_leaves_no_branch_stat() {
+        let mut tree = AgentTree::bare();
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "port".to_string(),
+            depth: 1,
+            branch: Some("mush/1".to_string()),
+            fork: None,
+            cmd: tx,
+        });
+        tree.agent_stats.insert(
+            AgentId(1),
+            git::Stat {
+                files: 1,
+                added: 3,
+                removed: 1,
+            },
+        );
+
+        tree.mark_reclaimed(AgentId(1), Landed::Merged);
+
+        let node = tree.node(AgentId(1)).unwrap();
+        assert_eq!(node.branch, None, "the branch went with the checkout");
+        assert_eq!(node.landed, Some(Landed::Merged));
+        assert_eq!(node.kept, None);
+        assert!(
+            !tree.agent_stats.contains_key(&AgentId(1)),
+            "and the stat went with the branch it described, or the row and the title keep summing a branch that is gone: {:?}",
+            tree.agent_stats
         );
     }
 
