@@ -5356,6 +5356,17 @@ fn run_shell(
         matches!(detach, Detach::Job { .. }),
         cap,
     ));
+    // A command that ended with its group still standing: its own end was the
+    // only end — nothing in mush asked it to stop — and what stayed behind was
+    // in the group mush gave the command, so the wait ended it while the id was
+    // still provably the command's ([`jobs::GroupEnding`]). The model is told,
+    // because a model that wrote `server &` reads `[exit 0]` as "the server is
+    // running" (finding E3); the clause is the completion line's own, so a
+    // human reading the transcript and a model reading its result are told the
+    // same thing.
+    if let Some(clause) = running.left_behind().and_then(jobs::GroupEnding::clause) {
+        report.push_str(&format!("[{clause}]\n"));
+    }
     Ok(report)
 }
 
@@ -7571,9 +7582,9 @@ mod tests {
     /// This one stays a real `sh`. It is the *reason* the output goes to files
     /// rather than pipes — a pipe is only complete once every holder exits — and
     /// a scripted machine cannot demonstrate that, because a scripted job holds
-    /// nothing. It is bounded: the command returns at once, and the `sleep 30`
-    /// it leaves behind dies with the process group when the scratch files are
-    /// read.
+    /// nothing. The command returns at once, and what it left in its group is
+    /// ended by the call's own end (finding E3), so the group is gone — and said
+    /// to be gone — by the time the report is read.
     #[test]
     fn a_background_job_does_not_hold_the_tool_hostage() {
         let (actor, _mailbox) = test_actor("background");
@@ -7581,8 +7592,8 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
         let report = run_shell(
-            "sleep 30 & echo started",
-            &std::env::temp_dir(),
+            "echo $$ > bg.pgid; sleep 30 & echo started",
+            actor.ws.root(),
             Duration::from_secs(10),
             Detach::No,
             &cancel,
@@ -7593,10 +7604,27 @@ mod tests {
         assert!(report.contains("started"), "{report}");
         assert!(report.contains("[exit 0]"), "{report}");
         assert!(
+            report.contains("1 process in its group was stopped"),
+            "the model is told the background child is gone: {report}"
+        );
+        assert!(
             started.elapsed() < Duration::from_secs(5),
             "took {:?}",
             started.elapsed()
         );
+        // And it is gone, not merely announced: the group id the command
+        // printed is its own `$$`, which `process_group(0)` made the leader's,
+        // and no process is in it any more.
+        let pgid: u32 = fs::read_to_string(actor.ws.root().join("bg.pgid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::machine::group_members(pgid).is_empty() {
+            assert!(Instant::now() < deadline, "the group is still there");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
