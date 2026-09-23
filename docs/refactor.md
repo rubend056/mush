@@ -425,7 +425,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | A1 | cancel/deadline only consulted on read timeout | http `Watch` (regression test) |
 | A2 | `tokens * 3` overflow | `config::clamp_context` |
 | A3 | `parse_context_hint` misfires / misses | `config` (markers + range) |
-| A4 | caps as floors; reserve > window | `config::{cmd_cap, history_budget}` (the read and listing caps went with the file tools) |
+| A4 | caps as floors; reserve > window | `config::{cmd_cap, history_budget}`, plus the file tools' caps that came back with them: `workspace::{READ_FILE_CAP, SEARCH_FILE_CAP}` and `agent::LIST_LIMIT` (H31, `findings.md` §8.36) |
 | A5 | window derived once; runtime switches never re-derive | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
 | A6 | CLI provider never selects its endpoint | `config::resolve_with` test |
 | A7 | no cap on response body | `http` `MAX_BODY_BYTES` |
