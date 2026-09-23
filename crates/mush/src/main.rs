@@ -40,7 +40,6 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
-use mush_core::config::WindowSource;
 use mush_core::text::mask_key;
 use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
 use serde_json::Value;
@@ -723,15 +722,11 @@ fn describe(
     };
     // The window is the one fact whose *source* matters, and a number can come
     // by four roads: the human, mush's own table, the endpoint's model list, the
-    // endpoint's refusal. Each is named in words here — the meter has one
-    // display column for the same fact ([`crate::app::window_mark`]), so this
-    // dump carries the sentence.
-    let window = match config.context_source {
-        WindowSource::Stated => "stated by the human",
-        WindowSource::Table => "assumed from mush's model table",
-        WindowSource::Advertised => "advertised by the endpoint's model list",
-        WindowSource::Complaint => "named by the endpoint in a refusal",
-    };
+    // endpoint's refusal. Each is named in words by [`WindowSource::words`],
+    // beside the roads themselves, so this dump and `/context`'s report cannot
+    // describe one window differently — the meter has one display column for
+    // the same fact ([`crate::app::window_mark`]) and paints the mark.
+    let window = config.context_source.words();
     let cap = if config.uses_max_completion_tokens() {
         "max_completion_tokens"
     } else {
@@ -1288,6 +1283,7 @@ fn install_panic_hook_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mush_core::config::WindowSource;
     use mush_core::Message;
 
     #[test]

@@ -202,6 +202,26 @@ pub enum WindowSource {
     Complaint,
 }
 
+impl WindowSource {
+    /// The road in words — which hand stated the window — one sentence per
+    /// road.
+    ///
+    /// Beside the roads themselves, because two surfaces print the sentence
+    /// and neither owns it: `--print-config`'s window row and `/context`'s
+    /// report. A second copy is how the two would come to describe one window
+    /// differently. The meter paints a one-column mark instead (`window_mark`
+    /// in `app`): the bar has no room for a sentence, and a surface that has
+    /// the room says what the road was.
+    pub fn words(self) -> &'static str {
+        match self {
+            WindowSource::Stated => "stated by the human",
+            WindowSource::Table => "assumed from mush's model table",
+            WindowSource::Advertised => "advertised by the endpoint's model list",
+            WindowSource::Complaint => "named by the endpoint in a refusal",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub provider: Provider,
@@ -632,6 +652,22 @@ impl Config {
     pub fn set_context(&mut self, tokens: usize) {
         self.context_tokens = clamp_context(tokens);
         self.context_source = WindowSource::Stated;
+    }
+
+    /// Forget the window the human stated, and derive one again: `/context
+    /// auto`'s write, and the road back from a statement a workspace would
+    /// otherwise carry forever.
+    ///
+    /// The road is dropped to [`WindowSource::Table`] *before*
+    /// [`Self::rederive_context`] is asked for a number: it leaves a window the
+    /// human stated alone — a model change must not overrule one — so the
+    /// statement has to be given up first, not after. Nothing else is owed for
+    /// the forgetting to stick: the session stores a window only while
+    /// [`Self::context_explicit`] is true, so the next save drops the field and
+    /// a restart derives the same number again.
+    pub fn forget_context(&mut self) {
+        self.context_source = WindowSource::Table;
+        self.rederive_context();
     }
 
     /// The one cap on the text a tool result may carry — a command's output, a

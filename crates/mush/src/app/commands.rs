@@ -25,6 +25,7 @@
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
+//! | `/context [N|auto]` | optional | say the window and its road, state one, or re-derive |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read every note about the focused agent |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
@@ -33,7 +34,9 @@
 //! Git is not a command surface: the tree names the branch and the worktree,
 //! and `git` itself is the tool for acting on them. The worktree commands mush
 //! used to wrap (`/diff`, `/merge`, `/discard`, `/forget`, `/worktrees`) are
-//! gone, and so is `/context` (the meter is on screen) and `/new` (Ctrl-N).
+//! gone, and so is `/new` (Ctrl-N). `/context` went with them once — the meter
+//! is on screen — and is back because the meter paints the number, and only a
+//! command can say which road the number came by.
 //!
 //! Anything else is an error value: an unknown slash, or a real command whose
 //! argument does not read.
@@ -56,6 +59,8 @@ pub enum Command {
     ApiKey(Option<String>),
     /// `/models`: re-read the endpoint's list.
     Models,
+    /// `/context`: say the window in force and the road it came by.
+    Context(ContextArg),
     Compact,
     /// `/notes`: read every note about the focused agent, in full.
     ///
@@ -63,6 +68,23 @@ pub enum Command {
     /// lists the agent's whole set of notices, the ones the foot already showed
     /// included, because that is what the lines mush wrote about the agent are.
     Notes,
+}
+
+/// `/context`'s argument: what the human asked of the window.
+///
+/// Read here like every other argument, so the arm that carries it out matches
+/// a value rather than parsing text a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextArg {
+    /// No argument: say the window in force and the road it came by.
+    Report,
+    /// A token count, read by [`mush_core::config::parse_context`]: the one
+    /// number reader `--context`, `MUSH_CONTEXT` and this command share, so
+    /// one typo cannot be answered two ways by three doors.
+    State(usize),
+    /// `auto`: drop this workspace's statement, and derive the window from the
+    /// model table again.
+    Auto,
 }
 
 /// Why a typed line is not a command to run.
@@ -145,6 +167,12 @@ pub const COMMANDS: &[Spec] = &[
         aliases: &[],
         args: "",
         help: "refresh the model list from the endpoint",
+    },
+    Spec {
+        name: "/context",
+        aliases: &[],
+        args: "[N|auto]",
+        help: "say the window's size and road, state one, or auto for the table",
     },
     Spec {
         name: "/compact",
@@ -240,6 +268,20 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/help" => Command::Help,
         "/model" => Command::Model,
         "/models" => Command::Models,
+        "/context" if argument.is_empty() => Command::Context(ContextArg::Report),
+        // `auto` is a word rather than a number, read letter-blind the way
+        // `--thinking on` and `/provider` read theirs, so `AUTO` is the same
+        // ask; a word mush does not know falls to the number reader's refusal
+        // (which names the road) instead of being guessed at.
+        "/context" if argument.eq_ignore_ascii_case("auto") => Command::Context(ContextArg::Auto),
+        // The number is read by the one reader `--context` and `MUSH_CONTEXT`
+        // use: a value that does not read is refused with the sentence naming
+        // the road that carried it, and the arm carries out a typed value
+        // rather than parsing text a second time.
+        "/context" => match mush_core::config::parse_context(argument, "/context") {
+            Ok(tokens) => Command::Context(ContextArg::State(tokens)),
+            Err(error) => return Err(CommandError::Usage(error)),
+        },
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
@@ -417,6 +459,52 @@ mod tests {
         assert_eq!(parse_command("/models all"), Ok(Command::Models));
         assert_eq!(parse_command("/compact harder"), Ok(Command::Compact));
         assert_eq!(parse_command("/notes please"), Ok(Command::Notes));
+        assert_eq!(
+            parse_command("/context"),
+            Ok(Command::Context(ContextArg::Report))
+        );
+        assert_eq!(
+            parse_command("/context 32768"),
+            Ok(Command::Context(ContextArg::State(32_768)))
+        );
+        assert_eq!(
+            parse_command("/context auto"),
+            Ok(Command::Context(ContextArg::Auto))
+        );
+        assert_eq!(
+            parse_command("/context AUTO"),
+            Ok(Command::Context(ContextArg::Auto)),
+            "a word is read letter-blind, as /provider's and --thinking's are"
+        );
+    }
+
+    /// `/context`'s number is read by [`mush_core::config::parse_context`] — the
+    /// one reader `--context` and `MUSH_CONTEXT` use — so the three doors refuse
+    /// one typo with one sentence, naming the road that carried the value.
+    /// `main.rs`'s `the_context_flag_and_the_variable_read_one_number_one_way`
+    /// pins the other two doors.
+    #[test]
+    fn a_context_argument_that_is_not_a_number_is_refused_by_name() {
+        assert_eq!(
+            parse_command("/context 8k"),
+            Err(CommandError::Usage(
+                "/context needs a token count, got `8k`".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_command("/context 0"),
+            Err(CommandError::Usage(
+                "/context needs a token count, got `0`".to_string()
+            )),
+            "a window of no tokens is not a window"
+        );
+        // The same number the flag reads, read the same way: the line's own
+        // trim is the box's, and the reader's trim is the same one the flag
+        // and the variable go through.
+        assert_eq!(
+            parse_command("/context  8192"),
+            Ok(Command::Context(ContextArg::State(8_192)))
+        );
     }
 
     /// The table renders with the provider list filled in, and nothing left

@@ -57,7 +57,7 @@ use crate::http;
 use crate::session_save::SessionSave;
 
 use chat::{Copied, SelectKey};
-use commands::{Command, CommandError};
+use commands::{Command, CommandError, ContextArg};
 use keys::Intent;
 
 pub enum Msg {
@@ -3159,6 +3159,49 @@ impl App {
                 // answers, not now: a road that read the list here would be
                 // reading an answer that has not arrived (finding D4).
                 self.refresh_models();
+            }
+            Command::Context(ContextArg::Report) => {
+                // The window in force and the road it came by, in one line: the
+                // meter's own label plus the words `--print-config` prints,
+                // from the one definition
+                // ([`mush_core::config::WindowSource::words`]).
+                self.say(format!(
+                    "{} · {}",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
+            }
+            Command::Context(ContextArg::State(tokens)) => {
+                // `set_context` clamps a typo into a window an endpoint will
+                // accept and marks the road Stated; the cell's one edit door
+                // makes the UI's copy and every actor's copy one write.
+                self.cell.edit(|cfg| cfg.set_context(tokens));
+                // The workspace is what remembers it, so the file is written
+                // before the line promises it — the same "must not be lost"
+                // road a human's message takes.
+                self.flush_session();
+                self.say(format!(
+                    "{} · {} — this workspace will remember it",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
+            }
+            Command::Context(ContextArg::Auto) => {
+                // Drop the statement and derive a window again; the order is
+                // `forget_context`'s, and it matters — `rederive_context`
+                // leaves a window the human stated alone.
+                self.cell.edit(|cfg| cfg.forget_context());
+                // The *stored* statement has to go with it, or the next start
+                // would read the number back as a statement — the trap this
+                // command is the road back from. The snapshot writes `context`
+                // only while the road is Stated ([`Self::session_snapshot`]),
+                // so the flush is what writes the field away.
+                self.flush_session();
+                self.say(format!(
+                    "{} · {} — the statement is forgotten",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
             }
         }
         // A command is a transition the human drove: whatever they asked for
@@ -13300,6 +13343,144 @@ mod tests {
         let stated = app.context_meter();
         assert!(!stated.contains('~'), "{stated}");
         assert!(stated.ends_with(&tokens_label(32_768)), "{stated}");
+    }
+
+    /// `/context` says the window in force *and the road it came by*, in the
+    /// words `--print-config` prints: the meter has one column for the mark,
+    /// and a human who asks has a whole line for the sentence. The words come
+    /// from `WindowSource::words`, so the two surfaces cannot describe one
+    /// window differently.
+    #[test]
+    fn the_context_command_names_the_road_the_window_came_by() {
+        let (mut app, _rx) = test_app("context-road");
+        for (source, words) in [
+            (WindowSource::Stated, "stated by the human"),
+            (WindowSource::Table, "assumed from mush's model table"),
+            (
+                WindowSource::Advertised,
+                "advertised by the endpoint's model list",
+            ),
+            (
+                WindowSource::Complaint,
+                "named by the endpoint in a refusal",
+            ),
+        ] {
+            app.cell.edit(|cfg| {
+                cfg.context_source = source;
+                cfg.context_tokens = 500_000;
+            });
+            run(&mut app, "/context");
+            assert_eq!(
+                text_of(&app),
+                format!("{} · {words}", app.context_label()),
+                "{source:?}: the window and its road in one line"
+            );
+        }
+    }
+
+    /// What a restart makes of a stored session: the layer chain `main.rs`
+    /// builds at startup (`config::resolve`), minus the process environment
+    /// this test does not want to read — a base config, no flags, no variables,
+    /// no home file, and the session file as the middle layer.
+    fn resolved_from_session(stored: &Session) -> Config {
+        mush_core::config::resolve_with(
+            Config::new("http://127.0.0.1:1", "test-model", None),
+            &mush_core::Overrides::default(),
+            &mush_core::Overrides::default(),
+            &UserConfig::default(),
+            Some(stored),
+        )
+        .expect("the stored layer resolves")
+        .config
+    }
+
+    /// `/context N` is a statement about *this workspace*: the cell clamps it
+    /// and marks the road Stated, so the meter's copy and every actor's copy
+    /// move together, and the session file — the layer a restart reads back —
+    /// carries it. The acknowledgement names the new window, the road, and who
+    /// will remember it.
+    #[test]
+    fn the_context_command_states_a_window_and_the_workspace_remembers_it() {
+        let root = dir("context-state");
+        let (mut app, _writer) = app_writing(&root);
+        // Taken before the command, the way every actor of a running tree holds
+        // its handle: an edit that reached only the UI would leave the
+        // requests measuring against the old window.
+        let handle = app.cell.handle();
+
+        run(&mut app, "/context 32000");
+
+        assert_eq!(app.cfg().context_tokens, 32_000);
+        assert_eq!(app.cfg().context_source, WindowSource::Stated);
+        assert_eq!(
+            handle.config().unwrap().context_tokens,
+            32_000,
+            "the actors' copy moved with the UI's"
+        );
+        assert_eq!(
+            text_of(&app),
+            "ctx 32k (set) · stated by the human — this workspace will remember it"
+        );
+
+        // The file is what remembers it past this process, and the next start
+        // reads it back through the one resolution: stated, and beating the
+        // model table.
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert_eq!(stored.context, Some(32_000), "the statement is on disk");
+        let resolved = resolved_from_session(&stored);
+        assert_eq!(resolved.context_tokens, 32_000);
+        assert!(
+            resolved.context_explicit(),
+            "a stored statement is a statement, not a guess"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/context auto` is the road back from the trap: a workspace that
+    /// remembers a number forever. The statement is dropped, the window
+    /// re-derives from the model table, and the *stored* statement goes with
+    /// it — the session writes `context` only while the road is Stated, so the
+    /// next start derives the table's window instead of reading the number back
+    /// as a statement.
+    #[test]
+    fn context_auto_returns_the_workspace_to_the_derived_window_and_forgets_the_statement() {
+        let root = dir("context-auto");
+        let (mut app, _writer) = app_writing(&root);
+        run(&mut app, "/context 32000");
+        assert_eq!(
+            Session::load(&root).expect("the statement flushed").context,
+            Some(32_000),
+            "the trap the auto road is walked back from"
+        );
+
+        run(&mut app, "/context auto");
+
+        assert_eq!(
+            app.cfg().context_tokens,
+            8_192,
+            "the model has no documented window, so the table's fallback stands"
+        );
+        assert_eq!(app.cfg().context_source, WindowSource::Table);
+        assert_eq!(
+            text_of(&app),
+            "ctx ~8.2k · assumed from mush's model table — the statement is forgotten"
+        );
+
+        let stored = Session::load(&root).expect("the forgetting flushed");
+        assert_eq!(
+            stored.context, None,
+            "the stored statement is gone, not left to be re-applied"
+        );
+        let resolved = resolved_from_session(&stored);
+        assert_eq!(resolved.context_tokens, 8_192, "a restart derives it again");
+        assert!(
+            !resolved.context_explicit(),
+            "and reads no statement into the fresh process"
+        );
+        assert_eq!(resolved.context_source, WindowSource::Table);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A window an actor learned reaches the UI's cell, through the event that
