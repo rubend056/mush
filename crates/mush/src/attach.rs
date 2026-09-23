@@ -349,13 +349,21 @@ enum Line {
 /// byte past the cap has arrived, stops keeping and drains to the newline
 /// instead — constant memory whichever way the line ends. A read that times out
 /// is [`Line::Gone`], the same as EOF: the client may come back, but this
-/// connection is not going to wait for it.
+/// connection is not going to wait for it. A read a signal interrupts is
+/// retried — `EINTR` is the read not having happened, not the client leaving
+/// (finding R13) — so only a connection's own error ends the line.
 fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
     let mut line: Vec<u8> = Vec::new();
     let mut oversize = false;
     loop {
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
+            // A signal — `SIGWINCH` is the one a running mush's own handlers
+            // raise — interrupts the read with `EINTR`: the read has not
+            // happened and the client has not left, so the same call is made
+            // again (finding R13, B25's class). `line` holds what earlier
+            // reads gathered, so a retry resumes rather than restarts.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             // The idle window fired (SO_RCVTIMEO answers EAGAIN): the client is
             // not saying anything, and this thread has other clients to make
             // room for.
@@ -421,8 +429,9 @@ fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
 /// lives on to answer whatever line comes after it.
 ///
 /// The reads are bounded by the client's own words: a line within the cap, and
-/// something said inside the idle window. Both are the socket's, so the waiting
-/// is the kernel's and this thread is not woken to check a clock.
+/// something said inside the idle window — a signal's interruption is retried,
+/// not read as a close (finding R13). Both bounds are the socket's, so the
+/// waiting is the kernel's and this thread is not woken to check a clock.
 fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
     let from = peer_label(&stream);
     if stream.set_read_timeout(Some(idle)).is_err() {
@@ -1330,6 +1339,41 @@ mod tests {
         );
         drop(guard);
         let _ = std::fs::remove_dir_all(&idle);
+    }
+
+    /// A read a signal interrupts is not a client leaving: `SIGWINCH` (a
+    /// running mush's own handler) interrupts a socket read with `EINTR`, and
+    /// without a retry `serve_connection`'s `Err(_) => return` reads that as
+    /// the client gone — the request never runs and the client is told mush
+    /// closed the connection without an answer (finding R13, B25's class).
+    #[test]
+    fn an_interrupted_read_is_retried_and_is_not_a_close() {
+        /// A reader whose first read is interrupted and whose second carries
+        /// the line: the shape a signal gives a real socket.
+        struct InterruptedOnce {
+            reads: Vec<io::Result<&'static [u8]>>,
+        }
+        impl io::Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.reads.remove(0) {
+                    Ok(bytes) => {
+                        buf[..bytes.len()].copy_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        let mut reader = BufReader::new(InterruptedOnce {
+            reads: vec![
+                Err(io::Error::new(io::ErrorKind::Interrupted, "SIGWINCH")),
+                Ok(b"{\"id\":1,\"op\":\"agents\"}\n"),
+            ],
+        });
+        match read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap() {
+            Line::Text(line) => assert_eq!(line, r#"{"id":1,"op":"agents"}"#),
+            other => panic!("an interrupted read is retried, not a close: {other:?}"),
+        }
     }
 
     /// The cap is on the line, not near it: exactly `cap` bytes are a line and
