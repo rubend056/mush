@@ -110,8 +110,10 @@ pub const KEYS: &[Binding] = &[
         // every actor in the tree, kills what they left running, and drops
         // every transcript (root and children) — the ack's `agents stopped,
         // root restarted` is the same fact, and "start a new chat" on its own
-        // read as if only a beginning were at stake (finding D1).
-        help: "start a new chat (stops every agent, drops every transcript)",
+        // read as if only a beginning were at stake (finding D1). The second
+        // press is named because a conversation makes the key two-step, the
+        // shape `Ctrl-Q` has over live work (finding C4).
+        help: "start a new chat (a second press stops every agent, drops every transcript)",
     },
     Binding {
         context: Context::Anywhere,

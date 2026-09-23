@@ -41,6 +41,44 @@ pub fn ensure_mush_dir(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The name a conversation is kept under when a new chat clears it:
+/// `.mush/session.json.previous`, beside the store it replaces.
+pub const PREVIOUS_FILE: &str = "session.json.previous";
+
+/// Where that copy is: `<root>/.mush/session.json.previous`.
+pub fn previous_session_path(root: &Path) -> PathBuf {
+    mushroom_dir(root).join(PREVIOUS_FILE)
+}
+
+/// Keep `session` beside the store, under the name a new chat's warning points
+/// at, and answer where it landed.
+///
+/// One slot, not a numbered family like [`keep_unreadable`]'s: the promise is
+/// that the conversation just cleared can be reclaimed, and the newest cleared
+/// conversation is the one the human is looking for. A copy family would be an
+/// archive of conversations, which the chat layer refuses to keep in so many
+/// words (`Chat::forget`'s "No archive" rule).
+///
+/// Synchronous, and the same bytes [`Session::save`] writes — images shed, the
+/// same serializer, the same atomic rename — because the caller clears the
+/// store the moment this returns: a copy that is late or half-written is not
+/// the copy the key promised. A failure is the caller's to refuse the clear
+/// with, told by [`cannot_keep`]'s one sentence, so a workspace that cannot
+/// take the copy keeps the conversation instead of losing it.
+pub fn keep_previous(root: &Path, mut session: Session) -> Result<PathBuf, String> {
+    let to = previous_session_path(root);
+    session.shed_images();
+    let write = (|| -> std::io::Result<()> {
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(&session).map_err(std::io::Error::other)?;
+        crate::workspace::atomic_write(&to, &json)
+    })();
+    write.map_err(|error| cannot_keep(&to, error))?;
+    Ok(to)
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

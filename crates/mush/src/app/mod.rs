@@ -401,6 +401,16 @@ pub enum StatusKind {
     /// `Info`: an arm nobody can see any more is not an arm, so the warning and
     /// the arming it stands for end together.
     Quit,
+    /// The warning a new chat waits on: `Ctrl-N` again and every transcript
+    /// goes, the conversation kept as `.mush/session.json.previous` (finding
+    /// C4).
+    ///
+    /// A kind of its own for the two rules a warning has, exactly as
+    /// [`StatusKind::Quit`]: it is ranked an alert, so the derived activity line
+    /// cannot hide the sentence that explains the second press — an arm nobody
+    /// can see is not an arm — and it fades like `Info`, so the warning and the
+    /// arming it stands for end together.
+    NewChat,
 }
 
 /// How long an `Info` line is worth showing. Long enough to read after a
@@ -544,6 +554,26 @@ fn quit_warning(items: &[String], columns: usize) -> String {
         text.push_str(&more(items.len() - named));
     }
     text
+}
+
+/// The line the first `Ctrl-N` over a non-empty conversation paints:
+/// `Ctrl-N again clears 12 lines — kept as .mush/session.json.previous`.
+///
+/// Both halves are the promise the second press makes: what goes — a count of
+/// lines, because a conversation is read in lines — and where it can be
+/// reclaimed. The name is spelled from [session]'s own constants rather than
+/// retyped here, so the line and the file the copy is written to cannot drift.
+fn new_chat_warning(lines: usize) -> String {
+    let lines = if lines == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{lines} lines")
+    };
+    format!(
+        "Ctrl-N again clears {lines} — kept as {}/{}",
+        session::MUSH_DIR,
+        session::PREVIOUS_FILE
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1541,6 +1571,9 @@ impl App {
         // the tree it is about: the line names what is running now, not what
         // was running when the key was pressed (finding H9).
         self.refresh_quit_warning();
+        // The same for a new chat's warning, about the conversation the key
+        // would drop: the count follows the chat (finding C4).
+        self.refresh_new_chat_warning();
         // The same expiry for the pane's own transient lines, on the same tick:
         // a command's answer or a hint that nobody ended by acting must not sit
         // in the foot for the life of the session (finding U8). Failures are not
@@ -2561,11 +2594,14 @@ impl App {
     /// `Enter` on a row, `edit` is the message box and the send — so the
     /// socket cannot reach a state the human could not.
     pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
-        // A client's op must not end the quit a key armed
-        // ([`Self::disarm_quit`]), so the warning is put back exactly as it
-        // stood — but not over a failure the op itself caused, a line the
+        // A client's op must not end a warning a key armed ([`Self::disarm_quit`]
+        // or [`Self::disarm_new_chat`]), so the warning is put back exactly as
+        // it stood — but not over a failure the op itself caused, a line the
         // human has to read (finding H9).
-        let armed_quit = self.status.clone().filter(|_| self.quit_armed());
+        let armed = self
+            .status
+            .clone()
+            .filter(|status| matches!(status.kind, StatusKind::Quit | StatusKind::NewChat));
         let reply = match &request.op {
             attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
             attach::Op::Agents => self.attach_agents(),
@@ -2577,7 +2613,7 @@ impl App {
                 send,
             } => self.attach_edit(from, *agent, *base, text, *send),
         };
-        if let Some(warning) = armed_quit {
+        if let Some(warning) = armed {
             let said = self.status.as_ref().map(|status| status.kind);
             if !matches!(said, Some(StatusKind::Error)) {
                 self.status = Some(warning);
@@ -3163,7 +3199,27 @@ impl App {
     /// Ctrl-N lands here: a chat that is cleared without restarting the root
     /// would leave the actor holding the old transcript (and a busy flag) while
     /// the UI shows an empty one.
+    ///
+    /// A conversation with something in it is cleared in two steps, the shape
+    /// `Ctrl-Q` uses over live work: the first press says what would go and
+    /// where it is kept ([`Self::arm_new_chat`]), the second keeps it as
+    /// `.mush/session.json.previous` and only then clears (finding C4). An empty
+    /// conversation is cleared by one press, because it has nothing at stake.
+    /// The copy is written *before* anything is stopped or cleared, and a copy
+    /// that cannot be written refuses the whole key: a keystroke must not be
+    /// able to lose what the copy exists to save.
     fn new_chat(&mut self) {
+        let lines = self.chat.lines_to_drop();
+        if lines > 0 && !self.new_chat_armed() {
+            self.arm_new_chat(lines);
+            return;
+        }
+        if lines > 0 {
+            if let Err(cannot) = self.keep_cleared_conversation() {
+                self.fail(format!("{cannot}; nothing cleared"));
+                return;
+            }
+        }
         self.stop_all();
         // Ctrl-N kills the old tree's processes here and not by dropping the
         // tree: a running job's watch thread holds its own `Arc<Registry>`
@@ -3194,6 +3250,18 @@ impl App {
         // to the debounce, a crash would bring it back with the next start.
         self.flush_session();
         self.say("new chat — agents stopped, root restarted");
+    }
+
+    /// Keep the conversation a new chat is about to clear, beside the store,
+    /// under the name the warning points at.
+    ///
+    /// The snapshot is the live conversation, not the file: the file may lag the
+    /// screen by up to [`SESSION_DEBOUNCE`], and the copy the key promises is of
+    /// what the human was reading. Written here, synchronously, for the one
+    /// caller that must wait on its own copy — the clear that follows must not
+    /// happen before the copy is safe ([`session::keep_previous`]).
+    fn keep_cleared_conversation(&self) -> Result<(), String> {
+        session::keep_previous(self.ws.root(), self.session_snapshot()).map(|_| ())
     }
 
     /// `Ctrl-T`: show or hide the model's reasoning above the turn it decided.
@@ -3491,6 +3559,14 @@ impl App {
         // in `apply_command`.
         if intent != Intent::Quit && !matches!(intent, Intent::Chat(_) | Intent::Send) {
             self.disarm_quit();
+        }
+        // A new chat's warning has no typed road to protect, so anything but
+        // its own key takes it back — a human who is typing a message is not
+        // pressing `Ctrl-N` twice in a row. Its own key is left standing for
+        // the same reason `Ctrl-Q` is: the second press reads the arm here,
+        // before `new_chat` (finding C4).
+        if intent != Intent::NewChat {
+            self.disarm_new_chat();
         }
         match intent {
             Intent::Ignore => {}
@@ -4062,6 +4138,25 @@ impl App {
         matches!(self.status_line(), Some((_, StatusKind::Quit)))
     }
 
+    /// Whether a new chat is waiting for its second key: the warning is the
+    /// line the bar is showing, inside that line's own life ([`INFO_TTL`]).
+    ///
+    /// Derived from the line and not stored beside it, exactly as
+    /// [`Self::quit_armed`]: whatever replaces the line — another key, a
+    /// failure, [`Self::disarm_new_chat`] — has disarmed the key by being
+    /// written.
+    fn new_chat_armed(&self) -> bool {
+        matches!(self.status_line(), Some((_, StatusKind::NewChat)))
+    }
+
+    /// Take an armed new chat back: the human did something other than press
+    /// `Ctrl-N` again, and the warning belongs to the moment it was said.
+    fn disarm_new_chat(&mut self) {
+        if self.new_chat_armed() {
+            self.status = None;
+        }
+    }
+
     /// Take an armed quit back: the human did something other than quit, and
     /// the warning belongs to the moment it was said, so it goes with it.
     fn disarm_quit(&mut self) {
@@ -4133,6 +4228,24 @@ impl App {
         }
     }
 
+    /// Arm the new chat: the bar's line becomes the warning for `lines`.
+    ///
+    /// [`Self::arm_quit`]'s shape, for the same reason: a warning that is still
+    /// standing keeps its clock, so a tick that recomposes the count cannot
+    /// extend the arming — and one whose five seconds are up arms again with a
+    /// life of its own, rather than expiring as it appears (finding C4).
+    fn arm_new_chat(&mut self, lines: usize) {
+        let set_at = if self.new_chat_armed() {
+            self.status.as_ref().map(|status| status.set_at)
+        } else {
+            None
+        };
+        self.set_status(StatusKind::NewChat, new_chat_warning(lines));
+        if let (Some(at), Some(status)) = (set_at, self.status.as_mut()) {
+            status.set_at = at;
+        }
+    }
+
     /// Keep an armed quit's warning true to the tree.
     ///
     /// The line is composed from the phases and the registry, so a tick
@@ -4158,6 +4271,35 @@ impl App {
             .is_some_and(|status| status.text != text)
         {
             self.arm_quit(&kills);
+            self.dirty_screen = true;
+        }
+    }
+
+    /// Keep an armed new chat's warning true to the conversation.
+    ///
+    /// The line counts the lines the second press would drop, and a turn that
+    /// lands while the human is deciding changes that number; a conversation
+    /// that empties — the last child's transcript reaped, say — has nothing
+    /// left to warn about and ends the arm, so the next `Ctrl-N` is an ordinary
+    /// one. [`Self::refresh_quit_warning`]'s shape, clock included (finding
+    /// C4).
+    fn refresh_new_chat_warning(&mut self) {
+        if !self.new_chat_armed() {
+            return;
+        }
+        let lines = self.chat.lines_to_drop();
+        if lines == 0 {
+            self.status = None;
+            self.dirty_screen = true;
+            return;
+        }
+        let text = new_chat_warning(lines);
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.text != text)
+        {
+            self.arm_new_chat(lines);
             self.dirty_screen = true;
         }
     }
@@ -4537,6 +4679,19 @@ mod tests {
             KeyCode::Char(key),
             KeyModifiers::CONTROL,
         )));
+    }
+
+    /// Start a new chat the way the key does now: one press over an empty
+    /// conversation, two over one with something to lose (finding C4). The
+    /// arming is pinned where it belongs —
+    /// `a_new_chat_keeps_the_old_conversation_and_arms_the_key` — so the tests
+    /// that only need the clear say so with this rather than repeating the two
+    /// presses.
+    fn new_chat(app: &mut App) {
+        ctrl(app, 'n');
+        if app.new_chat_armed() {
+            ctrl(app, 'n');
+        }
     }
 
     /// A press of the pane cycle, through the key table and the arms: the key
@@ -5548,6 +5703,10 @@ mod tests {
         app.set_term_size(30, 8);
         app.set_term_size(120, 32);
         assert!(!app.below_floor());
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
@@ -9934,7 +10093,7 @@ mod tests {
         app.send_message();
         assert_eq!(Session::load(&root).unwrap().messages.len(), 1);
 
-        ctrl(&mut app, 'n');
+        new_chat(&mut app);
 
         let stored = Session::load(&root).expect("the command flushed it");
         assert!(stored.messages.is_empty(), "the old chat is not resumed");
@@ -10937,7 +11096,7 @@ mod tests {
         app.chat.note_for(AgentId::ROOT, "old noise");
         let before = app.cell.handle();
 
-        ctrl(&mut app, 'n');
+        new_chat(&mut app);
 
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
@@ -10971,6 +11130,121 @@ mod tests {
         assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
     }
 
+    /// The audit's C4: `Ctrl-N` used to replace the store with an empty one from
+    /// one keystroke — the key unarmed, no copy kept, and the only warning
+    /// arriving *after* the loss. The first press now says what would go and
+    /// where it is kept; only the second clears, and it keeps the conversation
+    /// beside the store first.
+    #[test]
+    fn a_new_chat_keeps_the_old_conversation_and_arms_the_key() {
+        let root = dir("new-chat-keeps");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("a conversation worth keeping"));
+        app.flush_session();
+        let previous = root.join(".mush/session.json.previous");
+
+        ctrl(&mut app, 'n');
+
+        // The first press costs nothing: the message is still in the store,
+        // nothing has been copied yet, and the bar asks again — naming what
+        // would go and where the copy would be.
+        assert_eq!(
+            Session::load(&root)
+                .expect("the store is still there")
+                .messages
+                .len(),
+            1,
+            "the first press drops nothing"
+        );
+        assert!(!previous.exists(), "and copies nothing");
+        assert!(
+            text_of(&app).contains("Ctrl-N again"),
+            "the bar is waiting for the second key: {}",
+            text_of(&app)
+        );
+        assert!(
+            text_of(&app).contains(".mush/session.json.previous"),
+            "the line says where the copy is kept: {}",
+            text_of(&app)
+        );
+
+        ctrl(&mut app, 'n');
+
+        // The second press is the one that costs, and it costs a reclamation:
+        // the copy holds what the live store held a keystroke ago.
+        let kept = std::fs::read_to_string(&previous).expect("the copy is on disk");
+        assert!(
+            kept.contains("a conversation worth keeping"),
+            "the copy is the conversation: {kept}"
+        );
+        let stored = Session::load(&root).expect("the empty chat is what is live now");
+        assert!(stored.messages.is_empty(), "the live store is the new chat");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "and the pane agrees with it"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The twin: a conversation with nothing in it is cleared by one press —
+    /// the key must not become slower for the state it is for.
+    #[test]
+    fn an_empty_chat_is_cleared_by_one_press_unarmed() {
+        let root = dir("new-chat-empty");
+        let (mut app, _writer) = app_writing(&root);
+
+        ctrl(&mut app, 'n');
+
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "one press was the whole key"
+        );
+        assert!(
+            !text_of(&app).contains("Ctrl-N again"),
+            "nothing was armed for a conversation with nothing to lose: {}",
+            text_of(&app)
+        );
+        assert_eq!(text_of(&app), "new chat — agents stopped, root restarted");
+        assert!(
+            !root.join(".mush/session.json.previous").exists(),
+            "and nothing was copied"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Another key takes the new chat's arm back, the way it takes the quit's
+    /// (finding C4): the warning belongs to the moment it was said, and the
+    /// next `Ctrl-N` is a fresh first press. If the arm outlived the key that
+    /// moved on, the second `Ctrl-N` would clear the conversation here.
+    #[test]
+    fn another_key_takes_the_new_chat_arm_back() {
+        let (mut app, _rx) = test_app("new-chat-disarm");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("worth keeping"));
+
+        ctrl(&mut app, 'n');
+        assert!(
+            text_of(&app).contains("Ctrl-N again"),
+            "the first press arms: {}",
+            text_of(&app)
+        );
+
+        ctrl(&mut app, 't'); // a key that moves on
+        assert!(
+            !text_of(&app).contains("Ctrl-N again"),
+            "and the next key takes the arm back: {}",
+            text_of(&app)
+        );
+        ctrl(&mut app, 'n');
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "a fresh first press does not clear the conversation"
+        );
+    }
+
     /// Ctrl-N has to kill what the old tree left running on the machine, and it
     /// cannot rely on the registry's own `Drop` to do it: a running job's watch
     /// thread holds an `Arc<Registry>` (`jobs.rs`'s `Drop` docs), so the
@@ -10991,7 +11265,7 @@ mod tests {
             "the old tree's registry knows it"
         );
 
-        ctrl(&mut app, 'n');
+        new_chat(&mut app);
 
         assert_eq!(
             machine.kills(),
