@@ -1118,7 +1118,7 @@ pub fn resolve_with(
             .as_deref()
             .map(|key| checked_key(key, "home config's api_key"))
             .transpose()
-            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path().display()))?
+            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path_label()))?
             .filter(|key| !key.is_empty());
     }
     if !provider_given && !home.provider.is_empty() {
@@ -1133,7 +1133,7 @@ pub fn resolve_with(
                 "home config: unknown provider `{}` (try {}) — {}",
                 home.provider,
                 provider::names_hint(),
-                crate::userconfig::config_path().display()
+                crate::userconfig::config_path_label()
             )
         })?;
         config.provider = provider;
@@ -1148,7 +1148,7 @@ pub fn resolve_with(
         // provider arm above names it: `MUSH_CONFIG` can point anywhere, so the
         // layer's name alone is not enough to find the line to fix.
         config.base_url = checked_url(&home.base_url, "home config's base_url")
-            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path().display()))?;
+            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path_label()))?;
     }
     if !model_given && config.model.is_empty() && !home.model.is_empty() {
         config.model = home.model.clone();
@@ -1212,7 +1212,7 @@ pub fn resolve_with(
                     "session: endpoint {} is another host — no api key for this endpoint; \
                      the key was not sent — /key <secret> sets one (saved to {})",
                     config.base_url,
-                    crate::userconfig::config_path().display()
+                    crate::userconfig::config_path_label()
                 ));
             }
         }
@@ -1396,7 +1396,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains(&crate::userconfig::config_path().display().to_string()),
+            error.contains(&crate::userconfig::config_path_label()),
             "{error}"
         );
 
@@ -1564,7 +1564,7 @@ mod tests {
         .unwrap_err();
         assert!(error.starts_with(&said("home config's api_key")), "{error}");
         assert!(
-            error.contains(&crate::userconfig::config_path().display().to_string()),
+            error.contains(&crate::userconfig::config_path_label()),
             "{error}"
         );
 
@@ -1701,7 +1701,7 @@ mod tests {
         assert!(error.contains("deepsek"), "{error}");
         assert!(error.contains("deepseek or custom"), "{error}");
         assert!(
-            error.contains(&crate::userconfig::config_path().display().to_string()),
+            error.contains(&crate::userconfig::config_path_label()),
             "the file is named: {error}"
         );
         assert!(

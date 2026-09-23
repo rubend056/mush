@@ -15,8 +15,13 @@
 //!
 //! Path: `$MUSH_CONFIG`, else the platform config directory
 //! (`$XDG_CONFIG_HOME/mush/config.json`, usually `~/.config/mush/config.json`
-//! on Unix, Application Support on macOS, `%APPDATA%` on Windows).
+//! on Unix, Application Support on macOS, `%APPDATA%` on Windows). When
+//! neither names one — `HOME` unset with no `MUSH_CONFIG`, and no home the
+//! passwd database can name — there is no home config at all: mush refuses it
+//! rather than fall back to a relative path in the directory it was launched
+//! from (finding IN14).
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -135,20 +140,57 @@ pub struct UserConfig {
     pub thinking: Option<bool>,
 }
 
-/// Where the user config lives. `MUSH_CONFIG` overrides the path for tests and
-/// unusual setups; otherwise the platform's config directory is used
-/// (`$XDG_CONFIG_HOME/mush/config.json` on Unix, the Application Support
-/// directory on macOS, `%APPDATA%` on Windows).
-pub fn config_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("MUSH_CONFIG") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+/// The decision [`config_path`] makes, pure so a test can pin both answers
+/// without touching the process's environment: an explicit override is taken
+/// as given, and otherwise the platform config directory is the only road.
+fn config_path_from(
+    override_path: Option<OsString>,
+    config_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = override_path {
+        return Some(PathBuf::from(path));
     }
-    if let Some(dir) = dirs::config_dir() {
-        return dir.join("mush/config.json");
+    config_dir.map(|dir| dir.join("mush/config.json"))
+}
+
+/// Where the user config lives: `MUSH_CONFIG` names it outright, and otherwise
+/// it is the platform config directory (`$XDG_CONFIG_HOME/mush/config.json` on
+/// Unix, the Application Support directory on macOS, `%APPDATA%` on Windows).
+/// `None` is a machine with no home config at all — see the reason below.
+///
+/// The file is the *machine-global* one the API key is written to in plain
+/// text, so a home is what it is named after and the only road to it that is
+/// not the workspace is built from one. `MUSH_CONFIG` is an explicit road the
+/// human chose, relative or not, and it is taken as given. Without it, an
+/// unset `HOME` and no config directory (on Unix: no `$XDG_CONFIG_HOME` and no
+/// home the passwd database can name) has no such place: the old fallback was
+/// the *relative* `.mush-user-config.json`, which is whatever directory mush
+/// was launched from — usually a git repository, one `git add -A` from a
+/// committed credential — and a second workspace then reads a different config
+/// (finding IN14).
+///
+/// Refusing is truer than inventing a path: an absolute one under the cwd is
+/// still the workspace's own, and one anywhere else is a place the human never
+/// chose and the next run cannot promise to find again. So there is no home
+/// config, and every reader and writer says so by name — `HOME is not set` —
+/// instead of silently reading or writing the cwd ([`UserConfig::load`],
+/// [`config_path_label`]).
+pub fn config_path() -> Option<PathBuf> {
+    config_path_from(
+        std::env::var_os("MUSH_CONFIG").filter(|path| !path.is_empty()),
+        dirs::config_dir(),
+    )
+}
+
+/// The home config's path as a message names it, or the refusal that stands in
+/// it: one spelling for the refusals `config::resolve` writes, so a machine
+/// with no home reads the same sentence wherever a path would have been
+/// (finding IN14).
+pub fn config_path_label() -> String {
+    match config_path() {
+        Some(path) => path.display().to_string(),
+        None => "no home config: HOME is not set and MUSH_CONFIG names no file".to_string(),
     }
-    PathBuf::from(".mush-user-config.json")
 }
 
 /// A home config file as it was read: the values, and what to say when the file
@@ -197,7 +239,25 @@ pub enum KeyWrite {
 
 impl UserConfig {
     pub fn load() -> Loaded {
-        Self::load_from(&config_path())
+        Self::load_at(config_path())
+    }
+
+    /// The same read for an already-resolved path, and for a machine that has
+    /// none: `HOME` unset with no `MUSH_CONFIG` is not "a file that is not
+    /// there" — there is no home config at all, and the complaint says so by
+    /// name instead of letting the defaults arrive in silence (finding IN14).
+    fn load_at(path: Option<PathBuf>) -> Loaded {
+        let Some(path) = path else {
+            return Loaded {
+                config: UserConfig::default(),
+                complaint: Some(
+                    "no home config to read: HOME is not set and MUSH_CONFIG names no file \
+                     — set HOME or MUSH_CONFIG; using defaults"
+                        .to_string(),
+                ),
+            };
+        };
+        Self::load_from(&path)
     }
 
     /// Read the file, or the defaults.
@@ -380,6 +440,53 @@ mod tests {
             .map(|line| line.as_str().unwrap_or_default())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A machine with no home has no home config path — and never the cwd's
+    /// own (finding IN14).
+    ///
+    /// The relative fallback this replaced (`.mush-user-config.json`) was
+    /// reachable exactly when `$MUSH_CONFIG` was unset and the platform config
+    /// directory was `None` — on Unix, no `$XDG_CONFIG_HOME` and no home the
+    /// passwd database can name — and it put the API key in whatever directory
+    /// mush was launched from. The decision takes its two inputs as parameters
+    /// so both answers can be pinned without mutating the process's
+    /// environment.
+    #[test]
+    fn a_machine_with_no_home_has_no_home_config_path() {
+        assert_eq!(
+            config_path_from(None, None),
+            None,
+            "no override and no config directory is no path, never a relative one"
+        );
+        assert_eq!(
+            config_path_from(None, Some(PathBuf::from("/home/someone/.config"))),
+            Some(PathBuf::from("/home/someone/.config/mush/config.json")),
+            "the platform config directory is the one road"
+        );
+        assert_eq!(
+            config_path_from(Some(OsString::from("beside-me.json")), None),
+            Some(PathBuf::from("beside-me.json")),
+            "MUSH_CONFIG is the human's own road, taken as given"
+        );
+    }
+
+    /// The read on that machine is not "a file that was not there": the
+    /// complaint names the missing home, so the defaults never arrive in
+    /// silence and a human can fix the environment (finding IN14).
+    #[test]
+    fn a_machine_with_no_home_config_says_home_is_not_set() {
+        let loaded = UserConfig::load_at(None);
+        assert_eq!(loaded.config.api_key, None, "the defaults are the values");
+        let complaint = loaded.complaint.expect("there is something to say");
+        assert!(
+            complaint.contains("HOME is not set"),
+            "the sentence names the environment to fix: {complaint}"
+        );
+        assert!(
+            !complaint.contains(".mush-user-config.json"),
+            "and never a path in the cwd: {complaint}"
+        );
     }
 
     /// The file mush writes reads back as the values it was given, and carries

@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::Rect;
 
 use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
@@ -773,16 +774,18 @@ pub struct App {
     /// unrelated command triggers leaves the file's own key alone (finding
     /// C11).
     key_stated: bool,
-    /// Where [`Self::persist_user_config`] writes the home config. The real
-    /// value is [`userconfig::config_path`] — the machine-global file every
-    /// mush on this machine shares — and the field is here so a test can
-    /// point the write at a throwaway path: the fact C11 is about is which key
-    /// reaches the *file*, and a test reading the human's own config (or one
-    /// process-wide `MUSH_CONFIG` path shared by every test in this binary)
+    /// Where [`Self::persist_user_config`] writes the home config, or `None`
+    /// for a machine that has none ([`userconfig::config_path`], finding
+    /// IN14). The real value is [`userconfig::config_path`] — the machine-global
+    /// file every mush on this machine shares — and the field is here so a test
+    /// can point the write at a throwaway path: the fact C11 is about is which
+    /// key reaches the *file*, and a test reading the human's own config (or
+    /// one process-wide `MUSH_CONFIG` path shared by every test in this binary)
     /// would be reading every test's writes. It is also the one place the
     /// `/key` acks read their destination from, so the line and the write
-    /// cannot name two paths.
-    home_config: std::path::PathBuf,
+    /// cannot name two paths. `None` is not silence: [`Self::saved_to`] says
+    /// the home is missing by name, and a save refuses with the same words.
+    home_config: Option<std::path::PathBuf>,
     pub focus: Focus,
     /// Whether the zen view is on: the focused pane takes the whole screen
     /// (`Ctrl-F`).
@@ -917,6 +920,16 @@ impl App {
     /// old measure and the border cut forty columns off every one of them, so
     /// the rest of a `/notes` report was unreachable until it was closed and
     /// reopened (finding D12).
+    ///
+    /// The select mode's measure is re-derived here too, and the reason is the
+    /// same shape: a key can arrive in the same drain as the resize (`main`
+    /// drains every queued event and paints once), and the mode's step reads
+    /// the width the *pane will paint* — not the width the last frame painted,
+    /// which is a different pane at a different size. One `↓` after a widening
+    /// stepped from the narrow pane's last line onto its `…`, the new frame
+    /// painted the cursor after eight lines, and `↑` could not walk back
+    /// (finding PM5). The coming frame's own derivation is the one road that
+    /// knows the new measure, so it is asked here.
     pub fn set_term_size(&mut self, width: u16, height: u16) {
         let rewrapped = self.term_width != width;
         self.term_width = width;
@@ -924,6 +937,14 @@ impl App {
         if rewrapped {
             self.rewrap_picker();
         }
+        // Void the measure the last frame published, then let the frame the
+        // next paint will build publish the new one: the derivation below is
+        // the same one the paint runs, so the keys and the rows cannot
+        // disagree about where the fold falls. A frame that paints no
+        // transcript publishes nothing, and the measure stays forgotten — the
+        // safe reading (`Chat::forget_select_measure`).
+        self.chat.forget_select_measure();
+        let _coming_frame = self.screen(Rect::new(0, 0, width, height));
     }
 
     /// Re-lay out the open popup for the terminal's new width.
@@ -3465,6 +3486,11 @@ impl App {
                     line.push_str(&self.no_key_hint());
                 }
                 self.say(line);
+                // Said *before* the save, deliberately: the endpoint line is
+                // what the run now uses, and a failed save then replaces it
+                // with the one sentence a human has to act on — the order
+                // `/key` and the pickers do not need, because their acks *are*
+                // the promise about the file (finding IN12).
                 self.persist_user_config();
             }
             Command::ApiKey(None) => match &self.cell.ui().api_key {
@@ -3475,8 +3501,8 @@ impl App {
                 // so, so the promise was wrong in the one direction that costs
                 // a secret (finding A1).
                 None => self.say(format!(
-                    "no api key — /key <secret> sets one (saved to {})",
-                    self.home_config.display()
+                    "no api key — /key <secret> sets one ({})",
+                    self.saved_to()
                 )),
             },
             Command::ApiKey(Some(secret)) => {
@@ -3488,11 +3514,12 @@ impl App {
                 // one save a key may be written by, and its ack says where
                 // (finding C11).
                 self.key_stated = true;
-                self.persist_user_config();
-                self.say(format!(
-                    "api key set ({shown}…) — saved to {}",
-                    self.home_config.display()
-                ));
+                // The ack is a promise that the file holds the key, so it is
+                // only said for a write that landed: the failure keeps the one
+                // status slot `persist_user_config` put it in (finding IN12).
+                if self.persist_user_config() {
+                    self.say(format!("api key set ({shown}…) — {}", self.saved_to()));
+                }
             }
             Command::Models => {
                 // The count (or the lack of one) is said when the fetch
@@ -3571,7 +3598,29 @@ impl App {
     /// save keeps whatever key the file holds, while the fields it does own
     /// still land. A host change's `None` is a statement too, not silence
     /// (findings C6, D6).
-    fn persist_user_config(&mut self) {
+    ///
+    /// Returns whether the write landed, and *says* a failure here, in the one
+    /// status slot: a caller whose ack promises what the file holds —
+    /// `saved to …`, `provider: …`, `model: …` — must speak only on `true`.
+    /// `/key` said its ack after this had already failed, and the next line of
+    /// the same arm replaced the failure, so a human read that the key was on
+    /// disk when it lived only in the config cell — and the next start had
+    /// none (finding IN12). The failure names the file it could not reach, the
+    /// one thing a human needs to fix it — and a machine with no home config
+    /// at all gets the refusal naming `HOME` instead of a write into the cwd
+    /// (finding IN14).
+    fn persist_user_config(&mut self) -> bool {
+        let Some(path) = self.home_config.clone() else {
+            // There is no file to write, and there is no path to invent: the
+            // same sentence every reader of the home config gets names the
+            // missing home (finding IN14).
+            self.fail(
+                "could not save home config: HOME is not set and MUSH_CONFIG names no file \
+                 — set HOME or MUSH_CONFIG"
+                    .to_string(),
+            );
+            return false;
+        };
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
             provider: self.cfg().provider.name().to_string(),
@@ -3591,9 +3640,14 @@ impl App {
         } else {
             KeyWrite::Keep
         };
-        if let Err(error) = user.save_to(&self.home_config, key) {
-            self.fail(format!("could not save home config: {error}"));
+        if let Err(error) = user.save_to(&path, key) {
+            self.fail(format!(
+                "could not save home config {}: {error}",
+                path.display()
+            ));
+            return false;
         }
+        true
     }
 
     /// Ask for a fresh model list without waiting for it.
@@ -3822,16 +3876,20 @@ impl App {
         // reverts the pick (finding R19).
         self.mark_session_dirty();
         self.refresh_models();
-        self.persist_user_config();
-        let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
-        if forgotten {
-            // The model-list fetch above was the first request, and it went
-            // out without the key: the acknowledgement names what is missing
-            // and the road back (finding C6).
-            line.push_str(" · ");
-            line.push_str(&self.no_key_hint());
+        // The ack says what the cell now holds *and* that the file does; only
+        // the first half is true of a save that failed, whose own sentence is
+        // the one the slot must keep (finding IN12).
+        if self.persist_user_config() {
+            let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
+            if forgotten {
+                // The model-list fetch above was the first request, and it went
+                // out without the key: the acknowledgement names what is missing
+                // and the road back (finding C6).
+                line.push_str(" · ");
+                line.push_str(&self.no_key_hint());
+            }
+            self.say(line);
         }
-        self.say(line);
     }
 
     /// The tail an ack gets when a host change took the key: what is missing
@@ -3840,9 +3898,25 @@ impl App {
     /// stating its own destination, as it already does (findings C6, D6).
     fn no_key_hint(&self) -> String {
         format!(
-            "no api key for this endpoint — /key <secret> sets one (saved to {})",
-            self.home_config.display()
+            "no api key for this endpoint — /key <secret> sets one ({})",
+            self.saved_to()
         )
+    }
+
+    /// Where a `/key` ack says the key goes, in one spelling for all three
+    /// acks: `saved to <path>` where the machine has a home config, and the
+    /// refusal that stands in it where it has none — `HOME` unset with no
+    /// `MUSH_CONFIG` is a machine whose home config would be the workspace's
+    /// own directory, and mush refuses to invent one (finding IN14). The save
+    /// itself fails with a sentence naming `HOME`, so the promise is never
+    /// made on that machine.
+    fn saved_to(&self) -> String {
+        match &self.home_config {
+            Some(path) => format!("saved to {}", path.display()),
+            None => "no home config: HOME is not set and MUSH_CONFIG names no file \
+                     — a key set here is not saved"
+                .to_string(),
+        }
     }
 
     /// Point mush at another endpoint, re-deriving the window for it (finding
@@ -3921,12 +3995,16 @@ impl App {
                 // (finding R19).
                 self.mark_session_dirty();
                 self.adopt_advertised_context();
-                self.persist_user_config();
-                self.say(format!(
-                    "model: {} · {}",
-                    self.cfg().label(),
-                    self.context_label()
-                ));
+                // As for `/provider`: the ack's second clause is a promise
+                // about the file, so a failed write keeps its own line
+                // (finding IN12).
+                if self.persist_user_config() {
+                    self.say(format!(
+                        "model: {} · {}",
+                        self.cfg().label(),
+                        self.context_label()
+                    ));
+                }
             }
             PickerKind::Provider => self.apply_provider(id),
             // Nothing to apply: the list is a reading, and `key_picker` closes it
@@ -10970,6 +11048,105 @@ mod tests {
         assert!(app.chat.selecting(), "the chat pane opens the mode");
     }
 
+    /// The text of the rows one frame paints the select cursor on, for the
+    /// tests that read the mode through the frame rather than the state.
+    fn cursor_rows(screen: &Screen) -> Vec<String> {
+        let Screen::Panes(panes) = screen else {
+            return Vec::new();
+        };
+        let Some(transcript) = &panes.chat.transcript else {
+            return Vec::new();
+        };
+        let Some(select) = &transcript.select else {
+            return Vec::new();
+        };
+        let rows: Vec<String> = transcript
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        select.cursor.iter().map(|at| rows[*at].clone()).collect()
+    }
+
+    /// The audit's PM5: a resize and a key in the same drain stepped the cursor
+    /// at the measure the *last* frame painted while the frame painted at the
+    /// new size. A 30-line tool result whose rows wrap at a narrow pane has its
+    /// fold boundary at a different source line at a wide one, so one `↓` right
+    /// after the resize could leap the whole tail — and `↑` did not bring it
+    /// back, because backward from the `…` is the wide pane's last painted
+    /// line, not the line the human was on.
+    ///
+    /// The step now measures at the frame the drain is about to paint: a resize
+    /// voids the published measure in `App::set_term_size` and the coming
+    /// frame's own derivation publishes the new one before the key runs.
+    #[test]
+    fn a_resize_and_a_key_in_one_drain_step_at_the_new_measure() {
+        let (mut app, _rx) = test_app("resize-select");
+        let text = (1..=30)
+            .map(|line| format!("row{line:02} {}", "x".repeat(96)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.chat
+            .push_message(AgentId::ROOT, Message::tool("call-1", text));
+
+        // Frame one, at 40 columns: the paint publishes the measure, and the
+        // cursor is walked onto the second source line.
+        painted(&mut app, 40, 24);
+        assert!(
+            app.chat.start_select(AgentId::ROOT).is_none(),
+            "the mode is on"
+        );
+        app.chat.select_apply(AgentId::ROOT, SelectKey::First);
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        let at_40 = painted(&mut app, 40, 24).0;
+        assert!(
+            cursor_rows(&at_40).iter().any(|row| row.contains("row02")),
+            "the narrow pane paints the cursor on line 2: {:?}",
+            cursor_rows(&at_40)
+        );
+
+        // The resize and the key in one drain, the order `main`'s loop reads
+        // them: the Resize event first, then the key, then one paint.
+        app.set_term_size(120, 24);
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        let after = painted(&mut app, 120, 24).0;
+
+        // One `↓` is one source line down, and the wide pane paints it there.
+        assert!(
+            cursor_rows(&after).iter().any(|row| row.contains("row03")),
+            "one step lands on line 3: {:?}",
+            cursor_rows(&after)
+        );
+
+        // And `↑` returns: the step is reversible, which a `…` the cursor
+        // leapt onto is not (backward from it is the wide pane's last line).
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        let back = painted(&mut app, 120, 24).0;
+        assert!(
+            cursor_rows(&back).iter().any(|row| row.contains("row02")),
+            "`↑` brings the cursor back to line 2: {:?}",
+            cursor_rows(&back)
+        );
+
+        // And the copy still takes the stop the pane paints the cursor on —
+        // the whole walk is pinned by `enter_copies_the_line_the_pane_painted_
+        // the_cursor_on` in `chat.rs`; this is the resize's own case.
+        let copied = app
+            .chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert!(
+            copied.text.starts_with("row02 "),
+            "the copy names the line the pane painted the cursor on: {:?}",
+            copied.text
+        );
+    }
+
     /// A fold replaces the transcript under the select mode, and the mode must
     /// not be left pointing at rows that are gone: the automatic fold fires at
     /// nine tenths of the budget, so this is an ordinary long session's road,
@@ -15653,10 +15830,7 @@ mod tests {
         run(&mut app, "/key");
         assert_eq!(
             text_of(&app),
-            format!(
-                "no api key — /key <secret> sets one (saved to {})",
-                app.home_config.display()
-            )
+            format!("no api key — /key <secret> sets one ({})", app.saved_to())
         );
     }
 
@@ -15672,7 +15846,7 @@ mod tests {
         let (mut app, _rx) = test_app("env-key-stays-out");
         let home = Scratch::new("app-env-key");
         let path = home.join("config.json");
-        app.home_config = path.clone();
+        app.home_config = Some(path.clone());
 
         // The file's own key for the endpoint in force, and a key the run got
         // from the environment: both are in play, and a `/url` may write only
@@ -15719,6 +15893,115 @@ mod tests {
             text_of(&app)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The audit's IN14: with `HOME` unset and no `MUSH_CONFIG`, the home
+    /// config was the *relative* `.mush-user-config.json`, so the API key — in
+    /// plain text — landed in whatever directory mush was launched from,
+    /// usually a git repository, and a second workspace read a different
+    /// config. The path is now refused with a sentence naming `HOME` instead
+    /// of being substituted with the cwd.
+    #[test]
+    fn a_key_on_a_machine_with_no_home_config_says_home_is_not_set() {
+        let (mut app, _rx) = test_app("no-home-config");
+        app.home_config = None;
+
+        // The promise arm first, while the cell holds no key: where a key would
+        // go is what it says, and on this machine that is nowhere.
+        run(&mut app, "/key");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("HOME is not set"), "{line}");
+        assert!(
+            !line.contains("saved to"),
+            "no path in the cwd is promised: {line}"
+        );
+
+        // And the save: the key reaches the cell, the file does not exist.
+        run(&mut app, "/key sk-typed-0123456789");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("HOME is not set"), "{line}");
+        assert!(
+            !line.contains("saved to") && !line.contains("api key set"),
+            "no ack promised a file that cannot exist: {line}"
+        );
+        assert_eq!(
+            app.cfg().api_key.as_deref(),
+            Some("sk-typed-0123456789"),
+            "the run still uses the key the cell holds"
+        );
+    }
+
+    /// The audit's IN12: `saved to …` is a promise about the file, and `/key`,
+    /// `/provider` and a picked model all said it after the save had failed.
+    /// The failure had one status slot and the ack took it, so the human read
+    /// that a key was on disk when it was only in the config cell — and the
+    /// next start had none.
+    ///
+    /// The write's own sentence now keeps the slot and names the file it could
+    /// not reach, and no ack follows it.
+    #[test]
+    fn a_save_that_failed_is_not_replaced_by_an_ack_that_says_saved() {
+        let (mut app, _rx) = test_app("save-failure");
+        // A path no save can write: even `create_dir_all` refuses it, because
+        // its parent is a file.
+        let dir = Scratch::new("blocked-home");
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "not a directory\n").unwrap();
+        let path = blocked.join("config.json");
+        app.home_config = Some(path.clone());
+
+        // `/key`: the key reaches the cell — the run has it — but the file did
+        // not get it, and the line says so instead of `saved to …`.
+        run(&mut app, "/key sk-typed-0123456789");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            line.contains(&path.display().to_string()),
+            "the failure names the file it could not reach: {line}"
+        );
+        assert!(
+            !line.contains("saved to") && !line.contains("api key set"),
+            "no ack replaced the failure: {line}"
+        );
+        assert_eq!(
+            app.cfg().api_key.as_deref(),
+            Some("sk-typed-0123456789"),
+            "the run still uses the key the cell holds"
+        );
+
+        // `/provider`: the same one slot and the same ack it must not get.
+        run(&mut app, "/provider custom");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            !line.starts_with("provider:"),
+            "no ack replaced the failure: {line}"
+        );
+
+        // A picked model: the picker's ack is the third road that promises the
+        // file.
+        app.update(Msg::Models {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            models: vec![
+                http::Model {
+                    id: "test-model".to_string(),
+                    context: None,
+                },
+                http::Model {
+                    id: "picked".to_string(),
+                    context: None,
+                },
+            ],
+        });
+        run(&mut app, "/model");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            !line.starts_with("model:"),
+            "no ack replaced the failure: {line}"
+        );
     }
 
     /// `Enter` on a row says whose transcript the pane shows, and the brief it
@@ -18693,6 +18976,128 @@ mod tests {
         assert!(
             runs(&mut app, &rx, AgentId(1)),
             "the completion reached the parent the report woke"
+        );
+    }
+
+    /// The cut-off line reaches the one reader the whole road exists for, and
+    /// the row lives until that reader has it (finding R7).
+    ///
+    /// The panic itself is pinned in `agent.rs`
+    /// (`an_actor_thread_that_dies_mid_run_is_reported_cut_off`): the dying
+    /// thread files `CutOff` to the UI and then
+    /// `ChildDone { CUT_OFF_RUN, CutOff }` to its parent. What this test drives
+    /// is the road those two filings take through a live parent — the UI's mark
+    /// has to keep the row (or the tick's reap forgets it and sends the
+    /// `ForgetChild` that lands behind the completion in the same mailbox), and
+    /// the parent's fold has to hand `#2 cut off …` to its model.
+    #[test]
+    fn a_cut_off_childs_line_reaches_its_parents_model_and_its_row_waits_for_the_read() {
+        let root = repo("cut-off-fold");
+        let held = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                // The root is mid-run while the child dies and the reap runs:
+                // the boundary that folds the news is then the turn's end, and
+                // the forget the reap may send sits in the same mailbox behind
+                // the completion.
+                .held(held.clone())
+                .says("on it")
+                // The run the news buys: this request has to carry the line.
+                .says("done"),
+        );
+        let (mut app, rx) = app_with_live_scripted_root(&root, scripted.clone());
+        app.deliver("start the task".into(), Vec::new())
+            .expect("the root takes the words");
+        assert!(
+            held.wait_until_asked(Duration::from_secs(5)),
+            "the root reaches the held turn"
+        );
+
+        // #2, a shared child of the root, mid-run when its thread dies: the
+        // shape every spawned child has.
+        let (tx, _child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let opened = app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: None,
+            fork: None,
+            cmd: tx,
+        });
+        app.chat.push_message(opened.id, opened.opening);
+        app.tree.begin(AgentId(2), None);
+        let parent = app.tree.agent_tx[&AgentId::ROOT].clone();
+        // The parent's books name the child: `seed_parent` writes the tree's
+        // row into them as `ChildBook`, the road a parent restored from a
+        // stored session takes — and the fact a real spawn leaves in the same
+        // place. Without the book, a completion is a report about a child the
+        // parent cannot name.
+        app.seed_parent(AgentId::ROOT, &parent);
+        // The dying thread's own two filings, in its own order: the UI first,
+        // then the parent (`agent::file_death`).
+        app.on_agent(
+            AgentId(2),
+            AgentEvent::CutOff {
+                reason: "the model call died mid-reply".to_string(),
+            },
+        );
+        parent
+            .send(AgentMsg::ChildDone {
+                id: 2,
+                run: agent::CUT_OFF_RUN,
+                outcome: agent::Outcome::CutOff,
+            })
+            .expect("the root's mailbox");
+
+        // Enough finished children that the history window wants #2's row.
+        let _mailboxes: Vec<Receiver<AgentMsg>> =
+            (3..=53).map(|id| finished_child(&mut app, id)).collect();
+
+        // The frame the reap runs on: the row and the transcript are kept for
+        // the read the parent owes, and no `ForgetChild` follows the
+        // completion into the mailbox.
+        app.tick();
+        assert!(app.tree.has(AgentId(2)), "the unread row is not reaped");
+        assert_eq!(
+            app.chat.transcript(AgentId(2)).len(),
+            1,
+            "and its transcript stays with it"
+        );
+
+        // The turn ends, the boundary folds the line, and the run it buys is
+        // the proof the model was handed it.
+        held.release();
+        assert!(
+            pump(&mut app, &rx, &scripted, |_, asked| asked.len() >= 2),
+            "the root folds the news into a run"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[1].saw("#2 cut off"),
+            "the parent's model reads the line the whole road exists for: {}",
+            asked[1]
+                .messages
+                .iter()
+                .map(|message| message.text())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+
+        // The fold is the read (`agent::fold_completions` emits `ResultRead` as
+        // it writes the line), and only then is the row the reap's again: the
+        // mark was the whole reason it survived the tick above.
+        assert!(
+            !app.tree
+                .node(AgentId(2))
+                .expect("the row is there")
+                .result_unread,
+            "the parent's fold took the ✉ off"
+        );
+        app.tick();
+        assert!(
+            !app.tree.has(AgentId(2)),
+            "once read, the oldest row is droppable again"
         );
     }
 
