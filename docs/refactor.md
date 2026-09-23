@@ -396,9 +396,10 @@ has `age` for tests. The default suite still opens local mock sockets in
 both help surfaces rendered from the one table (§3.5). Stage 3 — `App::screen(&self,
 area) -> Screen` (`app/screen.rs`) now derives every painted value (tiers, pane
 rects, rows, words, ranks, the picker's window) and `ui::draw(frame, &Screen)`
-paints it, so `ui.rs` is 298 lines of column arithmetic and **no render function
-takes `&App`**; the draw sweep asserts the painted text over fifteen sizes ×
-fourteen states (B17, `7e123e1`).
+paints it, so `ui.rs` holds only the column arithmetic the painter needs and
+**no render function takes `&App`**; the draw sweep asserts the painted text over
+every size `SWEEP_SIZES` names and every state `sweep_states` pushes (B17,
+`7e123e1`).
 
 **Stage 4 — roadmap.** M2.8 = a job registry + `Machine`; M3 = the socket server
 over the two dispatchers; M4 = a base revision on `Buffer` + merge in core
