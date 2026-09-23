@@ -313,19 +313,13 @@ pub enum Work {
 }
 
 impl Work {
-    /// The head of the line a failed commit leaves, and the shape the pane
-    /// reads to paint it in mush's voice: the sentence is mush's own report
-    /// about its own act, and it reaches the pane as a `user` line, where an
-    /// unrecorded line on a *child's* transcript would read as the parent's
-    /// (`Chat`'s `unrecorded`). One spelling, used by the writer
-    /// ([`Work::status_line`]) and by the reader, so the sentence the actor
-    /// writes and the sentence the pane knows cannot drift; the line's *body*
-    /// is git's own error and is deliberately not read by anyone.
-    pub(crate) const UNCOMMITTED_HEAD: &'static str = "could not commit the worktree";
-
     /// The line the UI prints when this happened. One home for the sentence, so
     /// the row's status line, the transcript line a failed commit leaves
-    /// ([`report_work`]) and the listing agree about the same commit.
+    /// ([`report_work`]) and the listing agree about the same commit. Only the
+    /// sentence is spelled here: the pane no longer reads its opening to know
+    /// who wrote it — the transcript line carries [`Message::mush`]'s mark
+    /// ([`push_mush_line`]) — so the body can be git's own error without a
+    /// reader ever mistaking it for provenance.
     fn status_line(&self) -> Option<String> {
         match self {
             Work::Committed { branch, revision } => {
@@ -336,7 +330,9 @@ impl Work {
                 "{branch} holds ignored work only: {} — a commit cannot keep it",
                 git::named_paths(paths)
             )),
-            Work::Uncommitted { error, .. } => Some(format!("{}: {error}", Self::UNCOMMITTED_HEAD)),
+            Work::Uncommitted { error, .. } => {
+                Some(format!("could not commit the worktree: {error}"))
+            }
         }
     }
 
@@ -3090,7 +3086,7 @@ fn run_turns(
     // row promised and the guard stopped it again, so a resumable agent was not
     // (finding H14).
     if let Some(count) = state.loop_stop.take() {
-        push_line(
+        push_mush_line(
             actor,
             messages,
             format!(
@@ -3291,7 +3287,7 @@ fn run_turns(
                 // One door, so the model and the human see the same fact: the
                 // instruction travels in the transcript the next request is
                 // built from.
-                push_line(actor, messages, MALFORMED_INSTRUCTION.to_string());
+                push_mush_line(actor, messages, MALFORMED_INSTRUCTION.to_string());
                 continue;
             }
             Err(ModelError::Status { status, body }) => {
@@ -3406,7 +3402,7 @@ fn run_turns(
             // model answers, and a line that reached `messages` alone would be
             // a line the human's copy cannot account for — the actor's
             // transcript is replaced by the UI's at the next idle `Run`.
-            push_line(actor, messages, TRUNCATION_INSTRUCTION.to_string());
+            push_mush_line(actor, messages, TRUNCATION_INSTRUCTION.to_string());
             continue;
         }
         // A reply that was not cut off ends the run of them: the guard counts
@@ -4395,8 +4391,31 @@ fn prune_job_books(state: &mut ActorState) {
 /// hands back, a delivery that adoption then re-arms and the model reads
 /// twice. Every fold of a completion or a steering line goes through here, so
 /// the two copies cannot drift apart in either direction.
+///
+/// The line is somebody else's — a completion, a steering, a nudge — so it
+/// carries no provenance flag: those lines the pane already tells apart by
+/// their shape (a report's `#1 done:`, a fold's opening) or by the fact that
+/// it just watched them arrive. Mush's own lines to the model take
+/// [`push_mush_line`], the same road with the mark that makes them mush's.
 fn push_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
-    let message = Message::user(text);
+    push_message(actor, messages, Message::user(text));
+}
+
+/// [`push_line`] for a line *mush* wrote into the conversation: the loop
+/// guard's warning, a reply that was cut off or could not be read, the report
+/// a failed commit leaves. The sentence is the model's to read, so it is not a
+/// shape the pane can read provenance from: the line goes as `user` — the
+/// shape a request carries an instruction in — and [`Message::mush`] is what
+/// tells the pane it did not come from the human or another agent (finding
+/// F3, and the head [`Work`]'s name once carried: one mark for every writer
+/// instead of a prefix per sentence).
+fn push_mush_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
+    push_message(actor, messages, Message::mush(text));
+}
+
+/// The one push: the transcript and the UI get the same message, byte for
+/// byte, and no reader has to be told twice.
+fn push_message(actor: &Actor, messages: &mut Vec<Message>, message: Message) {
     messages.push(message.clone());
     actor.ctx.emit(actor.id, AgentEvent::Message(message));
 }
@@ -5802,7 +5821,10 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
 /// worktree, so that line becomes a message as well: the pane keeps it, the
 /// session stores it, and the model reads it at its next request — the sentence
 /// is about *its* work, and it is the hand that can repair a commit (finding
-/// F17). The other two shapes are progress reports the row and the listing
+/// F17). It travels [`push_mush_line`]'s road, so the pane paints it in mush's
+/// voice on the root's transcript and on a child's alike — an unmarked line
+/// there would read as the parent's, which is the lie the mark exists to
+/// prevent. The other two shapes are progress reports the row and the listing
 /// already carry; only unlanded work must not be missable.
 fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
     let Some(line) = work.status_line() else {
@@ -5810,7 +5832,7 @@ fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
     };
     actor.ctx.emit(actor.id, AgentEvent::Status(line.clone()));
     if matches!(work, Work::Uncommitted { .. }) {
-        push_line(actor, transcript, line);
+        push_mush_line(actor, transcript, line);
     }
 }
 
@@ -7094,8 +7116,11 @@ mod tests {
             .collect();
         assert_eq!(status, vec![line.clone()], "the row's tail is unchanged");
         assert!(
-            transcript.iter().any(|message| message.text() == line),
-            "and the line is a transcript line: {transcript:?}"
+            transcript
+                .iter()
+                .any(|message| message.text() == line && message.mush),
+            "and the line is a transcript line, marked mush's so a pane never \
+             reads it as the parent's: {transcript:?}"
         );
 
         // The next run neither clears it nor keeps it from the model: the
@@ -7112,8 +7137,8 @@ mod tests {
             asked[0]
                 .messages
                 .iter()
-                .any(|message| message.text() == line),
-            "and the model reads it: {:?}",
+                .any(|message| message.text() == line && message.mush),
+            "and the model reads it, still marked mush's: {:?}",
             asked[0]
                 .messages
                 .iter()
@@ -12775,6 +12800,12 @@ mod tests {
         assert!(error.contains("cut off"), "{error}");
         assert!(error.contains("in a row"), "{error}");
         assert_eq!(scripted.asked().len(), TRUNCATION_ROUNDS + 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.mush && message.text().contains("reply was cut off")),
+            "the model is told to write smaller, in mush's own marked line: {messages:?}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -12838,8 +12869,10 @@ mod tests {
         assert!(
             asked[1].messages.iter().any(|message| message
                 .text()
-                .contains("could not read the endpoint's last reply")),
-            "the model is told why it is answering again: {:?}",
+                .contains("could not read the endpoint's last reply")
+                && message.mush),
+            "the model is told why it is answering again, in mush's own marked \
+             line: {:?}",
             asked[1]
                 .messages
                 .iter()
@@ -18069,6 +18102,26 @@ mod tests {
                 .unwrap()
                 .saw("previous run was stopped as a loop"),
             "the resumed request must carry the guard's words"
+        );
+        assert!(
+            asked
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.mush
+                    && message
+                        .text()
+                        .contains("previous run was stopped as a loop")),
+            "and the guard's line is marked mush's, so a pane paints it in mush's \
+             voice rather than the parent's: {:?}",
+            asked
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
         );
         let _ = fs::remove_dir_all(&root);
     }
