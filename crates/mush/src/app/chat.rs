@@ -2993,16 +2993,22 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 
 /// Who said a user line when nothing recorded it: a transcript restored from the
 /// session file, or the one a fold just replaced. Everything mush writes into a
-/// conversation has a shape — a child's `#1 done: …` / `#1 stopped: …` /
+/// conversation is marked or shaped — a child's `#1 done: …` / `#1 stopped: …` /
 /// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary, the line
-/// that says the oldest turns were dropped ([`transcript::is_dropped_note`]) —
-/// and a child's transcript opens with the brief its parent spawned it with.
-/// What is left is the human's, because that is what most of a transcript is.
+/// that says the oldest turns were dropped (marked by `Message::note`'s flag and
+/// read by [`transcript::is_dropped_note`]) — and a child's transcript opens
+/// with the brief its parent spawned it with. What is left is the human's,
+/// because that is what most of a transcript is.
 ///
 /// The one line this cannot place is a parent's steering after a restart: the
 /// words look exactly like the human's own nudge, and nothing in the file says
 /// which they were. It reads as the human's until the process is new again —
 /// the alternative would be painting the human's question as somebody else's.
+/// A restored note is misread the same way and for the same reason: the flag
+/// that tells it ([`transcript::is_dropped_note`]) is not stored with the file,
+/// so the note comes back as a plain user line wearing the human's voice — its
+/// line still where the file put it, because nothing moves it. The other rule,
+/// matching its sentence, is exactly the one finding F3 removed.
 fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
     let text = message.text();
     if report(text) || text.starts_with(FOLDED) || transcript::is_dropped_note(message) {
@@ -5239,7 +5245,7 @@ mod tests {
     #[test]
     fn the_dropped_turns_note_reads_as_mushs_line() {
         let mut chat = Chat::bare();
-        chat.push_message(AgentId::ROOT, Message::user(transcript::DROPPED_TURNS_NOTE));
+        chat.push_message(AgentId::ROOT, Message::note(transcript::DROPPED_TURNS_NOTE));
         say(&mut chat, AgentId::ROOT, "a question of my own");
 
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12));

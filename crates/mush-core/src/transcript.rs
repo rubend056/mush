@@ -314,7 +314,10 @@ pub fn sanitize_tool_calls(mut message: Message) -> Message {
 /// replayed assistant turn that carries no `reasoning_content`. [`trim_history`]
 /// keeps it out of the `user_indices` arithmetic, which counts user lines as
 /// turn boundaries — and the pane must not paint it as the human's own words,
-/// so [`is_dropped_note`] is the one spelling of its shape for that reader too.
+/// which is why [`is_dropped_note`] tells it from a user line by
+/// [`Message::note`](crate::message::Message::note)'s flag and not by this
+/// text: a human's line that is word for word this sentence stays a user line
+/// (finding F3).
 pub const DROPPED_TURNS_NOTE: &str = "\
 The oldest turns of this conversation were dropped to fit the context window, \
 so this transcript is not the whole conversation: a fact you cannot find here \
@@ -360,10 +363,12 @@ may have been dropped rather than never said.";
 /// normal-sized part of the turn that carries it.
 ///
 /// A transcript that lost turns says so once, in `DROPPED_TURNS_NOTE`'s line.
-/// The note is built here, counted like any other message against whichever
-/// number the loop is stopping at, and kept out of the draining below — a
-/// `user` line would otherwise read as a turn boundary — and a later drain
-/// replaces it along with the turns it was explaining.
+/// The note is built here by [`Message::note`](crate::message::Message::note),
+/// counted like any other message against whichever number the loop is
+/// stopping at, and kept out of the draining below — a `user` line would
+/// otherwise read as a turn boundary — and a later drain replaces it along
+/// with the turns it was explaining. A `user` message whose text is that same
+/// sentence is not the note and is left exactly where it stood (finding F3).
 ///
 /// A note the transcript already carries is *moved back* to its place rather
 /// than stacked, wherever the copy came from: the UI appends the line it is
@@ -383,7 +388,7 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) -> Option<Messag
     if carried {
         messages.retain(|message| !is_dropped_note(message));
     }
-    let note = Message::user(DROPPED_TURNS_NOTE);
+    let note = Message::note(DROPPED_TURNS_NOTE);
     let target = trim_target(budget);
     let mut dropped = false;
     loop {
@@ -447,8 +452,9 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) -> Option<Messag
 /// while the actor's list is what a request is built from, and a note *after*
 /// the newest message reads as the newest thing said rather than as a statement
 /// about the front of the transcript. A transcript with no note is left exactly
-/// as it is; one carrying several (a file no version of mush wrote) is left
-/// with one, in the note's own place.
+/// as it is; one carrying several — which only this process can build, since
+/// the flag is never written to a file — is left with one, in the note's own
+/// place.
 pub fn place_dropped_note(messages: &mut Vec<Message>) {
     if !messages.iter().any(is_dropped_note) {
         return;
@@ -459,20 +465,26 @@ pub fn place_dropped_note(messages: &mut Vec<Message>) {
 
 /// Where the dropped turns were: after the system prompt and the opening task,
 /// before the oldest turn that was kept — index 2 in the system+task shape a
-/// request has, and the end of a shorter one. One spelling, so the trim that
-/// places the note and the copy that puts it back cannot disagree.
+/// request has, and the end of a shorter one. One spelling, built by
+/// [`Message::note`](crate::message::Message::note), so the trim that places
+/// the note and the copy that puts it back cannot disagree about either the
+/// sentence or its provenance.
 fn insert_dropped_note(messages: &mut Vec<Message>) {
     let at = 2.min(messages.len());
-    messages.insert(at, Message::user(DROPPED_TURNS_NOTE));
+    messages.insert(at, Message::note(DROPPED_TURNS_NOTE));
 }
 
 /// Whether a message is the note [`trim_history`] leaves behind when it drops
-/// turns. One shape, compared by the two places that have to tell the note from
-/// a turn: the trimmer — whose arithmetic counts `user` lines as turn
-/// boundaries — and the pane, which paints it in mush's voice rather than the
-/// human's.
+/// turns. Read by provenance — [`Message::note`](crate::message::Message::note)'s
+/// flag — and not by prose (finding F3): a `user` line is not the note because
+/// of what it says, since a human's message, a parent's brief or a nudge can
+/// be word for word [`DROPPED_TURNS_NOTE`], and taking one for the note moved
+/// it out of its place and into index 2, past an assistant message or inside a
+/// tool-call batch. The two readers are the trimmer, whose arithmetic counts
+/// `user` lines as turn boundaries, and the pane, which paints the note in
+/// mush's voice rather than the human's.
 pub fn is_dropped_note(message: &Message) -> bool {
-    message.role == "user" && message.text() == DROPPED_TURNS_NOTE
+    message.note
 }
 
 #[cfg(test)]
@@ -746,11 +758,12 @@ mod tests {
         );
     }
 
-    /// How many copies of the note a transcript carries.
+    /// How many copies of the note a transcript carries. By provenance, like
+    /// [`is_dropped_note`]: a line that merely quotes the sentence is not one.
     fn note_count(messages: &[Message]) -> usize {
         messages
             .iter()
-            .filter(|message| message.text() == DROPPED_TURNS_NOTE)
+            .filter(|message| is_dropped_note(message))
             .count()
     }
 
@@ -865,8 +878,9 @@ mod tests {
 
     /// The note's place is one spelling, shared by the trim that puts it there
     /// and the copy that puts it back: after the system prompt and the opening
-    /// task. A transcript with no note is untouched, and one carrying several
-    /// (a file no version of mush wrote) is left with one.
+    /// task. A transcript with no note is untouched; one carrying several —
+    /// only a copy built in this process can, since the flag is never written
+    /// to a file — is left with one, in the note's own place.
     #[test]
     fn place_dropped_note_puts_it_after_the_opening_task() {
         let mut untouched = vec![Message::system("you are mush"), Message::user("task")];
@@ -878,13 +892,75 @@ mod tests {
             Message::system("you are mush"),
             Message::user("task"),
             Message::assistant("working"),
-            Message::user(DROPPED_TURNS_NOTE),
-            Message::user(DROPPED_TURNS_NOTE),
+            Message::note(DROPPED_TURNS_NOTE),
+            Message::note(DROPPED_TURNS_NOTE),
         ];
         place_dropped_note(&mut messages);
         assert_eq!(note_count(&messages), 1, "one note, however many came back");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
         assert_eq!(messages[3].text(), "working");
+    }
+
+    /// The note is told from a line by provenance and never by its text
+    /// (finding F3): a human's message, a parent's brief or a nudge that is
+    /// word for word `DROPPED_TURNS_NOTE` is the human's own line and stays
+    /// exactly where it stood — index 1, the opening task the trimmer promises
+    /// to keep — while a trim has nothing to announce. Before, the line was
+    /// removed from there and re-inserted at index 2: past an assistant
+    /// message, and inside a tool-call pair when a batch was in play.
+    #[test]
+    fn a_user_line_that_quotes_the_note_is_not_the_note() {
+        // The audit's four-message shape at a budget that cuts nothing.
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user(DROPPED_TURNS_NOTE),
+            Message::assistant("working"),
+            Message::user("carry on"),
+        ];
+        let before = serde_json::to_string(&messages).unwrap();
+        assert!(
+            trim_history(&mut messages, 10_000).is_none(),
+            "nothing was cut, so there is no note to tell"
+        );
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            before,
+            "the human's own line did not move: {messages:?}"
+        );
+        assert_eq!(messages[1].role, "user", "the opening task survives");
+        assert_eq!(messages[1].text(), DROPPED_TURNS_NOTE);
+
+        // The same line with a batch in play: a `user` message left between a
+        // call and its result is the shape a strict server rejects.
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user(DROPPED_TURNS_NOTE),
+            assistant_calling(&["call_0"]),
+            Message::tool("call_0", "result"),
+            Message::user("carry on"),
+        ];
+        assert!(trim_history(&mut messages, 10_000).is_none());
+        assert_eq!(
+            roles(&messages),
+            ["system", "user", "assistant", "tool", "user"],
+            "the lookalike is a user turn where it stood, not a note at index 2"
+        );
+        assert_eq!(messages[1].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_0"));
+
+        // And a real note is still the note: the trim returns `Some` exactly
+        // when it really cut, and what it returns carries the flag.
+        let mut messages = long_transcript(50);
+        let told = trim_history(&mut messages, 8_000).expect("the drain cut turns");
+        assert!(
+            is_dropped_note(&told),
+            "the line handed to the UI is the note"
+        );
+        assert!(
+            is_dropped_note(&messages[2]),
+            "and so is the one left in place"
+        );
+        assert_eq!(note_count(&messages), 1);
     }
 
     /// Nothing dropped means nothing said: a transcript that already fits is

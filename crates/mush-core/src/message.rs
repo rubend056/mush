@@ -303,6 +303,28 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Whether this message is mush's dropped-turns note rather than a line
+    /// someone said: the provenance [`crate::transcript::is_dropped_note`]
+    /// reads, set only by the constructor this flag is named after.
+    ///
+    /// The flag exists because the *text* cannot be the shape (finding F3): a
+    /// human's message, a parent's brief or a nudge that is word for word
+    /// [`DROPPED_TURNS_NOTE`](crate::transcript::DROPPED_TURNS_NOTE) used to be
+    /// taken for the note, removed from where it sat and re-inserted at index
+    /// 2 — past an assistant turn, or between an assistant's tool call and its
+    /// result. The sentence itself stays exactly what it was: it is what the
+    /// model is told, and the one caller hands over `DROPPED_TURNS_NOTE` for
+    /// it.
+    ///
+    /// Not a wire field and not a stored one: `serde(skip)` keeps the flag out
+    /// of every request and out of `.mush/session.json` ([`Message`]'s
+    /// hand-written serializer never names it), so `false` is what a
+    /// deserialized message gets. A transcript read back from a session
+    /// therefore holds its note as a plain `user` line — the trimmer counts it
+    /// as a turn and the pane paints it in the human's voice — and a human's
+    /// identical line in the same file is no longer mistaken for the note.
+    #[serde(skip)]
+    pub note: bool,
 }
 
 /// `Message` is serialized by hand, and only because of `images`.
@@ -406,6 +428,25 @@ impl Message {
     pub fn user_with_images(text: impl Into<String>, images: Vec<Image>) -> Self {
         Self {
             images,
+            ..Self::user(text)
+        }
+    }
+
+    /// The dropped-turns note: the only constructor that sets `note`, so a
+    /// line a human typed, a parent briefed or a nudge quoted cannot become
+    /// the note by being word for word its sentence (finding F3).
+    ///
+    /// The text stays the caller's — [`trim_history`](crate::transcript::trim_history)
+    /// hands over [`DROPPED_TURNS_NOTE`](crate::transcript::DROPPED_TURNS_NOTE)
+    /// — because the sentence is what the model reads, and this constructor
+    /// holds no second copy of it. The role is the user's, the voice mush's
+    /// other out-of-band notes use (`COMPACT_INSTRUCTION`,
+    /// `TRUNCATION_INSTRUCTION`, a folded completion); the flag is what tells
+    /// the note from a user line for the two readers that must know
+    /// ([`crate::transcript::is_dropped_note`]).
+    pub fn note(text: impl Into<String>) -> Self {
+        Self {
+            note: true,
             ..Self::user(text)
         }
     }
