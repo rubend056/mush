@@ -2421,6 +2421,33 @@ fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
     messages
 }
 
+/// Whether an adopted transcript already carries the report `line` — the
+/// question adoption asks before it marks a completion delivered.
+///
+/// Two hands write a report into a transcript, and neither is the human's: the
+/// fold pushes mush's own line and marks it ([`Message::mush`]), while a `wait`
+/// hands the line over as its call's answer — a `tool` message, which no hand
+/// can type. So the mark, or the tool result, decides, with the text as the
+/// second half: the line names the id (`#N`/`#cN`), the outcome and the
+/// summary, so matching it is matching the id too. A human's lookalike — the
+/// same sentence typed by hand — is an unmarked `user` message, and it used to
+/// match on `text().contains` alone: adoption then marked the report delivered
+/// and the fold never handed it over, so the model never read a result the
+/// human had only quoted (finding F3's rule — provenance is never the
+/// sentence's shape — one road over).
+///
+/// The tool half asks `contains` rather than equality because a `wait` result
+/// may carry several lines at once. It does not ask whether the result's call
+/// *was* a `wait`, so a file whose contents quote the line — read back by
+/// `read_file` or `grep` — would still count: that narrowing needs the call
+/// above the result, and is left named rather than guessed at.
+fn reads_report(transcript: &[Message], line: &str) -> bool {
+    transcript.iter().any(|message| {
+        (message.mush && message.text() == line)
+            || (message.role == "tool" && message.text().contains(line))
+    })
+}
+
 /// What a command means for an actor that is not running.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Fold {
@@ -2485,15 +2512,14 @@ fn absorb(
             // recognised exactly like a `#N done: …` — the old scan knew only
             // the `done:` shape, so a failure read in the transcript looked
             // unread and was folded again (`docs/findings.md` B24).
+            //
+            // *Which* line counts as read is [`reads_report`]'s question, and
+            // it is the mark that answers it, not the words: a human who quotes
+            // the sentence is not a read of it.
             let announced: Vec<(u64, u64)> = state
                 .completed
                 .iter()
-                .filter(|(id, completion)| {
-                    let line = completion.outcome.line(**id);
-                    transcript
-                        .iter()
-                        .any(|message| message.text().contains(&line))
-                })
+                .filter(|(id, completion)| reads_report(transcript, &completion.outcome.line(**id)))
                 .map(|(id, completion)| (*id, completion.run))
                 .collect();
             // Adoption may only *add* marks, never remove one or move one
@@ -2507,15 +2533,12 @@ fn absorb(
             }
             // The same question for jobs, answered on the line itself: it
             // carries the job's id, its exit status, its command and its tail,
-            // so a transcript that holds it is a transcript that has read it.
+            // so a transcript that holds it is a transcript that has read it —
+            // when a hand of mush's put it there (see [`reads_report`]).
             let announced_jobs: Vec<JobId> = state
                 .done_jobs
                 .iter()
-                .filter(|(_, report)| {
-                    transcript
-                        .iter()
-                        .any(|message| message.text().contains(&report.line))
-                })
+                .filter(|(_, report)| reads_report(transcript, &report.line))
                 .map(|(id, _)| *id)
                 .collect();
             state.delivered_jobs.extend(announced_jobs);
@@ -4762,7 +4785,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // writers this parent's own books name are filtered out of it, because
         // for *them* the books are the finer answer — they are written where a
         // child's run starts and ends — and the books already judged them in
-        // the two lines above.
+        // the two lines above. The refusal states that rule in the words the
+        // prompt uses, because the model reads it at the moment it matters:
+        // whose writers are counted, that it is the directory rather than this
+        // parent's books, that a grandchild counts and an ended run does not,
+        // and that the spawner's own run is exempt. The old sentence read as a
+        // parent's own books ("already runs in this shared workspace, and only
+        // one shared child may run at a time"), which is H64's third site.
         let mut running_shared: Vec<u64> = state
             .shared
             .iter()
@@ -4784,9 +4813,12 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
-                 may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
-                 wait for it to finish."
+                "cannot spawn: {names} already runs in this shared workspace, where only one \
+                 shared child may run at a time — the directory's live writers, tree-wide, not \
+                 only the children your own books name: a grandchild working here counts, a \
+                 child whose run has ended does not, and your own run is exempt. Pass \
+                 base=<branch or commit> to give a sibling its own worktree, or wait for it to \
+                 finish."
             ));
         }
     }
@@ -7973,6 +8005,92 @@ mod tests {
         assert!(
             state.delivered.contains_key(&1),
             "the model reads it in the transcript, so it is already delivered"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Adoption asks whether the transcript already holds a report, and the
+    /// answer is the mark, not the sentence: `#1 done: …` is words a human can
+    /// type. The old scan matched any message by `text().contains` alone, so a
+    /// lookalike — the human quoting the line — marked the report delivered and
+    /// the fold never handed it over: the model never read a result the human
+    /// had only asked about. The same two lines from mush's own hand are the
+    /// read the scan is for (finding F3's rule, one road over).
+    #[test]
+    fn a_report_is_read_by_its_mark_not_by_its_words() {
+        let (actor, _mailbox) = test_actor("lookalike-report");
+        let child = "#1 done: wrote the parser";
+        let job = "#c2 done: exit 0 · 3m12s · cargo test — test result: ok";
+
+        // The human quotes both lines word for word. Neither is a read, and the
+        // fold still hands both over.
+        let mut state = ActorState::default();
+        known_child(&mut state, 1);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
+        note_job(&mut state, JobId(2), job.into(), true);
+        let mut messages = vec![Message::system("you are mush")];
+        let lookalike = vec![
+            Message::system("you are mush"),
+            Message::user(format!("did you already see {child} and {job}?")),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(lookalike)),
+            Fold::Run
+        ));
+        assert!(state.unread(1), "the human's words are not a read");
+        assert!(!state.delivered_jobs.contains(&JobId(2)));
+        assert!(
+            fold_completions(&actor, &mut state, &mut messages),
+            "both are still news"
+        );
+        assert!(
+            messages.iter().any(|m| m.mush && m.text() == child),
+            "the child's report reaches the model: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.mush && m.text() == job),
+            "and so does the job's: {messages:?}"
+        );
+
+        // The same two lines, written by mush itself, are the read adoption is
+        // looking for: the mark and the whole line, id and all.
+        let mut state = ActorState::default();
+        known_child(&mut state, 1);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
+        note_job(&mut state, JobId(2), job.into(), true);
+        let mut messages = vec![Message::system("you are mush")];
+        let carried = vec![
+            Message::system("you are mush"),
+            Message::mush(child),
+            Message::mush(job),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(carried)),
+            Fold::Run
+        ));
+        assert_eq!(state.delivered.get(&1), Some(&1), "a marked line is a read");
+        assert!(
+            state.delivered_jobs.contains(&JobId(2)),
+            "and so is a marked job line"
+        );
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "so neither is handed over again"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == child).count(),
+            1,
+            "one report, one line: {messages:?}"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -19043,7 +19161,10 @@ mod tests {
     ///
     /// #2's one reply is held, so its run is what the directory is busy with
     /// while the root asks again; the request reaching the model is also the
-    /// proof that #2's run booked itself in the tree-wide book.
+    /// proof that #2's run booked itself in the tree-wide book. The refusal the
+    /// root reads states that same rule — the directory's live writers,
+    /// tree-wide, a grandchild counted and an ended run not, the spawner exempt
+    /// — rather than the old per-parent narrowing (H64's third site).
     #[test]
     fn the_shared_workspace_rule_counts_every_live_writer_in_that_directory() {
         let gate = Arc::new(Gate::new());
@@ -19118,6 +19239,23 @@ mod tests {
             "the refusal names the grandchild's run: {refused}"
         );
         assert!(refused.contains("shared workspace"), "{refused}");
+        // The model reads this sentence at the moment it matters, so it owes
+        // the same six facts the prompt's sentence does — not a narrowing of
+        // them (`mush_core::prompt`'s
+        // `the_delegation_policy_states_the_directorys_live_writers`).
+        for owed in [
+            "only one shared child may run at a time",
+            "the directory's live writers, tree-wide",
+            "not only the children your own books name",
+            "a grandchild working here counts",
+            "a child whose run has ended does not",
+            "your own run is exempt",
+        ] {
+            assert!(
+                refused.contains(owed),
+                "the refusal owes `{owed}`: {refused}"
+            );
+        }
         assert_eq!(
             state.children.keys().copied().collect::<Vec<_>>(),
             vec![1],

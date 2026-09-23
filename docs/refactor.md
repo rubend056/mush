@@ -622,9 +622,10 @@ those rows were checked against at entry, measured at `38d0438`: 79 208 lines �
 prod 18 232, tests 34 663, comments 21 708, blank 4 605 (`scripts/census.py`).
 That sentence is kept as it stood: it is the census the four passes' rows were
 checked against at entry, not a number to be overwritten. This ledger's anchor is
-now `7338d81`: 86 623 lines — prod 19 092, tests 38 164, comments 24 395, blank
-4 972 (`scripts/census.py`); over `38d0438` that is prod +860, tests +3 501,
-comments +2 687, blank +367. The `b8d8baa` sentence above is left as it stands:
+now `332fe21`: 92 505 lines — prod 20 428, tests 40 741, comments 26 093, blank
+5 243 (`scripts/census.py`); over `7338d81`'s 86 623 (prod 19 092, tests 38 164,
+comments 24 395, blank 4 972) that is prod +1 336, tests +2 577, comments
++1 698, blank +271. The `b8d8baa` sentence above is left as it stands:
 it is the census the reviews before these read, not a number to be overwritten,
 and the rows below say where a later wave re-priced one of them (`1e07c2e`).
 
