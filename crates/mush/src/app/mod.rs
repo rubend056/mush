@@ -11254,6 +11254,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The audit's C4 copy is the store's file, not the box's: `Ctrl-N` keeps
+    /// the cleared conversation at `.mush/session.json.previous` through the
+    /// same `atomic_write` the store uses, told the same
+    /// [`mush_core::workspace::Fresh::Private`], so the copy comes out `0600`
+    /// whatever the human's umask says about new files. The contents and the
+    /// arm are `a_new_chat_keeps_the_old_conversation_and_arms_the_key`'s
+    /// fact; this names the mode, so the next merge that touches the call
+    /// cannot make the conversation group- or world-readable again.
+    #[test]
+    fn the_new_chat_copy_is_private_like_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = dir("new-chat-private");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("a conversation worth keeping"));
+        app.flush_session();
+
+        new_chat(&mut app);
+
+        let previous = root.join(".mush/session.json.previous");
+        let mode = std::fs::metadata(&previous)
+            .expect("the copy is on disk")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "the copy is the human's alone, like the store it mirrors"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The twin: a conversation with nothing in it is cleared by one press —
     /// the key must not become slower for the state it is for.
     #[test]

@@ -65,6 +65,10 @@ pub fn previous_session_path(root: &Path) -> PathBuf {
 /// the copy the key promised. A failure is the caller's to refuse the clear
 /// with, told by [`cannot_keep`]'s one sentence, so a workspace that cannot
 /// take the copy keeps the conversation instead of losing it.
+///
+/// Private, like the store it sits beside ([`crate::workspace::Fresh::Private`]):
+/// the copy holds the same conversation, so it gets the same `0600` — a new
+/// chat must not be the moment the human's umask hands it to the group.
 pub fn keep_previous(root: &Path, mut session: Session) -> Result<PathBuf, String> {
     let to = previous_session_path(root);
     session.shed_images();
@@ -73,7 +77,7 @@ pub fn keep_previous(root: &Path, mut session: Session) -> Result<PathBuf, Strin
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec_pretty(&session).map_err(std::io::Error::other)?;
-        crate::workspace::atomic_write(&to, &json)
+        crate::workspace::atomic_write(&to, &json, crate::workspace::Fresh::Private)
     })();
     write.map_err(|error| cannot_keep(&to, error))?;
     Ok(to)
