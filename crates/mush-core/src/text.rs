@@ -354,9 +354,10 @@ pub enum RunStyle {
     /// space is the column every wrapped continuation of the item hangs under.
     Bullet,
     /// A horizontal rule's row: `─` across the pane, painted where the source
-    /// line's `---` was. The one run whose text the view writes rather than
-    /// keeps — a rule is a line across the *pane*, and the pane's own width is
-    /// the only width it can be drawn at.
+    /// line's `---` was, and the same style for the `─┼─` separator a table
+    /// draws under its header. The runs the view writes rather than keeps:
+    /// both are lines across the *pane*, and the pane's own width is the only
+    /// width they can be drawn at.
     Rule,
     /// The `│ ` a block quote's `>` became. The quoted words keep their own
     /// runs; this is the bar beside them.
@@ -371,22 +372,26 @@ pub enum RunStyle {
 /// The model's prose read as a view: markdown parsed into styled runs, wrapped
 /// to a width. The pane paints the rows; nothing here writes anything back.
 ///
-/// A model writes markdown — headings, bullets, `**emphasis**`, code fences —
-/// and the pane painted the markers as if they were the sentence. This is the
-/// answer, and it is deliberately the small one. The parse is **line-local**:
-/// every source line is read on its own, so nothing here can reflow a
-/// paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
-/// the source did not have. That boundary is the point — the human called the
-/// full version a rabbit hole, and a chat reply needs a reading, not a document
-/// renderer. Tables, setext headings, reference links, HTML, nested lists and
-/// indented code blocks are all *not* rules; a line that uses one is simply the
-/// text it is.
+/// A model writes markdown — headings, bullets, `**emphasis**`, code fences,
+/// tables — and the pane painted the markers as if they were the sentence. This
+/// is the answer, and it is deliberately the small one. The parse is
+/// **line-local with one exception**: every source line is read on its own
+/// except a table, whose column widths are a fact about the whole block, so the
+/// walk buffers it and paints it as a block. Nothing else joins two lines: no
+/// paragraph is reflowed, no two lines are merged, a list is never re-indented
+/// and `- a\n- b` never becomes a layout the source did not have. That boundary
+/// is the point — the human called the full version a rabbit hole, and a chat
+/// reply needs a reading, not a document renderer. Setext headings, reference
+/// links, HTML, nested lists and indented code blocks are all *not* rules; a
+/// line that uses one is simply the text it is.
 ///
 /// It is **additive** too. The only text a rule removes is scaffolding a human
 /// does not read in a view — the `#`s of a heading, the `>` a quote's bar
-/// replaced, and the two fence lines of a code block. Every word is kept; a list keeps its marker and only styles it,
-/// because the marker is information; and a link always shows its URL beside
-/// its text, because a dropped URL is data loss. Above all this is a *view*:
+/// replaced, the two fence lines of a code block, and the delimiter row a
+/// table's separator replaced. Every word is kept: a table keeps every cell's
+/// text (a long cell wraps, it is never cut), a list keeps its marker and only
+/// styles it, because the marker is information; and a link always shows its URL
+/// beside its text, because a dropped URL is data loss. Above all this is a *view*:
 /// what the human copies out of the pane is still the model's own bytes,
 /// because nothing here rewrites the transcript — it only decides how a frame
 /// paints it.
@@ -490,6 +495,49 @@ pub enum RunStyle {
 ///   to the end of the message: an unterminated block is still a block, and the
 ///   code in it is still code.
 ///
+/// Block, over more than one line — the one rule whose block is read as a
+/// block:
+///
+/// - a **table** is a row whose next line is a *delimiter row* — every cell of
+///   that line is `:?-+:?`, with or without the outer pipes — and its body is
+///   every line after the delimiter that still looks like a row (it holds a
+///   `|` and is not a fence). A row with no delimiter under it is text, a
+///   delimiter row with no row above it is text, and the first line that is
+///   not a row ends the table. A delimiter row that is itself a rule is the
+///   **rule** the rule sentence promises: a bare `---` under `Title` is a
+///   break and `Title` stays a paragraph, exactly as the setext note says. A
+///   header that could also be read as another block — a line that begins `> `
+///   or `- ` and holds a `|` — is read as the table, because the delimiter row
+///   under it can be explained no other way.
+///
+///   The columns' widths are a fact about the whole block, so the walk buffers
+///   a table and paints it at the pane's own width: **the columns fill the
+///   pane exactly** — the cells' widths plus the ` │ ` between them sum to
+///   `width` — and a cell wraps inside its own column with the module's own
+///   wrap, so no row of a table is wider than the pane it is read on. No
+///   cell's text is dropped or truncated: a row with fewer cells than the
+///   header pads with empty ones, a row with more folds its extra cells into
+///   the last column, joined by the `|` the source separated them with —
+///   folding keeps the words where dropping them would not — and a pane too
+///   narrow for the table's columns folds them the same way, one level up. The
+///   alignment comes from the delimiter row — `:---` left, `:---:` center,
+///   `---:` right and `---` left, with a column the delimiter does not name
+///   left-aligned — and the padding spaces are the whole of it.
+///
+///   The delimiter row paints **no row of its own**: the `─┼─` separator is
+///   the header's underline, drawn in [`RunStyle::Rule`] and counted with the
+///   header's own source line, so [`markdown_row_counts`] stays one entry per
+///   source line and its total stays the number of painted rows (finding D14).
+///   The pane's stop map and the selection ride on that map exactly as they
+///   did before there were tables, and the selection still copies the *source*
+///   bytes: nothing about copy changes.
+///
+///   A `|` inside a `` `code span` `` and a `\|` are not cell boundaries; the
+///   backslash that escapes a pipe is scaffolding, and the cell paints the `|`
+///   it protected. A cell's text is read by the inline rules like any other
+///   words — `**bold**` inside a cell is a strong run — and the bar between two
+///   columns is layout, painted plain.
+///
 /// An mark that never closes is **text**: `**bold` is `**bold`, a lone `*` is a
 /// lone `*`, and a `[link](` with no `)` is the characters it is. Nothing is
 /// guessed, and nothing is dropped on the way.
@@ -548,8 +596,10 @@ pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
 ///
 /// The map a caller that tags painted rows with their source line needs: the
 /// pane's stop map cannot count a fence line's rows off the source, because a
-/// fence line paints a row only when its block has no body, and only the walk
-/// that paints the rows knows that. Asking the same walk for both answers is
+/// fence line paints a row only when its block has no body, and it cannot count
+/// a table's either, because a table's delimiter line paints nothing by itself
+/// and the separator under the header is counted with the header. Only the walk
+/// that paints the rows knows both. Asking the same walk for both answers is
 /// what keeps the map from drifting off the screen — a second count with a
 /// restated rule is the drift this exists to prevent (finding D14).
 ///
@@ -568,6 +618,15 @@ fn markdown_walk(text: &str, width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let mut counts = Vec::with_capacity(lines.len());
     let mut at = 0;
     while at < lines.len() {
+        // A table is the one block whose columns are a fact about more than one
+        // line, so it is read and painted whole ([`table_end`]).
+        if let Some(end) = table_end(&lines, at) {
+            let (rows, block) = table(&lines[at..end], width);
+            out.extend(rows);
+            counts.extend(block);
+            at = end;
+            continue;
+        }
         if !fence_line(&lines[at]) {
             let rows = wrap_block(&block(&lines[at], width), width);
             counts.push(rows.len());
@@ -1143,6 +1202,241 @@ fn runs_width(runs: &[Run]) -> usize {
             }
         })
         .sum()
+}
+
+/// One column's alignment, as its delimiter row spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Align {
+    /// `---` and `:---`.
+    Left,
+    /// `:---:`.
+    Center,
+    /// `---:`.
+    Right,
+}
+
+/// Whether a line looks like a table row: it holds a `|` and it is not a fence.
+///
+/// The `|` is the only thing that makes a line a row, because it is the only
+/// thing that makes it a table: a line without one has no cells to speak of,
+/// and a fence line opens a block of code this view reads as code — a table is
+/// not allowed to swallow it.
+fn is_row(line: &str) -> bool {
+    line.contains('|') && !fence_line(line)
+}
+
+/// One row's cells, in order: the text between the `|`s that are cell
+/// boundaries, each trimmed of the spaces that pad the column.
+///
+/// Not every `|` is a boundary: one inside a `` `code span` `` is the code's own
+/// character, and one a `\` escapes is the cell's own too — the backslash is
+/// scaffolding and is dropped, because a view that reads the `|` as content
+/// must not paint the escape that said so (the `\` of any other escape is the
+/// text's). A `|` at either end of the line is the row's own outer pipe and not
+/// a cell, which is why a row may be written `| a | b |` or `a | b` and mean the
+/// same two cells.
+fn cells(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut code = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                code = !code;
+                cell.push(ch);
+            }
+            '\\' if !code && chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' if !code => out.push(std::mem::take(&mut cell)),
+            _ => cell.push(ch),
+        }
+    }
+    out.push(cell);
+    if out.len() > 1 && out.first().is_some_and(|cell| cell.trim().is_empty()) {
+        out.remove(0);
+    }
+    if out.len() > 1 && out.last().is_some_and(|cell| cell.trim().is_empty()) {
+        out.pop();
+    }
+    out.iter().map(|cell| cell.trim().to_string()).collect()
+}
+
+/// The alignment each of a delimiter row's cells names, or `None` when the line
+/// is not a delimiter row: every cell must be `:?-+:?`, which is CommonMark's
+/// spelling.
+fn delimiter_row(line: &str) -> Option<Vec<Align>> {
+    let cells = cells(line);
+    let mut align = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let core = cell.strip_prefix(':').unwrap_or(cell);
+        let core = core.strip_suffix(':').unwrap_or(core);
+        if core.is_empty() || !core.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        align.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    Some(align)
+}
+
+/// Where the table that starts at `lines[at]` ends, or `None` when no table
+/// starts there.
+///
+/// A table is recognised by its **delimiter row**: a row whose next line has
+/// `:?-+:?` in every cell. So a row with no delimiter under it is text, and a
+/// delimiter row with no row above it is text too — a table is a fact about
+/// two lines at least. A delimiter row that is itself a rule (a bare `---`
+/// under a paragraph) is the *rule* the rule sentence promises: that reading is
+/// unconditional, so a setext heading stays a paragraph here.
+///
+/// The body is every line after the delimiter that still looks like a row
+/// ([`is_row`]); the first line that does not ends the table.
+fn table_end(lines: &[String], at: usize) -> Option<usize> {
+    if !is_row(&lines[at]) {
+        return None;
+    }
+    let delimiter = lines.get(at + 1)?;
+    if rule_line(delimiter) || delimiter_row(delimiter).is_none() {
+        return None;
+    }
+    let mut end = at + 2;
+    while end < lines.len() && is_row(&lines[end]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// One row's cells brought to `columns` of them: a short row pads with empty
+/// cells, a long one folds its extra cells into the last column, joined by the
+/// `|` the source separated them with.
+///
+/// Folding beats dropping because the view is additive: a row a model wrote
+/// with more cells than its header is still the row the model wrote, and the
+/// only alternative that keeps its words is to keep the cell that holds them.
+/// The same fold serves a pane too narrow for the table's columns, one level
+/// up: what does not fit in a column of its own goes in the last column there
+/// is.
+fn fit_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
+    if cells.len() > columns {
+        let tail = cells.split_off(columns - 1);
+        cells.push(tail.join(" | "));
+    }
+    cells.resize(columns, String::new());
+    cells
+}
+
+/// One table's block: the painted rows and the row count of every source line
+/// in it.
+///
+/// `source` is the block [`table_end`] found: the header, the delimiter row and
+/// the body rows, in order. The header says how many columns the table has; the
+/// delimiter row says how they lean, and a delimiter that names fewer columns
+/// leaves the rest left-aligned, as a bare `---` does.
+///
+/// Every row of the table is one of these, painted to the pane: the cells share
+/// the width fairly, each cell wraps inside its own column with the module's
+/// own wrap ([`wrap_runs`]) and is padded to the column's width with the spaces
+/// its alignment asks for, and the `│` between two columns is layout, painted
+/// plain. A cell that wrapped gets one physical row per row of its own text —
+/// the row is as tall as its tallest cell — so nothing a cell holds is dropped
+/// and no row outgrows the width.
+fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
+    let header = cells(&source[0]);
+    let columns = header.len().max(1);
+    let mut align = delimiter_row(&source[1]).unwrap_or_default();
+    align.resize(columns, Align::Left);
+    // The pane may not be able to hold every column: the separator and one
+    // column each cost four pane columns a column, so a narrower pane folds the
+    // columns that do not fit into the last one — the same fold a row's extra
+    // cells take, for the same reason.
+    let painted = columns.min(width.div_ceil(4)).max(1);
+    align.truncate(painted);
+    let room = width - 3 * (painted - 1);
+    let (base, extra) = (room / painted, room % painted);
+    let widths: Vec<usize> = (0..painted)
+        .map(|column| base + usize::from(column < extra))
+        .collect();
+
+    let row = |cells: Vec<String>| -> Vec<Vec<Run>> {
+        let columns: Vec<Vec<Run>> = fit_cells(cells, painted)
+            .iter()
+            .map(|cell| inline(cell))
+            .collect();
+        let wrapped: Vec<Vec<Vec<Run>>> = columns
+            .iter()
+            .zip(&widths)
+            .map(|(runs, width)| wrap_runs(runs, *width))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        (0..height)
+            .map(|at| {
+                let mut row: Vec<Run> = Vec::new();
+                for (column, rows) in wrapped.iter().enumerate() {
+                    if column > 0 {
+                        row.push(Run {
+                            text: " │ ".to_string(),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                    let content = rows.get(at).cloned().unwrap_or_default();
+                    let pad = widths[column].saturating_sub(runs_width(&content));
+                    let (left, right) = match align[column] {
+                        Align::Left => (0, pad),
+                        Align::Right => (pad, 0),
+                        Align::Center => (pad / 2, pad - pad / 2),
+                    };
+                    if left > 0 {
+                        row.push(Run {
+                            text: " ".repeat(left),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                    row.extend(content);
+                    if right > 0 {
+                        row.push(Run {
+                            text: " ".repeat(right),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                }
+                row
+            })
+            .collect()
+    };
+
+    let mut rows = Vec::new();
+    let mut counts = Vec::with_capacity(source.len());
+    let header_rows = row(header);
+    // The separator is the header's own underline: it is painted under the
+    // header's rows and counted with the header's source line, so the delimiter
+    // line paints no row of its own — the map is still one entry per source
+    // line and its total is still the number of painted rows (finding D14).
+    counts.push(header_rows.len() + 1);
+    rows.extend(header_rows);
+    let mut line = String::new();
+    for (column, width) in widths.iter().enumerate() {
+        if column > 0 {
+            line.push_str("─┼─");
+        }
+        line.push_str(&"─".repeat(*width));
+    }
+    rows.push(vec![Run {
+        text: line,
+        style: RunStyle::Rule,
+    }]);
+    counts.push(0);
+    for source in &source[2..] {
+        let painted = row(cells(source));
+        counts.push(painted.len());
+        rows.extend(painted);
+    }
+    (rows, counts)
 }
 
 /// [`wrap_text`] over styled runs: the same rows, each row split into runs of
@@ -2309,6 +2603,243 @@ mod tests {
             vec![("a *b".to_string(), RunStyle::Strong)]
         );
         assert_eq!(runs("*a**"), vec![("*a**".to_string(), RunStyle::Plain)]);
+    }
+
+    /// A table is the one block-level rule: the header, the delimiter row and
+    /// the body are read together, because the columns' widths are a fact about
+    /// the whole block. The delimiter row names the alignment, the header says
+    /// how many columns there are, and the `│` between two columns is layout.
+    ///
+    /// A table is painted at the pane's own width: the cells share it fairly and
+    /// a cell wraps inside its own column, so a table is exactly as wide as the
+    /// pane and never wider. The delimiter row paints no row of its own — the
+    /// `─┼─` line is the header's underline and counts with the header — and
+    /// the map is still one entry per source line whose total is the number of
+    /// painted rows (finding D14).
+    #[test]
+    fn a_table_is_painted_at_the_panes_own_width() {
+        let text = "| name | age |\n| :--- | ---: |\n| ana | 3 |\n| bob | 41 |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "name      │      age",
+                "──────────┼─────────",
+                "ana       │        3",
+                "bob       │       41",
+            ]
+        );
+        // The separator wears the rule's own style: it is a line across the
+        // pane, drawn rather than read.
+        assert_eq!(
+            markdown_rows(text, 20)[1],
+            vec![Run {
+                text: "──────────┼─────────".to_string(),
+                style: RunStyle::Rule,
+            }]
+        );
+        // The map: the header's line paints its row and the separator under
+        // it, the delimiter line paints nothing, and each body row paints one.
+        assert_eq!(markdown_row_counts(text, 20), vec![2, 0, 1, 1]);
+        // Nothing is dropped for fitting: the same table paints the same words
+        // at a width where the columns can only be two columns wide.
+        for width in 1..=20usize {
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table");
+            }
+        }
+        for width in 12..=20usize {
+            let flat: String = rows(text, width).join("");
+            for word in ["name", "age", "ana", "bob", "41"] {
+                assert!(flat.contains(word), "{word:?} is gone at {width}: {flat:?}");
+            }
+        }
+    }
+
+    /// The alignment comes from the delimiter row: `:---` left, `:---:` center,
+    /// `---:` right and `---` left. The padding spaces are the whole of the
+    /// mechanism.
+    #[test]
+    fn a_tables_alignment_is_the_delimiter_rows() {
+        let text = "| left | center | right |\n| :--- | :----: | ----: |\n| a | b | c |";
+        let painted = rows(text, 39);
+        assert_eq!(painted[0], "left        │   center    │       right");
+        assert_eq!(painted[1], "────────────┼─────────────┼────────────");
+        assert_eq!(painted[2], "a           │      b      │           c");
+        // A delimiter row without a colon is left-aligned, and a column the
+        // delimiter row does not name is left-aligned too.
+        let text = "| a | b |\n| --- | --- |\n| x | y |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "a         │ b       ",
+                "──────────┼─────────",
+                "x         │ y       "
+            ]
+        );
+    }
+
+    /// A cell wraps inside its own column, and the row is as tall as its
+    /// tallest cell: the cells beside a wrapped one are padded with blanks, and
+    /// a body row that wrapped into six paints six rows in the map.
+    #[test]
+    fn a_wrapped_cell_stays_inside_its_column() {
+        let text = "| a | a cell that must wrap |\n| --- | --- |\n| b | it does |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "a         │ a cell  ",
+                "          │ that    ",
+                "          │ must    ",
+                "          │ wrap    ",
+                "──────────┼─────────",
+                "b         │ it does ",
+            ]
+        );
+        assert_eq!(markdown_row_counts(text, 20), vec![5, 0, 1]);
+    }
+
+    /// A `|` is a cell boundary only where the text says so: inside a code span
+    /// and behind a `\` it is the cell's own character, and the backslash the
+    /// escape is written with is scaffolding — the cell paints the `|` it
+    /// protected, the way a heading paints no `#`.
+    #[test]
+    fn a_pipe_that_is_text_is_not_a_cell_boundary() {
+        let text = "| `a|b` | c |\n| --- | --- |\n| d \\| e | f |";
+        assert_eq!(
+            rows(text, 21),
+            vec![
+                "a|b       │ c        ",
+                "──────────┼──────────",
+                "d | e     │ f        ",
+            ]
+        );
+        assert_eq!(
+            markdown_rows(text, 21)[0],
+            vec![
+                Run {
+                    text: "a|b".to_string(),
+                    style: RunStyle::Code,
+                },
+                Run {
+                    text: "      ".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: " │ ".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: "c".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: "        ".to_string(),
+                    style: RunStyle::Plain,
+                },
+            ]
+        );
+        // A cell's words are still words: a marker inside one is read.
+        let text = "| **b** | c |\n| --- | --- |\n";
+        assert_eq!(rows(text, 21)[0], "b         │ c        ");
+    }
+
+    /// A ragged row is still the row it is: a short row pads with empty cells
+    /// and a long one folds its extra cells into the last column, joined by the
+    /// `|` the source separated them with — nothing a row holds is dropped.
+    #[test]
+    fn a_ragged_table_row_keeps_every_cell() {
+        let text = "| a | b |\n| --- | --- |\n| only |\n| x | y | z |";
+        assert_eq!(
+            rows(text, 21),
+            vec![
+                "a         │ b        ",
+                "──────────┼──────────",
+                "only      │          ",
+                "x         │ y | z    ",
+            ]
+        );
+    }
+
+    /// A table needs its delimiter row: a row without one, and a delimiter row
+    /// with nothing above it, are text exactly as typed. `Title` above a bare
+    /// `---` is the rule the rule sentence promises, not a one-column table.
+    #[test]
+    fn a_row_without_a_delimiter_is_text() {
+        for text in [
+            "| a | b |\n| c | d |",
+            "| --- | --- |",
+            "a | b\nnot a delimiter",
+            "| a | b |\n| :-- | nope |",
+        ] {
+            let painted = rows(text, 40);
+            assert!(
+                !painted
+                    .iter()
+                    .any(|row| row.contains('─') || row.contains('┼')),
+                "{text:?} was read as a table: {painted:?}"
+            );
+        }
+        // A delimiter row that names fewer columns than the header is still a
+        // delimiter row: the header says how many columns there are, and the
+        // ones the delimiter does not name are left-aligned, as a bare `---`
+        // is.
+        assert_eq!(
+            markdown_row_counts("| a | b |\n| --- |\n| x | y |", 40),
+            vec![2, 0, 1]
+        );
+        // `| a | b |` above a bare `---`: the `---` is a rule, and the row
+        // above it stays a row of text.
+        assert_eq!(
+            rows("| a | b |\n---", 12),
+            vec!["| a | b |", "────────────"]
+        );
+        // The header itself says the columns: `x | y` without outer pipes is
+        // the same two columns as `| x | y |`.
+        assert_eq!(
+            rows("x | y\n--- | ---\n1 | 2", 21),
+            rows("| x | y |\n| --- | --- |\n| 1 | 2 |", 21)
+        );
+    }
+
+    /// A table at any pane: the columns share the width, cells wrap inside
+    /// them, and the columns a pane cannot hold fold into the last one it can —
+    /// so no row outgrows the width and no cell's words are dropped. A cell
+    /// whose one glyph is wider than its column is the module's one exception.
+    #[test]
+    fn a_table_never_outgrows_the_pane() {
+        let text = "| aa | bb | cc | dd |\n| :-- | :-: | --: | --- |\n| 1 | 2 | 3 | 4 |\n| a much longer cell than that | x | y | z |";
+        for width in 1..=40usize {
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table");
+            }
+        }
+        // Where the columns have room for the words, every word is painted.
+        let flat: String = rows(text, 40).join("");
+        for word in ["aa", "bb", "cc", "dd", "much", "longer"] {
+            assert!(flat.contains(word), "{word:?} is gone at 40: {flat:?}");
+        }
+        // Eight columns at a four-column pane: the fold keeps every cell, and
+        // the one-character cells make the check a check on cells and not on
+        // the words a word-wrap split.
+        let text = "| a | b | c | d | e | f | g | h |\n| - | - | - | - | - | - | - | - |\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |";
+        for row in markdown_rows(text, 4) {
+            assert_row_fits(&row, 4, "a wide table at a narrow pane");
+        }
+        let painted = rows(text, 4);
+        // The pane holds one column, so each source row's cells fold into one
+        // column that wraps: the header paints eight rows and the separator,
+        // the delimiter none, and the body eight.
+        assert_eq!(markdown_row_counts(text, 4), vec![9, 0, 8]);
+        let flat: String = painted
+            .iter()
+            .filter(|row| !row.contains('─'))
+            .cloned()
+            .collect();
+        for cell in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "1", "2", "3", "4", "5", "6", "7", "8",
+        ] {
+            assert!(flat.contains(cell), "{cell:?} is gone: {flat:?}");
+        }
     }
 
     /// A fence is a block, and the fence lines are not painted: everything

@@ -6790,6 +6790,59 @@ mod tests {
         );
     }
 
+    /// A table reaches the frame the human reads: the header, the separator and
+    /// the body are painted as rows of the pane — the separator in the rule's
+    /// dim, since it is a line the pane draws and not words — and the reply's
+    /// own bytes are left alone.
+    #[test]
+    fn a_table_is_painted_through_the_pane() {
+        let source = "| name | age |\n| :--- | ---: |\n| ana | 3 |";
+        let message = Message::assistant(source);
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 20, false, Fold::DEFAULT, &[]);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "mush › name  │   age".to_string(),
+                "       ──────┼──────".to_string(),
+                "       ana   │     3".to_string(),
+                String::new(),
+            ]
+        );
+        let separator = rows[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('─'))
+            .expect("the separator");
+        assert_eq!(separator.style.fg, Some(Color::DarkGray));
+        assert!(
+            !shown(&rows).iter().any(|row| row.contains('|')),
+            "the source's own pipes are scaffolding: {:?}",
+            shown(&rows)
+        );
+        assert_eq!(
+            message.text(),
+            source,
+            "the transcript keeps the source bytes"
+        );
+
+        // And through a real pane, stops and all: the select mode's map is built
+        // from the same walk that paints the rows, and a table the map counted
+        // wrong would take the frame down there (`mark_rows`'
+        // `debug_assert`), so painting one is the check.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant(source));
+        let painted = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 20, 8));
+        assert!(
+            painted.iter().any(|row| row.contains('┼')),
+            "the separator is painted: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|row| row.contains("ana")),
+            "the body is painted: {painted:?}"
+        );
+    }
+
     /// A tool result is data, not prose: its bytes are what the human copies
     /// out — a diff, a test log, a shell transcript — so the view does not
     /// touch it. A `#` in such a line is a comment, an `*` is a glob and
