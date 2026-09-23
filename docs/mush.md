@@ -1471,10 +1471,15 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 - **Notices have kinds and lifetimes.** A line about a moment ends with the
   moment; a failure belongs to its run, is written to the session, and outlives a
   restart.
-- **A transport hiccup is retried; an answer is not.** A reset or a refused
-  connection is asked again three times, each retry announced in the transcript; a
-  status the endpoint chose, a body past the cap, or a cancellation is returned as
-  it is, first time.
+- **A request that never left mush is retried; an answer is not.** Only
+  `ModelError::Unsent` is asked again — a dial that never connected (a name that
+  does not resolve, a refused or timed-out connect, a failed TLS handshake) or a
+  write that failed before the whole request was handed over — at most twice,
+  each retry announced in the transcript. Everything after the write is final,
+  first time: a reset, an end of stream, a read timeout, a status the endpoint
+  chose (4xx and 5xx), a body past a cap, a body that did not parse, a
+  cancellation. One ask spends one 600 s `CHAT_DEADLINE`, handed to every attempt
+  as what is left of it.
 - **A window a human states always beats a default.** `--context` / `MUSH_CONTEXT`
   / the home config's `context` / `/context N` win over what an endpoint
   advertises, a model table and the provider's own fallback, and are remembered
