@@ -123,12 +123,22 @@ fn inner(area: Rect) -> Rect {
 /// there is no room to spend on the rest. The count of *everything* attached is
 /// the title's, not that row's, so an abbreviated list never claims to be the
 /// whole one.
-fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
+///
+/// `columns` is the field's own width: the `▣ ` mark is taken out of it and the
+/// rest is [`image_label`]'s budget, because a row wider than the field is what
+/// the renderer clips — and a clipped row loses the size that names the picture
+/// (PM4).
+fn attachment_rows(images: &[Image], cap: usize, columns: u16) -> Vec<String> {
     let cap = cap.min(MAX_ATTACHMENT_ROWS);
     if cap == 0 {
         return Vec::new();
     }
-    let label = |image: &Image| format!("▣ {}", image_label(image));
+    let label = |image: &Image| {
+        format!(
+            "▣ {}",
+            image_label(image, columns.saturating_sub(2) as usize)
+        )
+    };
     if images.len() <= cap {
         return images.iter().map(label).collect();
     }
@@ -140,6 +150,10 @@ fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
 /// The box's content rows for the room it was granted: the attachment rows that
 /// fit above the draft, and how many rows are left for the text.
 ///
+/// `field_width` is the field's own width, passed through to [`attachment_rows`]
+/// so an attachment row is built for the columns it is painted in — the box's
+/// field is the same width however many rows the layout grants it (PM4).
+///
 /// The one owner of "how many rows the content has" when the box is painted.
 /// [`App::input_rows`] asks the layout for the same count from the other side —
 /// the draft's lines, the attachments and the two border rows — and the two
@@ -149,8 +163,12 @@ fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
 /// `text_rows = field_height - attachments.len()` is true by construction. A row
 /// the box does not have is a row the message being typed would be pushed out
 /// of (finding D5).
-fn content_rows(field_height: u16, images: &[Image]) -> (Vec<String>, usize) {
-    let attachments = attachment_rows(images, (field_height as usize).saturating_sub(1));
+fn content_rows(field_height: u16, field_width: u16, images: &[Image]) -> (Vec<String>, usize) {
+    let attachments = attachment_rows(
+        images,
+        (field_height as usize).saturating_sub(1),
+        field_width,
+    );
     let text_rows = (field_height as usize).saturating_sub(attachments.len());
     (attachments, text_rows)
 }
@@ -756,7 +774,8 @@ impl App {
             // it caps the attachment rows to the room the box really has, one
             // row kept for the text, so the split below cannot hand the draft
             // the row the attachments took (finding D5).
-            let (attachments, text_rows) = content_rows(field.height, self.chat.attachments());
+            let (attachments, text_rows) =
+                content_rows(field.height, field.width, self.chat.attachments());
             let (lines, cursor_row, column) = self.chat.input().view(text_rows, columns);
             InputPane {
                 prompt,

@@ -3008,10 +3008,15 @@ fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize,
 /// the text (`Message::drop_images`), and a transcript restored from
 /// `.mush/session.json` carries that line — is read there; this paints the ones
 /// that still have them.
-fn image_rows(out: &mut Vec<Line<'static>>, message: &Message) {
+///
+/// `width` is the transcript pane's measure: the `  ▣ ` mark is taken out of it
+/// and the rest is [`image_label`]'s budget, so a name longer than the pane is
+/// cut here — with the house rule's `…` — instead of by the renderer, which
+/// would take the size with it (PM4).
+fn image_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
     for image in &message.images {
         out.push(Line::from(Span::styled(
-            format!("  ▣ {}", image_label(image)),
+            format!("  ▣ {}", image_label(image, width.saturating_sub(4))),
             dim(),
         )));
     }
@@ -3669,7 +3674,7 @@ fn render_message(
                     folded_marked(out, &mut rows, head, message.text(), width, kind, fold)
                 }
             }
-            image_rows(out, message);
+            image_rows(out, message, width);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
             rows.push(None);
@@ -3708,7 +3713,7 @@ fn render_message(
                 )));
                 rows.push(None);
             }
-            image_rows(out, message);
+            image_rows(out, message, width);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
             rows.push(None);
@@ -3720,7 +3725,7 @@ fn render_message(
             if let Some((kind, head)) = folded_block(message, None) {
                 folded_marked(out, &mut rows, head, message.text(), width, kind, fold);
             }
-            image_rows(out, message);
+            image_rows(out, message, width);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
             rows.push(None);
@@ -4961,7 +4966,7 @@ mod tests {
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8));
         assert!(
             rows.iter()
-                .any(|row| *row == format!("  ▣ {}", image_label(&read))),
+                .any(|row| *row == format!("  ▣ {}", image_label(&read, 56))),
             "the model's own reading is named: {rows:?}"
         );
 
@@ -4975,12 +4980,12 @@ mod tests {
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 10));
         assert!(
             rows.iter()
-                .any(|row| *row == format!("  ▣ {}", image_label(&sent))),
+                .any(|row| *row == format!("  ▣ {}", image_label(&sent, 56))),
             "the human's message is unchanged: {rows:?}"
         );
         assert!(
             rows.iter()
-                .any(|row| *row == format!("  ▣ {}", image_label(&read))),
+                .any(|row| *row == format!("  ▣ {}", image_label(&read, 56))),
             "and both pictures are in one pane: {rows:?}"
         );
     }

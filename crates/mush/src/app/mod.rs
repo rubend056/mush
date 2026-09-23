@@ -251,15 +251,33 @@ pub fn tokens_label(tokens: usize) -> String {
 /// two surfaces are describing two different things. The format is the mime
 /// without its `image/` head, exactly as a shed payload's placeholder spells it.
 /// The path goes through [`mush_core::text::sanitize`], like every other row a
-/// name reaches: these rows are painted raw, and a file name is the one part of
-/// this label an outside hand wrote.
-pub fn image_label(image: &Image) -> String {
+/// name reaches: these rows are handed to the renderer as the label builds
+/// them, and a file name is the one part of the label an outside hand wrote.
+///
+/// `columns` is the room the row has for the label, its own `▣` mark already
+/// taken out. The name is what gives when the label does not fit: the format
+/// and the size are the facts the row exists to say — two screenshots taken a
+/// second apart differ only in the name's tail, and a row that loses its size
+/// says nothing about which picture it is — so the name is shortened with
+/// [`mush_core::text::truncate`] (the house rule, its `…` included) to what the
+/// tail leaves, and the tail is painted whole whenever any columns are left for
+/// it. A row too narrow even for the tail gets the house rule over the whole
+/// label, because no rule can keep a size in columns that are not there.
+/// `usize::MAX` is a caller saying it has no row budget — the bar's sentences,
+/// which are painted as sentences and clipped, if at all, as one (PM4).
+pub fn image_label(image: &Image, columns: usize) -> String {
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
-    format!(
-        "{} ({format} · {})",
-        mush_core::text::sanitize(&image.path),
-        size_label(image.bytes.len())
-    )
+    let tail = format!(" ({format} · {})", size_label(image.bytes.len()));
+    let name = mush_core::text::sanitize(&image.path);
+    let tail_columns = unicode_width::UnicodeWidthStr::width(tail.as_str());
+    if columns <= tail_columns {
+        return mush_core::text::truncate(&format!("{name}{tail}"), columns);
+    }
+    let name_columns = columns - tail_columns;
+    if unicode_width::UnicodeWidthStr::width(name.as_str()) <= name_columns {
+        return format!("{name}{tail}");
+    }
+    format!("{}{tail}", mush_core::text::truncate(&name, name_columns))
 }
 
 /// The line an image gets when the model is not documented to accept image
@@ -4776,7 +4794,10 @@ impl App {
             }
         };
         let image = images.pop().expect("one image in, one image out");
-        let label = image_label(&image);
+        // A sentence, not a row: the bar paints its word whole and clips a
+        // sentence longer than the terminal as one, so there is no column
+        // budget for the label here (`usize::MAX`).
+        let label = image_label(&image, usize::MAX);
         let path = image.path.clone();
         // What this picture costs, weighed the one way the budget weighs a
         // picture: pixels when its header named them, bytes when it did not
@@ -7083,8 +7104,8 @@ mod tests {
 
         /// Every rule a frame must keep whatever it says: nothing painted
         /// outside a pane, every pane's own frame intact, the bar keeping its
-        /// row, and every line a pane was handed fitting the pane it is painted
-        /// in.
+        /// row, and every line and attachment row a pane was handed fitting
+        /// the pane it is painted in.
         fn assert_shape(&self, case: &str, width: u16, height: u16) {
             let at = format!("{case} at {width}×{height}");
             let Screen::Panes(panes) = &self.screen else {
@@ -7225,6 +7246,16 @@ mod tests {
                         prompt + unicode_width::UnicodeWidthStr::width(line.as_str())
                             <= field.width as usize,
                         "{at}: a message-box line is wider than its pane: {line:?}"
+                    );
+                }
+                // The attachment rows are painted whole, above the prompt: they
+                // have no prompt prefix to pay for, and a row wider than the
+                // field is what the renderer clips silently — how a long file
+                // name loses the size that names the picture (PM4).
+                for row in &input.attachments {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(row.as_str()) <= field.width as usize,
+                        "{at}: a message-box attachment row is wider than its pane: {row:?}"
                     );
                 }
             }
@@ -19765,6 +19796,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// PM4: `▣ name (mime · size)` was painted whole, so past the pane the
+    /// renderer cut the name mid-word and the size — the one fact two
+    /// screenshots taken a second apart differ in — was gone: at 80×24 the
+    /// transcript read `  ▣ Screenshot from 2024-01-01 12-00-00.png (png` and
+    /// stopped. The label is now shortened to the columns its row really has:
+    /// the name truncates by the house rule (`text::truncate`, its `…`), the
+    /// format and the size are painted whole, and `assert_shape` reads every
+    /// attachment row against the field it is painted in — the blind spot the
+    /// sweep never covered.
+    #[test]
+    fn an_image_row_truncates_its_name_and_keeps_its_size() {
+        let name = "Screenshot from 2024-01-01 12-00-00.png";
+        let (mut app, _rx) = test_app("image-row-fits");
+        let_the_model_see(&mut app);
+        // The file is really there, with the bytes the image carries: the send
+        // road reads it back to check the attachment is the file it names, and
+        // a message that cannot carry its picture is refused, not painted.
+        std::fs::write(app.ws.root().join(name), png(1_500_000)).unwrap();
+        app.chat.attach(Image {
+            path: name.to_string(),
+            mime: "image/png".to_string(),
+            bytes: png(1_500_000),
+            pixels: None,
+        });
+
+        // The box's own row at the 40-column floor: `▣ ` leaves 36 of the
+        // 38-column field, the tail takes 15, and the name gets the rest. The
+        // floor needs the twelve rows D5's frame names: a ten-row terminal
+        // gives the box one content row, and the text's row comes first.
+        let boxed = shot(&mut app, 40, 12);
+        boxed.assert_shape("an attachment at the floor", 40, 12);
+        assert!(
+            boxed.text().contains("… (png · 1.5 MB)"),
+            "the box cuts the name and keeps the size: {}",
+            boxed.text()
+        );
+
+        // Sent, the transcript names it by the same rule at the pane's width.
+        app.chat.insert("look");
+        app.send_message();
+        let wide = shot(&mut app, 80, 24);
+        wide.assert_shape("a sent picture at 80×24", 80, 24);
+        assert!(
+            wide.text().contains("… (png · 1.5 MB)"),
+            "the transcript cuts the name and keeps the size: {}",
+            wide.text()
+        );
     }
 
     /// The same for a `read` answer: the transcript's lines and their indices,
