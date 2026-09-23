@@ -30,7 +30,7 @@ use mush_core::transcript::{
     needs_compaction, place_dropped_note, repair_tool_pairs, sanitize_tool_calls, trim_history,
     trim_target, COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
 };
-use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
+use mush_core::workspace::{truncate_for_model, LineCount, READ_FILE_CAP, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
 
 use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
@@ -4910,6 +4910,15 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
 /// open for a while but not for good. The human's Stop is the outer bound, as
 /// everywhere; and the one-line answer cannot inflate a result, which is what
 /// [`result_cap`] exists to bound.
+///
+/// The before-count is bounded the same way the read road is ([`line_count`]):
+/// the stat answers a file past [`READ_FILE_CAP`] without opening it, and the
+/// answer then says the old line count was not read rather than spending the
+/// file's own size in memory to print a number — overwriting a 4 GiB file used
+/// to cost a 4 GiB allocation to produce "41 → 3 lines" (finding B5). A count
+/// that is printed is a count that was read, whole, within the cap.
+///
+/// [`line_count`]: Workspace::line_count
 fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     let path = tools::arg_string(args, "path")?;
     let content = tools::arg_string(args, "content")?;
@@ -4917,11 +4926,10 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     // file whether or not its bytes are text: answering "(new)" over a binary
     // file — an image, a blob — records a history fact that is simply false.
     let existed = actor.ws.exists(&path);
-    let before = actor
-        .ws
-        .read_file(&path)
-        .ok()
-        .map(|text| text.lines().count());
+    // The count of what is being replaced, bounded by the read cap: past it
+    // there is no number, because a partial one would be wrong and a whole one
+    // would cost the file (see this function's doc).
+    let before = actor.ws.line_count(&path);
     actor.ws.write_file(&path, &content)?;
     let after = content.lines().count();
     // "1 lines" is the kind of small wrongness a model copies into its own
@@ -4932,9 +4940,16 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
         format!("{after} lines")
     };
     Ok(match (existed, before) {
-        (_, Some(before)) => format!("wrote {path} — {before} → {after}"),
-        (true, None) => format!("wrote {path} — {after} (replaced a file that is not text)"),
-        (false, None) => format!("wrote {path} — {after} (new)"),
+        (false, _) => format!("wrote {path} — {after} (new)"),
+        (true, LineCount::Lines(before)) => format!("wrote {path} — {before} → {after}"),
+        (true, LineCount::More) => format!(
+            "wrote {path} — {after} (replaced a text file past the {} MB read cap — its line \
+             count was not read)",
+            READ_FILE_CAP / (1024 * 1024)
+        ),
+        (true, LineCount::NotText) => {
+            format!("wrote {path} — {after} (replaced a file that is not text)")
+        }
     })
 }
 
@@ -5027,6 +5042,14 @@ fn shown_path(rel: &str) -> String {
 /// is a refusal the model can correct. The shape is `edits` only — a list, of
 /// which a lone edit is the list of one — see [`tools::edits_arg`] for why the
 /// second, top-level spelling is gone.
+///
+/// The read is the strict whole read ([`Workspace::read_file`]): a file that is
+/// not valid UTF-8 is refused before any edit is attempted, naming the offset,
+/// the encoding problem and the road (`iconv` through `run_command`), and every
+/// byte is left as it was. The model's `read_file` tool still *shows* such a
+/// file lossily — a window is not an edit, and a refusal to show it would hide
+/// the file from the one tool that can diagnose it — but the road that writes
+/// back must not decode what it cannot re-encode (finding B6).
 fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let rel = tools::arg_string(args, "path")?;
     let edits = tools::edits_arg(args)?;
@@ -9241,6 +9264,107 @@ mod tests {
             replaced,
             "wrote blob.bin — 1 line (replaced a file that is not text)"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The whole read is capped, and the cap is said the same way whichever road
+    /// asks: `read_file` refuses a file past [`READ_FILE_CAP`] from the stat,
+    /// naming `run_command` as the road to a part of it, and `write_file` over
+    /// the same file still lands — its answer carries no line count, because
+    /// counting the old file would be the whole read the cap just refused
+    /// (finding B5: the old road read a 33 MiB file whole to count it and a
+    /// 512 MiB sparse blob whole to call it binary, peak RSS 2.6 → 515 MiB).
+    /// The 32 MiB + 4 KiB here is sparse: a few blocks on disk.
+    #[test]
+    fn a_whole_read_is_capped_and_says_where_to_go() {
+        let (actor, _mailbox) = test_actor("whole-read-cap");
+        let path = actor.ws.root().join("big.log");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(READ_FILE_CAP + 4096).unwrap();
+        drop(file);
+
+        let refused = actor.ws.read_file("big.log").unwrap_err();
+        assert!(refused.contains("past the 32 MB cap"), "{refused}");
+        assert!(
+            refused.contains("run_command"),
+            "the road that works: {refused}"
+        );
+        assert_eq!(actor.ws.line_count("big.log"), LineCount::More);
+
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let written = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WriteFile,
+            &json!({ "path": "big.log", "content": "small\n" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            written,
+            "wrote big.log — 1 line (replaced a text file past the 32 MB read cap — its line \
+             count was not read)"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "small\n");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A file that is not valid UTF-8 is not edited through a lossy read. The
+    /// old road decoded with `from_utf8_lossy`, so a Latin-1 `caf\xe9` was read
+    /// as U+FFFD, edited as text and written back — the two lines the model
+    /// never touched came back with the replacement character and the original
+    /// bytes were gone (finding B6; measured: after a one-line edit the file
+    /// held `239, 191, 189` where `233` had been). The edit now refuses before
+    /// reading out the loss, names the file, the offset and the road (`iconv`
+    /// through `run_command`), and leaves every byte as it was. The positive
+    /// twin: a valid UTF-8 file with multi-byte characters still edits.
+    #[test]
+    fn a_non_utf8_file_is_not_edited_through_a_lossy_read() {
+        let (actor, _mailbox) = test_actor("edit-non-utf8");
+        let path = actor.ws.root().join("latin.txt");
+        let latin1 = b"caf\xe9 = 1\nna\xefve = 2\n";
+        fs::write(&path, latin1).unwrap();
+
+        let refused = edit_tool(
+            &actor.ws,
+            &json!({
+                "path": "latin.txt",
+                "edits": { "old_string": "= 1", "new_string": "= 9" }
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("latin.txt"),
+            "the file is named: {refused}"
+        );
+        assert!(refused.contains("not valid UTF-8"), "{refused}");
+        assert!(
+            refused.contains("offset 3"),
+            "where the decode stopped: {refused}"
+        );
+        assert!(
+            refused.contains("iconv") && refused.contains("run_command"),
+            "the roads that still work: {refused}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            latin1,
+            "every byte of the file is exactly as it was"
+        );
+
+        let utf8 = "café = 1\nnaïve = 2\n";
+        fs::write(&path, utf8).unwrap();
+        let edited = edit_tool(
+            &actor.ws,
+            &json!({
+                "path": "latin.txt",
+                "edits": { "old_string": "= 1", "new_string": "= 9" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(edited, "edited latin.txt");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "café = 9\nnaïve = 2\n");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

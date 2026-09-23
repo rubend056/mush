@@ -31,9 +31,13 @@ const SKIP_DIRS: &[&str] = &[
     ".cache",
 ];
 
-/// The largest file a read tool will open whole. Past it the memory a read
-/// costs is the agent's problem rather than the file's, and the sentence says
-/// so; a window of a 200 MB log is `run_command`'s job (`tail`, `sed -n`).
+/// The largest file a read tool will open whole. Every whole read is checked
+/// against it from the file's stat, before a byte is read — the model's window
+/// ([`Workspace::read_window`]), the editor's read ([`Workspace::read_file`])
+/// and the bounded count a `write_file` answer carries
+/// ([`Workspace::line_count`]) — so past it the memory a read costs is the
+/// agent's problem rather than the file's, and the sentence says so; a window
+/// of a 200 MB log is `run_command`'s job (`tail`, `sed -n`).
 pub const READ_FILE_CAP: u64 = 32 * 1024 * 1024;
 
 /// The largest image a read will hand to a model, in *file* bytes — the
@@ -304,6 +308,26 @@ pub struct Matches {
     pub skipped: usize,
 }
 
+/// What a bounded line count of a whole file can say, from
+/// [`Workspace::line_count`]: the number of lines a file had when that number
+/// is knowable without spending more than [`READ_FILE_CAP`] of memory, and the
+/// honest word when it is not. `write_file`'s answer reads it, so a count it
+/// prints is right and a count it cannot know it does not print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineCount {
+    /// The file is text, no longer than [`READ_FILE_CAP`]: it has this many
+    /// lines, counted from the same bytes the edit road would read.
+    Lines(usize),
+    /// The file is text but past [`READ_FILE_CAP`]: there are more lines than
+    /// the cap will read, and how many is not knowable without the whole read
+    /// the cap refuses. No number is reported, because a partial count would be
+    /// a wrong one.
+    More,
+    /// No line count to report: binary (a NUL byte), not valid UTF-8, not a
+    /// regular file, not readable, or not there.
+    NotText,
+}
+
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
@@ -400,32 +424,106 @@ impl Workspace {
             .replace('\\', "/")
     }
 
-    /// Read a text file whole. Binary files are refused, and so is anything
-    /// that is not a regular file: `fs::read` on a FIFO blocks until a writer
-    /// appears — an actor parked forever on a name as innocent as `x.png` — and
-    /// a device may never end at all. The metadata answers what the path *is*
-    /// before anything is opened, the same shape of check [`Self::image_at`]
-    /// makes, so the two roads cannot disagree about which paths can be read.
-    /// The name is resolved for real first ([`Self::real_path`]), because a
-    /// link the root contains must not make this read a file outside it.
+    /// Read a text file whole, for the one road that writes back what it reads:
+    /// `edit_file`, whose exact replacement needs every byte it is replacing.
+    /// Binary files are refused, and so is anything that is not a regular file:
+    /// `fs::read` on a FIFO blocks until a writer appears — an actor parked
+    /// forever on a name as innocent as `x.png` — and a device may never end at
+    /// all. The metadata answers what the path *is* before anything is opened,
+    /// the same shape of check [`Self::image_at`] makes, so the two roads
+    /// cannot disagree about which paths can be read. The name is resolved for
+    /// real first ([`Self::real_path`]), because a link the root contains must
+    /// not make this read a file outside it. The read itself is bounded by
+    /// [`READ_FILE_CAP`] and checked from the stat before a byte is read (see
+    /// [`Self::whole_read`]): past the cap the refusal is [`over_read_cap`]'s,
+    /// the one sentence [`Self::read_window`] gives too, naming `run_command`
+    /// as the road that works.
+    ///
+    /// The decode is **strict**: bytes that are not valid UTF-8 are refused
+    /// ([`not_utf8`]), because this read's text is an edit's source *and* its
+    /// result — a lossy decode here is what rewrote a Latin-1 `caf\xe9` as
+    /// U+FFFD in the lines the model never touched (finding B6). The roads
+    /// that *show* a file rather than write it stay lossy on purpose, and each
+    /// says so in its own doc ([`Self::read_window`], [`Self::search`]). The
+    /// model's own `read_file` tool takes the window road; nothing here is a
+    /// display.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
     /// with a sentence of its own — then the six-tool cut took the file tools
     /// away and this became `edit_file`'s private read, which must see the whole
     /// file or refuse the edit. The read tools are back ([`Self::read_window`],
     /// [`Self::read_image`]) because the shell cannot serve them behind a
-    /// machine lock, so the cut lives there and this stays the whole-file read.
+    /// machine lock, so the cut lives there and this stays the whole-file read —
+    /// whole within the cap, or refused.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
+        self.whole_read(rel, Decoding::Strict)?.text_or_refusal(rel)
+    }
+
+    /// How many lines the text file at `rel` has, for an answer about a file
+    /// that is being replaced. The read is bounded by [`READ_FILE_CAP`]: the
+    /// stat answers "not a file" and past-the-cap ([`LineCount::More`])
+    /// without opening anything, and only a text file within the cap is read —
+    /// so the count costs the cap's memory at worst, never the file's own size
+    /// (finding B5: counting a 4 GiB file's lines to say "41 → 3 lines" used to
+    /// cost a 4 GiB allocation). Binary and non-UTF-8 files are
+    /// [`LineCount::NotText`], the same fact [`Self::read_file`] refuses on the
+    /// edit road.
+    pub fn line_count(&self, rel: &str) -> LineCount {
+        match self.whole_read(rel, Decoding::Strict) {
+            Ok(WholeRead::Text(text)) => LineCount::Lines(text.lines().count()),
+            Ok(WholeRead::PastCap(_)) => LineCount::More,
+            _ => LineCount::NotText,
+        }
+    }
+
+    /// A whole text file's bytes, read within [`READ_FILE_CAP`] and decoded by
+    /// the road's own rule ([`Decoding`]). One read behind [`Self::read_file`],
+    /// [`Self::read_window`] and [`Self::line_count`], so the cap cannot be
+    /// checked in three places and drift in one, and the facts a road turns
+    /// into a sentence are decided here once ([`WholeRead`]).
+    ///
+    /// The order of the decisions is the point, and each is made from a fact
+    /// already in hand rather than from the read:
+    ///
+    /// - the *shape* comes from `fs::metadata` before anything is opened, so a
+    ///   FIFO cannot park a read;
+    /// - the *cap* comes from that same stat, before any whole read: a 512 MiB
+    ///   blob is refused from its size instead of being loaded to find it out
+    ///   (finding B5 measured peak RSS 3 → 514 MiB on exactly that);
+    /// - the read is still bounded to the cap + 1 bytes, because a file can
+    ///   grow between the stat and the read — the same bound [`Self::image_at`]
+    ///   keeps, and a read that hits it refuses without a length in hand;
+    /// - a NUL byte is a binary file on either decoding, because a NUL is valid
+    ///   UTF-8 and the encoding check alone would let a blob through.
+    fn whole_read(&self, rel: &str, decoding: Decoding) -> Result<WholeRead, String> {
         let path = self.real_path(&self.resolve(rel)?, rel)?;
         let meta = fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
         if !meta.is_file() {
-            return Err(format!("{rel} is not a regular file — cannot read it"));
+            return Ok(WholeRead::NotRegular);
         }
-        let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if meta.len() > READ_FILE_CAP {
+            return Ok(WholeRead::PastCap(Some(meta.len())));
+        }
+        let file = fs::File::open(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(READ_FILE_CAP + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if bytes.len() as u64 > READ_FILE_CAP {
+            return Ok(WholeRead::PastCap(None));
+        }
         if bytes.contains(&0) {
-            return Err(format!("{rel} looks like a binary file"));
+            return Ok(WholeRead::Binary);
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        match decoding {
+            Decoding::Lossy => Ok(WholeRead::Text(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )),
+            Decoding::Strict => match String::from_utf8(bytes) {
+                Ok(text) => Ok(WholeRead::Text(text)),
+                Err(e) => Ok(WholeRead::NotUtf8(e.utf8_error().valid_up_to())),
+            },
+        }
     }
 
     /// Read `rel` as an image, when it is one: the mime its own first bytes
@@ -800,6 +898,18 @@ impl Workspace {
     /// what it reads into `edit_file`'s `old_string`, and a numbered line is a
     /// string that cannot match. The range is named once, in the trailing
     /// sentence.
+    ///
+    /// The cap is the same whole-read cap as everywhere else ([`READ_FILE_CAP`],
+    /// checked from the stat by [`Self::whole_read`] before a byte is read): this
+    /// road cannot get past it, and the refusal is [`over_read_cap`]'s one
+    /// sentence, naming `run_command` as the road to a part of the file.
+    ///
+    /// The decode is **lossy on purpose**: this road shows what a file holds and
+    /// never writes it back, so a byte that is not valid UTF-8 is shown as
+    /// U+FFFD rather than refused — a model that can see a Latin-1 config is a
+    /// model that can convert it. The edit road is the one that must not decode
+    /// what it cannot re-encode, and [`Self::read_file`] says so in its own doc
+    /// (finding B6).
     pub fn read_window(
         &self,
         rel: &str,
@@ -807,19 +917,9 @@ impl Workspace {
         limit: usize,
         cap: usize,
     ) -> Result<String, String> {
-        let path = self.real_path(&self.resolve(rel)?, rel)?;
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.len() > READ_FILE_CAP {
-                return Err(format!(
-                    "{rel} is {} bytes — past the {} MB cap on a whole read, and a window cannot \
-                     get past it (the file is opened whole first): read part of it with \
-                     run_command (`sed -n '1,200p' {rel}`)",
-                    meta.len(),
-                    READ_FILE_CAP / (1024 * 1024)
-                ));
-            }
-        }
-        let text = self.read_file(rel)?;
+        let text = self
+            .whole_read(rel, Decoding::Lossy)?
+            .text_or_refusal(rel)?;
         let total = text.lines().count();
         let offset = offset.max(1);
         if limit == 0 {
@@ -913,8 +1013,17 @@ impl Workspace {
     /// Literal on purpose: a regex engine is a dependency and a search that
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
-    /// and files past [`SEARCH_FILE_CAP`] are skipped, and a matching line is
-    /// cut to [`MATCH_LINE_CAP`] so one minified file cannot spend the result.
+    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped, and a
+    /// matching line is cut to [`MATCH_LINE_CAP`] so one minified file cannot
+    /// spend the result.
+    ///
+    /// The decode is **lossy on purpose**, like [`Self::read_window`]'s and for
+    /// the same reason: a search only shows what it found, so a file in another
+    /// encoding is searched as U+FFFD rather than skipped — a Latin-1 config the
+    /// model can still find a symbol in is worth more than a miss the model
+    /// cannot see through. A file that is not valid UTF-8 is not "binary" here;
+    /// the skip counter is for the files (blobs, NUL-bearing) that have no text
+    /// to search at all.
     ///
     /// What it skipped is counted and travels back with the matches
     /// ([`Matches::skipped`]): a search that says "no match" while it never
@@ -1118,6 +1227,111 @@ impl Workspace {
         atomic_write(&entry, content.as_bytes(), Fresh::Box)
             .map_err(|e| format!("cannot write {rel}: {e}"))
     }
+}
+
+/// How a whole-file read treats bytes that are not valid UTF-8.
+///
+/// Two roads read a file whole and they read it for different reasons, so they
+/// answer the same bytes differently. The *edit* road ([`Workspace::read_file`])
+/// is the one whose result is written back: a lossy decode there would rewrite
+/// every byte it could not decode, in lines the model never touched, so it is
+/// strict and refuses. The *window* road ([`Workspace::read_window`]) shows
+/// what it read and never writes it back, so it decodes lossily: the
+/// alternative is refusing to show the model a file it can still convert with
+/// `run_command`. [`Workspace::search`] makes the same lossy choice for the
+/// same reason, one file at a time, and says so in its own doc.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Decoding {
+    /// Refuse bytes that are not UTF-8 ([`not_utf8`]): what is read this way
+    /// may be written back.
+    Strict,
+    /// Show them as U+FFFD: what is read this way is shown, never written back.
+    Lossy,
+}
+
+/// What a whole-file text read found. One read behind three roads — the strict
+/// edit read ([`Workspace::read_file`]), the lossy window read
+/// ([`Workspace::read_window`]) and the bounded count a `write_file` answer
+/// carries ([`Workspace::line_count`]) — needs the same facts, so they are
+/// decided once in [`Workspace::whole_read`] and each road turns them into its
+/// own sentence. `Err` is reserved for the I/O with no decision in it (the path
+/// does not resolve, `open` or `read` failed).
+enum WholeRead {
+    /// The file is text, decoded by the road's [`Decoding`].
+    Text(String),
+    /// Past [`READ_FILE_CAP`]. `Some(len)` is the file's own stat; `None` is a
+    /// file that grew past the cap between the stat and the read, where the
+    /// only length in hand is the buffer's and naming it would put a false
+    /// number on the file (the same shape [`image_too_big`] uses).
+    PastCap(Option<u64>),
+    /// Not a regular file: a directory, a FIFO, a device.
+    NotRegular,
+    /// A NUL byte, on either decoding: binary whatever the encoding is, and a
+    /// NUL is valid UTF-8, so the encoding check alone would let a blob past.
+    Binary,
+    /// The bytes are not valid UTF-8; the offset is the first byte that does
+    /// not decode. The strict road refuses; the lossy road never sees this.
+    NotUtf8(usize),
+}
+
+impl WholeRead {
+    /// The whole read as text, or the sentence its caller reads. Both decoding
+    /// roads map through here so neither spells a refusal of its own; the one
+    /// arm a lossy read cannot reach — invalid UTF-8, which it decodes — is the
+    /// strict road's refusal, answered rather than panicked on.
+    fn text_or_refusal(self, rel: &str) -> Result<String, String> {
+        match self {
+            WholeRead::Text(text) => Ok(text),
+            WholeRead::PastCap(size) => Err(over_read_cap(rel, size)),
+            WholeRead::NotRegular => Err(format!("{rel} is not a regular file — cannot read it")),
+            WholeRead::Binary => Err(format!("{rel} looks like a binary file")),
+            WholeRead::NotUtf8(first_bad) => Err(not_utf8(rel, first_bad)),
+        }
+    }
+}
+
+/// The one refusal a read past [`READ_FILE_CAP`] gets, whichever road asked:
+/// [`Workspace::read_file`] and [`Workspace::read_window`] are one whole read,
+/// and a window cannot get past the cap either (the file is opened whole
+/// first). One spelling, because it is one fact, and one road that works —
+/// `run_command` reading part of the file.
+///
+/// `size` is the file's own length when the stat named it, and `None` when a
+/// read bounded by the cap hit the bound before the file's end — the length in
+/// hand is the buffer's, and naming it would put a number on the file that is
+/// not its own (the same shape [`image_too_big`] uses).
+fn over_read_cap(rel: &str, size: Option<u64>) -> String {
+    let cap = READ_FILE_CAP / (1024 * 1024);
+    let road = format!("read part of it with run_command (`sed -n '1,200p' {rel}`)");
+    match size {
+        Some(size) => format!(
+            "{rel} is {size} bytes — past the {cap} MB cap on a whole read, and a window cannot \
+             get past it (the file is opened whole first): {road}"
+        ),
+        None => format!(
+            "{rel} grew past the {cap} MB cap while it was being read — its size is not known, \
+             and a window cannot get past the cap (the file is opened whole first): {road}"
+        ),
+    }
+}
+
+/// The refusal a strict whole-file read gives bytes that are not valid UTF-8:
+/// the edit road is the one whose text is written back, and a decode that
+/// cannot keep a byte cannot edit the file without rewriting it — every
+/// undecodable byte becomes U+FFFD, in lines the model never named (finding B6,
+/// a Latin-1 `caf\xe9` that came back U+FFFD). `first_bad` is where the decode
+/// stopped, which is where the encoding shows itself (offset 3 of a `caf\xe9`
+/// is the `\xe9`). The road is a converter in the shell, which can be told the
+/// encoding the model guessed: the bytes must be converted first, not edited
+/// through.
+fn not_utf8(rel: &str, first_bad: usize) -> String {
+    format!(
+        "{rel} is not valid UTF-8 — the first byte that does not decode is at offset {first_bad}, \
+         so this is a file in another encoding (a Latin-1 config, a Shift-JIS note), and an edit \
+         would rewrite every byte it cannot decode as U+FFFD, in lines the model never touched. \
+         Every byte is left as it was: convert it first with run_command (`iconv -f ISO-8859-1 -t \
+         UTF-8 {rel} > {rel}.utf8`), or change it with a tool that knows its encoding"
+    )
 }
 
 /// The one refusal an image past [`IMAGE_FILE_CAP`] gets, whichever door it
@@ -2908,11 +3122,18 @@ mod tests {
         assert!(known.contains("of 3000000 bytes"), "{known}");
     }
 
-    /// The whole-read cap is a different ruler from the image cap, and it had
-    /// no test either: a file past it is refused by `read_window` from the stat
-    /// before anything is opened or read, and the sentence names the road that
-    /// does work (`run_command`). The 32 MiB here are sparse — a few blocks on
-    /// disk — so the pin costs nothing to hold.
+    /// The whole-read cap is a different ruler from the image cap, and every
+    /// whole read is checked against it from the stat: `read_window` and
+    /// `read_file` are one read ([`Workspace::whole_read`]), so they refuse with
+    /// the *same* sentence, naming the road that does work (`run_command`) — and
+    /// the count `write_file` asks for is bounded the same way
+    /// ([`LineCount::More`]). The 32 MiB + 4 KiB here are sparse — a few blocks
+    /// on disk — so the pin costs nothing to hold.
+    ///
+    /// A file past the cap with no read bit makes the "before the bytes are
+    /// read" claim falsifiable: the cap sentence can only come from the stat,
+    /// because an open of this file fails. A read-first implementation answers
+    /// with the permission error and this test fails.
     #[test]
     fn a_file_bigger_than_the_read_cap_is_refused_before_any_read() {
         let ws = temp_workspace("over-read-cap");
@@ -2921,16 +3142,33 @@ mod tests {
         file.set_len(READ_FILE_CAP + 4096).unwrap();
         drop(file);
 
-        let refused = ws.read_window("huge.log", 1, 10, 4_000).unwrap_err();
+        let window = ws.read_window("huge.log", 1, 10, 4_000).unwrap_err();
         assert!(
-            refused.contains(&format!("{} bytes", READ_FILE_CAP + 4096)),
-            "the file's own length is named: {refused}"
+            window.contains(&format!("{} bytes", READ_FILE_CAP + 4096)),
+            "the file's own length is named: {window}"
         );
-        assert!(refused.contains("past the 32 MB cap"), "{refused}");
+        assert!(window.contains("past the 32 MB cap"), "{window}");
         assert!(
-            refused.contains("run_command"),
-            "the road that works: {refused}"
+            window.contains("run_command"),
+            "the road that works: {window}"
         );
+        let whole = ws.read_file("huge.log").unwrap_err();
+        assert_eq!(whole, window, "one cap, one sentence, whichever road asked");
+        assert_eq!(
+            ws.line_count("huge.log"),
+            LineCount::More,
+            "the count is not read over the cap either"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = ws.read_file("huge.log").unwrap_err();
+        assert_eq!(
+            refused, window,
+            "the cap refusal comes from the stat, not from an open of the file"
+        );
+        assert_eq!(ws.line_count("huge.log"), LineCount::More);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// The cap is the transport's, not the sniffer's: a file past it that is
@@ -3143,8 +3381,12 @@ mod tests {
     }
 
     /// The whole file or a refusal: `edit_file` is the one caller left, and an
-    /// exact replacement needs every byte it is replacing. A binary file is the
-    /// one thing refused, because lossy UTF-8 would rewrite it.
+    /// exact replacement needs every byte it is replacing. Two things are
+    /// refused, for two different reasons: a binary file (a NUL byte) is not
+    /// text at all, and a non-UTF-8 file ([`not_utf8`], the test beside this
+    /// one) is text this read cannot decode without rewriting it — the lossy
+    /// decode is what made the old edit road rewrite a Latin-1 file (finding
+    /// B6). Everything else comes back whole within the cap.
     #[test]
     fn read_refuses_a_binary_file_and_reads_the_rest_whole() {
         let ws = temp_workspace("binary");
@@ -3156,6 +3398,63 @@ mod tests {
         let long = "x".repeat(64 * 1024);
         ws.write_file("long.txt", &long).unwrap();
         assert_eq!(ws.read_file("long.txt").unwrap(), long);
+    }
+
+    /// The edit road's decode is strict: a non-UTF-8 file is refused with the
+    /// offset, the encoding problem and the road that can still change it
+    /// (`iconv` through `run_command`) — every byte would otherwise be rewritten
+    /// as U+FFFD in the lines the model never touched (finding B6, measured on
+    /// `caf\xe9 = 1\nna\xefve = 2\n`). The window and search roads keep showing
+    /// the same file lossily on purpose: a shown read is not a written one, and
+    /// a refusal there would hide the file from the only tools that can diagnose
+    /// it.
+    #[test]
+    fn a_non_utf8_file_is_refused_whole_and_shown_in_a_window() {
+        let ws = temp_workspace("non-utf8");
+        let bytes = b"caf\xe9 = 1\nna\xefve = 2\n";
+        fs::write(ws.root().join("latin.txt"), bytes).unwrap();
+
+        let refused = ws.read_file("latin.txt").unwrap_err();
+        assert!(
+            refused.contains("latin.txt"),
+            "the file is named: {refused}"
+        );
+        assert!(refused.contains("not valid UTF-8"), "{refused}");
+        assert!(
+            refused.contains("offset 3"),
+            "where the decode stopped: {refused}"
+        );
+        assert!(
+            refused.contains("iconv") && refused.contains("run_command"),
+            "the roads that still work: {refused}"
+        );
+        assert_eq!(
+            fs::read(ws.root().join("latin.txt")).unwrap(),
+            bytes,
+            "the refusal touched nothing"
+        );
+
+        let shown = ws.read_window("latin.txt", 1, 10, 4_000).unwrap();
+        assert!(
+            shown.starts_with("caf\u{fffd} = 1\nna\u{fffd}ve = 2"),
+            "the window still shows the file, lossily: {shown}"
+        );
+        let found = ws.search("caf", "", false, 10).unwrap();
+        assert!(
+            found
+                .matches
+                .iter()
+                .any(|line| line.starts_with("latin.txt:1:")),
+            "search still searches it, lossily: {:?}",
+            found.matches
+        );
+
+        // The positive twin: valid UTF-8 with multi-byte characters reads whole.
+        let utf8 = "café = 1\nnaïve = 2\n";
+        fs::write(ws.root().join("utf8.txt"), utf8).unwrap();
+        assert_eq!(ws.read_file("utf8.txt").unwrap(), utf8);
+        assert_eq!(ws.line_count("utf8.txt"), LineCount::Lines(2));
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     #[test]
