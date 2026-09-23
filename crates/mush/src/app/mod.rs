@@ -2863,13 +2863,21 @@ impl App {
             Command::Url(url) => {
                 // A new endpoint may host a different model with a different
                 // window; re-derive it unless the human stated one (finding A5).
-                self.switch_endpoint(&url);
+                let forgotten = self.switch_endpoint(&url);
                 self.refresh_models();
-                self.say(format!(
+                let mut line = format!(
                     "endpoint: {} · {}",
                     self.cfg().base_url,
                     self.context_label()
-                ));
+                );
+                if forgotten {
+                    // The fetch above went out without the key: say what is
+                    // missing and where a new one goes, the same words the
+                    // `/provider` arm uses (finding C6).
+                    line.push_str(" · ");
+                    line.push_str(&self.no_key_hint());
+                }
+                self.say(line);
                 self.persist_user_config();
             }
             Command::ApiKey(None) => match &self.cell.ui().api_key {
@@ -2919,6 +2927,11 @@ impl App {
 
     /// Remember the current setup in the home config file so the API key (and
     /// endpoint defaults) survive restarts. Never writes to the workspace.
+    ///
+    /// The key is saved *with* the endpoint it is for: a save that follows a
+    /// switch which moved the host states `api_key: None`, and `save_to` treats
+    /// that as a statement, so the old host's key is not merged forward to the
+    /// new one (findings C6, D6).
     fn persist_user_config(&mut self) {
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
@@ -3111,30 +3124,54 @@ impl App {
             ));
             return;
         };
-        self.switch_provider(provider);
+        let forgotten = self.switch_provider(provider);
         self.refresh_models();
         self.persist_user_config();
-        self.say(format!(
-            "provider: {} · {}",
-            provider.name(),
-            self.context_label()
-        ));
+        let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
+        if forgotten {
+            // The model-list fetch above was the first request, and it went
+            // out without the key: the acknowledgement names what is missing
+            // and the road back (finding C6).
+            line.push_str(" · ");
+            line.push_str(&self.no_key_hint());
+        }
+        self.say(line);
+    }
+
+    /// The tail an ack gets when a host change took the key: what is missing
+    /// and the road back. One spelling for the `/provider` and `/url` arms, so
+    /// the two cannot describe the same loss two ways — and `/key` keeps
+    /// stating its own destination, as it already does (findings C6, D6).
+    fn no_key_hint(&self) -> String {
+        format!(
+            "no api key for this endpoint — /key <secret> sets one (saved to {})",
+            userconfig::config_path().display()
+        )
     }
 
     /// Point mush at another endpoint, re-deriving the window for it (finding
     /// A5). One write, so no actor sees the new endpoint with the old window.
-    fn switch_endpoint(&mut self, url: &str) {
+    ///
+    /// Returns whether the new host took the key with it (finding C6): the
+    /// caller says so, because the fetch that follows is the first request
+    /// built against the new endpoint.
+    fn switch_endpoint(&mut self, url: &str) -> bool {
         self.cell.edit(|cfg| {
             cfg.set_base_url(url);
             cfg.rederive_context();
-        });
+        })
     }
 
     /// Select a provider: the endpoint it owns, the model mush knows for it,
     /// and the window that goes with both — in one write, so a request cannot
     /// go out against the new provider with the old one's model or window
     /// (finding A5; a window the human stated is kept by `rederive_context`).
-    fn switch_provider(&mut self, provider: Provider) {
+    ///
+    /// Returns whether the switch moved the endpoint to another host and
+    /// dropped the key with it ([`ConfigCell::edit`]'s rule, finding C6). A
+    /// provider that keeps the endpoint (`custom`'s own row) keeps the key,
+    /// too: the destination did not move.
+    fn switch_provider(&mut self, provider: Provider) -> bool {
         self.cell.edit(|cfg| {
             cfg.provider = provider;
             // A provider that owns an endpoint points at it; one that stands for
@@ -3150,7 +3187,7 @@ impl App {
                 }
             }
             cfg.set_model(&model);
-        });
+        })
     }
 
     /// Apply the row `Enter` landed on. The row carries its own id, so nothing
@@ -11948,9 +11985,12 @@ mod tests {
     /// means a new one (finding A5).
     ///
     /// The switch itself, not `/url` and `/provider`: those arms fetch the
-    /// model list after switching, which is a socket the default suite does not
-    /// take. The arms call exactly these two functions and nothing else, so the
-    /// behaviour they have is the behaviour pinned here.
+    /// model list after switching, and the suite does not point that fetch at a
+    /// live endpoint. The arms call exactly these two functions and nothing
+    /// else, so the behaviour they have is the behaviour pinned here — except
+    /// the acknowledgement and the key, which
+    /// `switching_to_a_provider_forgets_the_key` drives through `/url` against
+    /// a port nothing listens on.
     #[test]
     fn a_runtime_switch_rederives_the_window() {
         let (mut app, _rx) = test_app("rederive");
@@ -11993,6 +12033,54 @@ mod tests {
             32_768,
             "what the human said stays"
         );
+    }
+
+    /// The audit's C6: `/provider` switched the endpoint, the model and the
+    /// window and left `api_key` alone, so the model-list fetch that follows
+    /// handed the current key to the vendor, and `persist_user_config` saved it
+    /// as that vendor's — outliving the session. A switch that changes the host
+    /// now forgets the key in both copies, and the ack names the road back.
+    #[test]
+    fn switching_to_a_provider_forgets_the_key() {
+        let (mut app, _rx) = test_app("provider-forgets-key");
+        app.cell.edit(|cfg| cfg.api_key = Some("sk-lan".into()));
+
+        assert!(
+            app.switch_provider(Provider::DeepSeek),
+            "the provider owns another host"
+        );
+        assert_eq!(app.cell.ui().api_key, None, "the UI's copy");
+        assert_eq!(
+            app.cell.handle().config().unwrap().api_key,
+            None,
+            "and the actors' copy: the fetch cannot carry it"
+        );
+        assert_eq!(app.cfg().base_url, "https://api.deepseek.com");
+
+        // `/url`'s own road, with a key in hand again. Nothing listens on port
+        // 2, so the fetch is refused in the instant and the model list falls
+        // back to the provider's table; the ack is the line the human reads.
+        isolate_user_config();
+        app.cell.edit(|cfg| cfg.api_key = Some("sk-lan".into()));
+        run(&mut app, "/url http://127.0.0.1:2");
+        assert_eq!(app.cfg().base_url, "http://127.0.0.1:2");
+        assert_eq!(app.cell.ui().api_key, None, "the key did not follow it");
+        let line = text_of(&app);
+        assert!(line.contains("no api key for this endpoint"), "{line}");
+        assert!(line.contains("/key"), "the road back is named: {line}");
+
+        // The twin: another path on the same host is the same destination, so
+        // the key stays and the ack says nothing about one.
+        let (mut app, _rx) = test_app("url-same-host");
+        app.cell.edit(|cfg| cfg.api_key = Some("sk-lan".into()));
+        run(&mut app, "/url http://127.0.0.1:1/proxy");
+        assert_eq!(
+            app.cell.ui().api_key.as_deref(),
+            Some("sk-lan"),
+            "the same host keeps its key"
+        );
+        let line = text_of(&app);
+        assert!(!line.contains("/key"), "{line}");
     }
 
     /// The model list is discovered on its own thread, so it arrives after the
