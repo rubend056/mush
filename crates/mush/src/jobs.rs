@@ -489,6 +489,10 @@ pub struct Foreground {
     /// agent that did not start it (refactor R20).
     owner: u64,
     live: Live,
+    /// Whether the registry has taken this command over as a job: `launch`
+    /// sets it once the record exists, and the `Drop` that follows the handover
+    /// must not kill the job the command just became.
+    handed_over: bool,
 }
 
 impl Foreground {
@@ -501,16 +505,31 @@ impl Foreground {
 }
 
 impl Drop for Foreground {
-    /// The call is over: its entry in the foreground map goes.
+    /// The call is over: its entry in the foreground map goes — and a command
+    /// that is *still running* is ended here, because this is the only road
+    /// left for it.
     ///
-    /// Nothing is killed here, on purpose. Every path that ends the call early
-    /// kills the command itself (`wait_bounded` does, before it returns), and a
-    /// command that ended by itself must not be signalled afterwards: its
-    /// process group id is free to be handed to somebody else's process, and a
-    /// `kill -9 -pgid` that landed there would kill work mush never started.
-    /// What keeps a *running* command from escaping is that the entry is
-    /// registered for the whole of the call, not this drop.
+    /// Every path that ends the call early kills the command itself
+    /// (`wait_bounded` does, before it returns), and a command that ended by
+    /// itself must not be signalled afterwards: its process group id is free to
+    /// be handed to somebody else's process, and a `kill -9 -pgid` that landed
+    /// there would kill work mush never started. What tells the two apart is
+    /// the command's own answer: `poll` saying `Ok(None)` means it has not been
+    /// *reaped*, so its pid — and therefore its group id — cannot have been
+    /// reused, and killing is safe. `Ok(Some(_))` is a command that ended, and
+    /// the kill is the one that must not happen.
+    ///
+    /// The road this exists for is the panic road (finding E4): a tool that
+    /// panics while the command runs unwinds through this `Drop`, and the old
+    /// no-kill rule left the process group in neither map — out of `kill_all`'s
+    /// reach for the rest of the session, with the machine lock still held if
+    /// the call had taken it. A hold the registry has taken over as a job
+    /// (`handed_over`) is not this road: the job list is what ends that command
+    /// now, and killing it here would kill the job the detach just started.
     fn drop(&mut self) {
+        if !self.handed_over && matches!(self.live.poll(), Ok(None)) {
+            self.live.kill();
+        }
         self.registry.forget_foreground(self.owner);
     }
 }
@@ -870,6 +889,7 @@ impl Registry {
             registry: Arc::clone(self),
             owner,
             live,
+            handed_over: false,
         }
     }
 
@@ -1081,8 +1101,14 @@ impl Registry {
         };
         // The job's record exists, so the job list is what names this command
         // from here on: the hold a foreground call was carrying can go. Not
-        // before — the window in between is one a `kill_all` falls into.
-        drop(held);
+        // before — the window in between is one a `kill_all` falls into. The
+        // handover is marked first, so the `Drop` above does not read "still
+        // running" as the panic road and kill the job the command just became
+        // (finding E4).
+        if let Some(mut held) = held {
+            held.handed_over = true;
+            drop(held);
+        }
         let registry = Arc::clone(self);
         let watching = live.clone();
         let started = self.clock.now();
@@ -1130,6 +1156,11 @@ impl Registry {
     /// Stop every job one agent started, and every command it is running as a
     /// tool call. A `Stop` aimed at an agent means "stop the work in flight",
     /// and a `run_command` the agent is waiting on is work in flight.
+    ///
+    /// A machine claim the owner still held goes with the work: an actor that
+    /// vanished (the UI's `report_cut_off`) never runs its own release, and a
+    /// lock held by an agent whose row is gone is a lock nobody can clear
+    /// ([`Registry::kill`], finding E4).
     pub fn kill_owned(&self, owner: u64) {
         self.kill(Some(owner));
     }
@@ -1144,11 +1175,21 @@ impl Registry {
     }
 
     /// Stop what `owner` started — both its jobs and the commands it is running
-    /// as tool calls — or, with `None`, everything this registry reaches.
+    /// as tool calls — or, with `None`, everything this registry reaches. A kill
+    /// aimed at an owner also frees the machine when that owner held it.
     ///
     /// The reach is two maps, and this is the one walk over them: a killer that
     /// walked only `jobs` would be a second, weaker rule, and the foreground
     /// half is exactly what the weaker rule misses (finding S4).
+    ///
+    /// The holder record is the third thing the owner's kill reaches, and the
+    /// only road that can: `release_machine` is the holder's own and a panicking
+    /// actor never runs it, `Registry::stop` refuses any other caller, and the
+    /// UI has no key that releases the machine. A holder that is a *detached
+    /// job* is cleared here too — the job is being killed, so it no longer
+    /// holds anything; its watch thread's `finish` would clear it a moment later
+    /// anyway, and a sibling queued behind the lock must not wait for a thread
+    /// it is killing.
     fn kill(&self, owner: Option<u64>) {
         // `map_or`, not `is_none_or`: the workspace declares Rust 1.74, where
         // the latter does not exist yet (clippy's msrv lint keeps this honest).
@@ -1162,6 +1203,12 @@ impl Registry {
                 if let State::Running(live) = &record.state {
                     live.kill();
                 }
+            }
+        }
+        if let Some(owner) = owner {
+            let mut inner = self.inner();
+            if matches!(&inner.holder, Some((holder, _, _)) if *holder == owner) {
+                inner.holder = None;
             }
         }
     }
@@ -1432,6 +1479,50 @@ fn preview(stdout: &str, stderr: &str, cap: usize) -> String {
         out.push_str(stderr.trim_end());
     }
     tail_for_model(&out, cap)
+}
+
+/// The live processes in one process group, from `/proc/<pid>/stat`'s `pgrp`
+/// field: how a test asserts that a group is *gone* rather than that its leader
+/// died.
+#[cfg(all(test, unix))]
+pub(crate) fn group_members(pgid: i32) -> Vec<i32> {
+    let mut members = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return members;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(rest) = stat.rsplit(')').next() else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.get(2).and_then(|field| field.parse::<i32>().ok()) == Some(pgid) {
+            members.push(pid);
+        }
+    }
+    members
+}
+
+/// Wait, bounded, for a process group to have no members left. Returns what is
+/// still there: empty means the group ended.
+#[cfg(all(test, unix))]
+pub(crate) fn wait_group_gone(pgid: i32) -> Vec<i32> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let members = group_members(pgid);
+        if members.is_empty() || Instant::now() >= deadline {
+            return members;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -2024,6 +2115,181 @@ mod tests {
             2,
             "and a finished call leaves nothing to kill"
         );
+    }
+
+    /// A hold dropped while its command still runs must end it: that is the
+    /// road a panicking actor's unwinding takes (finding E4). The old `Drop`
+    /// never killed, so the process group was in neither map afterwards — out
+    /// of `kill_all`'s reach for the rest of the session — and a command that
+    /// *had* ended must still not be signalled, because its group id is free to
+    /// be handed to somebody else's group.
+    #[test]
+    fn a_dropped_hold_kills_a_running_command_and_leaves_a_finished_one_alone() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::exits(0)),
+        );
+        let (registry, _events, _clock) = registry();
+        let spawn = |command: &str| {
+            machine
+                .spawn(&ShellCommand {
+                    command,
+                    root: Path::new("/tmp"),
+                })
+                .unwrap()
+        };
+
+        let running = registry.hold(7, spawn("cargo build"));
+        drop(running);
+        assert_eq!(machine.kills(), 1, "the running command was stopped");
+
+        let mut ended = registry.hold(7, spawn("cargo test"));
+        assert_eq!(ended.poll().unwrap(), Some(End::Exited(0)));
+        drop(ended);
+        assert_eq!(
+            machine.kills(),
+            1,
+            "a command that already ended is not signalled"
+        );
+        assert!(
+            !registry.holding_foreground(7),
+            "and both holds are forgotten"
+        );
+    }
+
+    /// The same drop on a *real* process group: a hold over a live `sh -c` is
+    /// released while the shell runs, and the group ends with it. This is the
+    /// half a scripted job cannot prove — `Running`'s kill is what finds the
+    /// group.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_hold_ends_a_real_process_group() {
+        let root = std::env::temp_dir().join(format!("mush-drop-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (registry, _events, _clock) = registry();
+        let job = crate::machine::Shell
+            .spawn(&ShellCommand {
+                command: "echo $$ > pgid; sleep 600",
+                root: &root,
+            })
+            .unwrap();
+        let held = registry.hold(7, job);
+        // The child writes its own pid before it sleeps; its pid is the group.
+        let pid_file = root.join("pgid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pgid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !crate::jobs::group_members(pgid).is_empty(),
+            "the group is running before the hold goes"
+        );
+
+        drop(held);
+
+        assert!(
+            crate::jobs::wait_group_gone(pgid).is_empty(),
+            "the dropped hold left its process group behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The hold a detached command is handed over *through* is not the panic
+    /// road: once the job's record exists, the job list is what ends it, and
+    /// the `Foreground`'s drop that follows `launch` must not kill the job it
+    /// just became (finding E4's fix must keep the detach road working).
+    #[test]
+    fn a_handed_over_hold_does_not_kill_the_job_it_became() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, _clock) = registry();
+        let held = registry.hold(
+            7,
+            machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: Path::new("/tmp"),
+                })
+                .unwrap(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let id = registry
+            .launch(Launch::held("cargo build".to_string(), false, tx, held))
+            .unwrap();
+
+        assert_eq!(
+            machine.kills(),
+            0,
+            "the handover is not a kill: the job runs on"
+        );
+        assert_eq!(registry.live_for(7).len(), 1, "under its own id: {id}");
+        registry.kill_all();
+        assert_eq!(machine.kills(), 1, "and quitting still kills it");
+    }
+
+    /// `kill_owned` is the road `report_cut_off` takes for an actor that
+    /// vanished, and a claimed machine must not outlive the work: the holder
+    /// record is freed with the jobs (finding E4). A kill aimed at another
+    /// agent leaves the holder where it is.
+    #[test]
+    fn killing_an_owners_jobs_frees_the_machine_it_held() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let (registry, _events, _clock) = registry();
+
+        // The job holder: `launch` writes the claim that names the job.
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo bench",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        registry
+            .launch(Launch::started(7, "cargo bench".to_string(), true, tx, job))
+            .unwrap();
+        assert!(
+            matches!(registry.held(), Some((7, _, Some(_)))),
+            "the exclusive job holds the machine"
+        );
+
+        // Somebody else's Stop is not a release.
+        registry.kill_owned(8);
+        assert!(registry.held().is_some(), "agent 8 does not own the claim");
+
+        registry.kill_owned(7);
+        assert_eq!(registry.held(), None, "the owner's kill frees the machine");
+        assert!(
+            registry.take_machine(9, "cargo bench").is_ok(),
+            "and a sibling can take it"
+        );
+        registry.release_machine(9);
+
+        // The foreground claim: `take_machine` writes it, the panic skipped
+        // the release, and the same kill has to clear it.
+        let held = registry.hold(
+            7,
+            machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: Path::new("/tmp"),
+                })
+                .unwrap(),
+        );
+        registry.take_machine(7, "cargo build").unwrap();
+        registry.kill_owned(7);
+        assert_eq!(registry.held(), None, "and the tool call's claim goes too");
+        drop(held);
+        registry.kill_all();
     }
 
     /// A tool call that outlives `CMD_DETACH_AFTER` becomes the job of the agent

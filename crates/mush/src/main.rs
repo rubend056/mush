@@ -18,6 +18,7 @@ mod lock;
 mod machine;
 mod model;
 mod session_save;
+mod signals;
 mod theme;
 mod ui;
 
@@ -877,6 +878,26 @@ fn run() -> Result<(), Box<dyn Error>> {
     // conversations would erase each other in turn. A refused start leaves the
     // store exactly as it found it (see `lock`).
     let _lock = lock::acquire(workspace.root())?;
+    // A mush that died without unwinding left its commands' scratch files in the
+    // temp directory, with an orphan still writing into them and no watcher left
+    // to cap it (finding E5). The names carry the pid that owned each pair, so a
+    // start can reap the dead and never a live mush's — this one included.
+    machine::reap_dead_scratch();
+    // A mush that is signalled ends through the same road `Ctrl-Q` takes — the
+    // exit flush, `kill_all`, the writer's join, the socket's removal — instead
+    // of dying raw with every process group it started still running (finding
+    // E1; `signals` carries the road and its reasons). The guard is held here
+    // for the whole run: dropping it would take the handlers away.
+    let _signals = match signals::install() {
+        Ok(signals) => Some(signals),
+        // Not fatal: a mush without handlers is the mush that existed before
+        // this module, and refusing to start would trade a resource leak for no
+        // mush at all. It is said, because it is not the normal state.
+        Err(error) => {
+            eprintln!("mush: signal handling disabled — {error}");
+            None
+        }
+    };
 
     // CLI flags > environment > saved session > home config > defaults; the
     // whole precedence lives in one tested function in mush-core.
@@ -987,6 +1008,12 @@ fn event_loop(
     const MAX_EVENTS_PER_FRAME: usize = 4096;
 
     while !app.should_quit {
+        // A signal is read here, on the thread that owns the terminal, the tree
+        // and the store: the flag turns into the quit road and the loop stops
+        // before painting a frame nobody will read.
+        if take_signal_quit(app) {
+            break;
+        }
         drain_actors(app, rx);
 
         // Read one event, then every event that is already available, and paint
@@ -1051,8 +1078,9 @@ fn drain_actors(app: &mut App, rx: &Receiver<Msg>) {
 ///
 /// Each mode is a promise to the human's shell: leaving raw mode on breaks their
 /// typing, and leaving bracketed paste on makes their own pastes arrive wrapped
-/// in escape codes. Everything that can end the program — a clean quit, a panic,
-/// an error on the way out — has to undo all of them, so they are entered here
+/// in escape codes. Everything that can end the program — a clean quit, a
+/// signal (`crate::signals` turns one into the quit road), a panic, an error on
+/// the way out — has to undo all of them, so they are entered here
 /// and undone by [`restore_terminal_modes`].
 fn enter_terminal_modes() -> io::Result<()> {
     enable_raw_mode()?;
@@ -1098,6 +1126,21 @@ impl Drop for TerminalGuard {
         restore_terminal_modes();
         let _ = self.terminal.show_cursor();
     }
+}
+
+/// The signal road's one step: the flag the handler set becomes the quit.
+///
+/// The thread matters. A handler runs on whichever thread the kernel chose;
+/// the quit road runs on this one, where `App` lives — so the session's flush,
+/// `kill_all` and the terminal's exit are one thread's work, and no thread has
+/// to reach into another's tree. Returns whether a quit was asked, so the loop
+/// can leave without painting a frame nobody will read.
+pub(crate) fn take_signal_quit(app: &mut App) -> bool {
+    if signals::quit_requested() {
+        app.signal_quit();
+        return true;
+    }
+    false
 }
 
 fn install_panic_hook() {

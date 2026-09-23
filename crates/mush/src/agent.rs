@@ -5369,6 +5369,14 @@ enum Ended {
     Detached,
 }
 
+/// The marker a test puts in a command to make the tool panic with the command
+/// running (finding E4's panic road). It is a shell comment, so the process
+/// group under the panic is a real one; the test's command announces itself
+/// first (`echo $$ > pid; touch ready`), so the group can be named before the
+/// panic takes it.
+#[cfg(test)]
+const PANIC_ON_PURPOSE: &str = "# mush-test: panic-while-the-command-runs";
+
 /// Run a shell command in `root` and return a report the model can read.
 ///
 /// The command itself is the [`Machine`]'s: how to start one, how it is
@@ -5391,6 +5399,24 @@ fn run_shell(
     // whose result the model is waiting for, which is exactly why nothing was
     // watching it before.
     let mut running = actor.ctx.registry.hold(actor.id, spawned);
+    // The panic road finding E4 is about: a tool that panics while the command
+    // runs leaves the hold to `Drop`, with nothing else to end the group and —
+    // on an exclusive call — the machine lock still claimed. A test drives it
+    // with a command no model would send, and the marker is a shell comment, so
+    // the process group under the panic is a real one.
+    #[cfg(test)]
+    if command.contains(PANIC_ON_PURPOSE) {
+        // A panic on the first instruction would be a race with the shell, not
+        // a test: wait for the command's own `touch ready` so the group is up
+        // and its pid is readable when the hold is dropped.
+        let ready = root.join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ready.exists(), "the test's command never started");
+        panic!("the tool panics with the command still running (test of finding E4)");
+    }
     let ended = wait_bounded(&mut running, timeout, detach.after(), cancel, actor, state)?;
     if matches!(ended, Ended::Detached) {
         if let Detach::Job {
@@ -11316,6 +11342,73 @@ mod tests {
         );
         actor.ctx.registry.kill_all();
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The panic road finding E4 is about, driven for real: an actor's tool
+    /// panics with an *exclusive* command running. The unwinding drops the hold,
+    /// whose `Drop` ends the command (see `jobs::Foreground`), and the claim the
+    /// panic skipped — `release_machine` never ran — is freed by the road the UI
+    /// takes for an actor that vanished (`report_cut_off` → `kill_owned`), so a
+    /// sibling can take the machine again.
+    #[test]
+    fn a_panicking_agent_kills_its_command_and_frees_the_machine() {
+        let (actor, _events, _mailbox) = build_actor(
+            "panic-tool",
+            Arc::new(HttpModel::new(test_cfg())),
+            test_cfg(),
+        );
+        let agent_id = actor.id;
+        let registry = actor.ctx.registry.clone();
+        let root = actor.ws.root().to_path_buf();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // The panic happens on the actor's own stack, exactly where a panic in
+        // tool code does: after the hold exists, before anything killed the
+        // command. The thread is the actor for this test.
+        let command = format!("echo $$ > pid; touch ready; sleep 600 {PANIC_ON_PURPOSE}");
+        let panicked = std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let mut state = ActorState::default();
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": command, "exclusive": true }),
+                &cancel,
+            )
+        });
+        assert!(
+            panicked.join().is_err(),
+            "the tool panicked, on purpose, with the command running"
+        );
+
+        let pgid: i32 = fs::read_to_string(root.join("pid"))
+            .expect("the command wrote its pid before the panic")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            crate::jobs::wait_group_gone(pgid).is_empty(),
+            "the panic left the command's process group behind"
+        );
+
+        // The other half of the road: the panic skipped the call's release, so
+        // the machine is still claimed by an agent whose tool is gone — until
+        // the UI's cut-off road frees it with the jobs.
+        assert!(
+            registry.held().is_some(),
+            "the claim outlives the panic (which is why the UI must clear it)"
+        );
+        registry.kill_owned(agent_id);
+        assert_eq!(registry.held(), None, "the cut-off road frees the machine");
+        assert!(
+            registry.take_machine(9, "cargo bench").is_ok(),
+            "and a sibling can take it"
+        );
+        registry.release_machine(9);
+        registry.kill_all();
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// And the holder's *non-exclusive* work runs beside its own exclusive job:
