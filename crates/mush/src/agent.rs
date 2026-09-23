@@ -313,6 +313,16 @@ pub enum Work {
 }
 
 impl Work {
+    /// The head of the line a failed commit leaves, and the shape the pane
+    /// reads to paint it in mush's voice: the sentence is mush's own report
+    /// about its own act, and it reaches the pane as a `user` line, where an
+    /// unrecorded line on a *child's* transcript would read as the parent's
+    /// (`Chat`'s `unrecorded`). One spelling, used by the writer
+    /// ([`Work::status_line`]) and by the reader, so the sentence the actor
+    /// writes and the sentence the pane knows cannot drift; the line's *body*
+    /// is git's own error and is deliberately not read by anyone.
+    pub(crate) const UNCOMMITTED_HEAD: &'static str = "could not commit the worktree";
+
     /// The line the UI prints when this happened. One home for the sentence, so
     /// the row's status line, the transcript line a failed commit leaves
     /// ([`report_work`]) and the listing agree about the same commit.
@@ -326,9 +336,7 @@ impl Work {
                 "{branch} holds ignored work only: {} — a commit cannot keep it",
                 git::named_paths(paths)
             )),
-            Work::Uncommitted { error, .. } => {
-                Some(format!("could not commit the worktree: {error}"))
-            }
+            Work::Uncommitted { error, .. } => Some(format!("{}: {error}", Self::UNCOMMITTED_HEAD)),
         }
     }
 
@@ -2403,13 +2411,13 @@ fn fold_parked(
 /// travels in; one helper, so no door can repair differently from another.
 fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
     repair_tool_pairs(&mut messages);
-    // The copy can also carry the dropped-turns note — the UI puts what it is
-    // told at the end, a stored copy holds it where its own trim left it. The
-    // actor's list is what a request is built from, so the note goes back where
-    // the dropped turns were before anything reads it — the fold included,
-    // whose own request must carry the sentence where the model expects a
-    // statement about the transcript's front
-    // (`mush_core::transcript::place_dropped_note`).
+    // The copy can also carry the dropped-turns note: a session file another
+    // version wrote may hold it after the newest line, and this hand-over is
+    // the door a copy the actor did not build comes through. The actor's list
+    // is what a request is built from, so the note goes back where the dropped
+    // turns were before anything reads it — the fold included, whose own
+    // request must carry the sentence where the model expects a statement about
+    // the transcript's front (`mush_core::transcript::place_dropped_note`).
     place_dropped_note(&mut messages);
     messages
 }

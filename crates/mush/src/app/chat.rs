@@ -61,7 +61,7 @@ use mush_core::session;
 use mush_core::text::{markdown_row_counts, truncate, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
-use crate::agent::summarize_args;
+use crate::agent::{summarize_args, Work};
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
@@ -1155,28 +1155,104 @@ impl Chat {
     /// user line that is the echo of the words the box just sent is the human's,
     /// and every other user line was written by another agent or by mush (see
     /// [`unrecorded`]).
+    ///
+    /// It is also where a dropped-turns note is *placed*: the note reaches the
+    /// pane through the same append road every line takes, while its place is
+    /// the transcript's front ([`transcript::place_dropped_note`], the one
+    /// spelling of that place, shared with the request). The messages it passes
+    /// keep their text and their voices; only their indices change, so the
+    /// caches keyed by index move with them ([`Self::shift_indices`]).
     pub fn push_message(&mut self, agent: AgentId, message: Message) {
         let prior = self.revision(agent);
+        let note = transcript::is_dropped_note(&message);
         if message.role == "user" {
             let index = self.transcript(agent).len();
             let voice = match self.pending.take() {
                 Some(words) if words == message.text().trim() => Voice::Human,
                 _ => elsewhere(agent, index, &message),
             };
-            if voice != Voice::Human {
+            // A note's voice is read off its flag at paint time
+            // ([`unrecorded`]) — and it does not keep the index it arrived at
+            // (below), so nothing is recorded for it here.
+            if voice != Voice::Human && !note {
                 self.spoken.entry(agent).or_default().insert(index, voice);
             }
         }
-        if agent == AgentId::ROOT {
-            self.root.push(message);
+        let messages = if agent == AgentId::ROOT {
+            &mut self.root
         } else {
-            self.agents.entry(agent).or_default().push(message);
+            self.agents.entry(agent).or_default()
+        };
+        let arrived = messages.len();
+        if !note {
+            messages.push(message);
+        } else if let Some(at) = messages.iter().position(transcript::is_dropped_note) {
+            // A copy that already carries one keeps one, in the note's own
+            // place: the sentence is the same one, and nothing moves.
+            messages[at] = message;
+        } else {
+            messages.push(message);
+            transcript::place_dropped_note(messages);
+            let at = messages
+                .iter()
+                .position(transcript::is_dropped_note)
+                .unwrap_or(arrived);
+            self.shift_indices(agent, at, arrived);
         }
         self.advance(agent, prior);
     }
 
+    /// Move every index at or past `from` one step later, because a line that
+    /// belongs at `from` arrived at the end of the transcript: the messages it
+    /// passed keep their text and their voices and only their indices change.
+    ///
+    /// Everything keyed by index moves with them — the voices recorded for the
+    /// lines the note jumped over, and the select cursor — while a held
+    /// reading's `up_to` is a count of messages and moves only when the window
+    /// reaches past the insertion point. The summary cache is dropped rather
+    /// than shifted: it is derived from the messages themselves (finding A13's
+    /// parse), so the next paint reads each call from the index it now sits at.
+    fn shift_indices(&mut self, agent: AgentId, from: usize, arrived: usize) {
+        if let Some(voices) = self.spoken.get_mut(&agent) {
+            let moved: Vec<(usize, Voice)> = voices
+                .iter()
+                .filter(|(index, _)| (from..arrived).contains(index))
+                .map(|(index, voice)| (*index, *voice))
+                .collect();
+            for (index, voice) in moved {
+                voices.remove(&index);
+                voices.insert(index + 1, voice);
+            }
+        }
+        self.summaries.borrow_mut().remove(&agent);
+        if let Some(Reading::Holding { up_to, .. }) = self.reading.get_mut(&agent) {
+            if *up_to > from {
+                *up_to += 1;
+            }
+        }
+        if let Some(select) = self.select.as_mut().filter(|select| select.agent == agent) {
+            if select.cursor.0 >= from {
+                select.cursor.0 += 1;
+            }
+            if let Some(anchor) = select.anchor.as_mut() {
+                if anchor.0 >= from {
+                    anchor.0 += 1;
+                }
+            }
+            let (index, row) = select.top.get();
+            if index >= from {
+                select.top.set((index + 1, row));
+            }
+        }
+    }
+
     /// Replace an agent's transcript: the root's is compacted to
-    /// `[system, user(summary)]`, a restored one arrives whole.
+    /// `[system, user(summary)]`, a restored one arrives whole. A copy that
+    /// carries the dropped-turns note anywhere is placed where the request keeps
+    /// it before it is stored ([`transcript::place_dropped_note`]): the note's
+    /// provenance is the flag (finding F3) and its place is the transcript's
+    /// front (finding A18), so a restored pane and the next request read the
+    /// same order.
     ///
     /// The voices this conversation knew go with it: the indices they were keyed
     /// by describe the transcript that is gone, and a stale one would paint
@@ -1216,6 +1292,13 @@ impl Chat {
         {
             self.select = None;
         }
+        // The copy may hold the dropped-turns note anywhere the hand that wrote
+        // it left it — a session file holds it where its own trim put it, and
+        // the flag is what tells it (finding F3). It is placed where the request
+        // keeps it before the pane paints it (finding A18), so a restored pane
+        // and the next request read the same order.
+        let mut messages = messages;
+        transcript::place_dropped_note(&mut messages);
         if agent == AgentId::ROOT {
             self.root = messages;
         } else {
@@ -2998,9 +3081,19 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// conversation is marked or shaped — a child's `#1 done: …` / `#1 stopped: …` /
 /// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary, the line
 /// that says the oldest turns were dropped (marked by `Message::note`'s flag and
-/// read by [`transcript::is_dropped_note`]) — and a child's transcript opens
-/// with the brief its parent spawned it with. What is left is the human's,
+/// read by [`transcript::is_dropped_note`]) and the line a failed commit leaves
+/// (shaped by its head, [`Work::UNCOMMITTED_HEAD`]) — and a child's transcript
+/// opens with the brief its parent spawned it with. What is left is the human's,
 /// because that is what most of a transcript is.
+///
+/// The work line is read by its *head* alone, never by its body: the head is
+/// mush's own fixed opening, spelled once beside the sentence it opens
+/// ([`Work::UNCOMMITTED_HEAD`], shared with the writer), while the body is
+/// git's error — arbitrary text a human can type too. The line reaches the pane
+/// as the `user` message the model must keep reading (its place in the request
+/// is the point of finding F17), so the shape is the only provenance there is,
+/// and the same read serves the live transcript and the one restored from the
+/// session file.
 ///
 /// The one line this cannot place is a parent's steering after a restart: the
 /// words look exactly like the human's own nudge, and nothing in the file says
@@ -3014,7 +3107,11 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// carries no flag stays the human's.
 fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
     let text = message.text();
-    if report(text) || text.starts_with(FOLDED) || transcript::is_dropped_note(message) {
+    if report(text)
+        || text.starts_with(FOLDED)
+        || text.starts_with(Work::UNCOMMITTED_HEAD)
+        || transcript::is_dropped_note(message)
+    {
         return Voice::Mush;
     }
     if agent != AgentId::ROOT && index == 0 {
@@ -5267,6 +5364,110 @@ mod tests {
         );
     }
 
+    /// A dropped-turns note lands where the transcript's *front* is, not where
+    /// the line arrived (finding A18): the actor emits it at the message
+    /// boundary where the trim cut, so the pane hears it after the turns the
+    /// request kept — and a note at the end reads as the newest thing said
+    /// rather than as a statement about what the front lost. The pane and the
+    /// request must read the same transcript, so the pane uses the request's own
+    /// rule ([`transcript::place_dropped_note`]), which reads the front off the
+    /// list it is given: a request opens with the system prompt and the task,
+    /// while the pane's copy carries the task and no prompt.
+    #[test]
+    fn a_dropped_turns_note_lands_after_the_brief_and_before_the_oldest_kept_turn() {
+        let words = |messages: &[Message]| -> Vec<String> {
+            messages.iter().map(|m| m.text().to_string()).collect()
+        };
+
+        // A child's road: its transcript opens with the brief, and the note
+        // arrives at the end, where the append puts what it is told.
+        let mut child = Chat::bare();
+        child.push_message(AgentId(1), Message::user("the brief"));
+        child.push_message(AgentId(1), Message::assistant("reading"));
+        child.push_message(AgentId(1), Message::user("more"));
+        child.push_message(AgentId(1), Message::note(transcript::DROPPED_TURNS_NOTE));
+        let order = words(child.transcript(AgentId(1)));
+        assert_eq!(
+            order,
+            vec![
+                "the brief",
+                transcript::DROPPED_TURNS_NOTE,
+                "reading",
+                "more"
+            ],
+            "after the brief and before the oldest kept turn"
+        );
+        let rows = shown(&pane_rows(&child, &pane(AgentId(1)), 60, 20));
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("no `{needle}` row: {rows:?}"))
+        };
+        assert!(
+            at("The oldest turns") < at("mush › reading"),
+            "the pane paints the note before the turns it explains: {rows:?}"
+        );
+
+        // The root's road: the opening task is the front there is no brief for.
+        let mut root = Chat::bare();
+        say(&mut root, AgentId::ROOT, "do the work");
+        root.push_message(AgentId::ROOT, Message::assistant("working"));
+        root.push_message(AgentId::ROOT, Message::note(transcript::DROPPED_TURNS_NOTE));
+        assert_eq!(
+            words(root.transcript(AgentId::ROOT)),
+            vec!["do the work", transcript::DROPPED_TURNS_NOTE, "working"],
+            "after the opening task, before the oldest kept turn"
+        );
+
+        // And the pane's order *is* the request's: the bounded view is the
+        // pane's copy with the prompt in front ([`Chat::bounded_transcript`]),
+        // so the note sits at the same place in both and nothing is a second
+        // derivation of the front.
+        let view = root.bounded_transcript(AgentId::ROOT, usize::MAX);
+        assert_eq!(view[0].role, "system", "the request opens with the prompt");
+        assert_eq!(
+            words(&view[1..]),
+            words(root.transcript(AgentId::ROOT)),
+            "the request's order is the pane's order"
+        );
+
+        // The road a stored copy comes by: a file that holds the note after the
+        // newest line is normalized by the same placement before it is painted.
+        let mut restored = Chat::bare();
+        restored.replace_transcript(
+            AgentId(1),
+            vec![
+                Message::user("the brief"),
+                Message::assistant("reading"),
+                Message::note(transcript::DROPPED_TURNS_NOTE),
+            ],
+        );
+        assert_eq!(
+            words(restored.transcript(AgentId(1))),
+            vec!["the brief", transcript::DROPPED_TURNS_NOTE, "reading"],
+            "a restored copy lands the note after the brief too"
+        );
+
+        // The messages the note passed keep their *voice*: a parent's steering
+        // was recorded at the index it arrived at, and the note's placement
+        // must move that record with the line it describes — an index left
+        // behind would paint the note in the parent's voice.
+        let mut steered = Chat::bare();
+        steered.push_message(AgentId(1), Message::user("the brief"));
+        steered.push_message(AgentId(1), Message::user("keep the steps small"));
+        steered.push_message(AgentId(1), Message::note(transcript::DROPPED_TURNS_NOTE));
+        let rows = shown(&pane_rows(&steered, &pane(AgentId(1)), 60, 20));
+        assert!(
+            rows.iter()
+                .any(|row| row == "parent › keep the steps small"),
+            "the steering keeps the voice it was recorded with: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("· The oldest turns")),
+            "and the note still reads as mush's: {rows:?}"
+        );
+    }
+
     /// The note's voice survives the session file: the flag is what tells it
     /// from a human's line ([`Message::note`]), and the file is what carries
     /// the flag across a restart — so a note read back is painted in mush's
@@ -5323,6 +5524,70 @@ mod tests {
         assert!(
             rows.iter().any(|row| row == "you › delegate the parser"),
             "{rows:?}"
+        );
+    }
+
+    /// A failed commit's line is mush's own report about mush's own act, so the
+    /// pane paints it in mush's voice — never as the parent's, which is what an
+    /// unrecorded line on a *child's* transcript reads as, and never as the
+    /// human's on the root's. The line is the sentence `Work::status_line`
+    /// writes for `Uncommitted` and the sentence the model reads in the request
+    /// (finding F17); the pane knows it by the head that sentence opens with,
+    /// spelled once beside its writer ([`Work::UNCOMMITTED_HEAD`]) and shared
+    /// with this reader — the body is git's error and nobody reads it for
+    /// provenance.
+    #[test]
+    fn a_failed_commits_line_is_painted_in_mushs_voice() {
+        let line = "could not commit the worktree: /repo/.mush/wt/1 is no longer a worktree";
+        assert!(
+            line.starts_with(Work::UNCOMMITTED_HEAD),
+            "the line this test paints is the shape the actor writes"
+        );
+
+        // A child's transcript: the brief, the model's reply, then the report
+        // the run's end leaves. Before, the report read `parent ›`.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), Message::user("the brief"));
+        chat.push_message(AgentId(1), Message::assistant("reading"));
+        chat.push_message(AgentId(1), Message::user(line));
+        let rows = shown(&pane_rows(&chat, &pane(AgentId(1)), 60, 12));
+        let painted: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("could not commit"))
+            .collect();
+        assert_eq!(painted.len(), 1, "the line is painted once: {rows:?}");
+        assert!(
+            painted[0].starts_with("· "),
+            "mush's voice, not the parent's: {rows:?}"
+        );
+
+        // The root's pane: no parent exists there, and the line is still mush's
+        // — not the human asking themselves what happened to the worktree.
+        let mut root = Chat::bare();
+        say(&mut root, AgentId::ROOT, "commit the work");
+        root.push_message(AgentId::ROOT, Message::user(line));
+        let rows = shown(&pane_rows(&root, &pane(AgentId::ROOT), 60, 12));
+        assert!(
+            rows.iter().any(|row| row.starts_with("· could not commit")),
+            "mush's voice on the root's road too: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "you › commit the work"),
+            "and the human keeps their own words: {rows:?}"
+        );
+
+        // The read is the paint-time one, so a transcript restored from the
+        // session file — which arrives without the voices a live push recorded
+        // — paints the same line the same way.
+        let mut restored = Chat::bare();
+        restored.replace_transcript(
+            AgentId(1),
+            vec![Message::user("the brief"), Message::user(line)],
+        );
+        let rows = shown(&pane_rows(&restored, &pane(AgentId(1)), 60, 12));
+        assert!(
+            rows.iter().any(|row| row.starts_with("· could not commit")),
+            "the shape is read from the stored line itself: {rows:?}"
         );
     }
 
