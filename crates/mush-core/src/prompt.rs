@@ -115,7 +115,10 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool, delegates: bool
             "You work at `{root}`, a worktree of your own branch. It is your workspace root, \
              and every command already starts there — so never `cd` to an absolute path a brief \
              or a task names: that is another checkout, and work done there lands outside your \
-             branch."
+             branch. A worktree is a checkout of refs, not a copy of the parent's tree: its \
+             submodules come with it when the base's tree records any (mush fetches them as the \
+             worktree is made), and `git submodule update --init` is the road if one is still \
+             empty."
         )
     } else {
         format!("Your workspace is `{root}`.")
@@ -507,9 +510,19 @@ mod tests {
         let prompt = subagent_prompt("/tmp/wt/3", 1, true, false);
         assert!(prompt.contains("worktree of your own branch"), "{prompt}");
         assert!(prompt.contains("`/tmp/wt/3`"), "{prompt}");
+        // What a fresh worktree *is*, and the road for a submodule that did
+        // not come with it: a child that finds an empty `third_party/` must
+        // know both that the tree is a checkout of refs and what to run
+        // (finding F5).
+        assert!(
+            prompt.contains("a checkout of refs, not a copy of the parent's tree"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("git submodule update --init"), "{prompt}");
         // A shared child gets the shared-workspace sentence instead.
         let shared = subagent_prompt("/tmp/wt/3", 1, false, false);
         assert!(!shared.contains("worktree of your own branch"), "{shared}");
+        assert!(!shared.contains("git submodule update --init"), "{shared}");
     }
 
     /// Every tool already runs in the workspace with its cwd at the root, so

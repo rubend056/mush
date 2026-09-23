@@ -496,8 +496,41 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
             path_arg,
             base.unwrap_or("HEAD"),
         ],
-    )
-    .map(|_| (path, branch))
+    )?;
+    // A worktree is a checkout of *refs*, and git's `worktree add` does not
+    // populate submodules — there is no flag to ask for it (`git worktree add
+    // -h` has no submodule option on git 2.55). A base tree that records a
+    // submodule leaves an empty directory in the new checkout while `git
+    // status` stays clean, so a child told to build or test pays for a tree it
+    // was never told is incomplete (finding F5). The contents are brought in
+    // here, at the one moment mush owns the checkout.
+    populate_submodules(&path);
+    Ok((path, branch))
+}
+
+/// Bring the new checkout's submodules in, when its tree records any.
+///
+/// `git worktree add` copies refs, not submodule contents: a base tree that
+/// records one at `lib/sub` leaves that directory empty in the new worktree,
+/// and `git status --porcelain` is empty — a tracked directory that is not
+/// populated is not a change git reports (measured: `worktree_add` for a
+/// repository with one local submodule leaves `lib/sub` empty and the status
+/// clean, finding F5). `git submodule update --init --recursive` is git's own
+/// road for filling it, run only when the checkout carries `.gitmodules`, so an
+/// ordinary spawn spends no process on the question.
+///
+/// Deliberately best-effort: the branch and the refs are right, and a submodule
+/// that cannot be fetched (no network, a private remote, a protocol the human's
+/// git refuses) is a fact the child can act on — its prompt names the road it
+/// would run by hand — never a reason to lose the worktree a spawn is standing
+/// on. There is no surface here to *name* the failure on: the answer a caller
+/// gets back is the path and the branch, and the one who reads the empty
+/// directory is the child.
+fn populate_submodules(worktree: &Path) {
+    if !worktree.join(".gitmodules").is_file() {
+        return;
+    }
+    let _ = run(worktree, &["submodule", "update", "--init", "--recursive"]);
 }
 
 /// Which of the two ways a branch adds nothing to its base: what one word,
@@ -1287,6 +1320,59 @@ mod tests {
             "and nothing was made before the refusal"
         );
         let _ = fs::remove_dir_all(&unborn);
+    }
+
+    /// A worktree is a checkout of refs, and git's `worktree add` does not
+    /// populate submodules: a repository whose base tree records one gets an
+    /// empty directory in the child's checkout with a clean `git status`, and
+    /// the child is told to build in it (finding F5). The add fills it.
+    #[test]
+    fn a_submodule_repo_gets_its_submodules_in_the_new_worktree() {
+        let source = init_repo("submodule-source");
+        fs::write(source.join("s.txt"), "the submodule's file\n").unwrap();
+        run(&source, &["add", "-A"]).unwrap();
+        run(&source, &["commit", "-qm", "the submodule"]).unwrap();
+
+        let dir = init_repo("submodule");
+        run(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "lib/sub",
+            ],
+        )
+        .unwrap();
+        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+
+        // A local submodule clones over the `file` transport, which git
+        // refuses for submodules unless the human says otherwise; the test is
+        // that human, through git's own road for saying it. mush itself never
+        // sets this: the protocol policy in a child's checkout is the human's
+        // (a repository must not be able to make mush clone a local path).
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        let added = worktree_add(&dir, 6, Some("HEAD"));
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        let (path, _branch) = added.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/s.txt")).unwrap(),
+            "the submodule's file\n",
+            "the new checkout carries what the base tree records"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "and the populated submodule is not a change git reports"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
     }
 
     /// A put-away commit carries its own identity and its own answer to
