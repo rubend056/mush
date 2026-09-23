@@ -155,7 +155,10 @@ reply.
 `base` gives a child its own git worktree (`.mush/wt/<id>` on branch
 `mush/<id>`), forked from that branch, tag or commit — so parallel agents edit
 real files without colliding. Without a `base` the child shares the checkout,
-and only one shared child may run at a time. A `base` git cannot resolve is a
+and a shared spawn is refused while another shared child is live in that
+checkout — the count is the directory's, across the whole tree, not one
+parent's books (the spawner is not counted, so a shared child may still
+delegate into the tree its own run is in). A `base` git cannot resolve is a
 **failed delegation**, refused before anything is created, never a child that
 quietly runs somewhere else. A run's work is **committed** to the child's branch
 when the run ends (`mush #3: <brief>`, with the outcome spelled into the subject
