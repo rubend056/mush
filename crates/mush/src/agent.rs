@@ -856,8 +856,9 @@ pub enum AgentEvent {
     /// model's turn starts ([`AgentEvent::Thinking`]), which is what a run
     /// wears between a finished tool and the request that follows it.
     Status(String),
-    /// The model's turn is starting: the request fits the window and is about
-    /// to go on the wire, so nothing is running locally any more.
+    /// The model's turn is starting: the request fits the window and the wire's
+    /// ceiling and is about to go on the wire, so nothing is running locally
+    /// any more.
     ///
     /// A reader can conclude both halves from it: the tool named before it has
     /// finished — its result is in the transcript — and what is being waited on
@@ -867,7 +868,7 @@ pub enum AgentEvent {
     /// read as a machine still busy with work that was over.
     ///
     /// Emitted at the one place a request is asked (`run_loop`), after the fit
-    /// test and immediately before the ask, so a request refused before the
+    /// tests and immediately before the ask, so a request refused before the
     /// wire paints no phase for a request that never went out. A tool that
     /// blocks locally — a parked `wait`, a long `run_command` — emits none:
     /// those are tool calls, and the tool's own label is what the row should
@@ -2883,6 +2884,52 @@ fn request_tokens(messages: &[Message]) -> usize {
     request_weight(messages).div_ceil(BYTES_PER_TOKEN)
 }
 
+/// The most bytes the wire may be handed: the message box's own ceiling,
+/// applied to the assembled request body.
+///
+/// A picture is priced by its pixels ([`Image::weight`]), so a 100×100 png
+/// weighing 2 MB costs the window fourteen tokens and the wire 2.8 MB of base64
+/// `data:` URL — the box counts bytes for exactly that reason, and its bound is
+/// eight of the files the transport caps one at (`BOX_IMAGE_BYTES`,
+/// `IMAGE_FILE_CAP * 8`, in `crates/mush/src/app/mod.rs`). The same queue is the
+/// honest bound on the body a request is built into, base64's 4/3 included: a
+/// body this size holds about six of the files the transport caps. Text alone
+/// does not come near it — the largest window the provider table documents is
+/// 500k tokens, whose whole history budget is ~1.3 MB — so what this refuses is
+/// a body made of pictures, and the window's weight gate stays the text's.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// The exact byte length of the body the wire would be handed for this request,
+/// without building it.
+///
+/// [`request_weight`] is the window's meter and cannot answer this: a picture
+/// travels as a base64 `data:` URL, 4/3 of its file, while the meter prices its
+/// pixels — so a request a window passes can be one no body should be built for
+/// (a hundred tiny 2 MB pngs weigh ~6 KB of budget and ~280 MB of base64). The
+/// count runs the same serializer the wire runs (`serde_json::to_string` in
+/// `model.rs`), so the number is that body's exact length; a counting sink
+/// instead of a `String` means the hundreds of megabytes are never held at once
+/// — each picture's base64 is built and dropped inside `to_writer`. An `Err` is
+/// a serialization failure and is never read as a size.
+fn request_bytes(request: &ChatRequest<'_>) -> Result<usize, String> {
+    /// A sink that keeps only the count. `flush` has nothing to do: there is no
+    /// buffer behind it.
+    struct Counted(usize);
+    impl std::io::Write for Counted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counted = Counted(0);
+    serde_json::to_writer(&mut counted, request)
+        .map_err(|error| format!("could not measure the request: {error}"))?;
+    Ok(counted.0)
+}
+
 /// The messages a request may carry for the model it is addressed to: the
 /// transcript it was handed, minus the image parts of a model the provider
 /// table says cannot see ([`vision_capable`]).
@@ -3026,6 +3073,24 @@ fn over_window_line(cfg: &Config, carried: usize, budget: usize) -> String {
          budget for a {}-token window, and nothing left to drop. Downscale an attached picture, \
          `/compact` the conversation, or read less — any of the three makes room",
         cfg.context_tokens
+    )
+}
+
+/// The one line a request refused for its *bytes* carries: what the body
+/// measures, the ceiling it is over, and the roads that make it smaller.
+///
+/// The window's refusal ([`over_window_line`]) cannot speak for this one:
+/// nothing is over the budget and there is nothing left to drop, so "downscale,
+/// fold, read less" would be a sentence about a different number. Here the body
+/// is the subject and a picture's base64 is what makes it, so the roads are the
+/// two a picture has — downscale it, drop it — plus the fold that re-bases the
+/// conversation and takes the turn it arrived in with it.
+fn over_request_bytes_line(bytes: usize) -> String {
+    format!(
+        "cannot send this request: the assembled body is {bytes} bytes against the \
+         {MAX_REQUEST_BYTES}-byte ceiling for one request, even though the transcript fits the \
+         window — a picture's base64 is what makes a body this big. Downscale or drop an attached \
+         picture, or `/compact` the conversation: any of the three sends less"
     )
 }
 
@@ -3227,16 +3292,24 @@ fn run_turns(
         // A stop that arrived since the last boundary is honoured by the call
         // below, which polls the cancel flag and answers `Cancelled`.
         //
-        // The invariant, on the assembled request: the system prompt and the
-        // opening task are not droppable, so a shape that still does not fit —
-        // a picture too big for the window is the common one — is refused here,
-        // where no money has been spent, instead of by the endpoint's 400. The
-        // turn ends with one line naming what does not fit and the roads that
-        // change it; the actor is alive, and the next message tries again with
-        // whatever the human changed. What the model may actually see is
-        // decided first ([`for_the_model`]): a blind model's request is the
-        // transcript without its image parts, and it is that request the
+        // The invariant is on the assembled request, and it has two gates
+        // because a request is two different sizes: the weight the window's
+        // budget is stated in, and the bytes the wire is handed. The first is
+        // here. The system prompt and the opening task are not droppable, so a
+        // shape that still does not fit — a picture too big for the window is
+        // the common one — is refused where no money has been spent, instead of
+        // by the endpoint's 400, with one line naming what does not fit and the
+        // roads that change it; the actor is alive, and the next message tries
+        // again with whatever the human changed. What the model may actually
+        // see is decided first ([`for_the_model`]): a blind model's request is
+        // the transcript without its image parts, and it is that request the
         // window has to hold.
+        //
+        // The second gate is the body's own ceiling ([`MAX_REQUEST_BYTES`]),
+        // asked of the built request below ([`request_bytes`]) for the one gap
+        // the first cannot see: pixels are what a picture's weight is made of
+        // and base64 is what the wire carries, so a 100×100 png weighing 2 MB
+        // costs the meter fourteen tokens and the body 2.8 MB.
         let visible = for_the_model(actor, &cfg, messages);
         let carried = request_weight(&visible);
         if carried > budget {
@@ -3249,12 +3322,24 @@ fn run_turns(
         // simply answer, and a model that answers is a run that has finished.
         let request = request(&cfg, &visible, &schemas, cfg.reply_cap());
 
+        // The window's weight gate passed, but weight is not size: the count
+        // here is the exact length of the body `model.rs` would send — the
+        // number that becomes the wire's `Content-Length` — and a body past the
+        // ceiling is one no request should be handed a transport. Taken before
+        // the model's turn is announced, so a refused request neither paints a
+        // phase nor spends anything; a serialization failure propagates as the
+        // error it is, never as a size.
+        let bytes = request_bytes(&request)?;
+        if bytes > MAX_REQUEST_BYTES {
+            return Err(over_request_bytes_line(bytes));
+        }
+
         // The model's turn is starting, and the tools before it are done: no
         // other event says so. The last `Status` named a tool *before* it ran,
         // so without this the row and the foot kept `run_command …` — the
         // label of a command that had already exited — through the whole model
         // call that followed it. Said here, after the fold, the trim and the
-        // fit test, so a request refused before the wire paints no phase for
+        // fit tests, so a request refused before the wire paints no phase for
         // one that never went out. A tool that blocks locally (`wait`, a long
         // `run_command`) emits none: it is a tool call, and the tool's own
         // label is the truth while it runs.
@@ -5976,9 +6061,11 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
 /// the transcript and in the request for this same turn, and refusing them
 /// would save the conversation nothing while costing a turn and the model's
 /// work. What bounds a write is the wire's own invariant: the assembled request
-/// is weighed before it is sent ([`run_loop`]'s [`over_window_line`] refusal),
-/// so a write big enough to push the request past the window ends *that turn*
-/// with that one line, naming what does not fit and the roads that make room.
+/// is weighed before it is sent ([`run_loop`]'s [`over_window_line`] refusal)
+/// and then counted against the body's ceiling ([`MAX_REQUEST_BYTES`], the
+/// [`request_bytes`] gate), so a write big enough to push the request past
+/// either ends *that turn* with that one line, naming what does not fit and the
+/// roads that make room.
 /// The bytes are on disk — the write ran — so the work is not lost, and the
 /// turn stays in the transcript until [`trim_history`] can shed it like any
 /// other older turn: the newest turn is the one a trim cannot cut, and a trim
@@ -10701,7 +10788,7 @@ mod tests {
     }
 
     /// A write big enough to break a small window's budget ends the turn at the
-    /// wire's own refusal — and the file is on disk, because the write ran.
+    /// window's own refusal — and the file is on disk, because the write ran.
     ///
     /// The content lives in the assistant's tool call, not in the one-line
     /// result, so the window's shed road (the newest turn's results) cannot take
@@ -10789,6 +10876,93 @@ mod tests {
                 .iter()
                 .all(|message| message.weight() < content.len()),
             "nor does the actor's transcript"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The window's meter and the wire's body are two different sizes: a
+    /// picture is priced by its pixels while it travels as base64, so a request
+    /// the window passes can still be one no body should be built for.
+    ///
+    /// Seven 2 MB pngs at 100×100 cost the window ~60 bytes of weight each and
+    /// the wire ~2.8 MB each: a ~19.6 MB body against the 16 MiB ceiling, on a
+    /// transcript a 12,288-byte budget passes. `run_loop` refuses the built
+    /// request before the model is asked, with the byte line's own roads.
+    ///
+    /// The fixture's model is the provider table's one vision model, asserted
+    /// here so the pictures cannot be silently stripped ([`for_the_model`]
+    /// drops a blind model's image parts, and a request without them would pass
+    /// for a different reason).
+    #[test]
+    fn a_request_under_the_window_can_still_be_refused_for_its_bytes() {
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        assert!(
+            vision_capable(&cfg.config().unwrap().model),
+            "the table's one vision model, or `for_the_model` strips the pictures"
+        );
+        let scripted = Arc::new(Scripted::new().says("done"));
+        let (actor, _events, _mailbox) = build_actor_about(
+            "request-bytes",
+            scripted.clone(),
+            cfg.clone(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let images: Vec<Image> = (0..7)
+            .map(|i| Image {
+                path: format!("shot{i}.png"),
+                mime: "image/png".to_string(),
+                bytes: vec![0u8; 2 * 1024 * 1024],
+                pixels: Some((100, 100)),
+            })
+            .collect();
+        let mut messages = vec![
+            measured_prompt(&actor),
+            Message::user_with_images("look at these", images),
+        ];
+        let config = cfg.config().unwrap();
+        let budget = config.history_budget();
+
+        // The window's gate passes it — the whole transcript weighs a third of
+        // the budget, the seven pictures ~60 bytes each — while the body is the
+        // size the window never sees: base64 of 14 MB of png. The pictures'
+        // weight under their own wire bytes is the gap this gate exists for.
+        let weight = request_weight(&messages);
+        assert!(
+            weight < budget,
+            "the window gate passes: {weight} < {budget}"
+        );
+        let schemas = tool_schemas(&actor);
+        let bytes = {
+            let built = request(&config, &messages, &schemas, config.reply_cap());
+            serde_json::to_string(&built).unwrap().len()
+        };
+        assert!(
+            bytes > MAX_REQUEST_BYTES,
+            "and the body is over the ceiling: {bytes} > {MAX_REQUEST_BYTES}"
+        );
+        assert!(
+            messages[1].weight() * 1_000 < bytes,
+            "the window charged {} bytes for pictures the wire carries in {bytes}",
+            messages[1].weight()
+        );
+
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert!(
+            error.contains(&MAX_REQUEST_BYTES.to_string()),
+            "the line names the ceiling: {error}"
+        );
+        assert!(
+            error.contains("Downscale") && error.contains("/compact"),
+            "and the roads that make the body smaller: {error}"
+        );
+        assert!(
+            scripted.asked().is_empty(),
+            "the model was never asked: the refusal is before the wire"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
