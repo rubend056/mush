@@ -3824,10 +3824,24 @@ impl App {
     /// to hold `mush-agent-{id}` until mush quit — a run with a hundred
     /// children held a hundred threads, of which at most the handful a human is
     /// talking to were ever going to wake again (§8.21). Parking ends the
-    /// thread and nothing else: the node, the id and the transcript stay
-    /// exactly where they fall, and the next message to that child rebuilds its
+    /// thread and the jobs that thread started — the send is
+    /// [`AgentMsg::Shutdown`], whose arm is `registry.kill_owned(actor.id)`
+    /// (`agent.rs`), and a job belongs to the agent that started it (§5.6,
+    /// [`Self::reap_history`]) — while the node, the id and the transcript stay
+    /// exactly where they fall: the next message to that child rebuilds its
     /// actor from the transcript on screen ([`Self::deliver_to_actor`]), so what
     /// the human sees does not change by one row.
+    ///
+    /// A node whose books still show a live job is not parked at all —
+    /// [`AgentTree::parkable`] asks [`AgentTree::in_flight`], which reads the
+    /// same registry the rows do — so the work a park can end is the work the
+    /// tree has not recorded yet: an actor woken by a message this tick cannot
+    /// see, which started a run before the `Shutdown` behind it in its own
+    /// mailbox was read. That is the window the kill lives in, and it is not a
+    /// reason to leave it out of the sentence above: a `Shutdown` is a kill of
+    /// whatever the actor owns, and a human has to be able to read that parking
+    /// is not free of consequences for a server, watch or benchmark a child
+    /// detached.
     ///
     /// The send is the whole probe, and it answers one question: is there a
     /// thread here? A live actor takes the `Shutdown` and ends; a mailbox with no
@@ -6022,6 +6036,80 @@ mod tests {
             "the parking tick must not Shutdown the run the message started"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parking ends the thread and the jobs that thread started: the
+    /// `Shutdown` this pass sends is `registry.kill_owned(actor.id)`'s trigger
+    /// (`agent.rs`, §5.6), so a server, watch or benchmark a child detached
+    /// does not outlive the actor a later tick reclaims. The books are the
+    /// guard in front of that — a node with a live job is not parkable at all
+    /// (`may_park`'s `in_flight_with`) — so the work a park can end is the
+    /// work the tree has not recorded: an actor woken by a message this tick
+    /// cannot see, which started a run before the `Shutdown` behind it in its
+    /// mailbox was read. The kill is staged here on exactly that second child,
+    /// by hand, because the pass refuses to send to it for the very job under
+    /// test.
+    #[test]
+    fn parking_a_child_ends_the_jobs_it_started() {
+        let (mut app, _rx) = test_app("park-kills-jobs");
+        // Ten finished children, so the warm window leaves #1 and #2 for the
+        // pass, and the test holds every mailbox a park could send to.
+        let mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=10).map(|id| finished_child(&mut app, id)).collect();
+        // #2 is the child with something to lose: a live actor of its own, and
+        // a job the tree's books see. `agent::revive` is the road a woken child
+        // takes (`App::deliver_to_actor`), over the tree's own registry.
+        let tx = agent::revive(
+            app.tree.handles(),
+            app.cell.handle(),
+            app.ui_tx.clone(),
+            app.tree.conversation().0,
+            app.ws.root().to_path_buf(),
+            agent::ReviveSpec {
+                id: 2,
+                depth: 1,
+                brief: "task 2".into(),
+                branch: None,
+                messages: Vec::new(),
+                parent: None,
+            },
+        );
+        let machine = running_job_on(&mut app, 2);
+
+        assert!(
+            app.tree.parkable().contains(&AgentId(1)),
+            "the child with nothing running is what the pass reclaims: {:?}",
+            app.tree.parkable()
+        );
+        assert!(
+            !app.tree.parkable().contains(&AgentId(2)),
+            "a live job keeps its child's thread: {:?}",
+            app.tree.parkable()
+        );
+
+        app.park_history();
+        assert!(
+            matches!(mailboxes[0].try_recv(), Ok(AgentMsg::Shutdown)),
+            "the park ended #1's thread with a Shutdown"
+        );
+        assert_eq!(
+            machine.kills(),
+            0,
+            "and left #2's job alone while the books can see it"
+        );
+
+        // The message a park sends to a child the books have not caught up
+        // with: the actor takes it, and the job it owns dies with the thread.
+        tx.send(AgentMsg::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while machine.kills() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the Shutdown a park sends ends the job the actor started"
+        );
     }
 
     /// The other direction of the same road: a report finds no actor behind the
