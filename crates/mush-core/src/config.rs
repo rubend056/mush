@@ -202,6 +202,26 @@ pub enum WindowSource {
     Complaint,
 }
 
+impl WindowSource {
+    /// The road in words — which hand stated the window — one sentence per
+    /// road.
+    ///
+    /// Beside the roads themselves, because two surfaces print the sentence
+    /// and neither owns it: `--print-config`'s window row and `/context`'s
+    /// report. A second copy is how the two would come to describe one window
+    /// differently. The meter paints a one-column mark instead (`window_mark`
+    /// in `app`): the bar has no room for a sentence, and a surface that has
+    /// the room says what the road was.
+    pub fn words(self) -> &'static str {
+        match self {
+            WindowSource::Stated => "stated by the human",
+            WindowSource::Table => "assumed from mush's model table",
+            WindowSource::Advertised => "advertised by the endpoint's model list",
+            WindowSource::Complaint => "named by the endpoint in a refusal",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub provider: Provider,
