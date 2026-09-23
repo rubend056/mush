@@ -641,6 +641,57 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   375 pids, ≈4.3 GiB) could not be reproduced at this base. The fix belongs in
   the tests' scratch-root helpers — one `Scratch` type whose `Drop` removes the
   root, or one helper they all call — and a child is being sent for it.
+- **H64** — ⬜ open, the code half of H55, re-read and left by #123's pass (§8.88):
+  `crates/mush-core/src/prompt.rs:58` still says "without one the child works in
+  this workspace, and only one such child may run at a time", while the rule
+  `spawn_tool` enforces is the *directory's* live writers, tree-wide — the
+  `writers()` static keyed by the canonical workspace root, booked for a shared
+  run through `WriterGuard`, minus the spawner's own children (its books are the
+  finer answer for them) and never the spawner itself (`d7f12a2`, §8.83). The
+  manual's two halves were repaired (`20c30a7` README, `e5f67a1` docs/mush.md),
+  so what H55 owes now is the code alone: the prompt's sentence, the doc at
+  `agent.rs:1806`, and the refusal at `agent.rs:4507` ("already runs in this
+  shared workspace, and only one shared child may run at a time") all quote the
+  per-parent claim as the rule. `prompt.rs` is the human's file.
+- **H65** — ⬜ open, the doc `retrying` carries, re-read by #123 and left (§8.88):
+  `crates/mush/src/model.rs:303`'s "resolving a host has no timeout (docs/mush.md
+  §8)" is false since the wire phases were bounded — `http::resolve_bounded`
+  (`http.rs:970`) ends its wait at the smaller of `RESOLVE_TIMEOUT` (10 s,
+  `http.rs:954`) and `Watch::left`, and a spent wait answers through
+  `Watch::spend` — and the same doc's "costs milliseconds" (`model.rs:301`) is
+  false of the case it names: a refused dial pays `RETRY_BACKOFF` 500 ms and then
+  1 000 ms (`model.rs:260`), the 1.5 s sum `model.rs`'s own test asserts
+  (`RETRY_BACKOFF + RETRY_BACKOFF * 2`, `:1170`).
+- **H66** — ⬜ open, one sentence in code: `crates/mush/src/http.rs:3005`'s "the
+  cap that is a quarter of it" (in `live_endpoint_accepts_the_shipped_reply_cap`'s
+  comment) where `Config::reply_cap` divides by `REPLY_SHARE_DIVISOR = 8`
+  (`mush-core/src/config.rs:69`) and `REPLY_SHARE_WORDS` spells "an eighth of the
+  window" (`:75`). §123 corrected the two documents that said a quarter
+  (`fc31aff`, §8.88); the code's own comment still says it.
+- **H67** — ⬜ open, one spelling written twice: `crates/mush/src/app/mod.rs:4265`
+  builds the copy refusal as `"cannot copy {from} into {}/.mush/paste: {e}"`
+  inline, where `workspace::PASTE_REL` (`mush-core/src/workspace.rs:1844`, read by
+  `paste_dir`/`paste_rel` and by every message about a paste) is the one spelling
+  (R44, §8.72).
+- **H68** — ⬜ open, two sentences in `crates/mush/src/jobs.rs`, re-read by #123
+  and left (§8.88): `STATUS_WINDOW`'s doc (`:104`) says "Spent on the windows
+  rather than on the list, so no job is ever dropped from a status for being
+  old", while the registry keeps at most `MAX_JOBS` live plus `JOB_HISTORY = 8`
+  finished (`:86`; the eviction at `:1461`, the listing's own doc at `:933`) — an
+  old finished job *is* dropped and no status can list it; and `Live::kill`'s doc
+  (`:483`, "Killing is idempotent and goes through the handle rather than the
+  flag") reads as an either/or over a body (`:487`) that stores `stop` first and
+  then takes the handle. The same line is §8.86's A23 residual — "Stop it and
+  everything it started" is the process group mush gave the command, and a
+  command that left it is outside cleanup's reach (`d4c596c`, §8.83).
+- **H69** — ⬜ open, the module doc's own list: `crates/mush/src/theme.rs:7`
+  names the accent sites as "the focused border, the picker's frame and selection,
+  the message prompt, the bar's badge, the selected agent row and an activity
+  line" — seven — where `ui::select_painted` (`ui.rs:263`) paints two more with
+  `theme.accent()` (the cursor's row as the hue's characters on `Black`, the
+  selection's rows as `Black` on the hue), so the count is nine, as the manual's
+  decision log now says (`bff3e2a`, §8.88). The list is the last surface that
+  stops at seven.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -666,7 +717,8 @@ cursor. Their closure sheet is
 audits owed are on H12, H16, H21, H27, H28, H30, H34 and H35 (H28 is closed by
 `926a12a`, H58), the narrowed B23/B27 retry class is on those rows in §2.75,
 H49–H53 are the rows the campaign opened, and H54–H63 are the rows this wave
-opened or settled.
+opened or settled. H64–H69 are the sentences the three documents' pass found
+still drifting in code (§8.88), and §8.87 is the human's `#58` report answered.
 
 ---
 
@@ -4572,6 +4624,13 @@ open set is nine minors: A13, A14, A15, A18, A21 and A22 (agent-and-wire), C7
 open at `38d0438` — A3, A6 and F6 — closed in §8.73–§8.83, with D19, A9, A10,
 D7–D18, D20–D26, B13, B14, B16, C8, C10–C12, E6, E8–E10 and F2, F4, F5, F14–F16.
 
+**Addendum, 22 September 2026 — this sheet now speaks for `df115bc`.** Since
+`7338d81` the tree has grown to **87 068** (· 4 999 blank · 24 513 comment ·
+38 456 tests · 19 100 prod — +445, and prod +8 of it), and D9's leftover is
+closed: the row whose parent the history window reaped now wears `⚮` and no
+longer passes for a root child (§8.87). The counts above remain the snapshot at
+`7338d81`; no finding's status moved.
+
 ### agent-and-wire (`docs/audits/agent-and-wire.md`)
 
 | # | severity | the defect | status at `7338d81` |
@@ -7599,3 +7658,204 @@ sentences, §8.83); `crates/mush/src/app/commands.rs`'s `/url` arm still accepts
 control character without a sentence (`4f7793c`, §8.79); and
 `docs/audits/agent-and-wire.md`'s blind-spot bullet still reads as open for A9's
 overflow, which `330fe61` closed (§8.79) — evidence files stay as found.
+
+---
+
+## 8.87 A row whose parent the history window reaped wears ⚮ (#119, `4592da5`, merged `a65cdb5`)
+
+The human's live report — “an old #58 row appearing” — was the history window's
+own road. `CHILD_HISTORY = 50` drops the oldest children (`AgentTree::past_history`,
+applied by `App::reap_history`), and a node does not inherit its parent's age, so
+#49 was reaped while the probe it had spawned stayed; the frame read
+`✓ #58 Adversarial write-road …` among the root's current children, claiming a
+parent it does not have. The row had always been *ordered* at the top level —
+`rows()` cannot place a node whose parent is not in the tree anywhere else — and
+since D9 it is *indented* there too (`painted_depth` is zero for a node whose
+parent is not in the tree): the exact shape a child of the root wears. Same
+order, same indent, same glyph — the structure itself cannot tell the two apart,
+which is why the fact has to be said in the row.
+
+The row now says it. `⚮` (U+26AE, `DIVORCE SYMBOL`) is the one symbol Unicode
+has for a severed pair, and here the severed pair is the parent link. It rides
+the head, right after the id it qualifies — the head is the one field `fit_row`
+never gives up (R1: the title yields first), which is where a mark that must
+survive the 80×24 floor has to sit — and it costs one column, the arithmetic
+`every_row_mark_is_one_column` pins for every mark a row can wear, `⚮` counted
+beside `▶`, `⏸`, `✉`, `⚙` and `⚠`.
+
+`AgentRow::parent_gone` reads `AgentTree::parent_gone` —
+`node.parent.is_some_and(|parent| !self.has(parent))` — so it is true only when
+`parent` names an id the *tree* does not hold. The four no's are the design, not
+fallout: the root has no parent to lose, a leftover worktree found on disk never
+had one in this tree, a root child's parent is the root, and any node whose parent
+is in the tree is a child. The indent rule stays D9's: `AgentNode::depth` is still
+where the agent was spawned (the actor's prompt and the spawn limit read it), and
+the mark is about the missing parent alone.
+
+Measured on the painted pane at the 80×24 floor, cursor on the probe, its parent
+reaped by the window's own road (50 newer root children, then the probe, so
+`past_history` drops the oldest two and `reap_history` lands what a tick does with
+it):
+
+```
+before   "     ✓ #2 probe  done"    (#1's probe, two levels in, no mark)
+after    " ✓ #2 ⚮ probe  done"      (#1 reaped, D9's top level, the mark)
+```
+
+Pinned by:
+- `a_row_whose_parent_the_window_reaped_says_its_parent_is_gone` (`screen.rs`):
+  the live window road read as painted cells, with the root and a root child
+  asserting no mark, the pane unfocused, and the hidden-rows `▲` title;
+- `a_parent_gone_row_says_so_in_every_state_it_can_wear` (`screen.rs`): focused
+  and unfocused, 80×24 and 120×40, the four themes, the mark beside a landed row,
+  a `⊘` stop and a `⏸1` count, and the rows that must stay unmarked;
+- `a_reaped_parent_is_a_parent_gone` (`tree.rs`): the predicate's four no's, and
+  the stored-depth/painted-depth pair it must not disturb;
+- `a_row_without_a_painted_parent_is_painted_at_the_top_level` (`app/mod.rs`),
+  the one line outside those modules, and only its expected cells moved: the
+  orphan it reads is now `" ✓ #2 ⚮ 2  done"`.
+
+**The merge's own one-line fix.** `fc22789` is the root's answer to a semantic
+merge: #118's `agents_pane` fixture (`ui.rs`) builds `AgentRow` literals and #119
+added `parent_gone` to the struct, in different regions of one file — git merged
+both and the combination did not build. The fixture's four rows are not about the
+severed-parent mark, so it passes `false`; the gate on the merge is what caught
+it.
+
+This is D9's leftover: that rule made the painted order and the painted indent
+one spelling of the nesting, and a parent the window reaped is the one case where
+the order says *top level* while the link says otherwise. The rule is kept and
+the leftover is said — the row is still ordered and indented as a top-level row,
+and the mark is what keeps its orphan from reading as the root's own child.
+
+---
+
+## 8.88 The three documents say what the code says (#123, `2b978a1`..`35c714b`, merged `df115bc`)
+
+§8.86 wrote down the drift the living docs carried at `7338d81`; this is the pass
+that paid it. `mush/123` is 52 commits, one fact each, over `README.md`,
+`docs/mush.md` and `docs/refactor.md` — **3 files, 254 insertions, 145
+deletions** — re-deriving every sentence it touched from the tree (`git show`,
+`grep`, and, where a number was claimed, the command that produces it). The root
+merged it as `df115bc`, a clean merge; no line under `crates/` moved.
+
+**What §8.86 listed, answered item by item.**
+
+- **The retry.** `README.md`'s paragraph described a transport failure as retried
+  "three times in total" with half an hour as the worst case; `2b978a1` wrote what
+  `retrying` does — one class repeated (`ModelError::Unsent`: a dial that never
+  connected, a write that did not hand the whole request over), `RETRY_ATTEMPTS = 3`
+  being the first try and two retries, and the one 600 s `CHAT_DEADLINE` handed to
+  every attempt as what is left of it. `d736b1b` fixed `docs/mush.md`'s "A reset or
+  a refused connection is asked again three times", `8a90e90` the per-phase
+  ceilings (`RESOLVE_TIMEOUT` 10 s, `CONNECT_TIMEOUT` 5 s per address, `WRITE_TIMEOUT`
+  30 s re-set per chunk, each the smaller of its own ceiling and `Watch::left`, a
+  spent phase answering through `Watch::spend`), `9247b6b` `docs/refactor.md` §7's
+  paraphrase and `349a892` the B23 row's "transport failures only".
+- **`Ctrl-N`, `Ctrl-O`, `/context`.** `f7b6301`/`c81a689` made `Ctrl-N` two-step
+  over a non-empty conversation, keeping `.mush/session.json.previous` and refusing
+  the key if that copy cannot be written (C4); `a8fb33f`/`f601f26` named
+  `Ctrl-O`/`Intent::ToggleOutput` in both key tables; `6bfed7c`/`819405f` named
+  `/context` (its `Report`, `State` and `Auto` arms, and the four roads a window
+  comes by, `WindowSource::words`). `docs/mush.md`'s commands line now lists every
+  command `COMMANDS` parses.
+- **The session debounce.** `d166aee`: `SESSION_DEBOUNCE` is 60 s
+  (`app/mod.rs:475`), not a second a save.
+- **`/key` vs `MUSH_API_KEY`.** `042a6ad` (README) and `6921452` (docs/mush.md):
+  only `/key`'s arm saves `KeyWrite::Stated`; `/url`, `/model` and `/provider` save
+  `KeyWrite::Keep`, so a key the run read from the environment is never copied into
+  the home config (C11, `d338355`).
+- **The reply cap.** `fc31aff`: `REPLY_SHARE_DIVISOR = 8` and
+  `REPLY_SHARE_WORDS = "an eighth of the window"` (`mush-core/src/config.rs:69`,
+  `:75`), floored at 1 024 and capped at 120 000 — where the row said a quarter.
+- **The file-tool caps.** `26358e5`: `READ_FILE_CAP` (32 MiB), `SEARCH_FILE_CAP`
+  (2 MiB) and `LIST_LIMIT = 400` back, and named, after H31 brought the tools back.
+- **The ignored tests.** `e7da11b`: four, not three — the model list, the shipped
+  reply cap and the TLS handshake in `http.rs`, plus `app/mod.rs`'s
+  `a_frame_fits_in_a_60fps_budget_on_a_long_transcript`; `README.md:340` already
+  said "the three live-endpoint checks … plus the frame-budget test."
+- **The shared-writer sentence.** `20c30a7` (README) and `e5f67a1` (docs/mush.md):
+  the count `spawn_tool` makes is the directory's live writers, tree-wide
+  (`writers()`/`WriterGuard`, keyed by the canonical root), the spawner exempt —
+  H55's manual half.
+- **The census head.** `6802b27`: `docs/refactor.md` §11's anchor moves to
+  `7338d81` — 86 623 lines (prod 19 092, tests 38 164, comments 24 395, blank
+  4 972), reproduced for this record — while the two older heads (`38d0438`'s and
+  `b8d8baa`'s) keep their own "left as it stands" notes.
+- **The `run_command` row.** `309b679`: a command that writes past 8 MiB is killed
+  (`Stopped::TooMuchOutput`), not merely cut, and its result says so (`c96aae1`).
+
+**What §8.86 did not list, and the pass found.** The model seam (`4b72768`:
+`ModelClient::chat` takes the call's `timeout`, so `retrying` can hand each attempt
+its remainder; D3's `ask` verified landed and left as it stood); the group kill
+(`5b3a47f`: `machine::kill_group` through `rustix`, not a `kill -9 -pgid` child —
+`kill_command` has no definition left under `crates/`); a base is resolved in the
+spawning agent's own workspace (`5870703`); `scripts/mock_llm.py` is for
+hand-driven runs and nothing calls it (`9eeced6`); `--print-config`'s row list
+(`2cceae5`: the `vision` row is the image gate, `home config` and `notice` are
+conditional); the accent sites are nine (`bff3e2a`: `select_painted`'s cursor band
+and selection, in the decision log's own count); a cut-off run can be a dead
+thread (`a4994c9`, finding F6); a stop is news on the row, not a line in the
+session (`e19df76`); the meter's four marks (`1e1b8d8`, `92de0c9`); the copy
+promise covers every folded block (`d855fca`); the attachment rows shrink with the
+box (`da3a4d8`); the path refusals a file tool makes, in full (`54b4202`); an edit
+refuses a file that is not valid UTF-8 (`b0b8950`, finding B6); the tree's id
+reserve is `reserve_agents` (`0e17c7a`, `37ba616`); the crate layout names every
+module that exists, the six additions included (`33a4338`); `LOOP_ROUNDS` lives in
+`agent.rs`, because the `agent/` split never landed (`23f4b88`); the design doc
+says the tree has been read blind, and points at §8.51/§8.70 (`0c6e6de`,
+`a139d0f`); and only the actor's waits read the clock through `AgentCtx` — `Watch`
+is handed `clock::system()`, the deliberate exception `clock.rs:33`'s doc names
+(`35c714b`). The ledger's R-rows whose statuses had moved were re-read: R55 by
+`556b507`, R60 by `bb80762`, R66 by `dd704ff` (its wider `enter(phase)` refactor
+deliberately not done), R71 by `6876220` and the tenth review's closing paragraph
+by `bab693f`, R72 by `c2631c9`, R17 by `1310e0f`; and §11's preamble stopped
+claiming to be the one ledger of everything those reviews found (`7041de9`). Two
+commits changed no claim at all: `bde3f04` and `e1d56ba` re-wrapped paragraphs the
+edits had made ragged.
+
+**What the pass refused, and what it left.** It refused to rewrite history:
+`docs/refactor.md` §1's diagnosis sentence is kept as it stood at `d4f80ae`
+(`5b3a47f`), the two older census heads keep their own notes (`6802b27`), R17's
+row names the `\`-to-`/` fold as the one `rel` then had (`1310e0f`), and
+`mock_llm.py` is kept (`9eeced6`). It refused what it did not own:
+`mush-core/src/prompt.rs`'s shared-child sentence ("not this file's to edit",
+`20c30a7`), the wider `AgentNode::enter(phase)` refactor (`dd704ff`), and D3's
+`ask` (`4b72768`). What it left is the code's own drifted sentences — entered
+in the open queue as **H64–H69**, because they are sentences in files a docs pass
+does not touch — and `docs/simplification-review.md:150`'s "`busy_children` and
+`busy_counts` are the same count derived twice", which does not hold at
+`df115bc`: `busy_children` has no definition left under `crates/`,
+`AgentTree::busy_counts` (`tree.rs:1764`) is the one walk per frame, and `napping`
+reads it — the ✓ beside the review's item is the fix `fc5982a` landed, and the
+sentence beside it describes the defect that fix closed. §8.86's other code
+sentences are still there and still not this pass's: `agent.rs`'s
+`a_wrongly_typed_title_is_refused_never_silently_dropped` still says the schema
+"requires one", `commands.rs`'s `/url` arm still names nothing about the
+control-character refusal `set_base_url` makes, and `jobs.rs:483`'s "Stop it and
+everything it started" is H68 in the open queue; the evidence files stay as found.
+`docs/refactor.md`'s census anchor still speaks for
+`7338d81`; moving it is the next record pass's, exactly as this pass moved it from
+`38d0438`.
+
+**The one lead the pass's own body reports, checked at the base.** `9247b6b`'s
+body says the retry drift "stands in `docs/mush.md` §12's bullet, which is outside
+this file and is reported rather than edited". At `df115bc` that bullet reads
+"**A request that never left mush is retried; an answer is not.**", lists
+`Unsent`, "at most twice" and the one 600 s `CHAT_DEADLINE` — `d736b1b`, earlier
+in the same pass, had already rewritten it. The record could not find the drift
+the body names, and does not repeat the claim.
+
+**What this record could not verify.** The pass wrote no summary file — the three
+documents and the commits are the whole of it — so only what the base settles is
+entered here. *Unverified:* its claims about its own reading rather than the
+tree's state, `33a4338`'s "every line already there was re-read against the module
+it names and left as it was" being the plainest; the tree carries the result, not
+the method.
+
+**Census at `df115bc`** (`python3 scripts/census.py`): **TOTAL 87 068 · blank
+4 999 · comment 24 513 · tests 38 456 · prod 19 100.** Against `7338d81`
+(86 623 · 4 972 · 24 395 · 38 164 · 19 092) that is **+445 — prod +8, tests
++292, comments +118, blank +27**, and it is entirely #119's row and its pins:
+the pass edits no `.rs`, and neither do the two record commits between the two
+merges.

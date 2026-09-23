@@ -472,7 +472,7 @@ elided, and the cursor is always on screen.
 | anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
-| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
+| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root · a row whose parent the history window has reaped wears `⚮` after its id |
 | chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/context` `/compact` `/notes` `/help` `/quit` |
 
 A paste whose every word is an image's path attaches them all — one or several,
@@ -667,7 +667,11 @@ are computed in `App`.
   with children out wears `⏸N` — the count, beside its own phase and never
   instead of it — and `⊘` marks both a cancel in flight and a run that landed
   stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
-  parent has not read, `✉N` the ones from an agent's own children. Tool calls are
+  parent has not read, `✉N` the ones from an agent's own children, and `⚮`
+  marks a row whose parent the history window has reaped: `rows()` orders a
+  parentless node at the top level and D9 indents it there, the exact shape a
+  root child wears, so the mark is what keeps an orphan from reading as the
+  root's own child. Tool calls are
   `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
   `⚙ control #4 message "…"`), and notices are neutral `·` unless something
   actually failed (`!`).
