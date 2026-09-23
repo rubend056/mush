@@ -465,7 +465,7 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -935,5 +935,65 @@ mod tests {
                 "{accent:?}: and the row above it keeps its own"
             );
         }
+    }
+
+    /// The repository root, from this crate's manifest directory: a test's cwd
+    /// is the crate, and a doc path in a block below is the workspace's.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// Compare a generated block in `file` against `rendered`, or — with
+    /// `MUSH_BLESS_DOCS` set — write `rendered` in its place.
+    ///
+    /// This is the whole zero-drift mechanism: a block whose words the code
+    /// prints is rewritten by the one command its own head names, and any other
+    /// `cargo test` fails while the two disagree. The comparison is the whole
+    /// region — the head comment, `rendered` and the tail — so a hand edit
+    /// anywhere in it is drift, whitespace included. `rendered` is the block's
+    /// whole text, fences and all when the block is a code block, because a
+    /// manual is read as markdown and the check must not care what markdown
+    /// does with it.
+    ///
+    /// One mutex, because three checks write `docs/mush.md`: a blessing run
+    /// rewrites whole files, and two tests interleaving a read with a write
+    /// would lose one block.
+    pub(crate) fn doc_block(file: &str, id: &str, check: &str, rendered: &str) {
+        static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = WRITER.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let path = repo_root().join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let head = format!(
+            "<!-- generated: {id} (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush {check}) -->"
+        );
+        let tail = format!("<!-- /generated: {id} -->");
+        let block = format!("{head}\n{rendered}\n{tail}");
+
+        // The head is a whole line in the file, never a substring of one.
+        let start = text
+            .match_indices(&head)
+            .find(|(at, _)| *at == 0 || text.as_bytes()[at - 1] == b'\n')
+            .unwrap_or_else(|| panic!("{file} has no `{id}` block"))
+            .0;
+        let after = start + head.len();
+        let end = after
+            + text[after..]
+                .find(&tail)
+                .unwrap_or_else(|| panic!("{file}'s `{id}` block has no tail"))
+            + tail.len();
+
+        if std::env::var_os("MUSH_BLESS_DOCS").is_some() {
+            let next = format!("{}{block}{}", &text[..start], &text[end..]);
+            std::fs::write(&path, next)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            return;
+        }
+        assert_eq!(
+            &text[start..end],
+            block,
+            "{file}'s `{id}` block is stale — regenerate it with:\n  MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush {check}"
+        );
     }
 }

@@ -7,17 +7,8 @@ dirty count, and line delta always in view.
 mush does not edit files itself. The agents do, and mush is how you steer them
 and see what changed.
 
-```
-┌ agents · 2 working · Σ +12 −3 ───┬ mush ───────────────────────────────┐
-│▶◐ #0 ⏸1 root  thinking 4s        │you › rename the lexer module        │
-│   ◐ #1 lexer  mush/1 +12−3       │mush › Starting with the rename.     │
-│   ✓ #2 docs  wrote README        │      ⚙ edit_file src/lex.rs         │
-│                                  ├─────────────────────────────────────┤
-│                                  │ › _                                 │
-└──────────────────────────────────┴─────────────────────────────────────┘
- chat  Tab cycles panes · /help lists commands · Ctrl-P picks a model
- ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k (fold 387.4k) ~500k
-```
+<!-- generated: frame (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush ui::tests::the_readme_frame_matches_the_code) -->
+<!-- /generated: frame -->
 
 ## Quick start
 
@@ -193,17 +184,65 @@ not fit is refused before the wire. Nothing goes out over the window.
 
 ## Keys
 
-| Context | Keys |
-|---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat — stops every agent, restarts the root; with a conversation to lose, the first press says what would go and where it is kept, and the second writes that copy (`.mush/session.json.previous`) and only then clears (an empty chat clears on one press; a copy that cannot be written refuses the key) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output — a tool's result, mush's report about a child or a job, and the brief a child's pane opens with; a failure always shows · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
-| selecting | `↑`/`↓` move the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · a letter is not typing while this is open: the mode has the keyboard, and `Tab` leaves it |
-| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
-| chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript (the select mode's cursor while it is open) · `Esc` clear the box and its attachments |
-| picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
+The keys are one table in `crates/mush/src/app/keys.rs` and the commands one in
+`crates/mush/src/app/commands.rs`; `mush --help` prints exactly these, and a test
+fails while either block is stale:
 
-Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/context`,
-`/compact`, `/notes`, `/help`, `/quit` (`mush --help` prints this table and the
-keys).
+<!-- generated: keys (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush app::keys::tests::the_keys_block_matches_the_code) -->
+```
+  anywhere:
+    Ctrl-Q               quit (a second press confirms while work is running)
+    Ctrl-C               stop the focused agent
+    Ctrl-X               stop every running agent
+    Ctrl-N               start a new chat (a second press stops every agent, drops every transcript)
+    Ctrl-P               model picker
+    Ctrl-T               show or hide the model's reasoning
+    Ctrl-O               show or hide tool output, reports and briefs (a failure always shows)
+    Ctrl-F               the focused pane takes the whole screen, and back
+    Ctrl-Y               select the transcript: Enter copies, Esc leaves
+    Tab / Shift-Tab      cycle panes (agents, chat)
+
+  in a picker:
+    Enter                take the selected row
+    Esc                  close the picker
+    j / k, ↑ / ↓         move down / up the list
+    g / G, Home / End    first / last row
+    PgUp / PgDn          page the list
+
+  selecting (Ctrl-Y):
+    ↑ / ↓                the cursor one line older / newer
+    Shift-↑ / Shift-↓    the same move, keeping the selection
+    PgUp / PgDn          ten lines at a time (with Shift, keeping the selection)
+    Home / End           the oldest / newest line
+    Enter                copy the selection, or the cursor's own line
+    Esc                  leave without copying
+
+  agents pane:
+    ←                    the selected agent's parent
+    →                    the selected agent's first child
+    Enter                show the selected agent's transcript
+    j / k, ↑ / ↓         move down / up a row
+    g / G, Home / End    first / last row
+    PgUp / PgDn          page up / down the rows
+    c                    cancel the selected agent
+    Esc                  back to the root agent
+
+  chat pane:
+    Enter                send the message
+    Ctrl-V               attach the image on the clipboard
+    Shift / Alt-Enter    new line in the message
+    letters and symbols  type into the message box
+    ← / →, Home / End    move the box cursor
+    Backspace / Delete   delete in the box; at the start of the box, Backspace pops the newest attachment
+    Ctrl-U               clear the words in the box, keeping the images
+    Ctrl-Z               put back the words and images the box last lost
+    ↑ / ↓, PgUp / PgDn   scroll the transcript
+    Esc                  clear the box and its attachments
+```
+<!-- /generated: keys -->
+
+<!-- generated: commands (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush app::commands::tests::the_commands_block_matches_the_code) -->
+<!-- /generated: commands -->
 
 ## The screen
 

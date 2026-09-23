@@ -467,13 +467,65 @@ and the view is measured in display columns (`unicode-width`, through
 scrolls horizontally instead of clipping its tail: `…` marks whichever edge is
 elided, and the cursor is always on screen.
 
-| Context | Keys |
-|---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
-| selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
-| picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
-| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root · a row whose parent the history window has reaped wears `⚮` after its id |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/context` `/compact` `/notes` `/help` `/quit` |
+The keys are one table in `crates/mush/src/app/keys.rs` and the commands one in
+`crates/mush/src/app/commands.rs`. `mush --help` and the in-app `/help` print
+exactly these two, and a test fails while either block below is stale:
+
+<!-- generated: keys (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush app::keys::tests::the_keys_block_matches_the_code) -->
+```
+  anywhere:
+    Ctrl-Q               quit (a second press confirms while work is running)
+    Ctrl-C               stop the focused agent
+    Ctrl-X               stop every running agent
+    Ctrl-N               start a new chat (a second press stops every agent, drops every transcript)
+    Ctrl-P               model picker
+    Ctrl-T               show or hide the model's reasoning
+    Ctrl-O               show or hide tool output, reports and briefs (a failure always shows)
+    Ctrl-F               the focused pane takes the whole screen, and back
+    Ctrl-Y               select the transcript: Enter copies, Esc leaves
+    Tab / Shift-Tab      cycle panes (agents, chat)
+
+  in a picker:
+    Enter                take the selected row
+    Esc                  close the picker
+    j / k, ↑ / ↓         move down / up the list
+    g / G, Home / End    first / last row
+    PgUp / PgDn          page the list
+
+  selecting (Ctrl-Y):
+    ↑ / ↓                the cursor one line older / newer
+    Shift-↑ / Shift-↓    the same move, keeping the selection
+    PgUp / PgDn          ten lines at a time (with Shift, keeping the selection)
+    Home / End           the oldest / newest line
+    Enter                copy the selection, or the cursor's own line
+    Esc                  leave without copying
+
+  agents pane:
+    ←                    the selected agent's parent
+    →                    the selected agent's first child
+    Enter                show the selected agent's transcript
+    j / k, ↑ / ↓         move down / up a row
+    g / G, Home / End    first / last row
+    PgUp / PgDn          page up / down the rows
+    c                    cancel the selected agent
+    Esc                  back to the root agent
+
+  chat pane:
+    Enter                send the message
+    Ctrl-V               attach the image on the clipboard
+    Shift / Alt-Enter    new line in the message
+    letters and symbols  type into the message box
+    ← / →, Home / End    move the box cursor
+    Backspace / Delete   delete in the box; at the start of the box, Backspace pops the newest attachment
+    Ctrl-U               clear the words in the box, keeping the images
+    Ctrl-Z               put back the words and images the box last lost
+    ↑ / ↓, PgUp / PgDn   scroll the transcript
+    Esc                  clear the box and its attachments
+```
+<!-- /generated: keys -->
+
+<!-- generated: commands (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush app::commands::tests::the_commands_block_matches_the_code) -->
+<!-- /generated: commands -->
 
 A paste whose every word is an image's path attaches them all — one or several,
 split on whitespace or newlines — and anything else is text and lands in the box
@@ -676,17 +728,15 @@ are computed in `App`.
   `⚙ control #4 message "…"`), and notices are neutral `·` unless something
   actually failed (`!`).
 
-```
-┌ agents · 2 working · 1 waiting · Σ +324 −40 ─────────────────────┐
-│▶· #0 ⏸1 root                                                     │
-│   ⧗ #1 ⏸1 lexer   waiting on results 3s                          │
-│     ◐ #2 tests  mush/2 +324−40  edit_file tests/lex.rs 3s        │
-│   ✓ #3 docs       wrote README.md                                │
-├──────────────────────────────────────────────────────────────────┤
-│ #2 write tests for the lexer                                     │
-│ edit_file tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2  │
-└──────────────────────────────────────────────────────────────────┘
-```
+The row marks, each painted from the phase or the flag that produces it, and a
+whole 100×28 frame with one row per mark — both generated by the code's own
+painters, so neither can outlive them:
+
+<!-- generated: marks (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush ui::tests::the_marks_block_matches_the_code) -->
+<!-- /generated: marks -->
+
+<!-- generated: frame (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush ui::tests::the_manual_frame_matches_the_code) -->
+<!-- /generated: frame -->
 
 The cursor row is the one wearing the pane's selection colour — which is now the
 workspace's own hue, below; there is no separate marker glyph, because the row's
