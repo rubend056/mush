@@ -1003,6 +1003,17 @@ impl Chat {
         )
     }
 
+    /// How many lines [`Self::clear`] would drop: the root transcript and every
+    /// child's, because a new chat empties all of them.
+    ///
+    /// What the armed `Ctrl-N`'s warning counts, derived on read so the line
+    /// cannot disagree with the chat it is about. Notices are not lines: a
+    /// failure is the workspace's, not the conversation's, and a count of what
+    /// the copy keeps must not claim one.
+    pub fn lines_to_drop(&self) -> usize {
+        self.root.len() + self.agents.values().map(Vec::len).sum::<usize>()
+    }
+
     /// Ctrl-N: the conversation is gone, the box and the scrollback with it.
     ///
     /// The reasoning toggle is *not* reset: it is a view the human chose, not a

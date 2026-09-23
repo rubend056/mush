@@ -789,9 +789,11 @@ impl App {
 /// frame: an error must never lose to work in progress (finding B12), and a quit
 /// warning ranks with a failure for the same reason (finding H9) — the human who
 /// pressed `Ctrl-Q` must not see the derived activity line instead of the names
-/// of what their second press kills, or the arm becomes a silent one. The order
-/// itself is `chat::Rank`, the one table; this only picks the winner, and the
-/// painter maps its rank to a colour.
+/// of what their second press kills, or the arm becomes a silent one. A new
+/// chat's warning ranks there too, and for the same reason: the second `Ctrl-N`
+/// must be as visible as the first (finding C4). The order itself is
+/// `chat::Rank`, the one table; this only picks the winner, and the painter maps
+/// its rank to a colour.
 ///
 /// The focused agent's activity is deliberately not a candidate here. It has two
 /// homes already — the row's own tail, with its age, and the transcript's `⚙`
@@ -802,7 +804,12 @@ impl App {
 /// the rows only imply (`tree_line`'s napping root).
 fn bar_word(status: Option<(&str, StatusKind)>, tree: Option<&str>) -> Option<(Rank, String)> {
     let alert = status
-        .filter(|(_, kind)| matches!(*kind, StatusKind::Error | StatusKind::Quit))
+        .filter(|(_, kind)| {
+            matches!(
+                *kind,
+                StatusKind::Error | StatusKind::Quit | StatusKind::NewChat
+            )
+        })
         .map(|(text, _)| text);
     let said = status
         .filter(|(_, kind)| *kind == StatusKind::Info)
@@ -1293,6 +1300,21 @@ mod tests {
         assert_eq!(
             text, "Ctrl-Q again quits · kills #0 thinking",
             "and it is what the human reads, not the run it names"
+        );
+    }
+
+    /// A new chat's warning *is* the arm (finding C4), so it ranks with the
+    /// quit's and with a failure: the derived activity line must not hide the
+    /// sentence that explains what the second `Ctrl-N` drops.
+    #[test]
+    fn the_new_chat_warning_outranks_the_tree_line() {
+        let warning = "Ctrl-N again clears 12 lines — kept as .mush/session.json.previous";
+        let (rank, text) = bar_word(Some((warning, StatusKind::NewChat)), Some("#0 thinking 3s"))
+            .expect("the warning is a word");
+        assert_eq!(rank, Rank::Alert, "a new chat warning ranks with a failure");
+        assert_eq!(
+            text, warning,
+            "and it is what the human reads, not the run under it"
         );
     }
 
