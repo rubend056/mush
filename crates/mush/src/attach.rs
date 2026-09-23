@@ -1,15 +1,18 @@
 //! The attach socket: an external agent drives a running mush (M3).
 //!
-//! A UNIX socket lives at `<root>/.mush/mush.sock` for as long as mush runs.
+//! A UNIX socket lives at `<root>/.mush/mush.sock` for as long as mush runs,
+//! owner-only (`0600`) whatever the process's umask, because the surface
+//! speaks for the human (finding R14).
 //! The listener has a thread of its own, and each connection another, so a
 //! client that goes quiet cannot block the ones behind it (finding A2); none of
 //! those threads ever touches `App`'s state. A request line is parsed, handed
 //! to the UI thread as [`Msg::Attach`] with a one-shot reply channel, and the
 //! answer is written back. `App` stays the only effector.
 //!
-//! Every road in — the connect, the line, the connections, the time a client
-//! may say nothing — is bounded (see [`CONNECT_TIMEOUT`],
-//! [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`] and [`IDLE_TIMEOUT`]), because a
+//! Every road in and out — the connect, the request line, the connections, the
+//! time a connection may make no progress in either direction, and the answer
+//! — is bounded (see [`CONNECT_TIMEOUT`], [`MAX_REQUEST_BYTES`],
+//! [`MAX_CONNECTIONS`], [`IDLE_TIMEOUT`] and [`MAX_ANSWER_BYTES`]), because a
 //! surface a same-user process can reach is a surface that must not be able to
 //! spend mush's heap, threads or patience.
 //!
@@ -20,6 +23,7 @@
 //! with `conflict` rather than guessing.
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,6 +70,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// client keeps talking, and the connection's next line is a fresh request.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+/// The ceiling on one answer line: the most the server may send, and what the
+/// CLI reads an answer under.
+///
+/// The answer to a `read` is the whole transcript, as long as the transcript
+/// is, and a client cannot bound a line it did not choose: a process that binds
+/// a free `.mush/mush.sock` and answers with an endless stream would spend the
+/// CLI's heap by the stream's size (finding R15). 16 MiB is the ceiling the
+/// tree already trusts for one model request (`agent.rs`'s `MAX_REQUEST_BYTES`),
+/// and a transcript past it is read in windows with `since`, not in one line:
+/// the server replaces an answer past the ceiling with a refusal naming it,
+/// and the CLI refuses to read a line past it.
+const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
+
 /// How many connections the surface serves at once.
 ///
 /// Each one owns a thread that waits on its client, so without a cap a script
@@ -74,12 +91,16 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// and closed: the client can retry, and the surface does not grow.
 const MAX_CONNECTIONS: usize = 64;
 
-/// How long a connection may say nothing before it is reaped.
+/// How long a connection may make no progress in either direction before it is
+/// reaped.
 ///
 /// The protocol is one request and one answer per line, so a client that has
-/// connected and then said nothing is either gone or not a client. This is the
-/// server's half of the bound [`ask`] already puts on itself ([`ASK_TIMEOUT`]),
-/// and the two numbers are the same on purpose.
+/// connected and then said nothing is either gone or not a client — and a
+/// client that has asked and then stopped taking its answer is not waiting
+/// either: the same window bounds the read that waits for the request and the
+/// write that answers it, because a thread parked in `write_all` is not idle on
+/// the read side. This is the server's half of the bound [`ask`] already puts
+/// on itself ([`ASK_TIMEOUT`]), and the two numbers are the same on purpose.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a serve is allowed: the live-connection cap and the idle window. One
@@ -164,17 +185,61 @@ fn bound_words(bound: Duration) -> String {
     }
 }
 
+/// Ask the name at `path` what it is before either side follows it: `Ok(true)`
+/// when a socket holds it, `Ok(false)` when nothing does, `Err(sentence)` for
+/// anything else — a symlink, a directory, a plain file.
+///
+/// `Path::exists` follows a symlink and so do `bind` and `connect`, so a
+/// same-user process could plant `.mush/mush.sock` as a link to its own
+/// socket: the server's liveness probe would reach the stranger (and the bind
+/// then fail, disabling attach for the session), while `mush read`/`edit
+/// --send` would answer from — and steer — whatever the link points at. Both
+/// sides ask first, and a name that is not a socket is refused with a sentence
+/// naming what it is, never followed (finding IN8). A socket or an absent name
+/// goes on to the caller's own rule; a name whose shape cannot be read at all
+/// is a refusal too, because a name that cannot be established is not one to
+/// trust.
+fn a_socket_holds(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => Ok(true),
+        Ok(meta) => Err(format!(
+            "{} is {} — the attach surface only takes a socket, and a name that is not one is never followed",
+            path.display(),
+            shape_words(&meta.file_type())
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("could not ask what {} is: {error}", path.display())),
+    }
+}
+
+/// The shape of a name, in the words [`a_socket_holds`] refuses with.
+fn shape_words(kind: &std::fs::FileType) -> &'static str {
+    if kind.is_symlink() {
+        "a symlink"
+    } else if kind.is_dir() {
+        "a directory"
+    } else if kind.is_file() {
+        "a regular file"
+    } else if kind.is_fifo() {
+        "a fifo"
+    } else {
+        "not a socket"
+    }
+}
+
 /// Bind the socket and serve it on a thread of its own.
 ///
 /// A bind that fails is never fatal — mush runs without attach and says so on
-/// stderr — so the error is returned rather than raised. A socket *file* with
-/// nothing listening behind it is a crash's leftover, not a live mush, and is
-/// cleared so this bind can take the name; a file a live listener holds is
-/// another mush, and the bind refuses the name rather than stealing its
-/// socket. A listener that takes longer than [`CONNECT_TIMEOUT`] to answer the
-/// probe is neither of those: a full accept queue also leaves a live listener's
-/// connect waiting, so the file is left in place rather than cleared, and the
-/// serve fails.
+/// stderr — so the error is returned rather than raised. The name's shape is
+/// asked before anything else: a name that is not a socket is refused with a
+/// sentence naming what it is, and never followed (finding IN8). A socket
+/// *file* with nothing listening behind it is a crash's leftover, not a live
+/// mush, and is cleared so this bind can take the name; a file a live listener
+/// holds is another mush, and the bind refuses the name rather than stealing
+/// its socket. A listener that takes longer than [`CONNECT_TIMEOUT`] to answer
+/// the probe is neither of those: a full accept queue also leaves a live
+/// listener's connect waiting, so the file is left in place rather than
+/// cleared, and the serve fails.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     serve_with(root, ui_tx, LIMITS, CONNECT_TIMEOUT, spawn_accept_loop)
 }
@@ -214,7 +279,10 @@ fn serve_with(
     start: impl FnOnce(UnixListener, Sender<Msg>, Limits) -> Result<(), String>,
 ) -> Result<Guard, String> {
     let path = socket_path(root);
-    if path.exists() {
+    // Only a socket — or no name at all — reaches the probe and the bind: a
+    // name that is not a socket is refused with a sentence, never followed
+    // (finding IN8).
+    if a_socket_holds(&path)? {
         match connect_bounded(&path, bound) {
             // A live listener holds the name; the bind below is what refuses to
             // steal it.
@@ -233,6 +301,20 @@ fn serve_with(
     }
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
+    // `bind` creates the socket with the process's umask, so a shared-group
+    // checkout (umask 002) or a lax umask (000) leaves it readable and
+    // answerable by every group member — the surface speaks for the human, so
+    // the name is narrowed to its owner right after it exists (finding R14).
+    // A chmod that fails fails the serve: a socket others may reach is not one
+    // to leave running, and the name goes with the error rather than staying
+    // behind for the next mush to find as a crash's leftover.
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "could not make {} owner-only: {error}",
+            path.display()
+        ));
+    }
     let guard = Guard { path };
     // The guard is built before the thread so the file is never left behind if
     // the spawn fails: returning here drops it, and its `Drop` removes the
@@ -332,13 +414,21 @@ enum Line {
 /// byte past the cap has arrived, stops keeping and drains to the newline
 /// instead — constant memory whichever way the line ends. A read that times out
 /// is [`Line::Gone`], the same as EOF: the client may come back, but this
-/// connection is not going to wait for it.
+/// connection is not going to wait for it. A read a signal interrupts is
+/// retried — `EINTR` is the read not having happened, not the client leaving
+/// (finding R13) — so only a connection's own error ends the line.
 fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
     let mut line: Vec<u8> = Vec::new();
     let mut oversize = false;
     loop {
         let chunk = match reader.fill_buf() {
             Ok(chunk) => chunk,
+            // A signal — `SIGWINCH` is the one a running mush's own handlers
+            // raise — interrupts the read with `EINTR`: the read has not
+            // happened and the client has not left, so the same call is made
+            // again (finding R13, B25's class). `line` holds what earlier
+            // reads gathered, so a retry resumes rather than restarts.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             // The idle window fired (SO_RCVTIMEO answers EAGAIN): the client is
             // not saying anything, and this thread has other clients to make
             // room for.
@@ -386,6 +476,62 @@ fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Li
     }
 }
 
+/// Read the one answer line, holding at most `cap` bytes of it.
+///
+/// [`read_line_capped`] is the server's reader: it drains past the cap so the
+/// *connection* can go on to its next request. The CLI has one answer to read
+/// and never reuses the connection, so a line past the cap ends here — the
+/// socket goes with the refusal instead of draining a stream the cap has
+/// already refused. The cap is the protocol's own answer ceiling
+/// ([`MAX_ANSWER_BYTES`]): the CLI's own read and write timeouts bound
+/// *silence*, not size, so without it a process that binds a free
+/// `.mush/mush.sock` and answers with an endless stream grows the CLI's heap
+/// by the stream's size (finding R15). A read a signal interrupts is retried
+/// here too (finding R13); a read that times out is the sender's own window
+/// ([`ASK_TIMEOUT`], the socket's read timeout) running out, not the sender
+/// closing.
+fn read_answer_capped(reader: &mut impl BufRead, cap: usize) -> Result<String, String> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(format!(
+                    "no answer from mush within {}",
+                    bound_words(ASK_TIMEOUT)
+                ))
+            }
+            Err(error) => return Err(format!("no answer from mush: {error}")),
+        };
+        if chunk.is_empty() {
+            if line.is_empty() {
+                return Err("mush closed the connection without an answer".to_string());
+            }
+            break;
+        }
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let piece = match newline {
+            Some(at) => &chunk[..at],
+            None => chunk,
+        };
+        if line.len() + piece.len() > cap {
+            return Err(format!("the answer from mush is longer than {cap} bytes"));
+        }
+        let piece_len = piece.len();
+        line.extend_from_slice(piece);
+        let took_newline = newline.is_some();
+        reader.consume(piece_len + usize::from(took_newline));
+        if took_newline {
+            break;
+        }
+    }
+    String::from_utf8(line).map_err(|_| "no answer from mush: it is not UTF-8 text".to_string())
+}
+
 /// What the bytes of a finished line are: a line, a line too long, or not text
 /// at all.
 fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
@@ -404,11 +550,24 @@ fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
 /// lives on to answer whatever line comes after it.
 ///
 /// The reads are bounded by the client's own words: a line within the cap, and
-/// something said inside the idle window. Both are the socket's, so the waiting
-/// is the kernel's and this thread is not woken to check a clock.
+/// something said inside the idle window — a signal's interruption is retried,
+/// not read as a close (finding R13). The writes answer under the same window:
+/// a client that stops reading is reaped at the bound rather than parking this
+/// thread in `write_all` and holding the slot for the session (finding
+/// R12/IN4). Both bounds are the socket's, so the waiting is the kernel's and
+/// this thread is not woken to check a clock.
 fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
     let from = peer_label(&stream);
-    if stream.set_read_timeout(Some(idle)).is_err() {
+    // The read bound alone does not cover the write: `SO_RCVTIMEO` cannot fire
+    // while this thread is inside `write_all`, so a client that sent a request
+    // and stopped reading — `Ctrl-Z` on `mush read` is the shipped shape —
+    // parks the thread in the kernel for as long as it likes, and 64 of them
+    // hold every slot for the session (finding R12/IN4). The write bound ends
+    // that: a connection that cannot be drained inside the window is closed
+    // with the answer unfinished — the client reads part of the line and then
+    // EOF — and its slot goes back to the surface to serve the next client.
+    if stream.set_read_timeout(Some(idle)).is_err() || stream.set_write_timeout(Some(idle)).is_err()
+    {
         return;
     }
     let Ok(read_side) = stream.try_clone() else {
@@ -433,12 +592,33 @@ fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
             Ok(Line::Gone) => return,
             Err(_) => return,
         };
-        let mut out = response.encode();
+        let mut out = encode_answer(response);
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() || writer.flush().is_err() {
             return;
         }
     }
+}
+
+/// One answer as the line the server writes, under [`MAX_ANSWER_BYTES`].
+///
+/// A line no client is allowed to read is a line the server may not send, so
+/// an answer past the ceiling is replaced by a refusal that names the ceiling
+/// and the way out (finding R15); the client's own reader would stop at the
+/// same number, so sending it would only be a longer way to the same refusal.
+/// The refusal is a few dozen bytes and cannot itself be past the ceiling.
+fn encode_answer(response: Response) -> String {
+    let out = response.encode();
+    if out.len() <= MAX_ANSWER_BYTES {
+        return out;
+    }
+    Response::error(
+        response.id,
+        ReplyError::too_large(format!(
+            "the answer is longer than {MAX_ANSWER_BYTES} bytes — read a smaller window with `since`"
+        )),
+    )
+    .encode()
 }
 
 /// Turn one line into a response: parse it, hand the request to the UI thread,
@@ -479,9 +659,15 @@ fn peer_label(stream: &UnixStream) -> String {
 /// The CLI's half of the protocol: connect to the socket under `dir`, send one
 /// request, read the one answer. `no mush is running in <dir>` when nothing is
 /// bound there, so the caller's message names the directory the human gave.
-/// The connect is bounded before anything else ([`CONNECT_TIMEOUT`] here,
-/// shorter in a test): a listener whose accept queue never drains is its own
-/// sentence, not a hang and not the same lie.
+/// The name is asked what it is before the connect ([`a_socket_holds`]): a
+/// name that is not a socket is refused with a sentence, never followed, where
+/// `mush read`/`edit --send` would otherwise answer from — and steer — whoever
+/// the name points at (finding IN8). The answer is read under the protocol's
+/// own ceiling ([`MAX_ANSWER_BYTES`]): a line past it is refused with the
+/// ceiling named, where an unbounded `read_line` would grow the CLI's heap by
+/// a stranger's stream (finding R15). The connect is bounded before anything
+/// else ([`CONNECT_TIMEOUT`] here, shorter in a test): a listener whose accept
+/// queue never drains is its own sentence, not a hang and not the same lie.
 pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
     ask_with(dir, request, CONNECT_TIMEOUT)
 }
@@ -495,6 +681,10 @@ pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
 /// clients.
 fn ask_with(dir: &Path, request: &Request, bound: Duration) -> Result<Response, String> {
     let socket = socket_path(dir);
+    // The name is asked before the connect follows it: a planted symlink at
+    // the socket's name would otherwise answer for whoever holds the other end
+    // (finding IN8).
+    a_socket_holds(&socket)?;
     let stream = connect_bounded(&socket, bound).map_err(|error| {
         if error.kind() == io::ErrorKind::TimedOut {
             format!(
@@ -524,10 +714,7 @@ fn ask_with(dir: &Path, request: &Request, bound: Duration) -> Result<Response, 
         .and_then(|()| writer.flush())
         .map_err(|error| format!("could not send the request: {error}"))?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| format!("no answer from mush: {error}"))?;
+    let line = read_answer_capped(&mut reader, MAX_ANSWER_BYTES)?;
     if line.trim().is_empty() {
         return Err("mush closed the connection without an answer".to_string());
     }
@@ -769,6 +956,19 @@ impl ReplyError {
         }
     }
 
+    /// The answer mush computed is longer than one line may carry
+    /// ([`MAX_ANSWER_BYTES`]). `bad_request` would tell a client to fix a
+    /// request that was fine and `unavailable` would promise a retry of the
+    /// same request the surface cannot answer; the message carries the one
+    /// thing the client can act on — a smaller `read`.
+    pub fn too_large(message: impl Into<String>) -> Self {
+        Self {
+            kind: "too_large".to_string(),
+            message: Some(message.into()),
+            revision: None,
+        }
+    }
+
     /// One line for a CLI to print on stderr.
     pub fn describe(&self) -> String {
         match (&self.message, self.revision) {
@@ -877,7 +1077,7 @@ impl Transcript {
 mod tests {
     use super::*;
     use mush_core::scratch::Scratch;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     fn round_trip(request: Request) -> Request {
         let line = request.encode();
@@ -1127,6 +1327,202 @@ mod tests {
         }
     }
 
+    /// The socket's name is asked what it *is*, on both sides: a planted
+    /// symlink at `.mush/mush.sock` is refused with a sentence and never
+    /// followed — the server neither probes nor binds through it, and `mush
+    /// read`/`edit --send` do not answer from the stranger it points at
+    /// (finding IN8).
+    #[test]
+    fn a_name_that_is_not_a_socket_is_refused_and_never_followed() {
+        // The stranger: a live listener whose socket the planted link points
+        // at. Non-blocking, so an empty backlog can be told from a connection.
+        let stranger_root = Scratch::new("attach-stranger");
+        let stranger_path = stranger_root.join("stranger.sock");
+        let stranger = UnixListener::bind(&stranger_path).unwrap();
+        stranger.set_nonblocking(true).unwrap();
+
+        let root = Scratch::new("attach-planted");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let name = socket_path(&root);
+        std::os::unix::fs::symlink(&stranger_path, &name).unwrap();
+
+        // The server refuses the name by what it is, and leaves it alone.
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let error = match serve(&root, tx) {
+            Ok(_) => panic!("a name that is not a socket must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("symlink"),
+            "the refusal names what the name is: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&name)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is still there: nothing replaced or removed it"
+        );
+
+        // Neither side followed the link: a connect would have queued a
+        // connection in the stranger's backlog, and nothing has.
+        assert!(
+            matches!(stranger.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the stranger was never connected to"
+        );
+
+        // The CLI refuses the same name in the same words.
+        let request = Request {
+            id: json!(1),
+            op: Op::Agents,
+        };
+        let error = ask(&root, &request).unwrap_err();
+        assert!(
+            error.contains("symlink"),
+            "the CLI names what the name is: {error}"
+        );
+
+        // Every other shape takes the same road, both sides, refused by name:
+        // a plain file, a directory and a dangling link are not sockets either.
+        let not_a_socket = |label: &str, shape: &str, plant: fn(&Path)| {
+            let root = Scratch::new(label);
+            std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+            let name = socket_path(&root);
+            plant(&name);
+            let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+            let error = match serve(&root, tx) {
+                Ok(_) => panic!("{label}: a name that is not a socket must be refused"),
+                Err(error) => error,
+            };
+            assert!(error.contains(shape), "{label} server: {error}");
+            let request = Request {
+                id: json!(2),
+                op: Op::Agents,
+            };
+            let error = ask(&root, &request).unwrap_err();
+            assert!(error.contains(shape), "{label} CLI: {error}");
+        };
+        not_a_socket("attach-file", "regular file", |path| {
+            std::fs::write(path, "not a socket").unwrap();
+        });
+        not_a_socket("attach-dir", "directory", |path| {
+            std::fs::create_dir(path).unwrap();
+        });
+        not_a_socket("attach-dangling", "symlink", |path| {
+            std::os::unix::fs::symlink(path.with_extension("gone"), path).unwrap();
+        });
+    }
+
+    /// A client that asks and then stops reading is not idle: `SO_RCVTIMEO`
+    /// cannot fire while the connection thread is inside `write_all`, so the
+    /// answer's own write carries the idle window — the thread is reaped at the
+    /// bound with the answer unfinished and its slot goes back to the surface
+    /// (finding R12/IN4). `Ctrl-Z` on `mush read` is the shipped shape of the
+    /// client this is for.
+    #[test]
+    fn a_client_that_stops_reading_mid_answer_is_reaped_at_the_write_bound() {
+        let root = Scratch::new("attach-write-bound");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let idle = Duration::from_millis(500);
+        let guard = serve_with(
+            &root,
+            tx,
+            Limits {
+                connections: 1,
+                idle,
+            },
+            CONNECT_TIMEOUT,
+            spawn_accept_loop,
+        )
+        .unwrap();
+        let socket = socket_path(&root);
+
+        // One client asks for an answer far past any socket buffer and then
+        // stops reading: its thread parks in the write.
+        let mut parked = UnixStream::connect(&socket).unwrap();
+        writeln!(parked, r#"{{"id":1,"op":"read","agent":0,"since":0}}"#).unwrap();
+        let answer = "x".repeat(8 * 1024 * 1024);
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                reply
+                    .send(Response::ok(
+                        request.id,
+                        json!({"lines": [{"line": 0, "text": answer}]}),
+                    ))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+
+        // The slot comes back at the bound. Poll it rather than sleeping a
+        // guess at the deadline: the bound is the server's clock, and a loaded
+        // box can stretch a sleep. A refused connection reaches the channel as
+        // nothing — the accept thread may close it under the request, so even
+        // the write is allowed to fail — and a served one is replied to. Ids
+        // tell a reply that raced an earlier drop from this attempt's.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut attempt = 0_u64;
+        let mut reader = loop {
+            attempt += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked connection's slot never came back (after {attempt} attempts)"
+            );
+            let mut second = UnixStream::connect(&socket).unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if writeln!(second, r#"{{"id":{attempt},"op":"agents"}}"#).is_err() {
+                // Refused and closed before the request landed: ask again.
+                continue;
+            }
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Msg::Attach { request, reply, .. }) if request.id == json!(attempt) => {
+                    reply
+                        .send(Response::ok(request.id, json!({"agents": []})))
+                        .unwrap();
+                    break BufReader::new(second);
+                }
+                // A reply to an attempt that raced its own drop: it has no
+                // client to reach, and it is not this attempt's.
+                Ok(Msg::Attach { reply, .. }) => drop(reply),
+                Ok(_) => panic!("expected Msg::Attach"),
+                // Refused, or the reap has not happened: ask again.
+                Err(_) => {}
+            }
+        };
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(decode(line.trim_end()).unwrap().reply, Reply::Ok(_)),
+            "the second client was served: {line}"
+        );
+
+        // And the parked client's answer was cut at the bound, not finished:
+        // it can read only what the socket buffers held.
+        parked
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(parked);
+        let mut got = 0_usize;
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(error) => panic!("the parked client could not read its cut answer: {error}"),
+            }
+        }
+        assert!(
+            got < answer.len(),
+            "the answer was completed ({got} bytes) instead of cut at the bound"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A socket file with nothing listening behind it is a crash's leftover and
     /// is cleared; a file a live listener holds is another mush, and it is not
     /// stolen — the bind fails and the caller runs without attach.
@@ -1315,6 +1711,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&idle);
     }
 
+    /// A read a signal interrupts is not a client leaving: `SIGWINCH` (a
+    /// running mush's own handler) interrupts a socket read with `EINTR`, and
+    /// without a retry `serve_connection`'s `Err(_) => return` reads that as
+    /// the client gone — the request never runs and the client is told mush
+    /// closed the connection without an answer (finding R13, B25's class).
+    #[test]
+    fn an_interrupted_read_is_retried_and_is_not_a_close() {
+        /// A reader whose first read is interrupted and whose second carries
+        /// the line: the shape a signal gives a real socket.
+        struct InterruptedOnce {
+            reads: Vec<io::Result<&'static [u8]>>,
+        }
+        impl io::Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.reads.remove(0) {
+                    Ok(bytes) => {
+                        buf[..bytes.len()].copy_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        let mut reader = BufReader::new(InterruptedOnce {
+            reads: vec![
+                Err(io::Error::new(io::ErrorKind::Interrupted, "SIGWINCH")),
+                Ok(b"{\"id\":1,\"op\":\"agents\"}\n"),
+            ],
+        });
+        match read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap() {
+            Line::Text(line) => assert_eq!(line, r#"{"id":1,"op":"agents"}"#),
+            other => panic!("an interrupted read is retried, not a close: {other:?}"),
+        }
+    }
+
+    /// A line no client may read is a line the server may not send: an answer
+    /// past the protocol's ceiling is replaced, before the write, by a refusal
+    /// naming the ceiling and the way out — `bad_request` and `unavailable`
+    /// would both be lies about a request that was fine (finding R15).
+    #[test]
+    fn an_answer_past_the_ceiling_is_replaced_by_a_naming_refusal() {
+        let root = Scratch::new("attach-answer-cap");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let socket = socket_path(&root);
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+
+        // The answer the ceiling is for: `read` is the one op whose answer is
+        // the size of the transcript, and this transcript is past 16 MiB.
+        writeln!(client, r#"{{"id":1,"op":"read","agent":0,"since":0}}"#).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                reply
+                    .send(Response::ok(
+                        request.id,
+                        json!({"lines": [{"line": 0, "text": "x".repeat(MAX_ANSWER_BYTES)}]}),
+                    ))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        match decode(line.trim_end()).unwrap().reply {
+            Reply::Err(error) => {
+                assert_eq!(error.kind, "too_large", "the kind is its own");
+                let message = error.message.expect("the refusal carries a message");
+                assert!(
+                    message.contains(&MAX_ANSWER_BYTES.to_string()),
+                    "the ceiling is named: {message}"
+                );
+                assert!(message.contains("since"), "and the way out: {message}");
+            }
+            Reply::Ok(body) => panic!("an answer past the ceiling was sent: {body}"),
+        }
+        drop(reader);
+        drop(client);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The CLI's own ceiling: a process that binds a free `.mush/mush.sock`
+    /// and answers with an endless stream cannot grow the CLI past
+    /// [`MAX_ANSWER_BYTES`] — the read stops at the ceiling, the socket goes
+    /// with the refusal, and the refusal names the ceiling (finding R15).
+    #[test]
+    fn the_cli_refuses_an_answer_past_the_ceiling() {
+        let root = Scratch::new("attach-answer-stranger");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let listener = UnixListener::bind(socket_path(&root)).unwrap();
+        let stranger = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // A JSON line that never ends until the reader stops taking it.
+            if stream.write_all(b"{\"id\":1,\"ok\":\"").is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 1024 * 1024];
+            while stream.write_all(&chunk).is_ok() {}
+        });
+        let request = Request {
+            id: json!(1),
+            op: Op::Agents,
+        };
+        let error = ask(&root, &request).unwrap_err();
+        assert!(
+            error.contains(&MAX_ANSWER_BYTES.to_string()),
+            "the refusal names the ceiling: {error}"
+        );
+        stranger.join().unwrap();
+    }
+
     /// The cap is on the line, not near it: exactly `cap` bytes are a line and
     /// `cap + 1` are not, and it is the refused line's newline that leaves the
     /// next line whole.
@@ -1344,6 +1855,23 @@ mod tests {
             Line::Text(line) => assert_eq!(line, "still a request"),
             other => panic!("the refused line ended at its newline: {other:?}"),
         }
+    }
+
+    /// The socket is the human's alone: `bind` creates it with the process's
+    /// umask, so a shared-group checkout or a lax umask would leave every
+    /// other account able to read the conversation and steer the session; it
+    /// is narrowed to owner-only right after the bind (finding R14).
+    #[test]
+    fn the_socket_is_owner_only() {
+        let root = Scratch::new("attach-mode");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let path = socket_path(&root);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the socket is owner-only, not {mode:04o}");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A thread that will not start must not leave the socket file behind. The
