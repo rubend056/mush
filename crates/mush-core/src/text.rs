@@ -225,6 +225,17 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
             // painted `bcd日`, five columns, and the terminal cut the glyph the
             // pane had no column for. So the break is a loop: while the tail
             // does not fit either, the tail is a row of its own.
+            //
+            // A break trims the **spaces it broke at**, and only those: `rest`
+            // begins at the space the row ended on, so every other character of
+            // the tail is the text's own. A no-break space, an ideographic space
+            // or a line separator is not a space to break at, so it is not one
+            // to delete either — `trim_start` ate the whole whitespace class
+            // and dropped characters the plain wrapper kept, which put the
+            // view's rows and the wrapper's rows on two different rules
+            // (finding B14). The tail rule is one rule now, spelled here and in
+            // `wrap_runs`: no character is dropped, and the two wrappers cannot
+            // disagree about where a row ends or what it holds.
             loop {
                 if current_width + char_width <= width || current.is_empty() {
                     break;
@@ -232,7 +243,7 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
                 if let Some(space) = last_space {
                     let rest = current.split_off(space);
                     out.push(std::mem::take(&mut current));
-                    current = rest.trim_start().to_string();
+                    current = rest.trim_start_matches(' ').to_string();
                 } else {
                     out.push(std::mem::take(&mut current));
                 }
@@ -376,8 +387,11 @@ pub enum RunStyle {
 /// cannot fit a row by itself. A rendered row therefore does not outgrow
 /// `width` — one glyph (or one tab, four columns at once) wider than the whole
 /// width is the only thing a row cannot honour, and a pane's body is never that
-/// narrow. The rows this returns are the rows the plain wrapper would have
-/// made for the same text, with the styles attached.
+/// narrow. The wrap is the plain wrapper's wrap, exactly: the same break
+/// points, the same tab stop, and the same tail on every break — the spaces
+/// the break happened at, and no other character, a no-break space included
+/// (finding B14) — with the styles attached, so a row is the row the plain
+/// wrapper would have made of the text the rules above left.
 pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
     markdown_walk(text, width).0
 }
@@ -1408,6 +1422,26 @@ mod tests {
             .collect()
     }
 
+    /// Every string of length 1..=`max_len` over `alphabet`, in order. The
+    /// equality test's fuzz is generated rather than typed out, so its
+    /// alphabet is readable and its reach is exact (finding B14).
+    fn strings_over(alphabet: &[char], max_len: usize) -> Vec<String> {
+        fn walk(alphabet: &[char], remaining: usize, current: &mut String, out: &mut Vec<String>) {
+            if remaining == 0 {
+                return;
+            }
+            for ch in alphabet {
+                current.push(*ch);
+                out.push(current.clone());
+                walk(alphabet, remaining - 1, current, out);
+                current.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk(alphabet, max_len, &mut String::new(), &mut out);
+        out
+    }
+
     /// A marker marks, and a marker that never closes is text — the characters
     /// as they were written, not half a span and not a dropped character. The
     /// same guard keeps a `*` used for arithmetic and a span of spaces as the
@@ -1723,6 +1757,11 @@ mod tests {
     /// two make the same rows, character for character, at every width — one
     /// rule with two spellings, and this is the test that says they cannot
     /// drift.
+    ///
+    /// The second half is the fuzz that found the last divergence (finding
+    /// B14): a no-break space is not a space, so a break that lands before one
+    /// must leave it in the row on both roads. Every string up to length 5 over
+    /// that alphabet, at widths 1..=12, is that fuzz kept as the pin.
     #[test]
     fn a_plain_message_wraps_exactly_like_wrap_text() {
         let texts = [
@@ -1742,6 +1781,16 @@ mod tests {
                 assert_eq!(
                     rows(text, width),
                     wrap_text(text, width),
+                    "{text:?} @ {width}"
+                );
+            }
+        }
+        let alphabet = ['a', 'b', ' ', '\u{a0}', '\u{3000}', '\u{2028}', '\t'];
+        for text in strings_over(&alphabet, 5) {
+            for width in 1..=12usize {
+                assert_eq!(
+                    rows(&text, width),
+                    wrap_text(&text, width),
                     "{text:?} @ {width}"
                 );
             }
