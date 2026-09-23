@@ -52,7 +52,8 @@ const DELEGATION: &str = "\
 Delegation:\n\
 - spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief \
 must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.\n\
-- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in \
+- base gives the child its own worktree and branch forked from that ref, resolved in this agent's own \
+workspace — `HEAD` is this agent's own HEAD, not the application root's — so siblings with bases run in \
 parallel; without one the child works in this workspace, and only one such child may run at a time. \
 Decide up front, or wait for the running one first. (The check can only fail after the brief \
 exists, so decide before writing it.)\n\
@@ -258,7 +259,7 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "brief": { "type": "string" },
                     "title": { "type": "string", "description": "A 3 word description of this agent's brief." },
-                    "base": { "type": "string", "description": "Branch, tag or commit for the child's own worktree and branch. Without one the child shares this workspace." }
+                    "base": { "type": "string", "description": "Branch, tag or commit; resolved in this agent's workspace, so `HEAD` is this agent's own HEAD. Without one: this workspace." }
                 },
                 "required": ["brief", "title"]
             }),

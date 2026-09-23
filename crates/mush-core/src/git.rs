@@ -412,9 +412,16 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 }
 
 /// Create the worktree at [`worktree_path`] on a new [`branch_name`], based on
-/// `base` — the parent agent's branch, or `HEAD` when the caller has none.
-/// Returns the path and the branch, both from the formatters above, so no caller
-/// ever spells `.mush/wt/<id>` or `mush/<id>` itself.
+/// `base` — the resolved revision the branch forks from, or `HEAD` in `dir`
+/// when the caller has none. Returns the path and the branch, both from the
+/// formatters above, so no caller ever spells `.mush/wt/<id>` or `mush/<id>`
+/// itself.
+///
+/// A caller that has a *name* (the spawn's `base` argument) resolves it first,
+/// in the workspace whose view the name was spoken in: the object store is
+/// shared, so a revision named in a nested agent's worktree is the same commit
+/// here, while the word `HEAD` is not (finding F9). Nothing about whose `HEAD`
+/// a base meant can be decided at this door.
 ///
 /// `dir` is the caller's workspace, and may be any directory *inside* a
 /// repository: git's own questions are answered from there and the checkout is
@@ -553,11 +560,17 @@ pub enum Reclaimed {
 
 /// Whether the worktree of agent `id` can be reclaimed right now, read-only.
 ///
-/// `base` is the *name* of the ref the branch was forked from — the parent
-/// agent's branch, or `HEAD` for a child of the root — and it stays a name
-/// because the first question is about the base *now*: a hand merge moves the
-/// base's tip onto the branch's work, and that is the state a sweep is looking
-/// for.
+/// `base` is the *name* of the ref the branch's work has to land in before its
+/// worktree can go — the parent agent's branch, or `HEAD` for a child of the
+/// root, the one derivation the actor and the UI share (finding F9) — and it
+/// stays a name because the first question is about the base *now*: a hand
+/// merge moves the base's tip onto the branch's work, and that is the state a
+/// sweep is looking for.
+///
+/// The spawn's fork may have named another ref (the caller's `base` argument);
+/// that is the history the branch was built on, not the question a removal
+/// asks. The removal asks whether the parent's tree already has the work, and
+/// for a nested child the parent's branch is where the merge happens.
 ///
 /// `fork` is the revision the worktree was created at, when the caller knows
 /// it. It answers the second question a removal needs and neither the base name
