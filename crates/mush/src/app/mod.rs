@@ -1568,13 +1568,30 @@ impl App {
                 id,
                 event,
             } => {
-                if conversation == self.tree.conversation() {
+                // The tree is the authority on which ids exist: a `Spawned` is
+                // a fact about the *parent* it is tagged with, every other
+                // event a fact about the agent that emitted it. An event that
+                // arrives after its subject is gone is news about nothing, and
+                // it must change nothing — no transcript, no notice, no
+                // weight, no row. The window is real and one frame wide: the
+                // event loop drains actors without blocking and the reap tick
+                // runs after the drain (`main`), so anything emitted after the
+                // last drain is applied after the reap. Without the guard a
+                // ghost is unreachable by every reaping path forever —
+                // `Chat::push_message` writes unconditionally while
+                // `Chat::forget` only walks the ids `tree.past_history()`
+                // returns — and an `Error`-kind notice is stored, so a false
+                // `✗` about work that never happened comes back on every
+                // launch (finding A4). The neighbouring doors already ask this
+                // (`App::attach_read`/`attach_edit` guard membership).
+                if conversation == self.tree.conversation() && self.tree.has(id) {
                     self.on_agent(id, event);
                 } else if let AgentEvent::Spawned { cmd, .. } = &event {
-                    // A tree Ctrl-N abandoned can still spawn children. They are
-                    // not ours, but they must not run either — and because this
-                    // event is dropped, telling the child here is the only
-                    // chance it gets to end.
+                    // A tree Ctrl-N abandoned can still spawn children, and so
+                    // can a parent the reap just forgot. They are not ours, but
+                    // they must not run either — and because this event is
+                    // dropped, telling the child here is the only chance it
+                    // gets to end.
                     let _ = cmd.send(AgentMsg::Shutdown);
                 }
             }
@@ -5042,6 +5059,80 @@ mod tests {
             ids,
             (2..=51).collect::<Vec<u64>>(),
             "reaping from the oldest end leaves the surviving numbers contiguous"
+        );
+    }
+
+    /// A4, the probe: an event whose subject the tree has reaped must change
+    /// nothing — no transcript, no notice, no weight, no row — and a `Spawned`
+    /// for a gone parent must answer its own channel with `Shutdown` rather
+    /// than leaking a child nobody owns.
+    ///
+    /// The door in [`App::update`] hands every event to `on_agent` without
+    /// asking whether the tree still holds the id; `Chat::push_message` writes
+    /// unconditionally and `Chat::forget` is only called by the reap for ids
+    /// `tree.past_history()` returns, so a ghost id is unreachable by every
+    /// reaping path forever — and an `Error`-kind notice is stored, so a false
+    /// `✗` comes back on the next launch.
+    #[test]
+    fn a_late_event_for_a_reaped_agent_changes_nothing() {
+        let (mut app, _rx) = test_app("late-event");
+        let _mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=51).map(|id| finished_child(&mut app, id)).collect();
+        app.tick();
+        let gone = AgentId(1);
+        assert!(!app.tree.has(gone), "the window reaped the oldest child");
+        let rows = app.tree.rows().len();
+        let stored_before = serde_json::to_string(&app.session_snapshot()).unwrap();
+
+        // Everything an actor can still say after its node is gone, in one
+        // frame's window between the last drain and the tick.
+        let (late_tx, late_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let events = vec![
+            AgentEvent::Message(Message::assistant("a reply the reap was too late for")),
+            AgentEvent::Notice("a notice for nobody".into()),
+            AgentEvent::Error("a failure that never happened".into()),
+            AgentEvent::SystemPrompt(Message::system("a prompt for a gone agent")),
+            AgentEvent::Done,
+            AgentEvent::Spawned {
+                child: 52,
+                parent: gone.0,
+                brief: "a child of a ghost".into(),
+                depth: 1,
+                branch: None,
+                fork: None,
+                title: None,
+                cmd: late_tx,
+            },
+        ];
+        for event in events {
+            app.update(Msg::Agent {
+                conversation: app.tree.conversation(),
+                id: gone,
+                event,
+            });
+        }
+
+        assert!(
+            app.chat.transcript(gone).is_empty(),
+            "a gone agent's transcript stays empty: {:?}",
+            app.chat.transcript(gone)
+        );
+        assert_eq!(
+            app.chat.notices_for(gone).count(),
+            0,
+            "no notice for a ghost"
+        );
+        assert_eq!(app.chat.used_weight_for(gone), 0, "no weight for a ghost");
+        assert_eq!(app.tree.rows().len(), rows, "no row came back");
+        assert!(!app.tree.has(AgentId(52)), "a ghost's child is not a row");
+        assert!(
+            matches!(late_rx.try_recv(), Ok(AgentMsg::Shutdown)),
+            "and the child it named is told to end instead of running"
+        );
+        assert_eq!(
+            serde_json::to_string(&app.session_snapshot()).unwrap(),
+            stored_before,
+            "nothing of a ghost reaches the store"
         );
     }
 
@@ -13611,9 +13702,12 @@ mod tests {
     fn a_napping_root_reports_its_children() {
         let (mut app, _rx) = test_app("napping-root");
         let conversation = app.tree.conversation();
+        // The event is tagged with the agent that emitted it — the parent —
+        // exactly as `spawn_tool` emits it; the tree's authority on ids is what
+        // let the door refuse a `Spawned` for a parent that is gone (A4).
         app.update(Msg::Agent {
             conversation,
-            id: AgentId(1),
+            id: AgentId::ROOT,
             event: AgentEvent::Spawned {
                 child: 1,
                 parent: 0,
