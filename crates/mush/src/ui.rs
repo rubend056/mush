@@ -111,7 +111,22 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
     let items: Vec<ListItem> = pane
         .rows
         .iter()
-        .map(|row| ListItem::new(agent_line(row, row_width)))
+        .map(|row| {
+            let line = ListItem::new(agent_line(row, row_width));
+            // A row whose parent the history window forgot is history: its
+            // stored link was cut, and neither the row nor the `⚮` it wears
+            // borrows a colour of its own — the whole row takes `dim()`, the
+            // module's content ink, which is the one ink that reports what
+            // happened. The accent only ever points (whose window this is,
+            // where the keyboard is), so it is not this row's to wear; the
+            // list's own highlight patches over the dim on the cursor row,
+            // wherever the keyboard is.
+            if row.parent_gone {
+                line.style(dim())
+            } else {
+                line
+            }
+        })
         .collect();
     // The cursor's mark depends on who has the keyboard, because the band *is*
     // the cursor: focused, the row is `Color::Black` on the hue — mush's one
@@ -811,6 +826,124 @@ pub(crate) mod tests {
             .draw(|frame| draw_agents(frame, &agents_pane(area), focus, theme))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// [`agents_pane`]'s sibling with a history in it: the root, a root child,
+    /// a leftover worktree found on disk (no parent here, nothing lost) and a
+    /// row whose stored parent the history window forgot (marked `⚮`, dim).
+    /// The depths are the painted ones a real tree hands over. A sibling, not
+    /// an extension: the four-row fixture's own depths are the ones the frames
+    /// the other tests read are painted with.
+    fn agents_pane_with_history(area: Rect, cursor: usize) -> AgentsPane {
+        let row = |id: u64, depth: usize, title: &str, parent_gone: bool| AgentRow {
+            id: AgentId(id),
+            depth,
+            parent_gone,
+            glyph: "✓",
+            focused: false,
+            result_unread: false,
+            unread_children: 0,
+            title: title.to_string(),
+            place: String::new(),
+            activity: String::new(),
+        };
+        AgentsPane {
+            area,
+            list_area: Block::default().borders(Borders::ALL).inner(area),
+            title: " agents ".to_string(),
+            rows: vec![
+                row(0, 0, "root", false),
+                row(1, 1, "child", false),
+                // A leftover worktree: no parent in this tree, nothing lost.
+                row(2, 1, "leftover", false),
+                // Its stored parent is an id the tree no longer holds.
+                row(3, 1, "forgotten", true),
+            ],
+            cursor,
+            footer: Vec::new(),
+        }
+    }
+
+    /// A row whose stored parent the history window forgot paints dim — the
+    /// module's content ink ([`dim`]) — and a leftover worktree on disk does
+    /// not: the dim and the `⚮` are one fact, that a link was cut, and a
+    /// leftover never had a link here to cut. The cursor row's highlight still
+    /// wins over the dim ink, whichever pane holds the keyboard.
+    #[test]
+    fn a_forgotten_row_paints_dim_and_a_leftover_worktree_does_not() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 44, 8);
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let painted = |cursor: usize, focus: Focus| -> Buffer {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_agents(
+                        frame,
+                        &agents_pane_with_history(area, cursor),
+                        focus,
+                        &theme,
+                    )
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let row_text = |buffer: &Buffer, y: u16| -> String {
+            (inner.x..inner.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        /// The ink of every cell that carries a symbol, spaces excluded.
+        fn inks(buffer: &Buffer, y: u16, inner: Rect) -> Vec<Option<Color>> {
+            (inner.x..inner.right())
+                .filter(|x| !buffer[(*x, y)].symbol().trim().is_empty())
+                .map(|x| buffer[(x, y)].style().fg)
+                .collect()
+        }
+
+        let quiet = painted(0, Focus::Chat);
+        assert_eq!(row_text(&quiet, inner.y + 3), "   ✓ #3 ⚮ forgotten");
+        assert!(
+            inks(&quiet, inner.y + 3, inner)
+                .iter()
+                .all(|fg| *fg == dim().fg),
+            "every cell of the forgotten row carries the content ink: {:?}",
+            inks(&quiet, inner.y + 3, inner)
+        );
+        assert_eq!(row_text(&quiet, inner.y + 2), "   ✓ #2 leftover");
+        assert!(
+            inks(&quiet, inner.y + 2, inner)
+                .iter()
+                .all(|fg| *fg != dim().fg),
+            "a leftover lost nothing, so it is not dimmed: {:?}",
+            inks(&quiet, inner.y + 2, inner)
+        );
+        assert_eq!(row_text(&quiet, inner.y + 1), "   ✓ #1 child");
+
+        // The cursor row's mark wins where the dim would be: the filled band
+        // while the pane has the keyboard, the accent as the row's own ink
+        // while the chat does.
+        let accent = theme.accent();
+        let focused = painted(3, Focus::Agents);
+        for x in inner.x..inner.right() {
+            let style = style_at(&focused, x, inner.y + 3);
+            assert!(
+                style.fg == Some(Color::Black) && style.bg == Some(accent),
+                "the band wins over the dim at ({x}, {}): {style:?}",
+                inner.y + 3
+            );
+        }
+        let cursor_quiet = painted(3, Focus::Chat);
+        for x in inner.x..inner.right() {
+            let style = style_at(&cursor_quiet, x, inner.y + 3);
+            assert!(
+                style.fg == Some(accent) && style.bg != Some(accent),
+                "the quiet mark wins over the dim at ({x}, {}): {style:?}",
+                inner.y + 3
+            );
+        }
     }
 
     /// The agents pane's cursor is a filled band only while that pane has the
