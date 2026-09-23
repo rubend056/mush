@@ -48,7 +48,9 @@ fn comment() -> Vec<String> {
             DEFAULT_PROVIDER.name(),
             Provider::Custom.default_base_url()
         ),
-        "base_url: an OpenAI-compatible endpoint, without a trailing slash.".to_string(),
+        "base_url: an OpenAI-compatible endpoint, without a trailing slash; a \
+         control character in it is refused."
+            .to_string(),
         "model: the model id to start with, when nothing above names one.".to_string(),
         format!(
             "context: a context window in tokens; the built-in default is {}. Stating it here beats what the endpoint advertises, as --context does.",
