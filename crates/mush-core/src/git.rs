@@ -270,6 +270,17 @@ pub fn worktree_path(root: &Path, id: u64) -> PathBuf {
     root.join(worktree_rel(id))
 }
 
+/// The directory every agent worktree lives under: `<root>/.mush/wt`.
+///
+/// The directory half of [`worktree_path`]'s spelling, for the reader that
+/// wants the place rather than one child's checkout in it: the workspace's
+/// file roads refuse to list, read or write anywhere in it, because every
+/// entry under it is a sibling actor's own tree
+/// (`workspace::Workspace::is_worktree_path`).
+pub fn worktree_dir(root: &Path) -> PathBuf {
+    root.join(WORKTREE_DIR)
+}
+
 /// The branch namespace every isolated agent's branch lives in: `mush/<id>`.
 /// One spelling, for the same reason [`WORKTREE_DIR`] is one: the name a
 /// worktree is created on, the id read back out of it, and the ref prefix
