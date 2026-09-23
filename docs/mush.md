@@ -1196,18 +1196,25 @@ version, audit, and wait for.
 | Idle CPU | ~0% | blocked on a 30 ms poll, no repaint unless an agent is running |
 | Memory | < 15 MB | the agent tree, the transcripts, and one message box |
 
-An unreachable endpoint cannot hang startup: connections are bounded by a 5 s
-`connect_timeout`, and the model list by a 10 s read timeout — after which the
-window opens and reports no model. A chat completion, by contrast, may take as
-long as the model needs: one 10-minute deadline bounds the whole request, while
-the socket itself is read in 200 ms slices so the reader can notice a
+An unreachable endpoint cannot hang startup: every phase of a request takes the
+smaller of its own ceiling and what is left of the ask's one deadline — 5 s
+`CONNECT_TIMEOUT` per address to connect, 30 s `WRITE_TIMEOUT` to write (the
+socket's own bound is re-set for every chunk, with the watch checked between
+them), 10 s `RESOLVE_TIMEOUT` to wait for a name — and a phase that spends the
+budget ends the call as the deadline it is (`the endpoint stopped responding`),
+never as a wire failure to ask again. The model list is one such ask with a 10 s
+`LIST_READ_TIMEOUT` as its whole budget, after which the window opens and
+reports no model. A chat completion, by contrast, may take as long as the model
+needs: one `CHAT_DEADLINE` of 10 minutes bounds the whole request, while the
+socket itself is read in 200 ms slices so the reader can notice a
 cancellation — and the deadline and cancel flag are checked after every
 successful read too, not only on a timeout, so a server dribbling one byte per
 slice cannot outlive them. Ctrl-C therefore stops a model that has not answered
 instead of waiting for its reply, and a wedged endpoint still cannot pin a
 thread forever. Name resolution is the one step std cannot bound itself, so it
-runs on its own thread behind a 10 s deadline the caller waits on: a lookup
-that outlives it is abandoned with a `TimedOut` naming the host, never a hang.
+runs on its own thread and the caller waits on it behind the same rule: a
+lookup that outlives its bound is abandoned with a `TimedOut` naming the host,
+never a hang.
 
 Rules: no full-buffer scan per frame, no redraw without a state change, and no
 subprocess inside `draw` — the git snapshot is cached in `App`, read on its own
