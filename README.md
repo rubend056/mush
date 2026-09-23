@@ -42,8 +42,11 @@ and see what changed.
 
 The rest of this file is the user-facing contract. The manual
 ([docs/mush.md](docs/mush.md)) adds the map into the code — the spec itself is
-the doc comments beside it — and every table in either file is generated from
-the code and checked by a test, so a table cannot drift silently.
+the doc comments beside it. Every block between `<!-- generated: … -->` markers
+is generated from the code and checked by a test named in its own head, so such
+a block cannot drift silently; the tables written by hand outside those blocks
+are prose, and a number in one is a claim to check rather than a fact a test
+keeps true.
 
 ## Quick start
 
