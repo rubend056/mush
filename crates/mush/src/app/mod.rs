@@ -1130,7 +1130,7 @@ impl App {
                 continue;
             };
             let line = agent::Outcome::CutOff.line(id.0);
-            self.chat.push_message(parent, Message::user(line));
+            self.chat.push_message(parent, Message::mush(line));
         }
         // The rows are back; the parents' books are not. Every parent restored
         // above — the root included: its children came back from the file and
@@ -2146,10 +2146,13 @@ impl App {
                 self.tree.compacting_ended(id, in_run);
             }
             AgentEvent::Compact { summary, in_run } => {
-                // The actor's transcript is now [system, user(summary)];
+                // The actor's transcript is now [system, the marked summary];
                 // mirror it so nudges, saves, and the visible chat stay in
-                // sync with what the model actually sees.
-                let carried = Message::user(prompt::compaction_message(&summary));
+                // sync with what the model actually sees. The mark is the
+                // actor's own ([`Message::mush`]): the carried summary is a
+                // sentence a human could type word for word, so the words
+                // cannot be what says whose it is (finding F3).
+                let carried = Message::mush(prompt::compaction_message(&summary));
                 self.chat.replace_transcript(id, vec![carried]);
                 // The fold is over, and the row must stop saying it is folding:
                 // the summary is read where it now lives, in the transcript.
@@ -8785,6 +8788,13 @@ mod tests {
         assert!(root_text.contains("#2 cut off"), "{root_text}");
         assert!(root_text.contains("nothing was committed"), "{root_text}");
         assert!(
+            app.chat
+                .transcript(AgentId::ROOT)
+                .iter()
+                .any(|message| message.mush && message.text().contains("#2 cut off")),
+            "the line is marked as mush's, not left to its shape: {root_text}"
+        );
+        assert!(
             !root_text.contains("#2 done:"),
             "a cut-off run must never read as a result: {root_text}"
         );
@@ -11446,6 +11456,10 @@ mod tests {
         let stored = Session::load(&root).expect("the fold flushed it");
         assert_eq!(stored.messages.len(), 1, "the conversation is the summary");
         assert!(stored.messages[0].text().contains("porting the parser"));
+        assert!(
+            stored.messages[0].mush,
+            "the mirror's carried summary is marked, and the file keeps the mark"
+        );
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
     }

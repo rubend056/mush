@@ -2602,7 +2602,7 @@ fn absorb(
             if !fresh {
                 return Fold::Idle;
             }
-            push_line(actor, transcript, line);
+            push_mush_line(actor, transcript, line);
             // The line is in this parent's transcript now, so the child's row
             // stops claiming nobody has read it — the one moment that fact
             // changes hands, told to the UI from the actor that owns it
@@ -2677,7 +2677,7 @@ fn absorb(
             match state.record_job(id, line, news) {
                 None => Fold::Idle,
                 Some(line) => {
-                    push_line(actor, transcript, line);
+                    push_mush_line(actor, transcript, line);
                     if news {
                         Fold::Run
                     } else {
@@ -3880,7 +3880,7 @@ fn compact_history(
     }
 
     let system = messages[0].clone();
-    *messages = vec![system, Message::user(prompt::compaction_message(&summary))];
+    *messages = vec![system, Message::mush(prompt::compaction_message(&summary))];
     actor.ctx.emit(
         actor.id,
         AgentEvent::Compact {
@@ -4108,15 +4108,16 @@ fn drain_mailbox(
                 shared,
             } => note_child_book(state, id, cmd, outcome, read, shared),
             AgentMsg::ForgetChild { id } => forget_child(state, id),
-            // A job's report is folded into the transcript as a user message:
-            // the model reads `#c2 done: exit 0 · …` in the next request, and
+            // A job's report is folded into the transcript as a marked `user`
+            // message (`push_mush_line`): the model reads `#c2 done: exit 0 · …`
+            // in the next request, and
             // the line is marked delivered so it is never injected twice. A
             // report the model has *already* read is not folded again however
             // often it is recorded (`docs/findings.md` B24), which is what makes
             // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
                 if let Some(line) = state.record_job(id, line, news) {
-                    push_line(actor, messages, line);
+                    push_mush_line(actor, messages, line);
                 }
             }
             // The UI sends a whole transcript when it believes we are idle.
@@ -4389,26 +4390,29 @@ fn prune_job_books(state: &mut ActorState) {
 /// A line that reaches `messages` alone is a line the human cannot see
 /// (`docs/findings.md` B20) and, because the UI's copy is what an idle `Run`
 /// hands back, a delivery that adoption then re-arms and the model reads
-/// twice. Every fold of a completion or a steering line goes through here, so
-/// the two copies cannot drift apart in either direction.
+/// twice. Every fold of another agent's line — a steering, a report — goes
+/// through here, so the two copies cannot drift apart in either direction.
 ///
-/// The line is somebody else's — a completion, a steering, a nudge — so it
-/// carries no provenance flag: those lines the pane already tells apart by
-/// their shape (a report's `#1 done:`, a fold's opening) or by the fact that
-/// it just watched them arrive. Mush's own lines to the model take
-/// [`push_mush_line`], the same road with the mark that makes them mush's.
+/// The line is somebody else's — a parent's steering — so it carries no
+/// provenance flag; the pane tells it from the human's by the fact that it
+/// just watched it arrive, and from mush's by the mark this road does not set.
+/// Mush's own lines to the model take [`push_mush_line`], the same road with
+/// the mark that makes them mush's — a child's or a job's report included:
+/// `#1 done: …` is a sentence a human could type word for word, so the words
+/// cannot be what says whose it is (finding F3).
 fn push_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
     push_message(actor, messages, Message::user(text));
 }
 
 /// [`push_line`] for a line *mush* wrote into the conversation: the loop
 /// guard's warning, a reply that was cut off or could not be read, the report
-/// a failed commit leaves. The sentence is the model's to read, so it is not a
-/// shape the pane can read provenance from: the line goes as `user` — the
-/// shape a request carries an instruction in — and [`Message::mush`] is what
-/// tells the pane it did not come from the human or another agent (finding
-/// F3, and the head [`Work`]'s name once carried: one mark for every writer
-/// instead of a prefix per sentence).
+/// a failed commit leaves, and a child's or a job's report a fold delivers.
+/// The sentence is the model's to read, so it is not a shape the pane can read
+/// provenance from: the line goes as `user` — the shape a request carries an
+/// instruction in — and [`Message::mush`] is what tells the pane it did not
+/// come from the human or another agent (finding F3, and the head [`Work`]'s
+/// name once carried: one mark for every writer instead of a prefix per
+/// sentence).
 fn push_mush_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
     push_message(actor, messages, Message::mush(text));
 }
@@ -4448,7 +4452,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     let mut news = false;
     for (job, line, job_news) in jobs {
         if let Some(line) = state.record_job(job, line, job_news) {
-            push_line(actor, messages, line);
+            push_mush_line(actor, messages, line);
         }
         news |= job_news;
     }
@@ -4465,7 +4469,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     for (child, run, outcome) in children {
         let (line, fresh) = state.record_child(child, run, outcome);
         if fresh {
-            push_line(actor, messages, line);
+            push_mush_line(actor, messages, line);
             actor.ctx.emit(actor.id, AgentEvent::ResultRead { child });
         }
         news = true;
@@ -9375,13 +9379,14 @@ mod tests {
     /// four fifths of the budget to a transcript with a fifth of room, so the
     /// request that carries them goes out over the window — or, on a transcript
     /// a trim can cut, is cut again. Measured through `run_loop` on the shape
-    /// the audit used (a first turn: one user line, the real 3,247-byte system
-    /// prompt) and the 8k default: four results at the cap left the next
-    /// request carrying 13,768 bytes against a 12,288-byte budget, with no cut,
-    /// no note and no fold: a transcript with one user line has no older turn
-    /// to drop, and a transcript over the budget cannot fold. Now the first
-    /// result takes what it can and each later one gets what is left of the
-    /// fifth, so the request that carries the whole batch fits.
+    /// the audit used (a first turn: one user line, the system prompt) and the
+    /// 8k default: four results at the cap left the next request carrying
+    /// 13,768 bytes against a 12,288-byte budget, with no cut, no note and no
+    /// fold: a transcript with one user line has no older turn to drop, and a
+    /// transcript over the budget cannot fold. Now the first result takes what
+    /// it can and each later one gets what is left of the fifth, so the request
+    /// that carries the whole batch fits. The audit counted 3,247 bytes for the
+    /// prompt; the fixture below measures the real one, which has grown since.
     #[test]
     fn one_turns_results_share_the_room_under_the_ceiling() {
         let big = "x".repeat(100_000);
@@ -9421,10 +9426,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         // The shape the audit measured: a first turn, so a transcript with one
-        // user line and no older turn a trim could drop, under a prompt the
-        // size of the real one rather than the tests' stand-in.
+        // user line and no older turn a trim could drop, under this actor's
+        // real system prompt — measured, never spelled.
         let mut messages = vec![
-            Message::system("s".repeat(3_247)),
+            measured_prompt(&actor),
             Message::user("run the four checks"),
         ];
 
@@ -9622,7 +9627,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let budget = test_cfg().config().unwrap().history_budget();
         let mut messages = vec![
-            Message::system("s".repeat(3_247)),
+            measured_prompt(&actor),
             Message::user("go"),
             Message {
                 role: "assistant".into(),
@@ -9688,11 +9693,11 @@ mod tests {
     /// prompt and the opening task are not droppable, a picture is not mush's to
     /// shed, and this turn has no older turn to cut: the request would go out
     /// over the window and the endpoint would answer a 400 with the money
-    /// already spent. Measured at the 8k default: a 2,560×1,440 png weighs
-    /// the request weighs 18,041 bytes — 3,686,400 px at 750 px/token, ×3
-    /// bytes, on top of the 3,247-byte system prompt — against a 12,288-byte
-    /// budget. The turn ends with one line naming the road out — a downscale —
-    /// and the picture is never sent.
+    /// already spent. Measured at the 8k default: a 2,560×1,440 png is 3,686,400
+    /// px at 750 px/token, ×3 bytes, which on top of the real system prompt —
+    /// measured in the test, never spelled, because it grows — is over the
+    /// 12,288-byte budget. The turn ends with one line naming the road out — a
+    /// downscale — and the picture is never sent.
     #[test]
     fn a_picture_the_window_cannot_hold_is_refused_before_the_wire() {
         let scripted = Arc::new(Scripted::new().says("looked"));
@@ -9711,7 +9716,7 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
-            Message::system("s".repeat(3_247)),
+            measured_prompt(&actor),
             Message::user_with_images(
                 "what is wrong here?",
                 vec![image_at("shot.png", 2_560, 1_440)],
@@ -9756,10 +9761,7 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let budget = test_cfg().config().unwrap().history_budget();
-        let mut messages = vec![
-            Message::system("s".repeat(3_247)),
-            Message::user("x".repeat(budget)),
-        ];
+        let mut messages = vec![measured_prompt(&actor), Message::user("x".repeat(budget))];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
         assert!(scripted.asked().is_empty(), "no request went out");
@@ -9785,12 +9787,12 @@ mod tests {
         let budget = test_cfg().config().unwrap().history_budget();
         let run = |label: &str,
                    scripted: &Arc<Scripted>,
-                   mut messages: Vec<Message>|
+                   tail: Vec<Message>|
          -> (Result<Option<String>, String>, usize) {
             // A shape with a picture goes to a model the table documents as
             // seeing: what it measures is the window, and the vision gate is
             // its own test (`a_blind_model_is_never_sent_an_image_part`).
-            let cfg = if messages.iter().any(|message| !message.images.is_empty()) {
+            let cfg = if tail.iter().any(|message| !message.images.is_empty()) {
                 ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None))
             } else {
                 test_cfg()
@@ -9802,6 +9804,10 @@ mod tests {
                 Arc::new(ScriptedMachine::new()),
                 Arc::new(clock::System),
             );
+            // The prompt is this actor's own, measured where the actor is —
+            // the shape the audit drove, with the size the real prompt has.
+            let mut messages = vec![measured_prompt(&actor)];
+            messages.extend(tail);
             let mut state = ActorState::default();
             let cancel = Arc::new(AtomicBool::new(false));
             let outcome = run_loop(&actor, &mut state, &mut messages, &cancel);
@@ -9824,7 +9830,6 @@ mod tests {
             "invariant-adopted",
             &adopted,
             vec![
-                Message::system("s".repeat(3_247)),
                 Message::user("go"),
                 Message {
                     role: "assistant".into(),
@@ -9846,10 +9851,10 @@ mod tests {
         let (outcome, sent) = run(
             "invariant-fitting-picture",
             &fitting,
-            vec![
-                Message::system("s".repeat(3_247)),
-                Message::user_with_images("here", vec![image_at("shot.png", 1_920, 1_080)]),
-            ],
+            vec![Message::user_with_images(
+                "here",
+                vec![image_at("shot.png", 1_920, 1_080)],
+            )],
         );
         assert!(
             outcome.is_ok(),
@@ -9862,10 +9867,10 @@ mod tests {
         let (outcome, sent) = run(
             "invariant-over-picture",
             &over,
-            vec![
-                Message::system("s".repeat(3_247)),
-                Message::user_with_images("here", vec![image_at("shot.png", 2_560, 1_440)]),
-            ],
+            vec![Message::user_with_images(
+                "here",
+                vec![image_at("shot.png", 2_560, 1_440)],
+            )],
         );
         assert!(outcome.is_err(), "an over-window picture is refused");
         assert_eq!(sent, 0);
@@ -9875,10 +9880,7 @@ mod tests {
         let (outcome, sent) = run(
             "invariant-words",
             &words,
-            vec![
-                Message::system("s".repeat(3_247)),
-                Message::user("x".repeat(budget)),
-            ],
+            vec![Message::user("x".repeat(budget))],
         );
         assert!(outcome.is_err(), "a paste over the budget is refused");
         assert_eq!(sent, 0);
@@ -10493,7 +10495,7 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
-            Message::system("s".repeat(3_247)),
+            measured_prompt(&actor),
             Message::user("write it in one call"),
         ];
 
@@ -11030,6 +11032,19 @@ mod tests {
     /// test that uses it must go through a scripted model.
     fn test_cfg() -> ConfigHandle {
         ConfigHandle::own(Config::new("http://127.0.0.1:1", "test", None))
+    }
+
+    /// The system prompt a fixture hands its actor: the real one for that
+    /// actor's workspace, measured rather than spelled.
+    ///
+    /// The fixtures that build a transcript by hand need the prompt for what it
+    /// *weighs* — their arithmetic rides on the budget it leaves — and a count
+    /// written here is a sentence that rots: 3,247 bytes was the audit's count,
+    /// and the real prompt has grown twice since. The actor's own root is the
+    /// honest measurement: the prompt names the workspace it runs in, so a
+    /// stand-in root would be a size that is nobody's request.
+    fn measured_prompt(actor: &Actor) -> Message {
+        Message::system(prompt::system_prompt(&actor.ws.root_str()))
     }
 
     /// A standalone actor over a scratch workspace, with `model` as its client
@@ -14817,6 +14832,10 @@ mod tests {
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
         assert!(
+            messages.last().unwrap().mush,
+            "the report carries the mark its writer sets, not its shape"
+        );
+        assert!(
             state.delivered.contains_key(&1),
             "and it counts as delivered"
         );
@@ -14851,6 +14870,13 @@ mod tests {
         assert!(
             folded.contains(&"#c3 stopped after 1s · npm run dev"),
             "and so is the kill, without a turn being paid for it: {folded:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.text().starts_with("#c"))
+                .all(|message| message.mush),
+            "a job's report carries the same mark: {messages:?}"
         );
         assert!(
             state.delivered_jobs.contains(&JobId(2)) && state.delivered_jobs.contains(&JobId(3))
@@ -16540,6 +16566,10 @@ mod tests {
             asked[1].messages[1].text(),
             prompt::compaction_message(summary)
         );
+        assert!(
+            asked[1].messages[1].mush,
+            "the fold's carried summary is marked as mush's line, not left to its words"
+        );
         // …and the work survives the fold: the child was asked afterwards.
         assert_eq!(
             fs::read_to_string(root.join(".mush/wt/1/iso.txt"))
@@ -16733,7 +16763,7 @@ mod tests {
             ..ActorState::default()
         };
         let mut transcript = vec![
-            Message::system("s".repeat(3_247)),
+            measured_prompt(&actor),
             Message::user("task"),
             Message::user("x".repeat(37_210)),
         ];
