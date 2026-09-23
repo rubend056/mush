@@ -702,10 +702,10 @@ lines and is kept for the invariant: **−4**.
   boundaries — and `Msg::Models` guards an *endpoint* instead, which a shared
   helper would hide.
 - **The re-asks of a stale snapshot** — `adopt_git`'s `tree.has` filter
-  (`mod.rs:1159-1164`), `sweep_worktrees`'s second `has` (`:1193`) and
-  `reclaim_isolated`'s `worktree_in_use` (`:1326`): the docs say why each is
-  asked again (a remove must be one decision), so these are one decision asked
-  at one moment, not two spellings.
+  (`mod.rs:1159-1164`), `sweep_worktrees`'s second `has` (`:1193`) and the
+  sweep worker's `Msg::SweepAsk`, answered by `App::worktree_in_use`: the docs
+  say why each is asked again (a remove must be one decision), so these are one
+  decision asked at one moment, not two spellings.
 - **`fork_base` read in `refresh_git` (`mod.rs:1117`) and again in
   `sweep_worktrees` (`:1203`)**: two moments, and both call the one derivation
   (`mod.rs:1241`'s `App::fork_base`, over `agent::fork_base`), so nothing can

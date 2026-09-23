@@ -624,10 +624,14 @@ those rows were checked against at entry, measured at `38d0438`: 79 208 lines �
 prod 18 232, tests 34 663, comments 21 708, blank 4 605 (`scripts/census.py`).
 That sentence is kept as it stood: it is the census the four passes' rows were
 checked against at entry, not a number to be overwritten. This ledger's anchor is
-now `332fe21`: 92 505 lines — prod 20 428, tests 40 741, comments 26 093, blank
-5 243 (`scripts/census.py`); over `7338d81`'s 86 623 (prod 19 092, tests 38 164,
-comments 24 395, blank 4 972) that is prod +1 336, tests +2 577, comments
-+1 698, blank +271. The `b8d8baa` sentence above is left as it stands:
+now `f9a911d`, master's tip after the audit-fix wave (§8.112): **102 334** lines
+— prod **21 836**, tests **45 195**, comments **29 619**, blank **5 684**
+(`scripts/census.py`); over `332fe21`'s 92 505 (prod 20 428, tests 40 741,
+comments 26 093, blank 5 243) that is prod +1 408, tests +4 454, comments
++3 526, blank +441, and over §8.107's `f46859f` reading (94 342 · 5 293 ·
+26 692 · 41 761 · 20 596) it is +7 992 for the wave — every line of it under
+`crates/`, the audits and the record being outside the script's count. The
+`b8d8baa` sentence above is left as it stands:
 it is the census the reviews before these read, not a number to be overwritten,
 and the rows below say where a later wave re-priced one of them (`1e07c2e`).
 
