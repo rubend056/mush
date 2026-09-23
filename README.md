@@ -101,7 +101,8 @@ Everything can be changed at runtime from the chat — no restart:
 
 **Resolution order on startup: CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults.** The home config lives at `$MUSH_CONFIG`,
-else the platform config directory (`~/.config/mush/config.json` on Linux) — it
+else the platform config directory (`~/.config/mush/config.json` on Linux); with
+`HOME` unset and no `MUSH_CONFIG` there is none, and a save refuses by name — it
 is *machine-global*:
 
 ```json

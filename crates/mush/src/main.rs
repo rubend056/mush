@@ -1220,8 +1220,10 @@ fn event_loop(
                 // The terminal changed size: schedule a redraw. ratatui's
                 // `terminal.draw` re-queries the size first, so the next
                 // frame already paints at the new dimensions — and the app is
-                // told the new size so a `/notes` report wraps to it and the
-                // floor notice is raised or lowered (finding P11).
+                // told the new size so a `/notes` report wraps to it, the
+                // floor notice is raised or lowered (finding P11), and the
+                // select mode re-measures the pane for the coming frame
+                // (finding PM5).
                 Event::Resize(width, height) => {
                     app.set_term_size(width, height);
                     app.dirty_screen = true;

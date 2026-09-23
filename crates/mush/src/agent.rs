@@ -2940,10 +2940,14 @@ fn request_bytes(request: &ChatRequest<'_>) -> Result<usize, String> {
 /// and a request that replays them would carry `image_url` parts an endpoint may
 /// reject — a whole turn and the human's money. The bytes stay in the actor's
 /// transcript (a picture goes with the turn it arrived in, and only the
-/// request's own copy is a copy); each message's own placeholder text stands
-/// where its images were (`Message::drop_images`), so the model still learns a
-/// picture was there and which file it came from, and one line says the model
-/// is why and `/model` is the road.
+/// request's own copy is a copy) — bar the payloads the conversation's own byte
+/// cap has already given up
+/// ([`IMAGE_BYTES_KEPT`](mush_core::message::IMAGE_BYTES_KEPT), applied by
+/// `retain_image_bytes` before this runs), which are gone from the actor's
+/// transcript too; each message's own placeholder text stands where its images
+/// were (`Message::drop_images`), so the model still learns a picture was there
+/// and which file it came from, and one line says the model is why and `/model`
+/// is the road.
 fn for_the_model<'a>(actor: &Actor, cfg: &Config, messages: &'a [Message]) -> Cow<'a, [Message]> {
     let images: usize = messages.iter().map(|message| message.images.len()).sum();
     if images == 0 || vision_capable(&cfg.model) {

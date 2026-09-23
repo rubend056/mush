@@ -56,7 +56,10 @@ pub const READ_FILE_CAP: u64 = 32 * 1024 * 1024;
 /// `Image::weight`, and `config::PIXELS_PER_TOKEN`): a picture under this cap
 /// can still be too big for the room a transcript has left, and the app's
 /// attach gate says so before it is sent — where the old code compared one
-/// ruler against the other and got both cases wrong.
+/// ruler against the other and got both cases wrong. Under this cap is not a
+/// promise the wire carries the bytes, either: a conversation's own byte budget
+/// ([`crate::message::IMAGE_BYTES_KEPT`]) can have given an older picture's
+/// payload up already, and the wire spells the placeholder sentence there.
 pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 
 /// The longest file `search` opens. A pattern that matches inside a 200 MB log

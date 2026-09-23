@@ -50,6 +50,8 @@ spec: the spec is the doc comments beside the code, written as the reason, and
 - Architecture is a single-owner **event loop**: `Msg` in, `App::update`,
   `ui::draw` (§6).
 - KISS is enforced by the dependency budget of §7.
+- **Linux is the platform**: built and gated there; macOS is expected by
+  reading, ungated; Windows is not supported (§1).
 
 ---
 
@@ -73,6 +75,14 @@ spec: the spec is the doc comments beside the code, written as the reason, and
 - A CRDT / collaborative-OT server. One human, the filesystem is truth.
 - Provider-specific, plugin-based, or extensible via a scripting language.
 - An agent framework. It ships one small agent loop, not an orchestration layer.
+
+**Platforms.** Linux is the platform mush is built and gated on. macOS is
+expected to build and run — nothing in the program is Linux-specific, only
+POSIX — but it has never been built there, so that is a claim from reading, not
+a measurement, and no promise follows it. Windows is not supported: the shell
+every command goes through (`sh -c`), the process-group cleanup that ends a
+command's tree, the one-mush-per-workspace lock (`flock`), the attach socket,
+and the signal road are POSIX facilities, and each of the five is structural.
 
 ### Why there are file tools beside a shell
 
@@ -144,8 +154,9 @@ an agent event — becomes a `Msg`, and one thread applies it to `App` (§6).
   `write_file`'s `content` and `edit_file`'s replacement are bytes the model
   already sent, so a cap there would save the conversation nothing and cost a
   turn and the work. A write large enough to push the request past the window
-  ends that turn at the request's own refusal (`cannot send this request: …`),
-  with the bytes already on disk. The caps' sizes follow the window:
+  ends that turn at the request's own refusal (`cannot send this request: …`) —
+  the window line or the byte ceiling's — with the bytes already on disk. The
+  caps' sizes follow the window:
   `Config::cmd_cap()` (`crates/mush-core/src/config.rs`), the `CMD_CAP`
   (`crates/mush-core/src/lib.rs`) and the `READ_FILE_CAP` / `SEARCH_FILE_CAP` /
   `IMAGE_FILE_CAP` constants (`crates/mush-core/src/workspace.rs`).
@@ -188,7 +199,7 @@ delegation tool, and three that manage what an agent started:
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush/wt`, the isolated children's own checkout directory; capped at `LIST_LIMIT` names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
-| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
+| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group, started at `nice` 10 (§5.6); 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title?`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
@@ -288,7 +299,13 @@ How an image is **weighed** (pixels, not bytes), where its dimensions come from,
 and how a stored transcript sheds the bytes in place:
 `crates/mush-core/src/message.rs` (`Message::content_parts`, `Message::weight`,
 `Message::drop_images`) and `crates/mush-core/src/workspace.rs`
-(`image_dimensions`).
+(`image_dimensions`). Pictures keep their payloads newest-first while they total
+at most `IMAGE_BYTES_KEPT` (8 MiB, `crates/mush-core/src/message.rs`); an older
+picture whose bytes no longer fit gives them up and keeps everything else — its
+row, path, mime and size, so `▣ name (png · 2.0 MB)` still reads the same — and
+the model sees the placeholder sentence ("bytes dropped to save room; read the
+file again if you need them") where the bytes were. The newest message's own
+pictures are never given up, and pricing is still by pixels.
 
 ### History budget
 
@@ -710,7 +727,9 @@ What the audit that shaped this section found, and the defects each rule fixed:
 ```
 
 The API key is never stored here — it lives in the machine-global home config
-(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). `/key` is the one road that
+(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). With `HOME` unset and no
+`MUSH_CONFIG` there is no home config, and mush says so by name rather than
+write one beside the checkout. `/key` is the one road that
 writes it there; `MUSH_API_KEY` supplies one from the environment for the run,
 and no other save copies it into the file. `.mush/.gitignore` containing `*`
 ignores every file in the directory, **including itself**, so the directory never
@@ -893,6 +912,16 @@ prevents. The lock itself: `crates/mush/src/jobs.rs` and `lock.rs`. Where the
 human sees jobs beyond the `⚙N` their owner's row already wears is `[OPEN]`
 (§11).
 
+**4. Every command mush runs is a guest.** Every child mush starts — a
+`run_command`, a `detach: true` job, a foreground call handed to the registry —
+is set to `nice` 10 right after it spawns (`CHILD_NICE` in
+`crates/mush/src/machine.rs`): lower priority than everything the human's own
+shell starts, so an agent's build queues behind their editor instead of ahead of
+it. The setting is a courtesy, not a precondition — a command that cannot be
+niced still runs — and a mush that was itself started below 10 (under `nice`)
+leaves its children at that even lower priority. 19 is the least urgent Linux
+allows; the constant is the one place to change it.
+
 ---
 
 ## 6. Architecture
@@ -959,7 +988,7 @@ mush/
       app/screen.rs  every painted value, derived by `App` (layout, rows, words)
       agent.rs       agent actors, model loop, tool dispatch, shell execution
       clipboard.rs   the system clipboard: wl-paste / xclip / pngpaste read an image,
-                     and wl-copy / xclip / pbcopy write text
+                     and wl-copy / xclip / pbcopy / clip write text
       jobs.rs        the job registry: detached commands, the machine lock
       model.rs       the `ModelClient` seam, the HTTP client, the transport retry
       machine.rs     the shell seam: spawn, poll, kill a command
@@ -1135,8 +1164,10 @@ them should ask rather than build.
   the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the endpoint-free pty scenarios are the
-  whole gate; they run anywhere rust and python3 do, so any CI can call them.
-  `scripts/census.py` prints the production/test/comment split.
+  whole gate; they run on any POSIX machine with rust and python3 (the pty
+  scenarios and several fixtures use a pty, `setsid` and `/proc`), so any POSIX
+  CI can call them. `scripts/census.py` prints the production/test/comment
+  split.
 - **Screen review.** `scripts/screen.py` drives the real binary over a pty and
   prints the painted screen as text at 200×50 down to 30×8, which is how the ten
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`

@@ -227,16 +227,17 @@ primitive, against ~8 lines of primitive and signature changes. Net −28.
 ## 3. `wrap_runs` is `wrap_capped` again — net −20
 
 **Sites.** text.rs 134-196 (`wrap_capped`, 47 code lines), 650-708 (`wrap_runs`,
-49), whose own doc says so: "The arithmetic is `wrap_capped`'s, tab expansion
-included, and a test pins the two against each other — one rule, two spellings,
-and no drift between the view and the text beside it."
+49), whose own doc now says: "The arithmetic is `glyph_width`'s — tab expansion,
+the breaks, and the width a tail left by a break is measured by — and a test pins
+the two against each other: one rule, two wrappers, and no drift between the view
+and the text beside it."
 
 ```rust
 // text.rs:150-157 — the tab stop and the width of one character
 let (rendered, char_width) = if ch == '\t' {
     ("    ".to_string(), 4)
 } else {
-    (ch.to_string(), UnicodeWidthChar::width(ch).unwrap_or(1).max(1))
+    (ch.to_string(), glyph_width(ch))
 };
 ```
 
@@ -245,7 +246,7 @@ let (rendered, char_width) = if ch == '\t' {
 let (char_width, tab) = if ch == '\t' {
     (4, true)
 } else {
-    (UnicodeWidthChar::width(ch).unwrap_or(1).max(1), false)
+    (glyph_width(ch), false)
 };
 ```
 

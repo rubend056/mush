@@ -524,8 +524,10 @@ impl Session {
 
     /// Replace every image payload in this conversation — the root transcript's
     /// and every subagent's — with the placeholder that names it. Called only
-    /// on the value [`Self::save`] owns; its comment says why the bytes never
-    /// reach the file.
+    /// on a value about to be written and never on the live conversation:
+    /// [`Self::save`] calls it on the value it owns, [`keep_previous`] on the
+    /// copy kept beside the store; [`Self::save`]'s doc says why the bytes
+    /// never reach the file.
     fn shed_images(&mut self) {
         for message in &mut self.messages {
             message.drop_images();
