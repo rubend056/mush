@@ -4245,12 +4245,14 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // where the model's workspace is; this is the *landing* question, and it
     // belongs to the tree the parent's work is in.
     let base_name = isolated.then(|| fork_base(actor.branch.as_deref()));
-    // The name the caller chose for the row, trimmed; blank means none, and the
-    // row falls back to its handle from the brief. A wrongly-typed title is
-    // refused, not silently dropped: the row is how the human finds the child
-    // (finding A7).
+    // The name the caller chose for the row, folded to the one line a row is:
+    // `first_line` drops a second line and collapses whitespace runs, so a
+    // model that wrote `parser\nport` names the row `parser` instead of putting
+    // a newline into a one-line painter (finding F14's newline half). A
+    // wrongly-typed title is refused, not silently dropped: the row is how the
+    // human finds the child (finding A7).
     let title = tools::arg_string_opt(args, "title")?
-        .map(|title| title.trim().to_string())
+        .map(|title| first_line(&title))
         .filter(|title| !title.is_empty());
     if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
@@ -17801,6 +17803,65 @@ mod tests {
             titles,
             vec![Some("parser port".to_string()), None, None],
             "only a real name is carried, and it is trimmed"
+        );
+    }
+
+    /// A title is a row's name and a row is one line. `truncate` keeps `\n` and
+    /// `\t`, so `title: "parser\nport"` used to reach a one-line painter and
+    /// break the row's shape; the fold belongs here, in `spawn_tool`, where the
+    /// title is read off the wire (finding F14's newline half). The first line
+    /// is [`first_line`]'s: whitespace runs collapse, and a second line is not
+    /// part of the name.
+    #[test]
+    fn a_title_with_a_newline_cannot_reach_a_one_line_row() {
+        let (actor, events, _mailbox) = build_actor_about(
+            "spawn-title-fold",
+            Arc::new(
+                Scripted::new()
+                    .when(|asked: &Asked| asked.depth() == Some(1))
+                    .says("done"),
+            ),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let spawn = |state: &mut ActorState, args: Value| {
+            exec_tool(&actor, state, ToolName::SpawnAgent, &args, &cancel)
+        };
+
+        spawn(
+            &mut state,
+            json!({ "brief": "port the parser", "title": "parser\nport the lexer" }),
+        )
+        .unwrap();
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
+        spawn(
+            &mut state,
+            json!({ "brief": "port the lexer", "title": "  parser\tport  " }),
+        )
+        .unwrap();
+
+        let titles: Vec<Option<String>> = events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Spawned { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![Some("parser".to_string()), Some("parser port".to_string())],
+            "a newline and a tab are folded before the row ever sees the name"
+        );
+        assert!(
+            titles
+                .iter()
+                .flatten()
+                .all(|title| !title.contains(['\n', '\t', '\r'])),
+            "nothing in a title can break a one-line row"
         );
     }
 
