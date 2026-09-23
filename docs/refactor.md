@@ -475,7 +475,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | U6 | an agent is a bare number | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
 | U7 | a waiting agent still says `working…` | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait`, and the row/foot say which |
 | U8 | a transient notice never leaves | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
-| U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
+| U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (an eighth of the window — `REPLY_SHARE_DIVISOR`, spelled to humans by `REPLY_SHARE_WORDS` — floored at 1 024 and capped at `MAX_REPLY_TOKENS` 120 000) |
 | U10 | walking back up a deep tree costs a keypress per ancestor | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
 | U11 | compaction has no visible state anywhere | `Phase::Compacting(Parked\|Requested\|NearlyFull)` (`app/tree.rs`), `≡` + the fold's words (`app/screen.rs`), the bar's "keep typing" sentence (`App::tree_line`), and `compact_now` owning the fold's cancel flag (`mush/38`) |
 | B20 | a child's completion reaches the model but not the screen, and can fold twice | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
