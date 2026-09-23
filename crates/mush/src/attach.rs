@@ -9,11 +9,12 @@
 //! to the UI thread as [`Msg::Attach`] with a one-shot reply channel, and the
 //! answer is written back. `App` stays the only effector.
 //!
-//! Every road in — the connect, the line, the connections, the time a client
-//! may say nothing — is bounded (see [`CONNECT_TIMEOUT`],
-//! [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`] and [`IDLE_TIMEOUT`]), because a
-//! surface a same-user process can reach is a surface that must not be able to
-//! spend mush's heap, threads or patience.
+//! Every road in and out — the connect, the request line, the connections, the
+//! time a client may say nothing, and the answer — is bounded (see
+//! [`CONNECT_TIMEOUT`], [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`],
+//! [`IDLE_TIMEOUT`] and [`MAX_ANSWER_BYTES`]), because a surface a same-user
+//! process can reach is a surface that must not be able to spend mush's heap,
+//! threads or patience.
 //!
 //! The protocol is newline-delimited JSON: one request and one response per
 //! line. Every request carries an `id` (any JSON value, echoed verbatim), and
@@ -68,6 +69,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// of the line is read and thrown away — constant memory however long the
 /// client keeps talking, and the connection's next line is a fresh request.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// The ceiling on one answer line: the most the server may send, and what the
+/// CLI reads an answer under.
+///
+/// The answer to a `read` is the whole transcript, as long as the transcript
+/// is, and a client cannot bound a line it did not choose: a process that binds
+/// a free `.mush/mush.sock` and answers with an endless stream would spend the
+/// CLI's heap by the stream's size (finding R15). 16 MiB is the ceiling the
+/// tree already trusts for one model request (`agent.rs`'s `MAX_REQUEST_BYTES`),
+/// and a transcript past it is read in windows with `since`, not in one line:
+/// the server replaces an answer past the ceiling with a refusal naming it,
+/// and the CLI refuses to read a line past it.
+const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many connections the surface serves at once.
 ///
@@ -458,6 +472,61 @@ fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Li
     }
 }
 
+/// Read the one answer line, holding at most `cap` bytes of it.
+///
+/// [`read_line_capped`] is the server's reader: it drains past the cap so the
+/// *connection* can go on to its next request. The CLI has one answer to read
+/// and never reuses the connection, so a line past the cap ends here — the
+/// socket goes with the refusal instead of draining a stream the cap has
+/// already refused. The cap is the protocol's own answer ceiling
+/// ([`MAX_ANSWER_BYTES`]): without it, a process that binds a free
+/// `.mush/mush.sock` and answers with an endless stream grows the CLI's heap
+/// by the stream's size, and no bound the CLI set for itself is a size (finding
+/// R15). A read a signal interrupts is retried here too (finding R13); a read
+/// that times out is the sender's own window ([`ASK_TIMEOUT`], the socket's
+/// read timeout) running out, not the sender closing.
+fn read_answer_capped(reader: &mut impl BufRead, cap: usize) -> Result<String, String> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(format!(
+                    "no answer from mush within {}",
+                    bound_words(ASK_TIMEOUT)
+                ))
+            }
+            Err(error) => return Err(format!("no answer from mush: {error}")),
+        };
+        if chunk.is_empty() {
+            if line.is_empty() {
+                return Err("mush closed the connection without an answer".to_string());
+            }
+            break;
+        }
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let piece = match newline {
+            Some(at) => &chunk[..at],
+            None => chunk,
+        };
+        if line.len() + piece.len() > cap {
+            return Err(format!("the answer from mush is longer than {cap} bytes"));
+        }
+        let piece_len = piece.len();
+        line.extend_from_slice(piece);
+        let took_newline = newline.is_some();
+        reader.consume(piece_len + usize::from(took_newline));
+        if took_newline {
+            break;
+        }
+    }
+    String::from_utf8(line).map_err(|_| "no answer from mush: it is not UTF-8 text".to_string())
+}
+
 /// What the bytes of a finished line are: a line, a line too long, or not text
 /// at all.
 fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
@@ -506,12 +575,33 @@ fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
             Ok(Line::Gone) => return,
             Err(_) => return,
         };
-        let mut out = response.encode();
+        let mut out = encode_answer(response);
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() || writer.flush().is_err() {
             return;
         }
     }
+}
+
+/// One answer as the line the server writes, under [`MAX_ANSWER_BYTES`].
+///
+/// A line no client is allowed to read is a line the server may not send, so
+/// an answer past the ceiling is replaced by a refusal that names the ceiling
+/// and the way out (finding R15); the client's own reader would stop at the
+/// same number, so sending it would only be a longer way to the same refusal.
+/// The refusal is a few dozen bytes and cannot itself be past the ceiling.
+fn encode_answer(response: Response) -> String {
+    let out = response.encode();
+    if out.len() <= MAX_ANSWER_BYTES {
+        return out;
+    }
+    Response::error(
+        response.id,
+        ReplyError::too_large(format!(
+            "the answer is longer than {MAX_ANSWER_BYTES} bytes — read a smaller window with `since`"
+        )),
+    )
+    .encode()
 }
 
 /// Turn one line into a response: parse it, hand the request to the UI thread,
@@ -555,7 +645,10 @@ fn peer_label(stream: &UnixStream) -> String {
 /// The name is asked what it is before the connect ([`a_socket_holds`]): a
 /// name that is not a socket is refused with a sentence, never followed, where
 /// `mush read`/`edit --send` would otherwise answer from — and steer — whoever
-/// the name points at (finding IN8). The connect is bounded before anything
+/// the name points at (finding IN8). The answer is read under the protocol's
+/// own ceiling ([`MAX_ANSWER_BYTES`]): a line past it is refused with the
+/// ceiling named, where an unbounded `read_line` would grow the CLI's heap by
+/// a stranger's stream (finding R15). The connect is bounded before anything
 /// else ([`CONNECT_TIMEOUT`] here, shorter in a test): a listener whose accept
 /// queue never drains is its own sentence, not a hang and not the same lie.
 pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
@@ -604,10 +697,7 @@ fn ask_with(dir: &Path, request: &Request, bound: Duration) -> Result<Response, 
         .and_then(|()| writer.flush())
         .map_err(|error| format!("could not send the request: {error}"))?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| format!("no answer from mush: {error}"))?;
+    let line = read_answer_capped(&mut reader, MAX_ANSWER_BYTES)?;
     if line.trim().is_empty() {
         return Err("mush closed the connection without an answer".to_string());
     }
@@ -844,6 +934,19 @@ impl ReplyError {
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self {
             kind: "unavailable".to_string(),
+            message: Some(message.into()),
+            revision: None,
+        }
+    }
+
+    /// The answer mush computed is longer than one line may carry
+    /// ([`MAX_ANSWER_BYTES`]). `bad_request` would tell a client to fix a
+    /// request that was fine and `unavailable` would promise a retry of the
+    /// same request the surface cannot answer; the message carries the one
+    /// thing the client can act on — a smaller `read`.
+    pub fn too_large(message: impl Into<String>) -> Self {
+        Self {
+            kind: "too_large".to_string(),
             message: Some(message.into()),
             revision: None,
         }
@@ -1514,6 +1617,86 @@ mod tests {
             Line::Text(line) => assert_eq!(line, r#"{"id":1,"op":"agents"}"#),
             other => panic!("an interrupted read is retried, not a close: {other:?}"),
         }
+    }
+
+    /// A line no client may read is a line the server may not send: an answer
+    /// past the protocol's ceiling is replaced, before the write, by a refusal
+    /// naming the ceiling and the way out — `bad_request` and `unavailable`
+    /// would both be lies about a request that was fine (finding R15).
+    #[test]
+    fn an_answer_past_the_ceiling_is_replaced_by_a_naming_refusal() {
+        let root = Scratch::new("attach-answer-cap");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let socket = socket_path(&root);
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+
+        // The answer the ceiling is for: `read` is the one op whose answer is
+        // the size of the transcript, and this transcript is past 16 MiB.
+        writeln!(client, r#"{{"id":1,"op":"read","agent":0,"since":0}}"#).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                reply
+                    .send(Response::ok(
+                        request.id,
+                        json!({"lines": [{"line": 0, "text": "x".repeat(MAX_ANSWER_BYTES)}]}),
+                    ))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        match decode(line.trim_end()).unwrap().reply {
+            Reply::Err(error) => {
+                assert_eq!(error.kind, "too_large", "the kind is its own");
+                let message = error.message.expect("the refusal carries a message");
+                assert!(
+                    message.contains(&MAX_ANSWER_BYTES.to_string()),
+                    "the ceiling is named: {message}"
+                );
+                assert!(message.contains("since"), "and the way out: {message}");
+            }
+            Reply::Ok(body) => panic!("an answer past the ceiling was sent: {body}"),
+        }
+        drop(reader);
+        drop(client);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The CLI's own ceiling: a process that binds a free `.mush/mush.sock`
+    /// and answers with an endless stream cannot grow the CLI past
+    /// [`MAX_ANSWER_BYTES`] — the read stops at the ceiling, the socket goes
+    /// with the refusal, and the refusal names the ceiling (finding R15).
+    #[test]
+    fn the_cli_refuses_an_answer_past_the_ceiling() {
+        let root = Scratch::new("attach-answer-stranger");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let listener = UnixListener::bind(socket_path(&root)).unwrap();
+        let stranger = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // A JSON line that never ends until the reader stops taking it.
+            if stream.write_all(b"{\"id\":1,\"ok\":\"").is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 1024 * 1024];
+            while stream.write_all(&chunk).is_ok() {}
+        });
+        let request = Request {
+            id: json!(1),
+            op: Op::Agents,
+        };
+        let error = ask(&root, &request).unwrap_err();
+        assert!(
+            error.contains(&MAX_ANSWER_BYTES.to_string()),
+            "the refusal names the ceiling: {error}"
+        );
+        stranger.join().unwrap();
     }
 
     /// The cap is on the line, not near it: exactly `cap` bytes are a line and
