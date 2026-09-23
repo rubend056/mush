@@ -742,7 +742,8 @@ and two readers — no drift.
 It found `R14`–`R20`. Confirmed: the doubled `absorb` paragraph (`R1`) was still
 there then, adjacent above the one loop; `Session::load_from` delegates to
 `read_from` (one parse, one absent/unreadable decision) and the `.bak` name has
-one home (`first_backup`, whose path is returned rather than re-derived); no
+one home, `workspace::backup_name` (since `0348028`), which answers the next free
+name beside the file and leaves each caller its own rename and its own reason; no
 notice string is spelled twice (`NOTHING_TO_COMPACT` is one const at both sites,
 the isolation `reason` is one `Option<String>` rendered for two readers, the
 session line is built once in `main`); the three notices take two doors on
