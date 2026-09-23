@@ -22,7 +22,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 
 use mush_core::secrets::scrub;
 use mush_core::workspace::{tail_for_model, truncate_for_model};
@@ -205,18 +205,27 @@ impl Job for Running {
 
 /// A command's output file, removed when it is dropped.
 ///
-/// `NamedTempFile` picks the name and creates it exclusively, so a guessable
-/// name in a shared temp directory can never redirect or read what a command
-/// prints — the property the hand-rolled counter and `0600` tried to buy. It is
-/// named (rather than an O_TMPFILE handle) because the child has to inherit a
-/// path it can write to.
+/// `NamedTempFile` picks the name and creates it exclusively, so a name another
+/// process guessed can never redirect or read what a command prints — the
+/// property the hand-rolled counter and `0600` tried to buy. It is named
+/// (rather than an O_TMPFILE handle) because the child has to inherit a path it
+/// can write to — and the name carries the pid of the mush it belongs to
+/// (`mush-cmd-<pid>-<random>-<kind>`), which is what lets a later start tell a
+/// dead mush's leftovers from a live one's and reap the first
+/// ([`reap_dead_scratch`]).
 struct Scratch {
     file: NamedTempFile,
 }
 
+/// What every scratch file's name starts with, before the owning mush's pid.
+const SCRATCH_PREFIX: &str = "mush-cmd-";
+
 impl Scratch {
     fn new(kind: &str) -> Result<Self, String> {
-        NamedTempFile::with_prefix(format!("mush-cmd-{kind}-"))
+        Builder::new()
+            .prefix(&format!("{SCRATCH_PREFIX}{}-", std::process::id()))
+            .suffix(&format!("-{kind}"))
+            .tempfile()
             .map(|file| Self { file })
             .map_err(|error| format!("cannot create a scratch file: {error}"))
     }
@@ -261,6 +270,64 @@ impl Scratch {
             .metadata()
             .map(|meta| meta.len())
             .unwrap_or(0)
+    }
+}
+
+/// Reap the scratch files a mush that is gone left behind.
+///
+/// A `NamedTempFile` is removed by `Drop` and by nothing else, and a mush that
+/// dies without unwinding runs no `Drop` — a killed mush (finding E1), or any
+/// exit that skips destructors — so the pair stays where it was, with the
+/// orphaned command still writing into it and no watcher left to cap it
+/// (finding E5). The name carries the pid of the mush that owned the file, so a
+/// start can ask the kernel which mushes are alive and reap only a dead one's:
+/// never a live mush's pair, on any workspace or on none.
+///
+/// The files live in the temp directory rather than under `.mush/`, which mush
+/// also owns, because they are *process* scratch and not workspace state: they
+/// exist for as long as one command runs, they hold what that command printed,
+/// and a workspace is a place the file tools, the search and the model's own
+/// tree read. Under `.mush/` a command's output would become part of what the
+/// tools can open and replace, and a store road that pruned or rewrote an
+/// unknown entry could unlink a file a *live* command is writing — the readers
+/// reopen by path, so their answer would be an empty window. The temp directory
+/// is also where these files already were; the pid in the name is the only
+/// change a stranger needs to reap them.
+pub fn reap_dead_scratch() {
+    let dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // A name from before the pid was in it (or anything else): not ours to
+        // judge, and a live mush of an older build could still be writing one.
+        let Some(rest) = name.strip_prefix(SCRATCH_PREFIX) else {
+            continue;
+        };
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        // `from_raw` refuses 0 and negatives: `kill(0)` is the caller's own
+        // process group, and no mush ever wrote a name like that.
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            continue;
+        };
+        // `test_kill` is the question "could this pid be signalled": `Ok` and
+        // `EPERM` both mean the process exists (the second is one that is not
+        // ours to signal), and only `ESRCH` means nobody is there. A pid that a
+        // dead mush once held and an unrelated process now holds reads as
+        // alive, which leaves a file behind — the safe direction.
+        match rustix::process::test_kill_process(pid) {
+            Ok(()) | Err(rustix::io::Errno::PERM) => continue,
+            Err(_) => {}
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -589,5 +656,68 @@ mod tests {
             "the command's PATH is the human's"
         );
         assert_eq!(end, End::Exited(0), "printenv found PATH");
+    }
+
+    /// The name is the contract a later start reaps by: the pid of the mush
+    /// that owns the file, the stream it carries, and the temp directory the
+    /// reaper sweeps (finding E5).
+    #[test]
+    fn a_scratch_file_is_named_after_the_mush_that_owns_it() {
+        let scratch = super::Scratch::new("out").unwrap();
+        let path = scratch.file.path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("mush-cmd-{}-", std::process::id())),
+            "the owning mush is in the name: {name}"
+        );
+        assert!(name.ends_with("-out"), "and so is the stream: {name}");
+        assert_eq!(
+            path.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the sweep and the file agree on the directory"
+        );
+    }
+
+    /// A start reaps a dead mush's pair — the road a SIGTERM'ed mush's own
+    /// files leave — and never touches a live mush's, or a name it cannot read
+    /// a pid out of (finding E5).
+    #[test]
+    fn a_start_reaps_a_dead_mushs_scratch() {
+        // A pid that is really gone: a child of this test, waited for.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let live = std::process::id();
+        let names = [
+            format!("mush-cmd-{dead}-aaaaaa-out"),
+            format!("mush-cmd-{dead}-bbbbbb-err"),
+            format!("mush-cmd-{live}-cccccc-out"),
+            format!("mush-cmd-{live}-dddddd-err"),
+            // The old shape, without a pid: a live mush of an older build could
+            // still be writing one, so the reaper does not guess.
+            "mush-cmd-out-legacy".to_string(),
+        ];
+        let paths: Vec<std::path::PathBuf> = names
+            .iter()
+            .map(|name| std::env::temp_dir().join(name))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"scratch").unwrap();
+        }
+
+        super::reap_dead_scratch();
+
+        assert!(
+            !paths[0].exists() && !paths[1].exists(),
+            "the dead mush's pair is gone"
+        );
+        assert!(
+            paths[2].exists() && paths[3].exists(),
+            "the live pair is untouched"
+        );
+        assert!(paths[4].exists(), "a name without a pid is not guessed at");
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

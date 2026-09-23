@@ -476,6 +476,19 @@ def scenario_sigterm(binary: str, root: pathlib.Path) -> bool:
         time.sleep(0.1)
 
     stored = session.read_text() if session.exists() else ""
+    # The killed mush's own scratch pair: whether its exit removed them or not,
+    # the next start must not leave a dead mush's pair behind (finding E5 — the
+    # name carries the pid, so a start can reap the dead and never a live one).
+    leftovers = sorted(pathlib.Path("/tmp").glob(f"mush-cmd-{tui.proc.pid}-*"))
+    # No more requests will be answered, and the endpoint thread must be gone
+    # before the next fork: forking a process that already has threads is a
+    # known CPython deadlock hazard (the cancel scenario's comment).
+    listener.close()
+    time.sleep(0.1)
+    reopened = Tui(binary, root, rows=24, cols=100, env_extra=env)
+    reopened.pump(1.5)
+    reopened_code = reopened.close()
+    still_there = [path for path in leftovers if path.exists()]
     results = [
         check(
             "the debounce had not written the answer yet",
@@ -492,6 +505,11 @@ def scenario_sigterm(binary: str, root: pathlib.Path) -> bool:
         check("the marker was never created", not marker.exists()),
         check("the exit flush wrote the answer", message in stored),
         check("the attach socket is gone", not socket_path.exists()),
+        check(
+            "the next start reaps the killed mush's scratch pair",
+            not still_there and reopened_code == 0,
+            f"{len(leftovers)} file(s), {len(still_there)} left after a start",
+        ),
     ]
     if not all(results):
         print(tui.tail())

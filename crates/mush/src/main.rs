@@ -878,6 +878,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     // conversations would erase each other in turn. A refused start leaves the
     // store exactly as it found it (see `lock`).
     let _lock = lock::acquire(workspace.root())?;
+    // A mush that died without unwinding left its commands' scratch files in the
+    // temp directory, with an orphan still writing into them and no watcher left
+    // to cap it (finding E5). The names carry the pid that owned each pair, so a
+    // start can reap the dead and never a live mush's — this one included.
+    machine::reap_dead_scratch();
     // A mush that is signalled ends through the same road `Ctrl-Q` takes — the
     // exit flush, `kill_all`, the writer's join, the socket's removal — instead
     // of dying raw with every process group it started still running (finding
