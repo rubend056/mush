@@ -188,7 +188,7 @@ delegation tool, and three that manage what an agent started:
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush/wt`, the isolated children's own checkout directory; capped at `LIST_LIMIT` names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
-| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
+| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group, started at `nice` 10 (§5.6); 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title?`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
@@ -892,6 +892,16 @@ still refused, because two claims to own the machine is the one thing the lock
 prevents. The lock itself: `crates/mush/src/jobs.rs` and `lock.rs`. Where the
 human sees jobs beyond the `⚙N` their owner's row already wears is `[OPEN]`
 (§11).
+
+**4. Every command mush runs is a guest.** Every child mush starts — a
+`run_command`, a `detach: true` job, a foreground call handed to the registry —
+is set to `nice` 10 right after it spawns (`CHILD_NICE` in
+`crates/mush/src/machine.rs`): lower priority than everything the human's own
+shell starts, so an agent's build queues behind their editor instead of ahead of
+it. The setting is a courtesy, not a precondition — a command that cannot be
+niced still runs — and a mush that was itself started below 10 (under `nice`)
+leaves its children at that even lower priority. 19 is the least urgent Linux
+allows; the constant is the one place to change it.
 
 ---
 
