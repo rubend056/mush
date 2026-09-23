@@ -155,7 +155,7 @@ and "there is a mailbox / transcript / cancel flag for N" cannot disagree.
 pub struct AgentTree { nodes: Vec<AgentNode>, index: HashMap<AgentId, usize>, cursor: usize, focused: AgentId, .. }
 
 impl AgentTree {
-    fn reserve_ids(&mut self, floor: u64);                       // leftovers raise the floor  (B1)
+    fn reserve_agents(&mut self, floor: u64);                      // leftovers raise the floor  (B1)
     fn insert(&mut self, ev: Spawned) -> &mut AgentNode;         // ids validated, not parsed
     fn begin(&mut self, id: AgentId, cancel: Arc<AtomicBool>);   // Running: clears the summary (B14)
     fn activity(&mut self, id: AgentId, label: impl Into<String>); // Status: ignored after Done/Failed (B5)
@@ -441,7 +441,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | A17 | `openai` alias sends the key to the LAN default | `Provider::parse` (aliases removed) |
 | A18 | git test hardcodes `master` | `git` test `init_repo` |
 | A19 | DNS resolution unbounded | `http::resolve_bounded` runs the lookup on its own thread and bounds the wait at 10 s on the `Clock`, so a hung resolver is a `TimedOut` naming the host |
-| B1 | leftover worktree id collides with a fresh child | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
+| B1 | leftover worktree id collides with a fresh child | `AgentTree::reserve_agents` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
 | B2 | `mask_key` slices on a byte boundary | core `text::mask_key` (3.6) |
 | B3 | zero-row pane still focusable | `App::below_floor` (`app/mod.rs`) refuses every intent but `Quit`, and `ui::draw` paints one notice below `min` — one `is_below_floor` predicate both read |
 | B4 | at 40×10 the only transcript row is a blank | `Chat::body` trims trailing blank separators before windowing (`trim_trailing_blanks`) |
