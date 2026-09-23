@@ -547,11 +547,11 @@ fn help_text() -> String {
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
          \x20                      nothing yet, so this changes no behaviour today\n\
          \x20   --print-config     Print the resolved config (endpoint, provider, the stored\n\
-         \x20                      session, model, window and whether it was stated,\n\
-         \x20                      temperature, reasoning effort and thinking mode, reply-cap\n\
-         \x20                      size and name, the schemas it reserves and the history\n\
-         \x20                      budget they leave, key masked, auto-approve and theme)\n\
-         \x20                      and exit 0\n\n\
+         \x20                      session, model and whether it can see, window and whether\n\
+         \x20                      it was stated, temperature, reasoning effort and thinking\n\
+         \x20                      mode, reply-cap size and name, the schemas it reserves and\n\
+         \x20                      the history budget they leave, key masked, auto-approve\n\
+         \x20                      and theme) and exit 0\n\n\
          KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
@@ -720,6 +720,24 @@ fn describe(
     } else {
         mush_core::text::sanitize(&config.model)
     };
+    // The image gate: whether the model in force may be sent a picture is the
+    // one *capability* a request can be refused for, and it lives only in the
+    // provider table — a human pasting a screenshot at a custom endpoint used
+    // to learn it from the refusal, having spent the gesture (finding C12).
+    // The answer comes from the same function the three gate sites ask
+    // (`mush_core::provider::vision_capable`), so the dump cannot advertise a
+    // picture the run would refuse, and the model it names is the one the gate
+    // reads, defanged the way the model row defangs it.
+    let vision = if mush_core::provider::vision_capable(&config.model) {
+        "yes — image parts are sent".to_string()
+    } else if config.model.is_empty() {
+        "no — no model yet".to_string()
+    } else {
+        format!(
+            "no — the table does not document image parts for {}",
+            mush_core::text::sanitize(&config.model)
+        )
+    };
     // The window is the one fact whose *source* matters, and a number can come
     // by four roads: the human, mush's own table, the endpoint's model list, the
     // endpoint's refusal. Each is named in words by [`WindowSource::words`],
@@ -778,6 +796,9 @@ fn describe(
         // window may all have come from this layer.
         ("session".to_string(), session_layer),
         ("model".to_string(), model),
+        // Under the model it is a fact about: the gate's answer and the id it
+        // was asked about cannot be read as being about two different models.
+        ("vision".to_string(), vision),
         (
             "window".to_string(),
             format!("{} tokens ({window})", config.context_tokens),
@@ -1666,6 +1687,53 @@ mod tests {
         };
         assert_eq!(field("reasoning"), "high (the provider's default)");
         assert_eq!(field("thinking"), "on (the provider's default)");
+    }
+
+    /// The dump answers the image gate, not only the request knobs: whether
+    /// the model in force may be sent a picture is the one *capability* a
+    /// request can be refused for, and it lived only in the provider table —
+    /// a human pasting a screenshot learned it by spending the gesture
+    /// (finding C12). The answer is read through the same function the gate
+    /// asks, so the dump cannot promise an image the run would drop.
+    #[test]
+    fn the_dump_answers_the_image_gate() {
+        let vision = |model: &str| {
+            let cfg = Config::new("http://host:1", model, None);
+            describe(
+                &cfg,
+                false,
+                &session::Stored::Absent,
+                &[],
+                None,
+                &theme::Theme::default(),
+            )
+            .into_iter()
+            .find(|(field, _)| field == "vision")
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("no `vision` row for `{model}`"))
+        };
+        // The table's one row that documents vision, and a model it does not
+        // name: both directions of the gate the request will meet.
+        assert_eq!(
+            vision("deepseek-flash"),
+            "yes \u{2014} image parts are sent"
+        );
+        assert_eq!(
+            vision("deepseek-v4-pro"),
+            "no \u{2014} the table does not document image parts for deepseek-v4-pro"
+        );
+        assert_eq!(vision(""), "no \u{2014} no model yet");
+        // The row's model is the one the gate reads, and it is defanged like
+        // the model row: an endpoint-chosen id on its way to a terminal.
+        assert_eq!(
+            vision("vendor/deepseek-flash"),
+            "yes \u{2014} image parts are sent",
+            "the gate strips a prefix; the dump asks the same function"
+        );
+        // `--help` names the row, so a human knows the dump answers the
+        // question before they paste.
+        let help = help_text();
+        assert!(help.contains("whether it can see"), "{help}");
     }
 
     /// The theme row says what a window would look like: the hue, the form the
