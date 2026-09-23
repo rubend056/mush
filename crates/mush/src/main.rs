@@ -40,6 +40,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
+use mush_core::config::WindowSource;
 use mush_core::text::mask_key;
 use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
 use serde_json::Value;
@@ -720,10 +721,16 @@ fn describe(
     } else {
         mush_core::text::sanitize(&config.model)
     };
-    let window = if config.context_explicit {
-        "stated"
-    } else {
-        "assumed from the model or the provider"
+    // The window is the one fact whose *source* matters, and a number can come
+    // by four roads: the human, mush's own table, the endpoint's model list, the
+    // endpoint's refusal. Each is named in words here — the meter has one
+    // display column for the same fact ([`crate::app::window_mark`]), so this
+    // dump carries the sentence.
+    let window = match config.context_source {
+        WindowSource::Stated => "stated by the human",
+        WindowSource::Table => "assumed from mush's model table",
+        WindowSource::Advertised => "advertised by the endpoint's model list",
+        WindowSource::Complaint => "named by the endpoint in a refusal",
     };
     let cap = if config.uses_max_completion_tokens() {
         "max_completion_tokens"
@@ -1579,7 +1586,7 @@ mod tests {
         // The id itself, not the facts line's `model @ endpoint`: the endpoint
         // is a row of its own two lines above.
         assert_eq!(field("model"), "deepseek-v4-pro");
-        assert_eq!(field("window"), "64000 tokens (stated)");
+        assert_eq!(field("window"), "64000 tokens (stated by the human)");
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
         assert_eq!(field("reasoning"), "max (stated)");
         assert_eq!(field("thinking"), "off (stated)");
@@ -1627,7 +1634,7 @@ mod tests {
         assert_eq!(field("model"), "no model");
         assert_eq!(
             field("window"),
-            "8192 tokens (assumed from the model or the provider)"
+            "8192 tokens (assumed from mush's model table)"
         );
         assert_eq!(field("temperature"), "1.0");
         // Nothing stated: the two knobs report the provider default they will
@@ -1735,6 +1742,62 @@ mod tests {
         );
     }
 
+    /// The human's live report: two mush sessions on one config painted `~1M`
+    /// and `~500k` in the `ctx` line, and nothing in the frame or in
+    /// `--print-config` could say which road each number had taken — the `~`
+    /// meant only "the human stated none". An unstated window arrives by three
+    /// roads (mush's model table, the endpoint's model list, the endpoint's
+    /// refusal) and a stated one is a fourth; each is named, by the meter's
+    /// one-column mark ([`crate::app::window_mark`], which `context_label` and
+    /// `context_meter` both paint) and by `--print-config`'s words.
+    #[test]
+    fn each_road_a_window_came_by_is_named_in_the_meter_and_in_print_config() {
+        for (source, mark, words) in [
+            (WindowSource::Stated, "", "stated by the human"),
+            (WindowSource::Table, "~", "assumed from mush's model table"),
+            (
+                WindowSource::Advertised,
+                "≈",
+                "advertised by the endpoint's model list",
+            ),
+            (
+                WindowSource::Complaint,
+                "≤",
+                "named by the endpoint in a refusal",
+            ),
+        ] {
+            let mut config = Config::new("http://127.0.0.1:1", "m", None);
+            config.context_source = source;
+            let lines = describe(
+                &config,
+                false,
+                &session::Stored::Absent,
+                &[],
+                None,
+                &theme::Theme::default(),
+            );
+            let window = lines
+                .iter()
+                .find(|(field, _)| field == "window")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("no `window` line for {source:?}"));
+            assert_eq!(
+                window,
+                format!("{} tokens ({words})", config.context_tokens),
+                "{source:?}: the dump names the road"
+            );
+            assert_eq!(
+                crate::app::window_mark(source),
+                mark,
+                "{source:?}: the mark the meter paints"
+            );
+            assert!(
+                mark.chars().count() <= 1,
+                "{mark:?} takes more than the one display column the meter has"
+            );
+        }
+    }
+
     /// The session the shipped DeepSeek defaults describe, as `--print-config`
     /// spells it: the window the human asked for, and a reply cap a quarter of
     /// it under the name every endpoint documents — not the 20_480 a real run
@@ -1745,7 +1808,7 @@ mod tests {
         let mut config = Config::new("https://api.deepseek.com", "", None);
         config.provider = config::Provider::DeepSeek;
         config.rederive_context();
-        assert!(!config.context_explicit, "a default, not a statement");
+        assert!(!config.context_explicit(), "a default, not a statement");
 
         let lines = describe(
             &config,
@@ -1764,7 +1827,7 @@ mod tests {
         };
         assert_eq!(
             field("window"),
-            "120000 tokens (assumed from the model or the provider)"
+            "120000 tokens (assumed from mush's model table)"
         );
         assert_eq!(
             field("reply cap"),

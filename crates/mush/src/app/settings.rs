@@ -8,15 +8,24 @@
 //!
 //! The invariant: every write to one of the copies goes through one of this
 //! module's functions, never by hand at the site that happened to learn
-//! something; and a window mush did not get from the human is written in
-//! exactly two places, both running the same policy in [`believable`] —
-//! [`ConfigCell::learn_context`], which is the UI adopting a number an actor
-//! announced, and [`ConfigHandle::learn_context`], which is an actor adopting
-//! what the endpoint said and which `AgentCtx` always announces as an event in
-//! the same call. Nothing else can write one, so "the UI shows a window the
-//! actor does not have" is not a state this module can reach. (The one way the
-//! copies can still differ is a thread that panicked while holding the cell;
-//! see `ConfigHandle::adopt`.)
+//! something. A window mush did not get from the human is written in exactly
+//! one place — the handle's private `ConfigHandle::learn_window` — by both
+//! roads: [`ConfigCell::learn_context`], which is the UI adopting a number an
+//! actor announced, and [`ConfigHandle::learn_context`], which is an actor
+//! adopting what the endpoint said. Both run the one policy in [`believable`],
+//! against the copy in force, and the UI's plain copy is then read back from
+//! the shared cell *whatever the answer* — the number and the road it came
+//! by — taken, both hold the new window; refused, both hold the window in
+//! force — so a learn decision cannot leave the two apart. (Finding D21: the
+//! UI used to judge an announced number against its own frame-cached copy, so a
+//! handle that had already learned a smaller window left the UI refusing a
+//! number that was already in force.)
+//!
+//! The handle takes the announcement as an argument
+//! ([`ConfigHandle::learn_context`]) and calls it exactly when the number
+//! landed, so a caller cannot learn a window the UI never hears about. (The one
+//! way the copies can still differ is a thread that panicked while holding the
+//! cell; see `ConfigHandle::adopt`.)
 //!
 //! Two faces, one cell: the UI thread holds a [`ConfigCell`] — a plain copy to
 //! read on every frame, and the shared cell to write through — and an actor is
@@ -25,6 +34,7 @@
 
 use std::sync::{Arc, Mutex};
 
+pub use mush_core::config::WindowSource;
 use mush_core::Config;
 
 /// What a request fails with when another thread panicked while holding the
@@ -32,27 +42,24 @@ use mush_core::Config;
 /// thing about the same failure.
 const POISONED: &str = "shared configuration poisoned";
 
-/// Where a window mush did not get from the human came from.
-///
-/// A number means the same thing whoever said it; how far it is to be trusted
-/// does not. `/v1/models` states the window as a field, so it is taken as
-/// given; a *complaint* is prose mush parses out of a refusal body, so it has
-/// to look plausible against the window in use as well — otherwise a rate-limit
-/// body would teach mush that the endpoint has ten tokens (finding A3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowSource {
-    /// The endpoint's model list named it for the model in use.
-    Advertised,
-    /// The endpoint named it in a refusal.
-    Complaint,
-}
-
 /// Whether a window from `source` is worth adopting, against the one in use.
 ///
 /// The one policy both faces of the cell run, so the UI cannot accept a number
-/// an actor refused, or the other way round.
+/// an actor refused, or the other way round. A number means the same thing
+/// whoever said it; how far it is to be trusted does not: `/v1/models` states
+/// the window as a field, so it is taken as given; a *complaint* is prose mush
+/// parses out of a refusal body, so it has to look plausible against the window
+/// in use as well — otherwise a rate-limit body would teach mush that the
+/// endpoint has ten tokens (finding A3).
+///
+/// The other two roads are not learnable numbers at all. `Stated` is the
+/// human's own: it outranks discovery, and a caller that already holds it has
+/// nothing to adopt. `Table` is mush's own assumption filling a silence — the
+/// number [`Config::rederive_context`] writes — not a fact an endpoint taught,
+/// so no learn call carries it.
 fn believable(in_use: usize, tokens: usize, source: WindowSource) -> bool {
     match source {
+        WindowSource::Stated | WindowSource::Table => false,
         WindowSource::Advertised => true,
         // A complaint is only taken when it shrinks the window without
         // collapsing it.
@@ -118,20 +125,32 @@ impl ConfigCell {
     /// Adopt a window the endpoint named, on the same terms as the actor that
     /// announced it.
     ///
+    /// The judgement and the write happen in the shared cell — the copy every
+    /// request is built from — and the UI's own copy is then read back from it
+    /// whatever the answer, the road included: the mark the meter paints is a
+    /// fact about the number in force, so it cannot lag it. Judging against the
+    /// frame-cached copy instead was a strand: an actor's handle can have
+    /// learned a window the UI has not heard about yet, and the UI then refused
+    /// a number that was already in force (finding D21).
+    ///
     /// Returns whether anything changed. A window the human stated is never
     /// touched, and an implausible complaint is refused — by the shared cell as
     /// well, so the two sides cannot disagree about a number.
     pub fn learn_context(&mut self, tokens: usize, source: WindowSource) -> bool {
-        if !believable(self.ui.context_tokens, tokens, source) {
-            return false;
-        }
         // The clamp, the refusal of a stated window and "nothing changed" are
-        // all `adopt_context`'s; only the trust policy above is this module's.
-        if !self.ui.adopt_context(tokens) {
-            return false;
+        // all `adopt_context`'s; the trust policy is `learn_window`'s. A
+        // poisoned cell is another thread's panic: the UI keeps its own copy,
+        // so the answer is the same "not taken" the actor would get.
+        let learned = self.shared.learn_window(tokens, source).unwrap_or(false);
+        // Read the resulting window back into the UI's copy, whatever the
+        // answer: the shared cell is the copy in force, so this is what makes
+        // "the UI shows a window the actor does not have" unreachable by a
+        // decision of either side.
+        if let Ok(cfg) = self.shared.config() {
+            self.ui.context_tokens = cfg.context_tokens;
+            self.ui.context_source = cfg.context_source;
         }
-        self.shared.adopt(&self.ui);
-        true
+        learned
     }
 
     /// Point the cell at another tree's cell, keeping the configuration the UI
@@ -152,9 +171,10 @@ impl ConfigCell {
 ///
 /// Deliberately narrower than the cell it points at: no setter, no raw lock.
 /// An actor that wanted to change the endpoint is not a thing mush has, and one
-/// that learns the window must go through [`ConfigHandle::learn_context`], whose
-/// caller announces the number (see `AgentCtx::learn_context` in `agent.rs`) so
-/// the UI hears about it instead of a mutex write nobody watches.
+/// that learns the window must go through [`ConfigHandle::learn_context`], which
+/// takes the announcement as its argument and calls it exactly when the number
+/// landed (see `AgentCtx::learn_context` in `agent.rs`) so the UI hears about it
+/// instead of a mutex write nobody watches.
 #[derive(Clone)]
 pub struct ConfigHandle {
     shared: Arc<Mutex<Config>>,
@@ -179,18 +199,41 @@ impl ConfigHandle {
     }
 
     /// Adopt a window the endpoint named: the width this tree measures its next
-    /// request against, and — announced by the caller — the number the UI
+    /// request against, and — announced by `announce` — the number the UI
     /// shows.
+    ///
+    /// `announce` is called exactly when the number landed, and it is an
+    /// argument rather than a convention because the raw write below is
+    /// private: a caller that learns a window and does not tell the UI is the
+    /// state finding D21 stranded the screen in. The one caller,
+    /// `AgentCtx::learn_context`, passes the event itself.
     ///
     /// `Ok(false)` is a number that was not worth taking: the human stated a
     /// window, or a complaint looked implausible. A caller reads that as "the
     /// endpoint said nothing usable", not as a failure.
-    pub fn learn_context(&self, tokens: usize, source: WindowSource) -> Result<bool, String> {
+    pub fn learn_context(
+        &self,
+        tokens: usize,
+        source: WindowSource,
+        announce: impl FnOnce(),
+    ) -> Result<bool, String> {
+        let learned = self.learn_window(tokens, source)?;
+        if learned {
+            announce();
+        }
+        Ok(learned)
+    }
+
+    /// The one raw write of a window into the shared cell, private on purpose:
+    /// every actor's road to the cell goes through [`Self::learn_context`],
+    /// which is what makes the announcement impossible to forget (finding
+    /// D21).
+    fn learn_window(&self, tokens: usize, source: WindowSource) -> Result<bool, String> {
         let mut shared = self.shared.lock().map_err(|_| POISONED.to_string())?;
         if !believable(shared.context_tokens, tokens, source) {
             return Ok(false);
         }
-        Ok(shared.adopt_context(tokens))
+        Ok(shared.adopt_context(tokens, source))
     }
 
     /// Copy a whole configuration in. Private on purpose: the only writer of a
@@ -219,6 +262,13 @@ impl ConfigHandle {
 mod tests {
     use super::{believable, ConfigCell, ConfigHandle, WindowSource};
     use mush_core::Config;
+
+    /// The handle's call the way `AgentCtx` makes it, minus the event: these
+    /// tests have no tree to tell, and `learn_context` takes the announcement
+    /// as the caller's.
+    fn learn(handle: &ConfigHandle, tokens: usize, source: WindowSource) -> Result<bool, String> {
+        handle.learn_context(tokens, source, || {})
+    }
 
     fn cell() -> ConfigCell {
         let mut cfg = Config::new("http://127.0.0.1:1", "a-model", None);
@@ -258,6 +308,12 @@ mod tests {
         );
         assert_eq!(cell.ui().context_tokens, 64_000);
         assert_eq!(cell.handle().config().unwrap().context_tokens, 64_000);
+        assert_eq!(cell.ui().context_source, WindowSource::Advertised);
+        assert_eq!(
+            cell.handle().config().unwrap().context_source,
+            WindowSource::Advertised,
+            "the road travels with the number, on both sides"
+        );
         assert!(
             !cell.learn_context(64_000, WindowSource::Advertised),
             "learning the number twice changes nothing"
@@ -306,6 +362,7 @@ mod tests {
         assert!(!cell.learn_context(16_000, WindowSource::Complaint));
         assert_eq!(cell.ui().context_tokens, 32_768);
         assert_eq!(cell.handle().config().unwrap().context_tokens, 32_768);
+        assert_eq!(cell.ui().context_source, WindowSource::Stated);
     }
 
     /// The trust policy is one function, and it is the shape a complaint is
@@ -326,6 +383,14 @@ mod tests {
             believable(128_000, 10, WindowSource::Advertised),
             "a model list is a field, not prose: it is taken as stated (and clamped)"
         );
+        assert!(
+            !believable(128_000, 200_000, WindowSource::Stated),
+            "the human's own number is not a learnable one"
+        );
+        assert!(
+            !believable(128_000, 200_000, WindowSource::Table),
+            "mush's own assumption is not a fact an endpoint taught"
+        );
     }
 
     /// The handle an actor is given writes a window and nothing else; a
@@ -335,24 +400,58 @@ mod tests {
         // A tree's cell as an endpoint's model list would have left it: 128k,
         // learned and not stated.
         let handle = ConfigHandle::own(Config::new("http://127.0.0.1:1", "m", None));
-        assert!(handle
-            .learn_context(128_000, WindowSource::Advertised)
-            .expect("an unpoisoned cell"));
+        assert!(learn(&handle, 128_000, WindowSource::Advertised).expect("an unpoisoned cell"));
 
         assert!(
-            !handle
-                .learn_context(10, WindowSource::Complaint)
-                .expect("an unpoisoned cell"),
+            !learn(&handle, 10, WindowSource::Complaint).expect("an unpoisoned cell"),
             "an implausible complaint is refused"
         );
         assert_eq!(handle.config().unwrap().context_tokens, 128_000);
         assert!(
-            handle
-                .learn_context(32_000, WindowSource::Complaint)
-                .expect("an unpoisoned cell"),
+            learn(&handle, 32_000, WindowSource::Complaint).expect("an unpoisoned cell"),
             "a plausible one is taken"
         );
         assert_eq!(handle.config().unwrap().context_tokens, 32_000);
+    }
+
+    /// Finding D21: the two copies cannot be left apart by a learn decision of
+    /// either side.
+    ///
+    /// The audit's probe built this state: the shared cell had learned 16_000
+    /// through a handle (an actor adopting a complaint) while the UI's copy
+    /// still showed 128_000, and the UI's next learn was judged against its own
+    /// stale copy — where a 4_000 complaint is implausible, 32× smaller than
+    /// 128k — and refused, leaving the bar and the tool caps reading one window
+    /// while every request used another. After the fix the judgement happens
+    /// against the copy in force, and whatever the answer the UI's copy is read
+    /// back from it.
+    #[test]
+    fn the_two_copies_agree_or_the_number_is_refused() {
+        let mut cell = cell();
+        let handle = cell.handle();
+        assert_eq!(cell.ui().context_tokens, 128_000, "the UI's own copy");
+
+        // An actor's handle learns first, the way a complaint on a request
+        // does; the UI has not heard about it yet.
+        assert!(learn(&handle, 16_000, WindowSource::Complaint).unwrap());
+        assert_eq!(handle.config().unwrap().context_tokens, 16_000);
+        assert_eq!(cell.ui().context_tokens, 128_000, "the stale UI copy");
+
+        // The number the probe's UI was refused: plausible against the 16k in
+        // force, implausible against the UI's stale 128k.
+        assert!(cell.learn_context(4_000, WindowSource::Complaint));
+        assert_eq!(cell.ui().context_tokens, 4_000, "the UI adopted it");
+        assert_eq!(
+            handle.config().unwrap().context_tokens,
+            4_000,
+            "and the actors read the same number"
+        );
+
+        // A number the cell in force refuses — a complaint that would grow the
+        // window — leaves both copies on the window in force.
+        assert!(!cell.learn_context(200_000, WindowSource::Complaint));
+        assert_eq!(cell.ui().context_tokens, 4_000);
+        assert_eq!(handle.config().unwrap().context_tokens, 4_000);
     }
 
     /// Ctrl-N replaces the tree: the fresh root gets the configuration in

@@ -418,6 +418,11 @@ impl Landed {
 pub struct AgentNode {
     pub id: AgentId,
     pub parent: Option<AgentId>,
+    /// Where this agent was *spawned*: the depth its system prompt is written
+    /// against, and the `MAX_DEPTH` spawn limit reads it (`agent.rs`). It is not
+    /// the indent its row wears — a node whose parent is no longer in the tree
+    /// is painted as a top-level row, and the indent comes from
+    /// [`AgentTree::painted_depth`] (finding D9).
     pub depth: usize,
     pub brief: String,
     /// The name the caller gave this agent, if it gave one: what the row
@@ -538,6 +543,23 @@ pub struct Roster {
     /// are its own, the same unit its row's `⏸N` mark counts: a grandchild's
     /// work is its own parent's to wait for.
     pub waiting: usize,
+}
+
+/// The row a nudge displaced: the phase it was wearing and the clock that
+/// phase was running on, kept together because putting the row back "exactly as
+/// it was" is both.
+///
+/// A nudge rewrites the phase to `thinking…` and restarts the clock, so a
+/// delivery that fails has to restore the pair: writing the phase back alone
+/// left the row wearing `waiting on results` with `0s` beside it, and a failed
+/// nudge is no news about how long the agent had been waiting (finding B10,
+/// refactor R66).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replaced {
+    /// The phase the row wore before the nudge.
+    pub phase: Phase,
+    /// The instant that phase began: the age the row painted.
+    pub since: Instant,
 }
 
 /// A child actor that now exists, as its parent reported it: everything the
@@ -901,12 +923,22 @@ impl AgentTree {
     /// refusing a nudge that would recreate the reclaimed path as a plain
     /// directory (finding S1). `landed` is stored, so a restart comes back with
     /// the same row rather than reviving an agent whose worktree is gone.
+    ///
+    /// The stat goes with the branch it described: `agent_stats` holds a
+    /// `+3−1` of the *branch's* diff, the row paints it beside the branch name
+    /// and the pane title sums every value in the map, so a reclaimed worktree
+    /// that kept its entry left the row saying `+3−1` and the title summing a
+    /// branch that is gone — the fresh map is installed before the sweep
+    /// decides, which is the defect the audit's probe caught (finding D8). One
+    /// removal, because the tree owns the map: the row and the title are two
+    /// readers of the same key.
     pub fn mark_reclaimed(&mut self, id: AgentId, landed: Landed) {
         if let Some(node) = self.node_mut(id) {
             node.landed = Some(landed);
             node.branch = None;
             node.kept = None;
         }
+        self.agent_stats.remove(&id);
     }
 
     /// What the last reclamation sweep found at this agent's worktree: the reason
@@ -971,6 +1003,13 @@ impl AgentTree {
     /// was doing is still in the transcript, where every tool call writes an
     /// `⚙` line.
     ///
+    /// A `⊘` is refused the same way, for the human's sake rather than the
+    /// fold's: `⊘ cancelling…` is their own keystroke's feedback on the row they
+    /// are watching, and a label in the actor's hand when a Stop crossed it in
+    /// flight must not erase it. Letting the label win would also make the
+    /// stale-cancel backstop never fire, because [`Self::expire_cancels`] only
+    /// retires a phase still `Cancelling` (finding D10).
+    ///
     /// The label lasts until the next label, or until the model's next turn
     /// ([`Self::thinking`]): a tool that has finished is not what the row
     /// should say while the model is being asked again.
@@ -979,7 +1018,7 @@ impl AgentTree {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            if node.phase.compacting().is_some() {
+            if node.phase.compacting().is_some() || matches!(node.phase, Phase::Cancelling) {
                 return;
             }
             node.phase = Phase::Activity(label.into());
@@ -997,9 +1036,12 @@ impl AgentTree {
     ///
     /// The guards are [`Self::activity`]'s, each for its own reason: only a run
     /// in flight can report it (a late or duplicated event must not put a
-    /// finished agent back to work — finding B5), and a fold is never replaced
-    /// by it (the run behind a *parked* fold keeps announcing its phases, and
-    /// the request the human is waiting for outranks them). `since` restarts,
+    /// finished agent back to work — finding B5), a fold is never replaced by
+    /// it (the run behind a *parked* fold keeps announcing its phases, and the
+    /// request the human is waiting for outranks them), and the `⊘` goes the
+    /// same way: the cancel the human just asked for outranks the model's next
+    /// turn too, and erasing it would leave the stale-cancel backstop nothing
+    /// to retire (finding D10). `since` restarts,
     /// so the age the pane paints is the age of *this* request — not of the
     /// tool that finished before it.
     pub fn thinking(&mut self, id: AgentId) {
@@ -1007,7 +1049,7 @@ impl AgentTree {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            if node.phase.compacting().is_some() {
+            if node.phase.compacting().is_some() || matches!(node.phase, Phase::Cancelling) {
                 return;
             }
             node.phase = Phase::Thinking;
@@ -1259,18 +1301,22 @@ impl AgentTree {
     }
 
     /// A nudge is on its way: the row shows the agent thinking. Returns the
-    /// phase it replaced, so a delivery that fails can put it back (B10).
+    /// phase it replaced and the clock that phase was running on — the row as it
+    /// was — so a delivery that fails can put both back (B10, R66).
     ///
     /// A fold is not replaced by it: the words land after the summarize call,
     /// not instead of it, and a row that started saying `thinking…` while the
     /// fold is still on the wire is the same lie the fold phase exists to stop.
     /// The run the nudge starts announces itself with `Running` when it does
     /// start.
-    pub fn nudge(&mut self, id: AgentId) -> Option<Phase> {
-        let previous = self.node(id).map(|node| node.phase.clone());
+    pub fn nudge(&mut self, id: AgentId) -> Option<Replaced> {
+        let previous = self.node(id).map(|node| Replaced {
+            phase: node.phase.clone(),
+            since: node.since,
+        });
         if previous
             .as_ref()
-            .is_some_and(|phase| phase.compacting().is_some())
+            .is_some_and(|was| was.phase.compacting().is_some())
         {
             return previous;
         }
@@ -1285,9 +1331,15 @@ impl AgentTree {
     /// leaving a `thinking…` on an agent nothing is running is a lie, and
     /// rewriting it to some other phase loses what the agent had achieved
     /// (finding B10).
-    pub fn nudge_failed(&mut self, id: AgentId, was: Option<Phase>) {
+    ///
+    /// The clock is part of "exactly as it was": [`Self::nudge`] started a new
+    /// one for the phase it showed, and the phase alone is not the row — a
+    /// `waiting on results 4m` written back without its `since` reads `0s`, as
+    /// if the agent had just begun to wait (refactor R66).
+    pub fn nudge_failed(&mut self, id: AgentId, was: Option<Replaced>) {
         if let (Some(node), Some(was)) = (self.node_mut(id), was) {
-            node.phase = was;
+            node.phase = was.phase;
+            node.since = was.since;
         }
     }
 
@@ -1505,10 +1557,19 @@ impl AgentTree {
     /// The focus and the cursor are put back on a node that is really there:
     /// reaping used to leave them on a ghost, so the pane stayed titled
     /// `agent #4` while typing reported that the agent was gone (finding B11).
+    ///
+    /// The cursor is a *node*, not the index it sat at: [`Self::past_history`]
+    /// drops the oldest rows, which are the rows *above* the cursor, so a cursor
+    /// held by index silently slides onto a different agent with no keystroke —
+    /// 51 finished children, ten `j`s and a reap moved it from `#10` to `#11`
+    /// (finding D7). The id the cursor named before the retain is the thing to
+    /// point it back at ([`Self::point_cursor_at`]), and the clamp in
+    /// [`Self::repair_focus`] is only for the case that agent went too.
     pub fn reap(&mut self, gone: &[AgentId]) {
         if gone.is_empty() {
             return;
         }
+        let named = self.cursor_id();
         self.agents.retain(|node| !gone.contains(&node.id));
         for id in gone {
             // Dropping the last sender ends the actor: an idle agent whose
@@ -1517,7 +1578,12 @@ impl AgentTree {
             self.agent_cancel.remove(id);
             self.agent_stats.remove(id);
         }
-        self.repair_focus();
+        // Point the cursor back at the agent it named, whenever that agent is
+        // still here; the clamp is the fallback for a cursor whose agent went
+        // with the reap, not the rule.
+        if !named.is_some_and(|id| self.point_cursor_at(id)) {
+            self.repair_focus();
+        }
     }
 
     /// Point the focus and the cursor at nodes that exist.
@@ -1579,6 +1645,31 @@ impl AgentTree {
     /// The parent this node hangs under, when that parent is still in the tree.
     fn parent_in_tree(&self, node: &AgentNode) -> Option<AgentId> {
         node.parent.filter(|parent| self.has(*parent))
+    }
+
+    /// The depth this node's row is *painted* at: zero for a row whose parent
+    /// is not in the tree — a leftover worktree, an agent whose parent the
+    /// history window forgot — and one more than its painted parent's
+    /// otherwise.
+    ///
+    /// [`AgentNode::depth`] is where the agent was *spawned*, and it stays that
+    /// because the actor's system prompt and the spawn limit read it
+    /// (`agent.rs`). But [`Self::rows`] has always ordered a parentless row at
+    /// the top level, so the indent has to be derived from the painted chain
+    /// too: an orphan that kept its stored depth was painted five columns in
+    /// over a `#1` row that was not on screen, while the row above it sat at
+    /// the top level — the painted order and the painted indent two spellings
+    /// of the nesting (finding D9).
+    ///
+    /// The walk is up the same parent links [`Self::rows`] orders by, and spawn
+    /// depth is bounded by `MAX_DEPTH = 3`, so asking this per row is cheap.
+    pub fn painted_depth(&self, node: &AgentNode) -> usize {
+        match self.parent_in_tree(node) {
+            None => 0,
+            Some(parent) => self
+                .node(parent)
+                .map_or(0, |parent| self.painted_depth(parent) + 1),
+        }
     }
 
     /// `agents[index]` and then its subtree, in spawn order among siblings —
@@ -2489,15 +2580,19 @@ mod tests {
         assert_eq!(tree.node(AgentId::ROOT).unwrap().summary, None);
     }
 
-    /// A nudge that cannot be delivered puts the row back exactly as it was,
-    /// instead of leaving a `thinking…` on an agent nothing is running
-    /// (finding B10).
+    /// A nudge that cannot be delivered puts the row back exactly as it was —
+    /// phase *and* clock: a phase written back without its `since` is the same
+    /// row freshly restarted, so a row that said `waiting on results 4m` came
+    /// back saying `0s` (finding B10, refactor R66).
     #[test]
-    fn a_nudge_that_cannot_be_delivered_restores_the_previous_phase() {
+    fn a_nudge_that_cannot_be_delivered_restores_the_previous_phase_and_its_clock() {
         let mut tree = AgentTree::bare();
         let (opened, _rx) = child(&mut tree, 1);
         let id = opened.id;
         tree.finish(id, Some("did the work".to_string()));
+        // The row has been at rest for four minutes: the clock is part of what
+        // the row says, and a failed nudge must not restart it.
+        tree.age(id, Duration::from_secs(240));
         // The actor is gone: its mailbox went with it, so the nudge cannot land.
         tree.agent_tx.remove(&id);
 
@@ -2507,10 +2602,19 @@ mod tests {
             Phase::Thinking,
             "a nudge on its way shows immediately"
         );
+        assert!(
+            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(1),
+            "and the clock it shows is the nudge's"
+        );
 
         tree.nudge_failed(id, was);
         let node = tree.node(id).unwrap();
         assert_eq!(node.phase, Phase::Done, "the ✓ is not rewritten");
+        assert!(
+            node.since.elapsed() >= Duration::from_secs(240),
+            "nor is its clock reset: the row came back as `0s` where it said `4m`: {:?}",
+            node.since.elapsed()
+        );
         assert_eq!(
             node.summary.as_deref(),
             Some("did the work"),
@@ -2568,6 +2672,79 @@ mod tests {
         assert_eq!(tree.cursor(), tree.agents.len().saturating_sub(1));
         assert!(!tree.agent_tx.contains_key(&gone));
         assert!(!tree.agent_stats.contains_key(&gone));
+    }
+
+    /// The cursor names an agent, not a row index: [`AgentTree::past_history`]
+    /// drops the *oldest* rows — the ones above the cursor — so a reap that kept
+    /// the index would silently move the selection to a different agent with no
+    /// keystroke (finding D7).
+    ///
+    /// The audit's probe: fifty-one finished children, ten `j`s and a reap read
+    /// `cursor index=10 before=Some(AgentId(10)) after=Some(AgentId(11))`.
+    #[test]
+    fn reaping_keeps_the_cursor_on_the_agent_it_named() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=51).map(|id| finished(&mut tree, id)).collect();
+        for _ in 0..10 {
+            tree.move_cursor(1);
+        }
+        let before = tree.cursor_id();
+        assert_eq!(before, Some(AgentId(10)), "ten rows down from the root");
+
+        let gone = tree.past_history();
+        assert_eq!(gone, vec![AgentId(1)], "the row above the cursor goes");
+        tree.reap(&gone);
+
+        assert_eq!(
+            tree.cursor_id(),
+            before,
+            "the cursor still names the agent it named: before={before:?} after={:?}",
+            tree.cursor_id()
+        );
+    }
+
+    /// A reclaimed worktree's stat described a branch that no longer exists:
+    /// the row kept painting `+3−1` and the pane title kept summing it, because
+    /// the stat stayed in `agent_stats` after [`AgentTree::mark_reclaimed`]
+    /// cleared the branch (finding D8).
+    ///
+    /// The audit's probe — a fresh stat map installed before the sweep decides,
+    /// so the worktree the same `adopt_git` reclaims leaves its figure behind —
+    /// read `["│   ✓ #1 port  mush/1 +3−1  did it     │"]` before and
+    /// `["│   ✓ #1 port  +3−1  did it            │"]` after.
+    #[test]
+    fn a_reclaimed_worktree_leaves_no_branch_stat() {
+        let mut tree = AgentTree::bare();
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "port".to_string(),
+            depth: 1,
+            branch: Some("mush/1".to_string()),
+            fork: None,
+            cmd: tx,
+        });
+        tree.agent_stats.insert(
+            AgentId(1),
+            git::Stat {
+                files: 1,
+                added: 3,
+                removed: 1,
+            },
+        );
+
+        tree.mark_reclaimed(AgentId(1), Landed::Merged);
+
+        let node = tree.node(AgentId(1)).unwrap();
+        assert_eq!(node.branch, None, "the branch went with the checkout");
+        assert_eq!(node.landed, Some(Landed::Merged));
+        assert_eq!(node.kept, None);
+        assert!(
+            !tree.agent_stats.contains_key(&AgentId(1)),
+            "and the stat went with the branch it described, or the row and the title keep summing a branch that is gone: {:?}",
+            tree.agent_stats
+        );
     }
 
     /// A finished child of the root: at rest, with a result its parent has read
@@ -2977,6 +3154,58 @@ mod tests {
         tree.finish(id, Some("did the thing".into()));
         assert_eq!(tree.node(id).unwrap().phase, Phase::Done);
         assert!(!tree.busy());
+    }
+
+    /// `⊘ cancelling…` is the human's own keystroke's feedback on the row they
+    /// are watching: a tool label or a thinking event arriving in the window
+    /// between the actor's check and its emit must not erase it — and erasing
+    /// it would also leave the stale-cancel backstop nothing to retire,
+    /// because [`AgentTree::expire_cancels`] only finds a phase still
+    /// `Cancelling` (finding D10).
+    ///
+    /// The audit's probe: after Ctrl-C set `Cancelling`, one
+    /// `activity(id, "edit_file src/a.rs")` became
+    /// `Activity("edit_file src/a.rs")`, one `thinking(id)` became `Thinking`,
+    /// and `expire_cancels()` then returned false.
+    #[test]
+    fn a_status_never_erases_the_cancelling_mark() {
+        let mut tree = AgentTree::bare();
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
+
+        assert!(!tree.cancel_requested(id), "a live mailbox hears the Stop");
+        let asked_at = tree.node(id).unwrap().since;
+
+        tree.activity(id, "edit_file src/a.rs");
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Cancelling,
+            "a tool label must not erase the cancel the human just asked for"
+        );
+        assert_eq!(
+            tree.node(id).unwrap().since,
+            asked_at,
+            "nor restart the clock the ⊘ is spinning on"
+        );
+
+        tree.thinking(id);
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Cancelling,
+            "and the model's next turn must not either"
+        );
+        assert_eq!(
+            tree.node(id).unwrap().since,
+            asked_at,
+            "the ⊘ still spins on the cancel's own clock"
+        );
+
+        // And the mark a status could not erase is still the live one the
+        // backstop retires: a phase that changed underneath would leave
+        // `⊘ cancelling…` spinning forever.
+        tree.age(id, Duration::from_secs(11));
+        assert!(tree.expire_cancels());
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Idle);
     }
 
     /// A cancel the actor never acknowledges goes quiet rather than spinning
