@@ -1344,6 +1344,9 @@ transitions.
   `python3`, though they do need `git`, and one scenario waits on a real shell
   sleep. `scripts/mock_llm.py` is kept for hand-driven runs; no test and no
   script refers to it.
+- **Blind reads.** The tree has been read end to end by six blind audits and four
+  blind duplication passes — the reader knowing the code and not the findings —
+  and their findings are written down in `docs/findings.md` §8.51 and §8.70.
 - **Live.** Four `#[ignore]`d tests keep the default suite green offline: two
 talk to the configured endpoint (the model list and the shipped reply cap), one
 makes a TLS handshake against `https://api.deepseek.com` (no key, so a 401 is
