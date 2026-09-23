@@ -155,6 +155,35 @@ impl NoticeKind {
     }
 }
 
+/// How every report the restore writes about the stored rows it refused opens
+/// (`App::vet_stored_agents`): the single-row line (`could not restore agent
+/// #7 …`) and the aggregate one (`could not restore 3 rows …`) share the
+/// phrase — and so do the lines older versions wrote, which is what
+/// [`is_restore_report`] has to catch on the way back in.
+const RESTORE_REPORT: &str = "could not restore ";
+
+/// Whether a notice is the restore's own report of a stored row it refused,
+/// rather than a fact about the workspace.
+///
+/// A refused row is a reading of `.mush/session.json` — what *this open* made
+/// of the file — and every open re-derives it from the same bytes, so it must
+/// not become the root's durable failure: written to the session, it would
+/// come back as a fact about a workspace nothing has changed about, and a file
+/// the human had repaired would still be accused by it. The line is said at the
+/// open that refused the row (`App::stored_row_skipped`) and ends with that
+/// open.
+///
+/// A line an older version already wrote is caught by the same predicate, so
+/// the legacy shape does not survive a load either. The distinction from the
+/// *unreadable* session — whose notice stays stored — is what each line is
+/// about: a file mush could not parse is a one-time event that names where the
+/// human's conversation went, while a row the restore refused is a sentence
+/// about a state the tree may no longer hold, said again at every open that
+/// reads the file.
+pub(crate) fn is_restore_report(text: &str) -> bool {
+    text.starts_with(RESTORE_REPORT)
+}
+
 /// Who said one line of a transcript.
 ///
 /// A conversation is not only the human's words: a child's pane opens with the
@@ -1583,10 +1612,15 @@ impl Chat {
     /// failures, oldest first. The information lines are deliberately absent —
     /// they answered a command in a moment that is over, and a restored
     /// `git diff HEAD...mush/2` would name a worktree nobody is looking at.
+    ///
+    /// The restore's own report of a skipped row is absent too, and for the
+    /// opposite reason: it is a reading of the file, not a fact of the
+    /// workspace ([`is_restore_report`]).
     pub fn stored_notices(&self) -> Vec<session::StoredNotice> {
         self.notices
             .iter()
             .filter(|notice| notice.kind == NoticeKind::Error)
+            .filter(|notice| !is_restore_report(&notice.text))
             .map(|notice| session::StoredNotice {
                 agent: notice.agent.0,
                 at: notice.at,
@@ -1598,9 +1632,21 @@ impl Chat {
     /// Adopt the failures of a previous process. They are older than anything
     /// this process can write, so they go in front and the oldest-first order
     /// of [`Self::notices_for`] holds without sorting.
+    ///
+    /// A stored report of a skipped row is the one line dropped on the way in:
+    /// the open that reads the file re-derives it — or does not, if the file
+    /// was fixed — and a line about a state the tree does not hold must not be
+    /// painted from a file that only remembers saying it
+    /// ([`is_restore_report`], and `App::stored_row_skipped` for the saying
+    /// road). An unreadable session keeps its stored line: that notice names a
+    /// *file* mush could not read, which is a one-time event, not a reading of
+    /// one.
     pub fn restore_notices(&mut self, stored: Vec<session::StoredNotice>) {
         let mut restored: Vec<Notice> = Vec::new();
         for notice in stored {
+            if is_restore_report(&notice.text) {
+                continue;
+            }
             // One failure per agent, the newest: two would disagree about which
             // of them is current, exactly as two live ones would, and a file
             // written by hand (or by another version) is not a reason to paint

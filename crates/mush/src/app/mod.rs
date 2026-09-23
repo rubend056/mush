@@ -404,6 +404,33 @@ fn chain_depths(links: &HashMap<u64, Option<u64>>, held: &HashSet<u64>) -> HashM
     depths
 }
 
+/// The one line mush says about the stored rows the restore refused, or `None`
+/// when it refused none.
+///
+/// Every row the file lost is named, because the file is the only place the
+/// human can find it again, and the reason rides with its id, because a hand
+/// edit that broke the file is what they have to repair. One row keeps the
+/// sentence the road has always written; several are named under their count,
+/// because a notice is one line per agent — the root's pane keeps the newest —
+/// so a line per row would leave only the last one readable, which is how `#98`
+/// was read on a bar while other rows had gone the same way.
+fn restore_report(file: &str, refused: &[(u64, &'static str)]) -> Option<String> {
+    match refused {
+        [] => None,
+        [(id, why)] => Some(format!(
+            "could not restore agent #{id} in {file} — {why}; the row was skipped"
+        )),
+        rows => Some(format!(
+            "could not restore {} rows in {file} — {}; the rows were skipped",
+            rows.len(),
+            rows.iter()
+                .map(|(id, why)| format!("#{id}: {why}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+    }
+}
+
 /// What a restored row's phase and summary mean in the books' vocabulary: the
 /// outcome a parent's `status`/`wait` should report for a child the tree
 /// brought back (finding H25).
@@ -1041,12 +1068,12 @@ impl App {
     /// `.mush/wt/<id>` checkout whatever the row said. The reservation is
     /// saturated, and skipped where it saturates: a row at the ceiling has no
     /// floor above it, and pinning the counter there would hand the next draw a
-    /// number it cannot pass. One bad row is refused and reported; the rows
-    /// after it still restore, because a file is not all-or-nothing.
+    /// number it cannot pass. One bad row is refused and reported in one line;
+    /// the rows after it still restore, because a file is not all-or-nothing.
     fn vet_stored_agents(
         &mut self,
         stored: Vec<session::AgentSession>,
-    ) -> (Vec<session::AgentSession>, Vec<String>) {
+    ) -> (Vec<session::AgentSession>, Option<String>) {
         let file = self.ws.rel(&session::session_path(self.ws.root()));
         for agent in &stored {
             let floor = agent.id.saturating_add(1);
@@ -1106,13 +1133,7 @@ impl App {
             .map(|(_, agent)| agent)
             .collect();
         accepted.sort_by_key(|agent| depths[&agent.id]);
-        let refused = skipped
-            .into_iter()
-            .map(|(id, why)| {
-                format!("could not restore agent #{id} in {file} — {why}; the row was skipped")
-            })
-            .collect();
-        (accepted, refused)
+        (accepted, restore_report(&file, &skipped))
     }
 
     /// Adopt the subagents of the previous conversation: their nodes, their
@@ -1132,8 +1153,8 @@ impl App {
             return;
         }
         let (stored, refused) = self.vet_stored_agents(stored);
-        for line in refused {
-            self.stored_unreadable(line);
+        if let Some(line) = refused {
+            self.stored_row_skipped(line);
         }
         let cfg = self.cell.handle();
         let ui_tx = self.ui_tx.clone();
@@ -2468,9 +2489,7 @@ impl App {
     /// A stored layer this process was handed could not be read, and the human
     /// has to hear it before they mistake the empty screen for an empty world:
     /// this workspace's conversation (finding S3), or the machine-global home
-    /// config whose key and settings the run is going without (finding C3). A
-    /// stored *row* the restore refuses is said through the same door for the
-    /// same reason (finding C9).
+    /// config whose key and settings the run is going without (finding C3).
     ///
     /// It takes the two homes a failure takes: the root pane's foot — wrapped
     /// to the pane, ranked `Alert`, read back whole by `/notes` — and the bar's
@@ -2485,9 +2504,32 @@ impl App {
     /// path, the reason and where the only copy went — and they take the same
     /// three homes [`Self::fail_for`] gives a run's own failure, so the two
     /// cannot drift about what a failure does (refactor R19).
+    ///
+    /// A stored *row* the restore refused is not this: that line is a reading
+    /// of the file this open made, and it goes through
+    /// [`Self::stored_row_skipped`], which leaves the store alone.
     pub fn stored_unreadable(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.fail_for(AgentId::ROOT, text.clone(), Some(text));
+    }
+
+    /// A stored row the restore refused, said at the open that refused it — and
+    /// said only there.
+    ///
+    /// It takes the two homes a failure takes: the root pane's foot, ranked
+    /// `Alert` and read back whole by `/notes`, and the bar's line one, because
+    /// a row is work the human had, and losing it in silence is the one thing
+    /// this line exists to prevent. What it does *not* take is
+    /// [`Self::stored_unreadable`]'s third home: no failure is ever written to
+    /// the session and nothing marks it dirty, so the file the line complains
+    /// about is not made to carry the complaint. [`chat::is_restore_report`] is
+    /// the predicate the saving and loading roads share, and the reason beside
+    /// it: the next open reads the same bytes and re-derives the refusal — or
+    /// does not, if the human has repaired the file — while a stored failure is
+    /// a fact about the workspace that outlives the process.
+    fn stored_row_skipped(&mut self, text: String) {
+        self.chat.note_error_for(AgentId::ROOT, text.clone());
+        self.fail(text);
     }
 
     /// A failure, in the three places one outlives the moment: the durable
@@ -7799,9 +7841,9 @@ mod tests {
     /// A loop in the file's own links is the one shape the tree cannot paint: a
     /// parent that *is* in the tree is not an orphan, so nothing breaks the
     /// loop — `AgentTree::painted_depth` walks the parent links, and these two
-    /// point at each other. The rows in the loop are refused; a row hanging
-    /// *off* the loop is not in one — its chain ends at a refused row — and
-    /// comes back as the orphan that refusal leaves it.
+    /// point at each other. The rows in the loop are refused and named in one
+    /// line; a row hanging *off* the loop is not in one — its chain ends at a
+    /// refused row — and comes back as the orphan that refusal leaves it.
     #[test]
     fn a_parent_link_that_leads_back_to_the_row_is_refused() {
         let root = repo("restored-cycle");
@@ -7821,6 +7863,19 @@ mod tests {
         assert!(
             app.tree.parent_gone(seven),
             "and it is the orphan its refused parent leaves it"
+        );
+        let line = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .expect("the refusal is said")
+            .text
+            .clone();
+        assert!(line.contains("2 rows"), "both loop rows are named: {line}");
+        assert!(
+            line.contains("#5: its parent link leads back to the row")
+                && line.contains("#6: its parent link leads back to the row"),
+            "with the reason that fits them: {line}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7859,8 +7914,7 @@ mod tests {
         );
         let lines: Vec<String> = app
             .chat
-            .stored_notices()
-            .iter()
+            .notices_for(AgentId::ROOT)
             .map(|notice| notice.text.clone())
             .collect();
         assert!(
@@ -7904,8 +7958,7 @@ mod tests {
         );
         let lines: Vec<String> = app
             .chat
-            .stored_notices()
-            .iter()
+            .notices_for(AgentId::ROOT)
             .map(|notice| notice.text.clone())
             .collect();
         assert!(
@@ -7941,13 +7994,171 @@ mod tests {
         );
         let lines: Vec<String> = app
             .chat
-            .stored_notices()
-            .iter()
+            .notices_for(AgentId::ROOT)
             .map(|notice| notice.text.clone())
             .collect();
         assert!(
             lines.iter().any(|line| line.contains("session.json")),
             "the refused row is named: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A row the restore refuses is said at the open that read the file — and
+    /// not written down. The old line was stored as the root's last failure, so
+    /// every later open read it back and said it again about a state the tree no
+    /// longer held, and a file the human repaired kept its accusation. The bar
+    /// and the pane's foot carry it at the open; the save leaves it behind.
+    #[test]
+    fn a_restore_report_is_not_carried_into_the_next_session() {
+        let root = repo("restore-report");
+        let stored = stored_with_rows(vec![
+            (2, Some(0), "first", "the first row's line"),
+            (2, Some(0), "second", "the second row's line"),
+        ]);
+        stored.save(&root).expect("the file the open reads");
+        let writer = Arc::new(session_save::Writer::new(root.to_path_buf(), None).unwrap());
+        let (mut app, _rx) = app_root(&root, Session::load(&root), writer.clone());
+
+        // Said where it happens: the bar carries it without anything being
+        // opened, and the pane's foot holds it whole.
+        assert!(
+            text_of(&app).starts_with("could not restore "),
+            "the bar carries it: {:?}",
+            text_of(&app)
+        );
+        let painted = screen(&mut app, 160, 30).join("\n");
+        assert!(
+            painted.contains("could not restore agent #2"),
+            "and the pane names the row: {painted}"
+        );
+        assert!(
+            painted.contains(".mush/session.json"),
+            "the file too: {painted}"
+        );
+
+        // Not carried: the save writes the file the line complains about
+        // without the complaint in it, and the file never held one — the line is
+        // what this open made of the rows, not something it read back.
+        assert!(
+            Session::load(&root)
+                .expect("the file is there")
+                .notices
+                .is_empty(),
+            "the line is derived, not remembered"
+        );
+        app.flush_session();
+        drop(app);
+        let written = Session::load(&root).expect("the save landed");
+        assert!(
+            written.notices.is_empty(),
+            "no report is stored: {:?}",
+            written.notices
+        );
+
+        // The save also wrote the refused row away — it was never in the tree —
+        // so the repaired file has nothing left to refuse, and the next open
+        // says nothing and invents no notice.
+        let (mut app, _rx) = app_root(&root, Session::load(&root), writer.clone());
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "a repaired file refuses no row"
+        );
+        app.flush_session();
+        drop(app);
+        let reopened = Session::load(&root).expect("the second save landed");
+        assert!(
+            reopened.notices.is_empty(),
+            "and no notice is invented for it: {:?}",
+            reopened.notices
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every row a refusal skipped is named in the one line the pane keeps: a
+    /// notice is one line per agent and the root's pane holds the newest, so the
+    /// old line-per-row left only the last refusal readable — the human read
+    /// `#98` while other rows had gone the same way. One row keeps the sentence
+    /// the road has always written; several share it under their count.
+    #[test]
+    fn the_restore_names_every_row_it_skipped() {
+        let root = repo("restore-report-all");
+        let stored = stored_with_rows(vec![
+            (0, Some(0), "impostor", "IMPOSTOR LINE"),
+            (2, Some(0), "first", "the first row's line"),
+            (2, Some(0), "second", "the second row's line"),
+        ]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        let line = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .expect("the refusals are said")
+            .text
+            .clone();
+        assert!(
+            line.starts_with("could not restore 2 rows in .mush/session.json"),
+            "{line}"
+        );
+        assert!(line.contains("#0: it holds the root's id"), "{line}");
+        assert!(line.contains("#2: its id is already taken"), "{line}");
+        assert!(line.contains("the rows were skipped"), "{line}");
+        assert!(
+            text_of(&app).contains("could not restore 2 rows"),
+            "and the bar carries the same line: {:?}",
+            text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file an older version wrote carries the line *it* stored for a skipped
+    /// row. It is not painted: this open reads the rows and decides for itself,
+    /// and a line naming a state the tree no longer holds is not a fact about
+    /// the workspace. A real failure beside it is untouched — the predicate is
+    /// narrow by its own wording.
+    #[test]
+    fn a_legacy_restore_report_is_not_painted_from_the_file() {
+        let root = repo("legacy-report");
+        let mut stored = stored_with_rows(vec![(2, Some(0), "child", "the child's line")]);
+        stored.notices = vec![
+            session::StoredNotice {
+                agent: 0,
+                at: 1,
+                text: "no route to host".into(),
+            },
+            session::StoredNotice {
+                agent: 0,
+                at: 1_790_182_811,
+                text: "could not restore agent #98 in .mush/session.json — its parent chain \
+                       does not reach the root; the row was skipped"
+                    .into(),
+            },
+        ];
+        let (mut app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        let notes: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["no route to host"],
+            "the failure comes back; the reading of the file does not"
+        );
+        let painted = screen(&mut app, 160, 30).join("\n");
+        assert!(
+            !painted.contains("#98") && !painted.contains("could not restore"),
+            "and nothing names the skipped row: {painted}"
+        );
+        assert!(
+            app.chat
+                .stored_notices()
+                .iter()
+                .all(|notice| !notice.text.contains("could not restore")),
+            "nor is the legacy line handed on to the next session"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
