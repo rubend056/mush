@@ -836,10 +836,18 @@ pub enum Commit {
 /// must be the root of its own working tree; anything else is refused as
 /// "`<dir>` is no longer a worktree" and never commits somewhere up the tree.
 ///
-/// The identity and the message are supplied here (`-c user.name=…`,
-/// `--no-verify`) so a commit does not depend on the human's identity and never
-/// runs their commit hooks. The index is that worktree's own, so a commit here
-/// cannot touch the human's index either.
+/// The identity, the message and the *signature* are supplied here (`-c
+/// user.name=…`, `-c user.email=…`, `-c commit.gpgsign=false`, `--no-verify`),
+/// so a commit does not depend on the human's identity, never runs their
+/// commit hooks, and never signs. Signing is configuration, not a hook, and it
+/// is the one part of the human's git setup a put-away commit cannot inherit: a
+/// machine that signs every commit by default (`commit.gpgsign=true`, in a
+/// config or in the repository) has no key here, so without the flag every
+/// isolated run ended as uncommitted work — the parent read an error instead of
+/// a revision, the worktree was correctly kept for holding it, and the count
+/// that refuses spawns at [`MAX_WORKTREES`] rose by one per child (finding
+/// F2). The index is that worktree's own, so a commit here cannot touch the
+/// human's index either.
 pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
     if !is_its_own_worktree(dir) {
         return Err(format!("{} is no longer a worktree", dir.display()));
@@ -862,6 +870,13 @@ pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
             "user.name=mush",
             "-c",
             "user.email=mush@local",
+            // The one config key a commit must not inherit: a machine that
+            // signs by default fails a commit it cannot sign, and this commit
+            // has no key and no human to ask for one (finding F2). A `-c`
+            // outranks both the repository's and the human's config, so the
+            // signing policy never decides whether a run's work is kept.
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "--no-verify",
             "-qm",
@@ -1221,6 +1236,35 @@ mod tests {
         // With a base branch named, the refusal is git's own.
         assert!(worktree_add(&unborn, 7, Some("HEAD")).is_err());
         let _ = fs::remove_dir_all(&unborn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A put-away commit carries its own identity and its own answer to
+    /// signing: a machine whose git signs every commit by default — and has no
+    /// key to sign with, which is what a missing signer is — must not be able
+    /// to stop a run's work from landing (finding F2).
+    #[test]
+    fn a_signing_config_does_not_stop_the_commit() {
+        let dir = init_repo("gpgsign");
+        run(&dir, &["config", "commit.gpgsign", "true"]).unwrap();
+        // The signer is not there, the shape a machine with no key has.
+        run(&dir, &["config", "gpg.program", "/nonexistent/mush-no-gpg"]).unwrap();
+        let (path, _branch) = worktree_add(&dir, 8, Some("HEAD")).unwrap();
+        fs::write(path.join("work.txt"), "the work\n").unwrap();
+
+        let made = commit_all(&path, "mush #8: port the parser").unwrap();
+        assert!(
+            matches!(made, Commit::Made(_)),
+            "the work is committed, not left behind by a signing config: {made:?}"
+        );
+        assert_eq!(
+            subject_of(&path, "HEAD").as_deref(),
+            Some("mush #8: port the parser")
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "and the worktree is clean afterwards"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
