@@ -1492,7 +1492,34 @@ fn root_actor(
         ids: ids.clone(),
         live: live.clone(),
     });
-    let ws = Workspace::new(&ctx.root).expect("workspace root must exist");
+    let ws = match Workspace::new(&ctx.root) {
+        Ok(ws) => ws,
+        Err(error) => {
+            // The directory mush was opened in is gone — an agent's own
+            // `rm -rf`, or a worktree removed from under the process — and
+            // there is no `Workspace` to resolve a path in. This runs on the
+            // UI thread (`App::new_chat`, the Ctrl-N road), where unwrapping
+            // took the whole process down with the terminal unrestored
+            // (finding A21). The refusal is the honest answer: the new
+            // conversation has no root, every message to it says so plainly
+            // (`App::deliver`'s `root agent is gone`), and the failure itself
+            // is filed where a failure lives. The mailbox is dead, so a send
+            // into it fails instead of queueing into nothing.
+            ctx.emit(
+                AgentId::ROOT.0,
+                AgentEvent::Error(workspace_gone_line(&ctx.root, &error)),
+            );
+            let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+            return RootHandle {
+                tx: cmd_tx,
+                cfg: shared,
+                conversation: conversation.0,
+                ids,
+                live,
+                jobs: registry,
+            };
+        }
+    };
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
     let actor = Actor {
         ctx,
@@ -1603,7 +1630,27 @@ pub fn revive(
         .map(|_| git::worktree_path(&root, id))
         .filter(|path| path.exists());
     let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
-    let ws = Workspace::new(&ws_root).expect("workspace root must exist");
+    let ws = match Workspace::new(&ws_root) {
+        Ok(ws) => ws,
+        Err(error) => {
+            // The one window `live_branch`'s existence check cannot close:
+            // the worktree was there when it was asked and is gone by the time
+            // the workspace is built (a sibling's `git worktree remove` — the
+            // repair mush's own refusal sentence tells a model to run). This
+            // runs on the UI thread (`App::deliver_to_actor`,
+            // `App::restore_agents`), where the old `expect` panicked the
+            // process (finding A21). The command is refused, not lost: the
+            // dead mailbox makes the caller's own send fail, and its refusal
+            // sentence reaches the human — this event says *why* the
+            // workspace could not be built.
+            let sink: Arc<dyn Events> = Arc::new(Ui::new(tx, ConversationId(conversation)));
+            sink.emit(
+                AgentId(id),
+                AgentEvent::Error(workspace_gone_line(&ws_root, &error)),
+            );
+            return dead_mailbox();
+        }
+    };
     let ws_root_str = ws.root_str();
     let ctx = Arc::new(AgentCtx {
         cfg: cfg.clone(),
@@ -1688,6 +1735,24 @@ fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> V
     carried.push(prompt);
     carried.extend(messages);
     adopted(carried)
+}
+
+/// Why an actor could not be built where it was asked to run: the directory is
+/// gone, and a [`Workspace`] is a canonicalized path — there is nothing to
+/// resolve a tool's argument in.
+///
+/// Both callers run on the UI thread — `root_actor` from Ctrl-N (`App::new_chat`),
+/// `revive` from the human's message to a parked child or a session restore —
+/// and both used to `expect("workspace root must exist")` here: a panic that
+/// took the whole process down with the terminal unrestored. The refusal is the
+/// sentence the human needs, because the cause is not something the agent can
+/// work around (finding A21).
+fn workspace_gone_line(root: &Path, error: &std::io::Error) -> String {
+    format!(
+        "cannot start an agent in {}: the directory is gone ({error}) — open mush in a \
+         directory that exists",
+        root.display()
+    )
 }
 
 /// A mailbox nobody is listening on: what a child is given when its caller
@@ -17905,6 +17970,106 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// The two `expect("workspace root must exist")` that used to sit on the UI
+    /// thread refused nothing and killed the process instead: `Workspace::new`
+    /// is `fs::canonicalize`, which fails for a directory that is gone, and
+    /// both of these callers run where a panic takes the terminal down with it
+    /// (finding A21). The unit fact is certain — `Workspace::new` can fail
+    /// here — and the road is a root that is already gone: Ctrl-N over a cwd a
+    /// model's own `rm -rf` removed.
+    #[test]
+    fn a_root_actor_over_a_gone_workspace_refuses_and_files_it() {
+        let root = scratch_dir("root-gone");
+        let _ = fs::remove_dir_all(&root);
+        let events = Recorder::new();
+        let handle = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            Arc::new(Scripted::new()),
+        );
+
+        let errors: Vec<String> = events
+            .events_for(AgentId::ROOT)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Error(why) => Some(why),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "the refusal is filed where a failure lives: {errors:?}"
+        );
+        assert!(
+            errors[0].contains(&root.display().to_string()),
+            "and it names the directory that is gone: {}",
+            errors[0]
+        );
+        assert!(
+            handle.tx.send(AgentMsg::Shutdown).is_err(),
+            "no actor was started: every send into the handle's mailbox fails"
+        );
+    }
+
+    /// The same door for a revival — the audit's suspected race, a worktree
+    /// removed between `live_branch`'s existence check and the workspace
+    /// build. The unit road is a root that is already gone: the revival is
+    /// refused (the dead mailbox fails the caller's own send, whose refusal
+    /// sentence reaches the human) and the reason is filed, where the old
+    /// `expect` panicked the process instead (finding A21).
+    #[test]
+    fn a_revive_over_a_gone_workspace_is_refused_not_panicked() {
+        let root = scratch_dir("revive-gone");
+        let _ = fs::remove_dir_all(&root);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
+        let ids = Ids::default();
+        let clock: Arc<dyn clock::Clock> = Arc::new(clock::System);
+        let handles = TreeHandles {
+            ids: ids.clone(),
+            live: Arc::new(AtomicU64::new(0)),
+            jobs: jobs::Registry::new(clock, events.clone(), ids),
+        };
+
+        let mailbox = revive(
+            handles,
+            test_cfg(),
+            tx,
+            1,
+            root.clone(),
+            ReviveSpec {
+                id: 5,
+                depth: 1,
+                brief: "the brief".to_string(),
+                branch: None,
+                messages: Vec::new(),
+                parent: None,
+            },
+        );
+
+        let error = match rx.try_recv() {
+            Ok(Msg::Agent {
+                id,
+                event: AgentEvent::Error(why),
+                ..
+            }) => {
+                assert_eq!(id, AgentId(5), "the refusal names the agent it refused");
+                why
+            }
+            _ => panic!("expected one refusal event, nothing else"),
+        };
+        assert!(
+            error.contains(&root.display().to_string()),
+            "the sentence names the workspace that is gone: {error}"
+        );
+        assert!(
+            mailbox.send(AgentMsg::Shutdown).is_err(),
+            "there is no actor behind the refused revival"
+        );
     }
 
     /// A named base is the history the child gets: the worktree forks from that
