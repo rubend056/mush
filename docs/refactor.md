@@ -477,7 +477,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | B20 | a child's completion reaches the model but not the screen, and can fold twice | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
 | B21 | a parent in a tool-calling chain never heard its child finish | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
 | B22 | a steering message to a subagent is invisible / an idle target not woken | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
-| B23 | a transient transport failure ends the run instead of being retried | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, transport failures only, each retry announced in the transcript |
+| B23 | a transient transport failure ends the run instead of being retried | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, and only an `Unsent` failure is retried: a dial that never connected, or a write that did not hand the whole request over. Everything after the write is final — an answer, a refusal, a cancellation, a broken frame — and each retry is announced in the transcript (`b6a59c3`, `190886c`) |
 
 ---
 
