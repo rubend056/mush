@@ -65,6 +65,9 @@ Everything can be changed at runtime from the chat — no restart:
 - `/key <secret>` — set the API key. Shown masked, and saved to the home
   config file (never to the workspace).
 - `/models` — refresh the model list for the current endpoint.
+- `/context` — say the window and the road it came by; `/context N` states one
+  for this workspace (remembered in `.mush/session.json`), and `/context auto`
+  drops the statement so the window derives again.
 
 Resolution order on startup: **CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults**. `MUSH_CONTEXT` sets the endpoint's
@@ -192,8 +195,9 @@ not fit is refused before the wire. Nothing goes out over the window.
 | chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript (the select mode's cursor while it is open) · `Esc` clear the box and its attachments |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
 
-Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/compact`,
-`/notes`, `/help`, `/quit` (`mush --help` prints this table and the keys).
+Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/context`,
+`/compact`, `/notes`, `/help`, `/quit` (`mush --help` prints this table and the
+keys).
 
 ## The screen
 
@@ -262,8 +266,10 @@ for an endpoint that accepts the connection and then stalls.
 Every request fits inside the endpoint's window, and the window comes from the
 first of these that knows:
 
-1. **You**: `--context N`, `MUSH_CONTEXT=N`, or a `context` in the home config. A
-   number you state is remembered in `.mush/session.json` and never overruled.
+1. **You**: `--context N`, `MUSH_CONTEXT=N`, a `context` in the home config, or
+   `/context N` in the chat. A number you state is remembered in
+   `.mush/session.json` and never overruled; `/context auto` drops the statement
+   and lets the window derive again.
 2. **The endpoint**, when it advertises one and mush fetched its model list: the
    first of `max_model_len`, `context_length`, `context_window`, `n_ctx` it
    reports, at the top level or under `meta`. Discovery runs when no model was
