@@ -1444,10 +1444,11 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
 ///   and unsafe, and this tree forbids `unsafe`), so spelling `0o644` here
 ///   would be a second guess at a number the kernel already knows — and a wrong
 ///   one on a box that chose `002` or `077`.
-/// - [`Fresh::Private`] — mush's own store: the session file and the
-///   key-bearing home `config.json`, which hold the whole conversation and the
-///   human's secrets. `0o600`, because a human's `022` umask is about the files
-///   the box shares and must not hand mush's private ones to the group.
+/// - [`Fresh::Private`] — mush's own store: the session file, the
+///   `.mush/session.json.previous` copy a new chat keeps beside it, and the
+///   key-bearing home `config.json` — conversations and the human's secrets.
+///   `0o600`, because a human's `022` umask is about the files the box shares
+///   and must not hand mush's private ones to the group.
 ///
 /// One decision in one place: the difference is this match and the reason
 /// beside it, never two copies of `0666 & !umask`.
