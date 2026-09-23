@@ -90,11 +90,35 @@ pub enum Msg {
         status: Option<git::RepoStatus>,
         /// What a sweep found at the worktree of every agent that is *at rest*
         /// and has a branch: the decision, not the deed. The read happens off
-        /// the UI thread because git is subprocesses; the removal it may lead to
-        /// happens on the thread that owns the tree, because only there can
-        /// "this node is not running" and the removal be one decision
+        /// the UI thread because git is subprocesses; the removal it may lead
+        /// to is handed to the sweep worker ([`Msg::Swept`]), which asks the
+        /// tree once more before every `git::reclaim` — "this node is not
+        /// running" is a fact the UI holds and a run can start between the two
         /// (finding H10).
         sweep: Vec<(AgentId, git::Reclaimable)>,
+    },
+    /// The sweep worker asking the tree, once per worktree, whether the node
+    /// that owns it is still at rest: `true` is "take it".
+    ///
+    /// The worker holds no tree and cannot read one, and this is the last
+    /// moment the tree can be asked before the removal — later than the read's
+    /// own at-rest guard, so a node that started running in between keeps its
+    /// worktree (findings H10, F8, S1). The UI answers and never waits: the
+    /// worker blocks on `reply`, exactly as [`Msg::Attach`] hands a socket
+    /// thread its answer.
+    SweepAsk {
+        id: AgentId,
+        reply: Sender<bool>,
+    },
+    /// What the sweep worker did, off the UI thread.
+    ///
+    /// The results are facts about the *repository*, not about the tree that
+    /// asked for them: a sweep that outlives a `Ctrl-N` took (or kept)
+    /// worktrees the next tree finds in the same state, so they are applied to
+    /// whatever rows the ids name now. There is at most one sweep out at a time
+    /// ([`App::start_sweep`]), so two results cannot race each other.
+    Swept {
+        results: Vec<(AgentId, git::Reclaimed)>,
     },
     /// An event from an agent actor. `conversation` identifies the tree that
     /// sent it, so an actor left over from Ctrl-N cannot write into the new
@@ -826,6 +850,10 @@ pub struct App {
     /// (`Msg::Clipboard`), and pressing `Ctrl-V` where the machine has no
     /// reader costs a status line and nothing else.
     write_clipboard: ClipboardWrite,
+    /// The road every worker thread on the UI side is started through, so a
+    /// spawn the OS refuses is answered and not raised ([`WorkerSpawn`]); a
+    /// test replaces it to drive that refusal.
+    worker_spawn: WorkerSpawn,
     /// The agents, their phases, the focus and the per-agent mailboxes,
     /// cancel flags and git stats.
     pub tree: AgentTree,
@@ -846,6 +874,18 @@ pub struct App {
     /// older tree is not one: it is dropped when it lands (finding D26), and
     /// `Ctrl-N` clears this with the tree that started it.
     git_in_flight: bool,
+    /// The sweep's removal worker is out: one `git` process chain per worktree
+    /// (finding R10). One at a time — [`Self::start_sweep`] says why.
+    sweep_in_flight: bool,
+    /// What the UI owes when that worker lands: the start's restore, or a new
+    /// chat's leftover walk. `None` is the ordinary read's sweep, whose only
+    /// work is the row marks the results carry.
+    sweep_owed: Option<SweepOwed>,
+    /// A read proposed a worktree while the sweep worker was out, so the
+    /// removal was not handed over (the same id must not be given to two
+    /// workers). When the worker lands the read is asked again rather than the
+    /// fact being lost.
+    sweep_missed: bool,
     /// The facts the spawn cap asks about this tree's worktrees — each node's
     /// base and fork — published for the actor threads that ask
     /// (`git::unlandable`, from `agent::spawn_tool`). The guard lives as long
@@ -902,6 +942,81 @@ pub(crate) fn window_mark(source: WindowSource) -> &'static str {
         WindowSource::Advertised => "≈",
         WindowSource::Complaint => "≤",
     }
+}
+
+/// How the UI starts a worker thread: `std::thread::Builder`, so a box at its
+/// thread limit is a returned error and not a raised panic.
+///
+/// `std::thread::spawn` panics when the OS refuses a thread — a container's
+/// `pids.max`, a `ulimit -u`, a fork storm — and that panic unwinds the UI
+/// thread, taking the whole TUI down mid-run; every other thread road in this
+/// tree answers the refusal instead (the session writer, the job watcher, the
+/// attach accept loop), and this is the UI's one road to the same contract
+/// (finding R11). Each caller beside a use says what *it* does with the
+/// answer: the flag that must fall so the fact is not frozen for the session,
+/// and the line the human reads.
+///
+/// The road is a function value on [`App`] rather than a bare free function
+/// because a test has to drive a refusal without exhausting the machine's own
+/// threads: replacing it with a refuser asks every caller the question the OS
+/// would ask at the limit, with nothing else on the machine disturbed.
+type WorkerSpawn = fn(&str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+/// The production [`WorkerSpawn`]: a named `Builder` thread, whose refusal is
+/// the `Err` that `std::thread::spawn` would have panicked on.
+fn spawn_worker(name: &str, job: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(job)
+        .map(|_| ())
+}
+
+/// One worktree the sweep worker is to take: the id, and the two facts
+/// [`git::reclaim`] decides with — the base name the branch is measured
+/// against, and the fork revision the run started at when the tree knows it.
+///
+/// The UI resolves all three before the hand-off because the worker holds no
+/// tree; the git facts themselves are re-read by `git::reclaim` at removal
+/// time, so the removal is decided by what git says *then* and not by this
+/// snapshot.
+struct Removal {
+    id: AgentId,
+    base: String,
+    fork: Option<String>,
+}
+
+impl Removal {
+    /// The isolated road's shape: a `mush/<id>` branch found in the repository
+    /// itself, measured against `HEAD`, with no fork revision to read — no run
+    /// wrote one into the session file for it ([`git::reclaimable`]).
+    fn against_head(id: u64) -> Self {
+        Self {
+            id: AgentId(id),
+            base: "HEAD".to_string(),
+            fork: None,
+        }
+    }
+}
+
+/// What the repository sweep owes the UI when it lands.
+///
+/// Both were the next line of a synchronous pass before the removal moved to a
+/// worker (finding R10), and each must still follow that pass in the same
+/// breath:
+///
+/// - [`Self::Restore`]: `agent::revive` picks its workspace from whether a
+///   worktree still exists, so the stored agents may not come back before the
+///   sweep has taken the branches whose work is already in the main checkout —
+///   the order H21's fix is.
+/// - [`Self::Discover`]: a leftover's row must not be registered for a branch
+///   the sweep is about to take, so a new chat walks the repository only after
+///   the sweep's answer ([`App::discover_worktrees`]).
+///
+/// The ordinary read's sweep owes neither: its rows already exist and only
+/// their marks change ([`App::sweep_worktrees`]).
+enum SweepOwed {
+    Restore(Vec<session::AgentSession>),
+    Discover,
 }
 
 impl App {
@@ -1047,12 +1162,16 @@ impl App {
             picker: None,
             git: None,
             write_clipboard: Arc::new(clipboard::write_text),
+            worker_spawn: spawn_worker,
             tree: AgentTree::rooted(root),
             session_save,
             session_dirty_at: None,
             ui_tx,
             git_at: None,
             git_in_flight: false,
+            sweep_in_flight: false,
+            sweep_owed: None,
+            sweep_missed: false,
             worktree_facts,
             status: None,
             should_quit: false,
@@ -1068,16 +1187,33 @@ impl App {
         // The failures come back before the agents do, because the agent that
         // went back to idle takes its line with it (see `restore_agents`).
         app.chat.restore_notices(stored_notices);
+        // The stored rows are judged — and every id the file names is spent —
+        // before anything can be spawned, so a child the root starts while the
+        // sweep is out cannot collide with a row that comes back later; the
+        // judgement itself is a file read, and the rows register in
+        // [`Self::finish_startup`] below.
+        let (vetted, refused) = app.vet_stored_agents(stored_agents);
+        if let Some(line) = refused {
+            app.stored_row_skipped(line);
+        }
         // The sweep runs before the agents come back: a restored agent's actor
         // is built on its worktree (`agent::revive`), and a branch whose work
         // the main checkout already holds must be gone before that, or the
         // same breath deletes the directory the actor was just built in — and
         // the row it answers for is frozen as `merged` while the actor still
         // writes into a path that no longer exists (finding H21).
-        app.reclaim_isolated();
-        app.restore_agents(stored_agents);
-        app.discover_worktrees();
-        app.refresh_git();
+        //
+        // The mutation half of that pass runs on a worker now (finding R10):
+        // `App::new` used to pay N × several `git` processes here with no TUI
+        // on screen — the one moment a human cannot even press a key to
+        // interrupt. What stays is the *read* — one `for-each-ref`, ~2 ms on
+        // this checkout — whose answer decides whether there is a pass at all:
+        // a repository with no `mush/<id>` branch restores the agents and
+        // paints its first frame exactly as it always has, while a residue
+        // defers the restore by one message, to the sweep's own answer
+        // ([`SweepOwed::Restore`], the order H21 needs).
+        let removals = app.isolated_removals();
+        app.start_sweep(removals, Some(SweepOwed::Restore(vetted)));
         app
     }
 
@@ -1212,6 +1348,10 @@ impl App {
     /// transcripts, and — through `agent::revive` — a live actor each, so a
     /// follow-up message continues the agent instead of starting over.
     ///
+    /// The file was already judged and its ids already spent by the caller
+    /// ([`Self::vet_stored_agents`], called from `App::new` before the sweep),
+    /// so the rows arrive parents first and whole.
+    ///
     /// A restored agent whose worktree is gone continues in the main checkout,
     /// which is where its work ended up once it was merged.
     ///
@@ -1223,10 +1363,6 @@ impl App {
     fn restore_agents(&mut self, stored: Vec<session::AgentSession>) {
         if stored.is_empty() {
             return;
-        }
-        let (stored, refused) = self.vet_stored_agents(stored);
-        if let Some(line) = refused {
-            self.stored_row_skipped(line);
         }
         let cfg = self.cell.handle();
         let ui_tx = self.ui_tx.clone();
@@ -1545,30 +1681,44 @@ impl App {
         // half — and the guard drops them with the app.
         self.worktree_facts.set(facts);
         let tx = self.ui_tx.clone();
-        std::thread::spawn(move || {
-            let mut stats = HashMap::new();
-            for (id, base, branch) in branches {
-                if let Some(stat) = git::branch_stat(&root, &base, &branch) {
-                    stats.insert(id, stat);
+        let started = (self.worker_spawn)(
+            "mush-git",
+            Box::new(move || {
+                let mut stats = HashMap::new();
+                for (id, base, branch) in branches {
+                    if let Some(stat) = git::branch_stat(&root, &base, &branch) {
+                        stats.insert(id, stat);
+                    }
                 }
-            }
-            // One answer per at-rest worktree, read here and acted on there:
-            // this thread never removes anything.
-            let sweep = sweep
-                .into_iter()
-                .map(|(id, base, fork)| {
-                    let found = git::reclaimable(&root, id.0, &base, fork.as_deref());
-                    (id, found)
-                })
-                .collect();
-            let status = git::status(&root);
-            let _ = tx.send(Msg::Git {
-                conversation,
-                stats,
-                status,
-                sweep,
-            });
-        });
+                // One answer per at-rest worktree, read here and acted on there:
+                // this thread never removes anything.
+                let sweep = sweep
+                    .into_iter()
+                    .map(|(id, base, fork)| {
+                        let found = git::reclaimable(&root, id.0, &base, fork.as_deref());
+                        (id, found)
+                    })
+                    .collect();
+                let status = git::status(&root);
+                let _ = tx.send(Msg::Git {
+                    conversation,
+                    stats,
+                    status,
+                    sweep,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // The read did not start, so the flag it set must fall: left up,
+            // no later ask could ever start one and the git facts would freeze
+            // for the session — and the human is told, because a bar that keeps
+            // painting yesterday's facts as today's is the lie the flag was
+            // protecting against. The next tick or transition asks again.
+            self.git_in_flight = false;
+            self.fail(format!(
+                "could not start the git read: {error} — the facts stay as they are"
+            ));
+        }
     }
 
     /// Adopt a repository read that finished on its own thread. Only a read
@@ -1606,15 +1756,19 @@ impl App {
     /// anything is working, and the row is marked `merged` or `nothing
     /// committed`, whichever git told (finding H10).
     ///
-    /// The removal happens *here*, on the thread that owns the tree, and only
-    /// after asking the tree again: the read above is a snapshot, and a node that
-    /// started running since it was taken must not have its worktree pulled out
-    /// from under its agent — the agent's file tools resolve their directory from
-    /// the workspace it was spawned with, so a run would recreate the path as a
-    /// plain directory no surface can see (finding S1). `git::reclaim` decides a
-    /// second time from git facts, so a worktree that went dirty in the meantime
-    /// is kept rather than destroyed.
+    /// The decisions are the read's and are applied here, on the thread that
+    /// owns the tree; the *removal* of a landable worktree is handed to the
+    /// sweep worker ([`Self::start_sweep`]), because `git::reclaim` is several
+    /// `git` processes per worktree and a keystroke must not wait for them
+    /// (finding R10). The at-rest guard is kept at the latest moment there is:
+    /// `in_flight_id` here, for the tree as the read landed, and the tree asked
+    /// once more through [`Msg::SweepAsk`] right before each removal — the read
+    /// above is a snapshot, and a node that started running since must not have
+    /// its worktree pulled out from under its agent (findings S1, F8). The git
+    /// facts are re-read by `git::reclaim` itself, so a worktree that went
+    /// dirty in the meantime is kept rather than destroyed.
     fn sweep_worktrees(&mut self, sweep: Vec<(AgentId, git::Reclaimable)>) {
+        let mut removals: Vec<Removal> = Vec::new();
         for (id, found) in sweep {
             // A node can be gone by now (a reap, a new conversation): the tree
             // owns which ids exist, and a sweep for a ghost must do nothing.
@@ -1628,24 +1782,17 @@ impl App {
                     if self.in_flight_id(id) {
                         continue;
                     }
-                    let base = self.fork_base(id);
-                    // The node's fork revision, asked again for the same reason
-                    // the base is: the decision above is a snapshot, and this is
-                    // the moment the removal happens.
+                    // The node's fork revision, read for the same reason the
+                    // base is: the worker is handed the two facts the removal
+                    // decides with, because it can hold no tree.
                     let fork = self.tree.node(id).and_then(|node| node.fork.clone());
-                    let root = self.ws.root().to_path_buf();
-                    match git::reclaim(&root, id.0, &base, fork.as_deref()) {
-                        git::Reclaimed::Removed { landing, .. } => {
-                            self.tree.mark_reclaimed(id, landing.into());
-                            // `landed` is what a restart shows, so it goes in the
-                            // same file the tree does.
-                            self.mark_session_dirty();
-                        }
-                        git::Reclaimed::Kept(why) => self.tree.mark_kept(id, Some(why)),
-                        git::Reclaimed::Nothing => self.tree.mark_kept(id, None),
-                    }
+                    let base = self.fork_base(id);
+                    removals.push(Removal { id, base, fork });
                 }
             }
+        }
+        if !removals.is_empty() {
+            self.start_sweep(removals, None);
         }
     }
 
@@ -1699,11 +1846,11 @@ impl App {
 
     /// Whether agent `id` holds its worktree right now: its own run or one of
     /// its jobs is out ([`Self::in_flight`]), or a busy child or unread result
-    /// will wake it into that directory — the sweep's guard, asked as a question
-    /// about one id, because `reclaim_isolated` runs on the human's key, where
-    /// [`Self::refresh_git`]'s walk has not run. An id with no node holds
-    /// nothing: a leftover discovered on disk has no actor to pull a directory
-    /// out from under.
+    /// will wake it into that directory — the question the sweep worker asks
+    /// the tree through [`Msg::SweepAsk`] before every removal, because the
+    /// tree is the only thing that knows and the worker is not on its thread.
+    /// An id with no node holds nothing: a leftover discovered on disk has no
+    /// actor to pull a directory out from under.
     fn worktree_in_use(&self, id: AgentId) -> bool {
         let Some(node) = self.tree.node(id) else {
             return false;
@@ -1717,80 +1864,211 @@ impl App {
             .any(|child| child.parent == Some(id) && (child.phase.is_busy() || child.result_unread))
     }
 
-    /// Reclaim every `mush/<id>` the repository still names — checkout or
-    /// not — and reserve the numbers of the ones the sweep keeps.
+    /// The repository's isolated branches as sweep requests: one per `mush/<id>`
+    /// naming that [`git::worktree_id`] can hold, measured against `HEAD` with
+    /// no fork revision — the shape a branch found on disk has, because no run
+    /// wrote a fork for it into the session file.
+    ///
+    /// The `for-each-ref` here is the read half of the pass, and it stays on
+    /// the UI thread: it is one git process (~2 ms on this checkout), and its
+    /// answer is what the caller needs *before* it can say whether there is a
+    /// sweep at all — the read/write line finding R10 draws, with the mutation
+    /// half on the worker.
     ///
     /// A branch whose work is already in the main checkout is H10's specimen:
     /// `mush/2` and `mush/3` were merged child work whose checkouts were long
     /// gone, and the next isolated spawn died on `a branch named 'mush/2'
-    /// already exists`. A branch the sweep will not take is left exactly where
-    /// it was and says why, and its number stays spent.
+    /// already exists`. What a sweep decides about each one comes back as
+    /// [`Msg::Swept`]; a branch the sweep will not take is left exactly where it
+    /// was and says why, and its number stays spent
+    /// ([`Self::apply_reclaimed`]).
+    fn isolated_removals(&self) -> Vec<Removal> {
+        git::isolated_ids(self.ws.root())
+            .unwrap_or_default()
+            .into_iter()
+            .map(Removal::against_head)
+            .collect()
+    }
+
+    /// Hand the removals to the sweep worker: one `git` process chain per
+    /// worktree, off the UI thread, with the row updates coming back as
+    /// [`Msg::Swept`].
     ///
-    /// `discover_worktrees` calls this for the repository as it stands, and
-    /// [`App::new`] calls it once *before* `restore_agents` — the order is the
-    /// fix for H21: a restored agent's actor is built on `.mush/wt/<id>`
-    /// (`agent::revive`), so a branch this pass takes has to be taken before
-    /// that, or the actor is built in a worktree the same breath deletes and
-    /// the node it answers for is frozen by `App::worktree_gone` while the
-    /// actor still writes into a path that no longer exists. A second call on
-    /// the same repository is nearly free: the branches it took are no longer
-    /// named.
+    /// The worker asks the tree about every removal before it makes it
+    /// ([`Msg::SweepAsk`]), because "this node is not running" is a fact only
+    /// the UI thread holds and a run can start between the read and the
+    /// removal; that question is the last moment the tree can be asked, and the
+    /// UI never waits for a process (findings H10, F8, S1).
     ///
-    /// Every reservation here saturates (`saturating_add`): the id comes from a
-    /// branch name, and a name above [`git::MAX_AGENT_ID`] leaves no floor the
-    /// next draw can count from — `worktree_id` refuses that name at the door,
-    /// and this is the belt for a floor that arrives anyway (D3).
-    fn reclaim_isolated(&mut self) {
-        let root = self.ws.root().to_path_buf();
-        for id in git::isolated_ids(&root).unwrap_or_default() {
-            // A worktree a node is using right now is not this pass's to take:
-            // the pass runs on the human's key, against a tree whose actors were
-            // only *told* to stop, so a life can still be inside the directory —
-            // its own run, its job, or the wake a child's result is about to
-            // bring it. The ordinary sweep refuses those already; without the
-            // same guard here the removal happens anyway, the next write
-            // recreates the path as a plain directory inside the human's
-            // checkout, and the run's end would commit there (finding F8).
-            if self.worktree_in_use(AgentId(id)) {
-                continue;
+    /// One worker at a time, so the same id is never given to two of them: a
+    /// batch that arrives while one is out is not handed over, and the read
+    /// that proposed it is asked again once the worker lands
+    /// ([`Self::sweep_missed`]). `owed` is what the *caller* needs when the
+    /// worker is done — nothing for the ordinary read, the start's restore or a
+    /// new chat's leftover walk for `App::new`/`new_chat` — and it covers the
+    /// refusal too: a spawn the OS refuses is a returned error on the tree's one
+    /// thread road (finding R11), the sweep is skipped, the owed work runs
+    /// without it, and the bar says why.
+    fn start_sweep(&mut self, removals: Vec<Removal>, owed: Option<SweepOwed>) {
+        if self.sweep_in_flight {
+            if let Some(owed) = owed {
+                // The obligation is replaced rather than stacked: the newest
+                // caller owns the tree's next step, and a `Ctrl-N` between a
+                // start's sweep and its landing must drop the restore it
+                // overtook.
+                self.sweep_owed = Some(owed);
+            } else if !removals.is_empty() {
+                self.sweep_missed = true;
             }
-            match git::reclaim(&root, id, "HEAD", None) {
-                git::Reclaimed::Removed {
-                    branch_kept,
-                    landing,
-                } => {
-                    // A restored agent that already has a row is marked here; a
-                    // leftover's row is registered by `discover_worktrees`, and
-                    // on the pre-restore call there is no node yet at all —
-                    // `landing` is `Merged` on this path, the answer a run with
-                    // no stored fork revision gets, and a node cannot be told a
-                    // merge it was never part of.
-                    self.tree.mark_reclaimed(AgentId(id), landing.into());
-                    // A ref git would not delete still holds the name — `-d` is
-                    // the only deletion mush runs, and it deletes what it can
-                    // certify — so the number is spent anyway, exactly as the
-                    // residue loop below treats a live `mush/<id>`.
-                    if branch_kept.is_some() {
-                        self.tree.reserve_agents(id.saturating_add(1));
+            return;
+        }
+        if removals.is_empty() {
+            // Nothing to sweep: the caller's next step does not wait for a
+            // worker that would have nothing to do (a repository with no
+            // residue at the start, a new chat beside no branches).
+            if let Some(owed) = owed {
+                self.run_owed(owed);
+            }
+            return;
+        }
+        let root = self.ws.root().to_path_buf();
+        let tx = self.ui_tx.clone();
+        let started = (self.worker_spawn)(
+            "mush-sweep",
+            Box::new(move || {
+                let mut results: Vec<(AgentId, git::Reclaimed)> = Vec::new();
+                for removal in removals {
+                    // The tree's own answer, asked by a thread that does not
+                    // hold it: `true` is "this worktree is at rest — take it",
+                    // and a refusal — or a UI that is gone — keeps it. The
+                    // window between a `true` and the removal is then one
+                    // message long, the shortest an off-thread process can make
+                    // it.
+                    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+                    if tx
+                        .send(Msg::SweepAsk {
+                            id: removal.id,
+                            reply: reply_tx,
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
+                    if !matches!(reply_rx.recv(), Ok(true)) {
+                        continue;
+                    }
+                    results.push((
+                        removal.id,
+                        git::reclaim(&root, removal.id.0, &removal.base, removal.fork.as_deref()),
+                    ));
                 }
-                git::Reclaimed::Kept(why) => {
-                    // Kept work is not a reason to hand the number out again.
-                    self.tree.reserve_agents(id.saturating_add(1));
-                    // A restored agent has a row already; a leftover's is
-                    // registered below, and the next git read fills its line in.
-                    self.tree.mark_kept(AgentId(id), Some(why));
+                let _ = tx.send(Msg::Swept { results });
+            }),
+        );
+        if let Err(error) = started {
+            let line =
+                format!("could not start the worktree sweep: {error} — the branches stay for now");
+            if let Some(owed) = owed {
+                self.run_owed(owed);
+            }
+            self.fail(line);
+        } else {
+            self.sweep_in_flight = true;
+            self.sweep_owed = owed;
+        }
+    }
+
+    /// Take one reclamation's outcome onto the row and the id space.
+    ///
+    /// The two roads that used to apply this themselves — the read's
+    /// [`Self::sweep_worktrees`] and the start's own pass — agreed on what an
+    /// outcome means and not on the floors: a branch the sweep *kept* keeps its
+    /// number spent (the branch outlives the checkout, and the next isolated
+    /// spawn would die on `a branch named 'mush/<id>' already exists`), which is
+    /// `saturating_add` because the id comes from a branch name and one above
+    /// [`git::MAX_AGENT_ID`] leaves no floor the next draw can count from
+    /// (finding D3).
+    ///
+    /// `landed` is written to the session as well as the row: it is what a
+    /// restart shows, so it goes in the same file the tree does.
+    fn apply_reclaimed(&mut self, id: AgentId, outcome: git::Reclaimed) {
+        match outcome {
+            git::Reclaimed::Removed {
+                branch_kept,
+                landing,
+            } => {
+                self.tree.mark_reclaimed(id, landing.into());
+                // A ref git would not delete still holds the name — `-d` is the
+                // only deletion mush runs, and it deletes what it can certify —
+                // so the number is spent anyway.
+                if branch_kept.is_some() {
+                    self.tree.reserve_agents(id.0.saturating_add(1));
                 }
-                git::Reclaimed::Nothing => {}
+                self.mark_session_dirty();
+            }
+            git::Reclaimed::Kept(why) => {
+                self.tree.reserve_agents(id.0.saturating_add(1));
+                self.tree.mark_kept(id, Some(why));
+            }
+            // Neither checkout nor branch by the time the removal ran: nothing
+            // was there, and a row still saying why it was kept describes a
+            // worktree that is gone.
+            git::Reclaimed::Nothing => self.tree.mark_kept(id, None),
+        }
+    }
+
+    /// Adopt the sweep worker's landing: mark the rows it changed, then do
+    /// whatever the sweep was holding up.
+    ///
+    /// A sweep the ordinary read asked for owes nothing and is complete here; a
+    /// start or a new chat runs its next step ([`Self::run_owed`]); and a read
+    /// that proposed a worktree while the worker was out is asked again, so a
+    /// hand merge is not lost to the overlap.
+    fn adopt_swept(&mut self, results: Vec<(AgentId, git::Reclaimed)>) {
+        self.sweep_in_flight = false;
+        for (id, outcome) in results {
+            self.apply_reclaimed(id, outcome);
+        }
+        self.dirty_screen = true;
+        let missed = std::mem::take(&mut self.sweep_missed);
+        match self.sweep_owed.take() {
+            Some(owed) => self.run_owed(owed),
+            None if missed => self.refresh_git(),
+            None => {}
+        }
+    }
+
+    /// Do what the sweep was holding up.
+    fn run_owed(&mut self, owed: SweepOwed) {
+        match owed {
+            SweepOwed::Restore(vetted) => self.finish_startup(vetted),
+            SweepOwed::Discover => {
+                self.discover_worktrees();
+                self.refresh_git();
             }
         }
     }
 
+    /// The start, finished: the stored agents come back, the repository's
+    /// leftovers are registered, and the first git read is asked for.
+    ///
+    /// `App::new` used to do this synchronously and call the sweep first; the
+    /// two are the same sequence now, one sweep message apart (finding R10).
+    fn finish_startup(&mut self, vetted: Vec<session::AgentSession>) {
+        self.restore_agents(vetted);
+        self.discover_worktrees();
+        self.refresh_git();
+    }
+
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
     /// branches) as finished tree nodes, so a leftover's branch is on its row
-    /// after a restart — and reclaim the ones whose work is already in the main
-    /// checkout *first*, so a merged branch is not a row and not a name the next
-    /// isolated spawn dies on (finding H10).
+    /// after a restart.
+    ///
+    /// The repository is read *after* the sweep a start or a new chat runs
+    /// first ([`SweepOwed`]), so a merged branch the sweep took is not a row and
+    /// not a name the next isolated spawn dies on (finding H10). The pass used
+    /// to sweep first itself; the order is the caller's now, because the
+    /// removal runs on a worker and this waits for its answer (finding R10).
     ///
     /// A registry entry whose checkout is gone is not work on disk and gets no
     /// row — `rm -rf .mush` leaves git naming those until they are pruned
@@ -1800,11 +2078,11 @@ impl App {
         let root = self.ws.root().to_path_buf();
         // Git's registry outlives the directory, and an entry pointing at a
         // directory nobody has is not a worktree: prune before anything reads
-        // the list, so the sweep and the rows both see the repository as it is.
-        // A merge by hand while the checkout was gone leaves *only* that entry
-        // between a merged branch and reclaiming it.
+        // the list, so the rows see the repository as it is. A merge by hand
+        // while the checkout was gone leaves *only* that entry between a merged
+        // branch and reclaiming it — the sweep that ran before this prunes the
+        // landable entries, and this is the belt for the ones it kept.
         let _ = git::run(&root, &["worktree", "prune"]);
-        self.reclaim_isolated();
         // `None` means git could not answer (no binary, not a repository). The
         // tree then keeps the leftovers it already knows about: dropping them
         // on a failed read would look like the work had been reclaimed.
@@ -1949,6 +2227,16 @@ impl App {
                     self.adopt_git(stats, status, sweep);
                 }
             }
+            Msg::SweepAsk { id, reply } => {
+                // The sweep worker's one question, answered from the tree it
+                // cannot hold: a node at rest (or no node at all — a leftover)
+                // may be taken; a running one, or one a busy child or unread
+                // result will wake into its worktree, may not (findings H10,
+                // F8, S1). A UI that is gone drops the sender instead, and the
+                // worker reads that as "keep".
+                let _ = reply.send(!self.worktree_in_use(id));
+            }
+            Msg::Swept { results } => self.adopt_swept(results),
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
@@ -3671,10 +3959,25 @@ impl App {
         self.models_in_flight = Some(endpoint.clone());
         let cfg = self.cfg().clone();
         let tx = self.ui_tx.clone();
-        std::thread::spawn(move || {
-            let models = http::list_models(&cfg);
-            let _ = tx.send(Msg::Models { endpoint, models });
-        });
+        let started = (self.worker_spawn)(
+            "mush-models",
+            Box::new(move || {
+                let models = http::list_models(&cfg);
+                let _ = tx.send(Msg::Models { endpoint, models });
+            }),
+        );
+        if let Err(error) = started {
+            // No list will ever come back for this ask, so `models_in_flight`
+            // must clear or a second ask at the same endpoint would be refused
+            // as already-in-flight — the picker's one road would be dead for
+            // the session. The human is told and can ask again with `/model`;
+            // the startup road says its own line (`main` hands an empty list
+            // in when the discovery thread is refused).
+            self.models_in_flight = None;
+            self.fail(format!(
+                "could not start the model fetch: {error} — ask again with /model"
+            ));
+        }
     }
 
     /// Adopt a model list that finished fetching on its own thread.
@@ -4102,17 +4405,21 @@ impl App {
         self.cell.adopt_handle(root.cfg.clone());
         self.tree = AgentTree::rooted(root);
         // Running agents vanish with the old conversation; worktrees they left
-        // behind are still reviewable (they are re-listed below).
+        // behind are still reviewable — but only after the sweep has said which
+        // of them are work at all: the pass runs before the leftover walk, or a
+        // branch it takes gets a row (findings H10, R10).
         self.chat.clear();
         self.spin = 0;
-        self.discover_worktrees();
         // A read in flight belongs to the tree that just died: it is dropped
         // when it lands (`Msg::Git`'s conversation), and the flag has to fall
         // with it. Left up, this ask — and every later one — would be refused
         // behind a read whose answer the new tree will never adopt, and the git
-        // facts would freeze at the first Ctrl-N (finding D26).
+        // facts would freeze at the first Ctrl-N (finding D26). It falls before
+        // the sweep starts because the sweep's landing asks for the new tree's
+        // own read.
         self.git_in_flight = false;
-        self.refresh_git();
+        let removals = self.isolated_removals();
+        self.start_sweep(removals, Some(SweepOwed::Discover));
         // The old conversation is gone from this moment: if the write were left
         // to the debounce, a crash would bring it back with the next start.
         self.flush_session();
@@ -4653,14 +4960,24 @@ impl App {
         // The road the app holds is what the thread runs, so a test's writer is
         // the one `Enter` reaches — no program is spawned by it.
         let write = Arc::clone(&self.write_clipboard);
-        std::thread::spawn(move || {
-            let result = write(&copied.text);
-            let _ = tx.send(Msg::Copied {
-                conversation,
-                line: copied.line,
-                result,
-            });
-        });
+        let started = (self.worker_spawn)(
+            "mush-clipboard-write",
+            Box::new(move || {
+                let result = write(&copied.text);
+                let _ = tx.send(Msg::Copied {
+                    conversation,
+                    line: copied.line,
+                    result,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // The copy never started, so nothing will report through
+            // `Msg::Copied`: the refusal is said on the bar now, in the shape
+            // the write's own failure road uses, because the human pressed a
+            // key and silence is the one answer the copy must not give.
+            self.fail(format!("could not copy to the clipboard: {error}"));
+        }
     }
 
     /// `Ctrl-V`: read the clipboard for an image and attach it to the box.
@@ -4675,13 +4992,25 @@ impl App {
         let ws = self.ws.clone();
         let tx = self.ui_tx.clone();
         let conversation = self.tree.conversation();
-        std::thread::spawn(move || {
-            let result = clipboard::read_image(&ws);
-            let _ = tx.send(Msg::Clipboard {
-                conversation,
-                result,
-            });
-        });
+        let started = (self.worker_spawn)(
+            "mush-clipboard-read",
+            Box::new(move || {
+                let result = clipboard::read_image(&ws);
+                let _ = tx.send(Msg::Clipboard {
+                    conversation,
+                    result,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // Nothing will report through `Msg::Clipboard`, so the refusal is
+            // said here: the read could not start, and the key still has a
+            // road — the path of an image file — which the line names rather
+            // than leaving the human to guess why `Ctrl-V` did nothing.
+            self.fail(format!(
+                "could not read the clipboard: {error} — paste the image's path instead"
+            ));
+        }
     }
 
     /// The images to carry to the agent at `id`: every one whose path that
@@ -5866,7 +6195,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         let cell = ConfigCell::own(cfg);
         let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
-        let app = App::new(ws, cell, stored, handle, tx, save);
+        let mut app = App::new(ws, cell, stored, handle, tx, save);
+        settle_sweep(&mut app, &rx);
         (app, rx)
     }
 
@@ -5912,7 +6242,7 @@ mod tests {
             root.to_path_buf(),
             scripted,
         );
-        let app = App::new(
+        let mut app = App::new(
             ws,
             ConfigCell::own(cfg),
             stored,
@@ -5920,6 +6250,7 @@ mod tests {
             tx,
             session_save::fake::Recorder::new(),
         );
+        settle_sweep(&mut app, &rx);
         (app, rx)
     }
 
@@ -5943,7 +6274,7 @@ mod tests {
         let cell = ConfigCell::own(cfg);
         let handle =
             agent::spawn_scripted_ui(cell.handle(), tx.clone(), root.to_path_buf(), scripted);
-        let app = App::new(
+        let mut app = App::new(
             ws,
             cell,
             None,
@@ -5951,6 +6282,7 @@ mod tests {
             tx,
             session_save::fake::Recorder::new(),
         );
+        settle_sweep(&mut app, &rx);
         (app, rx)
     }
 
@@ -5958,6 +6290,27 @@ mod tests {
     /// thread (`Msg::Git`) can be waited for instead of raced.
     fn app_and_rx(root: std::path::PathBuf) -> (App, Receiver<Msg>) {
         app_root(&root, None, session_save::fake::Recorder::new())
+    }
+
+    /// Adopt whatever a just-started sweep owes, before a test looks at the
+    /// tree.
+    ///
+    /// `App::new` used to hand back a restored tree and a swept repository
+    /// synchronously; since finding R10 the removal half runs on a worker, and
+    /// a repository with a residue comes back *before* the stored agents are
+    /// registered (the restore waits for the sweep, the order H21 needs). Tests
+    /// that work on such a repository pump that answer here, so what they see is
+    /// what the synchronous `App::new` handed back.
+    fn settle_sweep(app: &mut App, rx: &Receiver<Msg>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.sweep_in_flight && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => app.update(msg),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(!app.sweep_in_flight, "the sweep worker never answered");
     }
 
     /// Adopt the next `Msg::Git` that arrives within the deadline, applying any
@@ -7797,16 +8150,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `reclaim_isolated` runs on the human's key, against a tree whose actors
-    /// were only *told* to stop — so a node can still be running in its
-    /// worktree when the pass goes looking. The sweep's live-tree guard must
-    /// hold there too: a directory pulled out from under a live agent is
-    /// recreated as a plain path by the next write, and the run's end would
-    /// then commit inside the human's checkout (finding F8).
+    /// The sweep's live-tree guard, on the road a new chat drives: a node can
+    /// still be running in its worktree when the pass goes looking — a
+    /// directory pulled out from under a live agent is recreated as a plain
+    /// path by the next write, and the run's end would then commit inside the
+    /// human's checkout (finding F8) — and the guard is asked by the worker,
+    /// per worktree, through `Msg::SweepAsk` (finding R10).
     #[test]
     fn ctrl_n_never_reclaims_a_worktree_a_live_node_holds() {
         let root = repo("ctrl-n-live");
-        let (mut app, _rx) = app_and_rx(root.to_path_buf());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
 
         // A worktree whose branch adds nothing to HEAD and whose checkout is
         // clean: exactly the state the isolated pass takes.
@@ -7833,8 +8186,11 @@ mod tests {
             fork: None,
             cmd: tx,
         });
-        // The node is thinking: a run is in that directory right now.
-        app.reclaim_isolated();
+        // The node is thinking: a run is in that directory right now. The pass
+        // is the repository's own road, driven to its landing.
+        let removals = app.isolated_removals();
+        app.start_sweep(removals, None);
+        settle_sweep(&mut app, &rx);
         assert!(held.exists(), "a running agent keeps its worktree");
         assert!(
             git::resolve(&root, &git::branch_name(1)).is_some(),
@@ -7856,9 +8212,242 @@ mod tests {
             fork: None,
             cmd: tx2,
         });
-        app.reclaim_isolated();
+        let removals = app.isolated_removals();
+        app.start_sweep(removals, None);
+        settle_sweep(&mut app, &rx);
         assert!(held.exists(), "a parent about to be woken keeps it too");
         assert!(git::resolve(&root, &git::branch_name(1)).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The start's sweep runs on a worker (finding R10): a repository whose
+    /// `mush/<id>` branch is merged and clean used to be swept *inside*
+    /// `App::new` — N × several `git` processes with no TUI on screen. What is
+    /// left on this thread is the read that names the residue (one
+    /// `for-each-ref`), and the stored agents come back when the worker's
+    /// answer lands — the order H21 needs, one message later.
+    #[test]
+    fn the_start_defers_the_sweep_and_the_restore_to_the_worker() {
+        let root = repo("start-deferred");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/2", ".mush/wt/2"],
+        );
+        let worktree = root.join(".mush/wt/2");
+        let mut stored = stored_with_agent(
+            session::StoredStatus::Idle,
+            vec![Message::user("port the parser")],
+        );
+        stored.agents[0].branch = Some("mush/2".to_string());
+
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
+        let mut app = App::new(
+            ws,
+            cell,
+            Some(stored),
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+
+        assert!(
+            app.sweep_in_flight,
+            "the sweep is the worker's, and `App::new` does not wait for it"
+        );
+        assert!(
+            worktree.exists(),
+            "and the removal is not this thread's to make"
+        );
+        assert!(
+            !app.tree.has(AgentId(2)),
+            "the restore waits for the sweep's answer (the order H21 needs)"
+        );
+
+        settle_sweep(&mut app, &rx);
+        let node = app.tree.node(AgentId(2)).expect("the agent came back");
+        assert_eq!(
+            node.landed, None,
+            "a branch with no commit of its own is not a merge to claim"
+        );
+        assert_eq!(node.branch, None, "and the branch went with its worktree");
+        assert!(
+            !worktree.exists(),
+            "the sweep took it before any actor was built on it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The key that adopts a git read does not remove a worktree (finding
+    /// R10): the landable answers are handed to the sweep worker, which asks
+    /// the tree once more before every `git::reclaim` ([`Msg::SweepAsk`]). So
+    /// the checkout is still there when the read lands — no `git` process was
+    /// on this thread — and it goes when the tree's own answer is adopted.
+    #[test]
+    fn a_landable_worktree_is_removed_by_the_worker_not_by_the_read() {
+        let root = repo("sweep-off-thread");
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
+        wait_git(&mut app, &rx);
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        let worktree = root.join(".mush/wt/1");
+        // An at-rest child whose checkout adds nothing to HEAD and is clean.
+        spawn_agent(&mut app, 1, 0, 1, "build the thing", Some("mush/1"));
+        app.tree.finish(AgentId(1), Some("done".into()));
+        app.tree.result_read(AgentId(1));
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        assert!(
+            app.sweep_in_flight,
+            "the read handed the removal to a worker"
+        );
+        assert!(
+            worktree.exists(),
+            "and the key that adopted the read did not wait for a git process"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().landed,
+            None,
+            "the row is not marked landed before the removal happened"
+        );
+
+        settle_sweep(&mut app, &rx);
+        assert!(!worktree.exists(), "the worker took it");
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().landed,
+            Some(Landed::Merged),
+            "and the row says where the work went"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The at-rest guard is asked at the last moment there is (finding R10):
+    /// the read's decision was a snapshot, and a node whose run started before
+    /// the worker's own question is answered keeps the directory that run is in
+    /// — the S1/F8 hazard the synchronous pass closed with an `in_flight` check
+    /// at the moment of removal. The guard is a moment, not an exemption: once
+    /// the run has ended, the next read takes the worktree.
+    #[test]
+    fn a_node_that_starts_running_after_the_read_keeps_its_worktree() {
+        let root = repo("sweep-started-running");
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
+        wait_git(&mut app, &rx);
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        let worktree = root.join(".mush/wt/1");
+        spawn_agent(&mut app, 1, 0, 1, "build the thing", Some("mush/1"));
+        app.tree.finish(AgentId(1), Some("done".into()));
+        app.tree.result_read(AgentId(1));
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        assert!(app.sweep_in_flight, "the removal is the worker's now");
+        // The human asks it for something while the worker waits for the
+        // tree's answer: a run is in the directory again.
+        begin_run(&mut app, AgentId(1));
+        settle_sweep(&mut app, &rx);
+
+        assert!(
+            worktree.exists(),
+            "a run in the directory keeps it, however late it started"
+        );
+        assert!(
+            git::resolve(&root, &git::branch_name(1)).is_some(),
+            "and the branch too"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().landed,
+            None,
+            "the row was not told a merge that did not happen"
+        );
+
+        // The run ends; the next read says landable again, and it goes.
+        app.tree.finish(AgentId(1), Some("done".into()));
+        app.tree.result_read(AgentId(1));
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        settle_sweep(&mut app, &rx);
+        assert!(!worktree.exists(), "at rest again, the sweep takes it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One sweep worker at a time (finding R10): a read that lands while one is
+    /// out must not hand the same worktree to a second worker — the same
+    /// checkout would be reclaimed twice. The batch it brought is remembered
+    /// instead, and the read is asked again once the worker lands.
+    #[test]
+    fn a_read_that_lands_while_a_sweep_is_out_is_asked_again_not_stacked() {
+        let root = repo("sweep-not-stacked");
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
+        wait_git(&mut app, &rx);
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        spawn_agent(&mut app, 1, 0, 1, "build the thing", Some("mush/1"));
+        app.tree.finish(AgentId(1), Some("done".into()));
+        app.tree.result_read(AgentId(1));
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        assert!(app.sweep_in_flight, "the first read started the worker");
+        // A second read of the same repository lands while the worker is out:
+        // the same worktree is not handed over a second time.
+        app.update(Msg::Git {
+            conversation: app.tree.conversation(),
+            stats: HashMap::new(),
+            status: None,
+            sweep: vec![(AgentId(1), git::Reclaimable::Landable(git::Landing::Merged))],
+        });
+        assert!(
+            app.sweep_missed && app.sweep_in_flight,
+            "the batch waits for the worker instead of racing it"
+        );
+
+        settle_sweep(&mut app, &rx);
+        assert!(
+            app.git_in_flight,
+            "and the read that was not handed over is asked again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A refused sweep worker is finding R11's road applied to the start's own
+    /// pass: the removal is skipped, the work the sweep held up still runs (the
+    /// leftover walk here), and the bar says the branches stay.
+    #[test]
+    fn a_refused_sweep_still_runs_what_it_held_up_and_says_so() {
+        let root = repo("refused-sweep");
+        isolated_work(&root, 7, "port the parser module");
+        let (mut app, _rx) = app_and_rx(root.to_path_buf());
+
+        app.worker_spawn = refuse_spawn;
+        let removals = app.isolated_removals();
+        app.start_sweep(removals, Some(SweepOwed::Discover));
+
+        assert!(!app.sweep_in_flight, "no worker was started");
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not start the worktree sweep")),
+            "the human is told: {line:?}"
+        );
+        assert!(
+            app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "the leftover walk the sweep held up still ran"
+        );
+        assert!(
+            git::resolve(&root, &git::branch_name(7)).is_some(),
+            "and the branch is left exactly where it was"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -19731,11 +20320,12 @@ mod tests {
     }
 
     /// The periodic read is what notices a hand merge without a restart: within
-    /// one git read of the merge, the row says the work landed, the checkout is
-    /// gone, and — because mush took the branch with it — nothing offers a
-    /// `git diff` against either any more (finding H10). Before the merge the
-    /// same read says *why* the worktree is still there, which is the other half
-    /// of the rule.
+    /// one git read of the merge — and the sweep worker's own answer, which is
+    /// what removes the checkout off the UI thread (finding R10) — the row says
+    /// the work landed, the checkout is gone, and, because mush took the branch
+    /// with it, nothing offers a `git diff` against either any more (finding
+    /// H10). Before the merge the same read says *why* the worktree is still
+    /// there, which is the other half of the rule.
     #[test]
     fn a_hand_merge_is_marked_landed_by_the_next_git_read() {
         use std::fs;
@@ -19801,10 +20391,13 @@ mod tests {
         );
 
         // The human merges by hand: the work is in HEAD, and the next read is
-        // the only thing that has to notice.
+        // the only thing that has to notice. The removal itself is the sweep
+        // worker's; `wait_git` adopts the read, and `settle_sweep` the
+        // worker's questions and its landing.
         git(&root, &["merge", "--no-edit", "mush/1"]);
         app.refresh_git();
         wait_git(&mut app, &rx);
+        settle_sweep(&mut app, &rx);
 
         let child = app.tree.node(AgentId(1)).expect("the child is still here");
         assert_eq!(
@@ -19883,6 +20476,9 @@ mod tests {
 
         app.refresh_git();
         wait_git(&mut app, &rx);
+        // The removal is the sweep worker's now (finding R10); its landing is
+        // what marks the row and takes the checkout.
+        settle_sweep(&mut app, &rx);
 
         let child = app.tree.node(AgentId(1)).expect("the child is in the tree");
         assert_eq!(
@@ -20003,6 +20599,9 @@ mod tests {
             "the nested child merged into its parent is not counted"
         );
         wait_git(&mut app, &rx);
+        // Both worktrees were in the read's sweep; the worker's landing is what
+        // removes the landable one and marks its row (finding R10).
+        settle_sweep(&mut app, &rx);
 
         let child = app.tree.node(AgentId(2)).expect("the child is in the tree");
         assert_eq!(
@@ -20962,5 +21561,115 @@ mod tests {
         let error =
             attach::Transcript::read(&broken).expect_err("a line missing `text` is refused");
         assert!(error.contains("text"), "the missing key is named: {error}");
+    }
+
+    /// A `WorkerSpawn` that refuses every thread, like a box at its limit
+    /// (`ulimit -u`, a container's `pids.max`, a fork storm).
+    fn refuse_spawn(_name: &str, _job: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+        Err(std::io::Error::other("the box is at its thread limit"))
+    }
+
+    /// A refused spawn on the git read is a returned refusal, not a panic
+    /// (finding R11). Two facts are the caller's: the flag falls — left up, no
+    /// later ask could start a read and the facts would freeze for the session
+    /// — and the bar says the facts are stale instead of painting them as
+    /// live. The read has to be *askable again*: a later call with a working
+    /// road starts one.
+    #[test]
+    fn a_refused_git_read_clears_the_flag_and_says_the_facts_are_stale() {
+        let (mut app, rx) = test_app("refused-git-read");
+        // The startup read is out (`App::new` asks for one); adopt it so the
+        // road below is the test's own ask and not that one.
+        wait_git(&mut app, &rx);
+
+        app.worker_spawn = refuse_spawn;
+        app.refresh_git();
+
+        assert!(
+            !app.git_in_flight,
+            "a read that never started must not keep the flag up"
+        );
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not start the git read")),
+            "the human is told: {line:?}"
+        );
+
+        // The same road the tree believes in: a refusal is a fact about *this*
+        // ask, not a dead road. With a working spawn the next ask starts.
+        app.worker_spawn = spawn_worker;
+        app.refresh_git();
+        assert!(app.git_in_flight, "the next ask tries again");
+    }
+
+    /// The model fetch's refusal, the same shape: `models_in_flight` names the
+    /// endpoint being fetched, so a refused spawn that left it up would refuse
+    /// every later ask at that endpoint as already-in-flight — `/model` dead
+    /// for the session — and the human would wait for a list nobody is
+    /// fetching.
+    #[test]
+    fn a_refused_model_fetch_clears_the_flag_and_can_be_asked_again() {
+        let (mut app, _rx) = test_app("refused-models");
+
+        app.worker_spawn = refuse_spawn;
+        app.refresh_models();
+
+        assert!(app.models_in_flight.is_none(), "no fetch is out");
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not start the model fetch")),
+            "the human is told: {line:?}"
+        );
+
+        app.worker_spawn = spawn_worker;
+        app.refresh_models();
+        assert!(
+            app.models_in_flight.is_some(),
+            "the next ask reaches the endpoint"
+        );
+    }
+
+    /// `Enter` in the select mode refused a thread: nothing will report through
+    /// `Msg::Copied`, so the refusal is said on the bar at once — in the shape
+    /// the write's own failure road uses — because silence over a key the human
+    /// pressed is the one answer the copy must not give.
+    #[test]
+    fn a_refused_clipboard_write_says_the_copy_did_not_happen() {
+        let (mut app, _rx) = test_app("refused-copy");
+
+        app.worker_spawn = refuse_spawn;
+        app.copy_text(Copied {
+            text: "the reply".to_string(),
+            line: "copied 1 line from #1's reply — 9 bytes".to_string(),
+        });
+
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not copy to the clipboard")),
+            "the human is told the copy did not happen: {line:?}"
+        );
+    }
+
+    /// `Ctrl-V` refused a thread: the read cannot report through
+    /// `Msg::Clipboard`, so the bar says the read did not start and names the
+    /// road that still works — the path of an image file.
+    #[test]
+    fn a_refused_clipboard_read_says_the_read_did_not_start() {
+        let (mut app, _rx) = test_app("refused-paste");
+
+        app.worker_spawn = refuse_spawn;
+        app.attach_clipboard_image();
+
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref().is_some_and(|line| {
+                line.contains("could not read the clipboard")
+                    && line.contains("paste the image's path instead")
+            }),
+            "the human is told, and told what still works: {line:?}"
+        );
     }
 }
