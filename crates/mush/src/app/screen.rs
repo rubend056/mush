@@ -61,6 +61,10 @@ const MAX_INPUT_LINES: u16 = 6;
 /// that grows with every picture would push the transcript off the screen, and
 /// past this the last row counts the rest instead of naming them — the title
 /// still says how many, so nothing is hidden, only abbreviated.
+///
+/// This is the cap on the rows the box *asks* for; a box the layout granted
+/// fewer rows paints fewer, because the text's own row comes first
+/// ([`content_rows`]).
 const MAX_ATTACHMENT_ROWS: usize = 3;
 
 /// The popup the pickers paint in: a share of the terminal, floored so a model
@@ -102,27 +106,45 @@ fn inner(area: Rect) -> Rect {
 }
 
 /// The message box's attachment rows: `▣ path (format · size)`, one per image,
-/// at most [`MAX_ATTACHMENT_ROWS`], in the order they were attached.
+/// at most `cap` rows and never more than [`MAX_ATTACHMENT_ROWS`], in the order
+/// they were attached.
 ///
-/// Past the cap the last row counts the rest instead of naming them — the box
-/// is a box, and there is no fourth row to spend on the fourth screenshot. The
-/// count of *everything* attached is the title's, not that row's, so an
-/// abbreviated list never claims to be the whole one.
-fn attachment_rows(images: &[Image]) -> Vec<String> {
+/// The cap is the room the caller has for them — [`content_rows`] passes the
+/// rows the box was granted, one of them kept for the text. Past the cap the
+/// last row counts the rest instead of naming them — the box is a box, and
+/// there is no room to spend on the rest. The count of *everything* attached is
+/// the title's, not that row's, so an abbreviated list never claims to be the
+/// whole one.
+fn attachment_rows(images: &[Image], cap: usize) -> Vec<String> {
+    let cap = cap.min(MAX_ATTACHMENT_ROWS);
+    if cap == 0 {
+        return Vec::new();
+    }
     let label = |image: &Image| format!("▣ {}", image_label(image));
-    if images.len() <= MAX_ATTACHMENT_ROWS {
+    if images.len() <= cap {
         return images.iter().map(label).collect();
     }
-    let mut rows: Vec<String> = images
-        .iter()
-        .take(MAX_ATTACHMENT_ROWS - 1)
-        .map(label)
-        .collect();
-    rows.push(format!(
-        "▣ +{} more",
-        images.len() - (MAX_ATTACHMENT_ROWS - 1)
-    ));
+    let mut rows: Vec<String> = images.iter().take(cap - 1).map(label).collect();
+    rows.push(format!("▣ +{} more", images.len() - (cap - 1)));
     rows
+}
+
+/// The box's content rows for the room it was granted: the attachment rows that
+/// fit above the draft, and how many rows are left for the text.
+///
+/// The one owner of "how many rows the content has" when the box is painted.
+/// [`App::input_rows`] asks the layout for the same count from the other side —
+/// the draft's lines, the attachments and the two border rows — and the two
+/// agree whenever the layout grants the ask. When it does not (a short column at
+/// a small terminal), this is what gives: the attachment rows are capped at one
+/// row short of the room, so the text has a row first and
+/// `text_rows = field_height - attachments.len()` is true by construction. A row
+/// the box does not have is a row the message being typed would be pushed out
+/// of (finding D5).
+fn content_rows(field_height: u16, images: &[Image]) -> (Vec<String>, usize) {
+    let attachments = attachment_rows(images, (field_height as usize).saturating_sub(1));
+    let text_rows = (field_height as usize).saturating_sub(attachments.len());
+    (attachments, text_rows)
 }
 
 /// The bar's rows: two from 24 up, so the facts line — the branch, the dirty
@@ -272,7 +294,8 @@ pub struct InputPane {
     pub prompt: String,
     /// The attachment rows, above the text: `▣ path (format · size)`, one per
     /// image, at most [`MAX_ATTACHMENT_ROWS`] — the last of which counts the
-    /// rest when there are more. Dim, because they are what is about to be
+    /// rest when there are more — and never more than the room the box has
+    /// above the text's own row. Dim, because they are what is about to be
     /// said and not what is being typed.
     pub attachments: Vec<String>,
     /// How many images are attached. The rows are capped, so the title's count
@@ -603,17 +626,24 @@ impl App {
         self.chat_pane_with(rows[0], rows[1])
     }
 
-    /// The rows the message box wants: the draft's lines, capped so the pane
-    /// keeps the screen, plus the attachment rows and the box's two border
-    /// rows. The box grows with the message — a multi-line draft has to be
-    /// visible, not hidden behind a one-line window — and with the attachments,
-    /// which are painted above the text: a row the box does not have is a row
-    /// the message being typed is pushed out of.
+    /// The rows the message box asks the layout for: the draft's lines, capped
+    /// so the pane keeps the screen, plus the attachment rows and the box's two
+    /// border rows. The box grows with the message — a multi-line draft has to
+    /// be visible, not hidden behind a one-line window — and with the
+    /// attachments, which are painted above the text: a row the box does not
+    /// have is a row the message being typed is pushed out of.
+    ///
+    /// This is the *ask*. [`content_rows`] owns what the box paints when the
+    /// layout grants fewer rows than this — a short column at a small terminal —
+    /// and there the text's row comes first: the attachment rows are capped to
+    /// the room that is really there, so the draft on the cursor's line is
+    /// never the part that is left out (finding D5). The two derivations agree
+    /// whenever the ask is granted.
     ///
     /// One derivation, because two layouts read it: the split above, and the
     /// zen view, which has to hand the box exactly the rows this gives it so
     /// the box does not move when the tree takes the screen.
-    fn input_rows(&self) -> u16 {
+    pub(super) fn input_rows(&self) -> u16 {
         let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
         let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
         input_lines + attachment_count + 2
@@ -692,12 +722,12 @@ impl App {
             // The box scrolls with the cursor instead of clipping its tail:
             // what the human is editing is always the part on screen.
             // Multi-line drafts are painted line by line, so the cursor's own
-            // line is the one kept in view.
-            let attachments = attachment_rows(self.chat.attachments());
-            // The text has the rows the attachment rows leave: the painter
-            // stacks them above the lines, and a view that asked for the whole
-            // field would hand back lines that are under the box's bottom.
-            let text_rows = field.height.saturating_sub(attachments.len() as u16) as usize;
+            // line is the one kept in view. The text's rows are what the
+            // attachments leave, and `content_rows` is where that is decided:
+            // it caps the attachment rows to the room the box really has, one
+            // row kept for the text, so the split below cannot hand the draft
+            // the row the attachments took (finding D5).
+            let (attachments, text_rows) = content_rows(field.height, self.chat.attachments());
             let (lines, cursor_row, column) = self.chat.input().view(text_rows, columns);
             InputPane {
                 prompt,

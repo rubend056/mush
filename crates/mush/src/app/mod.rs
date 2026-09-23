@@ -4499,10 +4499,10 @@ mod tests {
     use std::sync::Mutex;
 
     use crossbeam_channel::Receiver;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, TestBackend};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-    use ratatui::layout::Rect;
+    use ratatui::layout::{Position, Rect};
     use ratatui::widgets::{Block, Borders};
     use ratatui::Terminal;
 
@@ -5952,6 +5952,20 @@ mod tests {
             .draw(|frame| crate::ui::draw(frame, &screen, theme))
             .unwrap();
         (screen, terminal.backend().buffer().clone())
+    }
+
+    /// [`painted`] with the position the frame asked the terminal to put the
+    /// cursor at: a cell's symbol reaches the `Buffer`, but the cursor is not a
+    /// cell, so the one fact D5's test reads has to come from the backend.
+    fn painted_cursor(app: &mut App, width: u16, height: u16) -> (Screen, Buffer, Position) {
+        app.set_term_size(width, height);
+        let screen = app.screen(Rect::new(0, 0, width, height));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &screen, &crate::theme::Theme::default()))
+            .unwrap();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        (screen, terminal.backend().buffer().clone(), cursor)
     }
 
     fn shot(app: &mut App, width: u16, height: u16) -> Shot {
@@ -16264,6 +16278,92 @@ mod tests {
             "the fetch's own word: {}",
             text_of(&app)
         );
+    }
+
+    /// D5: the box paints the line the cursor is on, however short it is.
+    ///
+    /// At 40×12 with three attachments the audit's frame put the cursor on
+    /// `▣ shots/shot0.png (png · 0 B)` and painted the draft nowhere: the box
+    /// asked for six rows, was granted five, and the attachment rows took them
+    /// all. The text gets its row before the attachments, so this paints a real
+    /// `TestBackend` frame at every sweep size, for 1..=8 attachments, and reads
+    /// back what reached the cells and where the cursor was recorded.
+    #[test]
+    fn the_box_paints_the_line_the_cursor_is_on() {
+        for attachments in 1..=8usize {
+            let (mut app, _rx) = test_app(&format!("box-line-{attachments}"));
+            let draft = "first line\nsecond line\nthird line";
+            app.chat.set_draft(AgentId::ROOT, draft);
+            for i in 0..attachments {
+                app.chat.attach(Image {
+                    path: format!("shots/shot{i}.png"),
+                    mime: "image/png".to_string(),
+                    bytes: Vec::new(),
+                    pixels: None,
+                });
+            }
+            for &(width, height) in SWEEP_SIZES {
+                if is_below_floor(width, height) {
+                    continue;
+                }
+                let at = format!("{width}×{height} with {attachments} attachments");
+                let (screen, buffer, cursor) = painted_cursor(&mut app, width, height);
+                let Screen::Panes(panes) = &screen else {
+                    panic!("{at}: the sweep sizes are above the floor")
+                };
+                let Some(input) = &panes.chat.input else {
+                    panic!("{at}: the box has no room at all")
+                };
+                let inner = Block::default()
+                    .borders(Borders::ALL)
+                    .inner(panes.chat.input_area);
+                let row =
+                    |y: u16| -> String { (0..width).map(|x| buffer[(x, y)].symbol()).collect() };
+
+                // Every attachment row the view built is painted inside the
+                // box: the rows are the room the box has, not a cap on top of
+                // it.
+                for text in &input.attachments {
+                    assert!(
+                        (inner.y..inner.y + inner.height).any(|y| row(y).contains(text.as_str())),
+                        "{at}: the attachment row {text:?} is not inside the box"
+                    );
+                }
+
+                // The cursor is in the text area — below every attachment row —
+                // and inside the box.
+                let text_top = inner.y + input.attachments.len() as u16;
+                assert!(
+                    cursor.y >= text_top,
+                    "{at}: the cursor sits on an attachment row: {cursor:?}"
+                );
+                assert!(
+                    cursor.y < inner.y + inner.height,
+                    "{at}: the cursor is outside the box: {cursor:?}"
+                );
+
+                // And it is the row its own line was painted on: the line the
+                // view windowed around the cursor is on the cell the backend
+                // recorded.
+                let painted = row(cursor.y);
+                let line = input.lines[input.cursor_row].trim();
+                assert!(
+                    line.is_empty() || painted.contains(line),
+                    "{at}: the cursor is not on its own line: {line:?} at {painted:?}"
+                );
+
+                // The draft is on screen whenever the box got the rows
+                // `input_rows` asked for.
+                if panes.chat.input_area.height >= app.input_rows() {
+                    for text in draft.lines() {
+                        assert!(
+                            (inner.y..inner.y + inner.height).any(|y| row(y).contains(text)),
+                            "{at}: the box asked for its rows and did not paint {text:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The same for a `read` answer: the transcript's lines and their indices,

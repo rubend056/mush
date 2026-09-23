@@ -327,9 +327,13 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
         let x = input_inner.x
             + ((prompt_width + input.column).min(input_inner.width.saturating_sub(1) as usize)
                 as u16);
-        // The attachment rows sit above the cursor's own line, so the cursor's
-        // row inside the box is that many rows further down.
-        let row = input.attachments.len() + input.cursor_row;
+        // The cursor lives in the text area, never on an attachment row: the
+        // box gives the text its row before the attachments (`content_rows`),
+        // so the rows above the cursor are only the attachment rows it was
+        // really granted, and there is a painted line below them. The last-row
+        // clamp is a backstop for a view that outlived its rect.
+        let row =
+            input.attachments.len() + input.cursor_row.min(input.lines.len().saturating_sub(1));
         let y = input_inner.y + (row as u16).min(input_inner.height.saturating_sub(1));
         frame.set_cursor_position(Position::new(x, y));
     }
