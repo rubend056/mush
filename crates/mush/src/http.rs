@@ -3061,8 +3061,9 @@ mod tests {
     #[ignore]
     fn live_endpoint_accepts_the_shipped_reply_cap() {
         // The same resolution startup runs (minus a home file), so the window —
-        // and the cap that is a quarter of it — is the one a real run would
-        // send, not `Config::from_env`'s un-derivable default.
+        // and the cap that is `window / REPLY_SHARE_DIVISOR` (`mush_core::config`
+        // owns the number, `Config::reply_cap` spends it) — is the one a real
+        // run would send, not `Config::from_env`'s un-derivable default.
         let mut cfg = mush_core::config::resolve(
             &mush_core::Overrides::from_env(),
             &mush_core::UserConfig::default(),
