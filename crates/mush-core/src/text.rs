@@ -243,6 +243,33 @@ pub fn columns(left: &str, left_width: usize, description: &str, width: usize) -
     out
 }
 
+/// The columns one character takes under the module's one width rule: a tab is
+/// four columns of layout, a character the tables know takes no column takes
+/// none, and a character the tables cannot measure at all is one.
+///
+/// [`UnicodeWidthChar::width`] answers `Some(0)` for the characters the tables
+/// know take no display column — a combining mark (NFD text), ZWJ, ZWNJ, ZWSP,
+/// BOM, SHY — and `None` only for a control character, which [`sanitize`] has
+/// already removed from every line this module wraps. `.max(1)` in place of
+/// this rule read that known zero as a missing answer and turned each of those
+/// glyphs into a column: `Screenshot\u{301}.png` measured 15 columns against a
+/// terminal's 14 and broke its row early, and a ZWJ emoji paid a column per
+/// joiner, leaving rows the pane had room for blank and spending fold rows the
+/// text did not need (finding PM3). Zero is a fact the tables state, not a
+/// floor.
+///
+/// The `unwrap_or(1)` is for the other `None`: a control character the tables
+/// refuse to measure keeps one column rather than none, so text that reaches
+/// this arithmetic unsanitized still paints every character it holds. A wide
+/// glyph — CJK, emoji presentation — keeps the two columns the tables give it.
+fn glyph_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else {
+        UnicodeWidthChar::width(ch).unwrap_or(1)
+    }
+}
+
 fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -262,10 +289,7 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
             let (rendered, char_width) = if ch == '\t' {
                 ("    ".to_string(), 4)
             } else {
-                (
-                    ch.to_string(),
-                    UnicodeWidthChar::width(ch).unwrap_or(1).max(1),
-                )
+                (ch.to_string(), glyph_width(ch))
             };
 
             // A row ends at its last space, and the character that did not fit
@@ -1191,20 +1215,15 @@ fn wrap_block(block: &Block, width: usize) -> Vec<Vec<Run>> {
 }
 
 /// The columns a run sequence takes, by [`wrap_runs`]' own arithmetic: a tab
-/// is four columns, a glyph is its own width, and a character the width is
-/// unknown for is one column. One spelling of the arithmetic beside the
-/// wrapper's, because the marker's margin and a table's padding both measure
-/// the runs the wrapper will paint.
+/// is four columns, and every other character is the width [`glyph_width`]
+/// gives it — a glyph's own width, a known-zero-width character's zero, and one
+/// column for the character the tables cannot measure. The marker's margin and
+/// a table's padding both measure the runs the wrapper will paint, so they read
+/// the rule beside the wrapper rather than a second copy of it.
 fn runs_width(runs: &[Run]) -> usize {
     runs.iter()
         .flat_map(|run| run.text.chars())
-        .map(|ch| {
-            if ch == '\t' {
-                4
-            } else {
-                UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
-            }
-        })
+        .map(glyph_width)
         .sum()
 }
 
@@ -1217,17 +1236,14 @@ fn runs_width(runs: &[Run]) -> usize {
 /// character, and the wrapper treats neither as a break, so both keep the units
 /// around them one. A run boundary is not a break either — `**bold**word` is
 /// one word — which is why the units are walked over the cell's characters
-/// rather than per run. The arithmetic is [`runs_width`]'s, one unit at a time.
+/// rather than per run. Each character is measured by [`glyph_width`], the same
+/// rule the wrapper breaks by, one unit at a time.
 fn longest_unit(runs: &[Run]) -> usize {
     let mut longest = 0;
     let mut unit = 0;
     for run in runs {
         for ch in run.text.chars() {
-            let width = if ch == '\t' {
-                4
-            } else {
-                UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
-            };
+            let width = glyph_width(ch);
             if ch == ' ' {
                 unit = 0;
             } else {
@@ -1578,8 +1594,8 @@ fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
 }
 
 /// [`wrap_text`] over styled runs: the same rows, each row split into runs of
-/// one style. The arithmetic is `wrap_capped`'s, tab expansion included, and a
-/// test pins the two against each other — one rule, two spellings, and no drift
+/// one style. The arithmetic is [`glyph_width`]'s, tab expansion included, and a
+/// test pins the two against each other — one rule, two wrappers, and no drift
 /// between the view and the text beside it.
 fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
     let width = width.max(1);
@@ -1597,7 +1613,7 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
         let (char_width, tab) = if ch == '\t' {
             (4, true)
         } else {
-            (UnicodeWidthChar::width(ch).unwrap_or(1).max(1), false)
+            (glyph_width(ch), false)
         };
         // The break is a loop, exactly as in `wrap_capped`: the tail a space
         // break leaves can itself be too full for this character, and a row
@@ -1616,10 +1632,7 @@ fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
             } else {
                 out.push(std::mem::take(&mut current));
             }
-            current_width = current
-                .iter()
-                .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(1).max(1))
-                .sum();
+            current_width = current.iter().map(|(ch, _)| glyph_width(*ch)).sum();
             last_space = None;
         }
         if tab {
@@ -2176,6 +2189,74 @@ mod tests {
         }
     }
 
+    /// A character the width tables know takes no display column takes none in
+    /// every road that measures a row: the plain wrapper, the styled wrapper,
+    /// [`runs_width`] and the table's column walk, because all of them read the
+    /// one rule ([`glyph_width`]). A floor of one column per character made NFD
+    /// text and a ZWJ emoji a column per mark or joiner wider than any terminal
+    /// paints them — `Screenshot\u{301}.png` broke a row of 14 columns into
+    /// two, and a family emoji cost columns a terminal gives back — while a
+    /// wide glyph (CJK, emoji presentation) keeps its real two columns
+    /// (finding PM3).
+    #[test]
+    fn a_known_zero_width_character_takes_no_column() {
+        // The crate's answer for these is a known zero, not an unknown `None`:
+        // the missing answer is a control character's, which `sanitize` has
+        // already removed from every line a wrapper walks.
+        for ch in [
+            '\u{301}',  // combining acute
+            '\u{200b}', // ZWSP
+            '\u{200c}', // ZWNJ
+            '\u{200d}', // ZWJ
+            '\u{feff}', // BOM
+            '\u{ad}',   // SHY
+        ] {
+            assert_eq!(UnicodeWidthChar::width(ch), Some(0), "{ch:?}");
+            let run = [Run {
+                text: format!("a{ch}b"),
+                style: RunStyle::Plain,
+            }];
+            assert_eq!(runs_width(&run), 2, "{ch:?} costs no column in a run");
+            assert_eq!(longest_unit(&run), 2, "{ch:?} costs no column in a cell");
+        }
+
+        // The plain wrapper: NFD text a terminal paints 14 columns wide is one
+        // row at 14, not two.
+        assert_eq!(
+            wrap_text("Screenshot\u{301}.png", 14),
+            vec!["Screenshot\u{301}.png".to_string()]
+        );
+        // And the styled wrapper paints the same one row of the same text.
+        assert_eq!(
+            markdown_rows("Screenshot\u{301}.png", 14),
+            vec![vec![Run {
+                text: "Screenshot\u{301}.png".to_string(),
+                style: RunStyle::Plain,
+            }]]
+        );
+        // A five-code-point family emoji is two columns per emoji and none per
+        // joiner: one six-column row, as a terminal paints it.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(wrap_text(family, 6), vec![family.to_string()]);
+        assert_eq!(rows(family, 6), vec![family.to_string()]);
+
+        // The table walk sizes a column by the same rule: the NFD header cell
+        // needs four columns, so at room 12 its column takes four and the one
+        // holding an eight-column word keeps the eight it needs — not 5 and 7.
+        let table = "| Cafe\u{301} | abcdefgh |\n| --- | --- |\n| x | y |";
+        let painted: Vec<String> = rows(table, 15);
+        assert_eq!(table_widths(&painted), vec![4, 8]);
+        assert_eq!(column_text(&painted, 0), "Cafe\u{301}x");
+
+        // A wide glyph keeps the width it paints: CJK and emoji presentation
+        // are two columns, so they break where their own width says.
+        assert_eq!(wrap_text("日本語", 4), vec!["日本", "語"]);
+        assert_eq!(
+            wrap_text("\u{1f600}\u{1f600}", 3),
+            vec!["\u{1f600}", "\u{1f600}"]
+        );
+    }
+
     /// Showing the edges of an API key must count characters: slicing four
     /// bytes of a multi-byte key panicked (finding B2).
     #[test]
@@ -2214,13 +2295,7 @@ mod tests {
         let widest = row
             .iter()
             .flat_map(|run| run.text.chars())
-            .map(|ch| {
-                if ch == '\t' {
-                    4
-                } else {
-                    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
-                }
-            })
+            .map(glyph_width)
             .max()
             .unwrap_or(1);
         assert!(
