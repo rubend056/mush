@@ -847,16 +847,15 @@ impl Workspace {
     fn write_pasted_image(&self, bytes: Vec<u8>, mime: &str) -> Result<Image, String> {
         session::ensure_mush_dir(self.root())
             .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
-        let dir = self.root().join(session::MUSH_DIR).join("paste");
-        fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}/paste: {e}", session::MUSH_DIR))?;
+        let dir = paste_dir(self.root());
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {PASTE_REL}: {e}"))?;
         let (name, mut file) = create_paste_file(&dir, now_millis(), mime)?;
         file.write_all(&bytes)
-            .map_err(|e| format!("cannot write {}/{name}: {e}", session::MUSH_DIR))?;
+            .map_err(|e| format!("cannot write {}: {e}", paste_rel(&name)))?;
         drop(file);
         let pixels = image_dimensions(mime, &bytes);
         Ok(Image {
-            path: format!("{}/paste/{name}", session::MUSH_DIR),
+            path: paste_rel(&name),
             mime: mime.to_string(),
             bytes,
             pixels,
@@ -1711,7 +1710,28 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// Create the file a paste's bytes go in under `dir` (`.mush/paste/`), and
+/// Where pasted pictures live under a workspace, as the one spelling every
+/// road that names the directory reads: the join that creates it, the path an
+/// [`Image`] carries, and every message about a paste.
+///
+/// The spelling is one because two write failures used to say `.mush/<name>`
+/// for a file whose path is `.mush/paste/<name>` — a refusal a human is meant
+/// to act on, naming a file that is not there. A path spelled twice is a path
+/// that can disagree with itself.
+pub const PASTE_REL: &str = ".mush/paste";
+
+/// The directory under `root` that pasted pictures are written into.
+pub fn paste_dir(root: &Path) -> PathBuf {
+    root.join(PASTE_REL)
+}
+
+/// The workspace-relative name of a file in [`paste_dir`]: the path an
+/// [`Image`] carries and the path a message about a pasted file spells.
+pub fn paste_rel(name: &str) -> String {
+    format!("{PASTE_REL}/{name}")
+}
+
+/// Create the file a paste's bytes go in under `dir` (a [`paste_dir`]), and
 /// hand back the name it took: `pasted-<unix millis>.<ext>`, or
 /// `pasted-<millis>-2.<ext>` and on when that name is already there.
 ///
@@ -1738,7 +1758,7 @@ fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs
         {
             Ok(file) => return Ok((name, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("cannot write {}/{name}: {e}", session::MUSH_DIR)),
+            Err(e) => return Err(format!("cannot write {}: {e}", paste_rel(&name))),
         }
     }
 }
@@ -2949,6 +2969,33 @@ mod tests {
             png(4),
             "and the second its own"
         );
+    }
+
+    /// A refusal a paste that cannot be written is told names the file where it
+    /// would have been — `.mush/paste/<name>` — not `.mush/<name>`: the message
+    /// is what the human acts on, and the two write failures used to point
+    /// beside the directory. One spelling ([`PASTE_REL`]) serves the join that
+    /// makes the directory, the refusal and the path an [`Image`] carries.
+    #[test]
+    fn a_paste_that_cannot_be_written_names_the_paste_directory() {
+        let ws = temp_workspace("paste-spelling");
+        // `.mush/paste` is a file, so the directory cannot be made and a file
+        // inside it cannot be opened.
+        fs::create_dir_all(ws.root().join(".mush")).unwrap();
+        fs::write(ws.root().join(PASTE_REL), "not a directory").unwrap();
+
+        let refused = ws.save_pasted_image(png(4), false).unwrap_err();
+        assert!(refused.contains("cannot create .mush/paste: "), "{refused}");
+
+        let refused = create_paste_file(&ws.root().join(PASTE_REL), 1_700_000_000_000, "image/png")
+            .unwrap_err();
+        assert!(
+            refused.contains("cannot write .mush/paste/pasted-1700000000000.png: "),
+            "{refused}"
+        );
+
+        assert_eq!(paste_rel("shot.png"), ".mush/paste/shot.png");
+        assert_eq!(paste_dir(ws.root()), ws.root().join(PASTE_REL));
     }
 
     /// An image past the cap is a refusal, not the text fallback, whichever
