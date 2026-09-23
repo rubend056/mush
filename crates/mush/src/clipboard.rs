@@ -7,7 +7,10 @@
 //! and `wl-copy`, X11's `xclip`, macOS's `pngpaste` and `pbcopy` — and shelling
 //! out to them is what a human does by hand. Which one exists is discovered by
 //! trying them, because a program that is not installed fails to spawn
-//! instantly and costs nothing to ask.
+//! instantly and costs nothing to ask. Every one of them is started without
+//! mush's secrets ([`mush_core::secrets::scrub`]): a clipboard tool does not
+//! talk to the provider, and the credential is not in the environment it is
+//! handed (finding C1).
 //!
 //! This module lives in the binary crate, not in `mush-core`: it is a
 //! subprocess and the clipboard is a machine facility, and `mush-core` is
@@ -34,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mush_core::message::Image;
+use mush_core::secrets::scrub;
 use mush_core::workspace::{image_mime, IMAGE_FILE_CAP};
 use mush_core::Workspace;
 
@@ -210,13 +214,13 @@ enum Answer {
 /// has the rest drained and dropped, so the memory a stuck tool can cost is a
 /// constant rather than the machine's.
 fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    let mut child = match scrub(&mut command).spawn() {
         Ok(child) => child,
         Err(_) => return Answer::Missing,
     };
@@ -464,13 +468,13 @@ enum Delivered {
 /// in a pipe are the program's to read or to leave, and that gap is the price of
 /// not blocking on a writer that may never read them.
 fn deliver(program: &str, args: &[String], text: &Arc<str>, deadline: Instant) -> Delivered {
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    let mut child = match scrub(&mut command).spawn() {
         Ok(child) => child,
         Err(_) => return Delivered::Missing,
     };
@@ -537,6 +541,61 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Workspace::new(&dir).unwrap()
+    }
+
+    /// Both clipboard roads spawn their child through
+    /// [`mush_core::secrets::scrub`] (finding C1), and neither `wl-paste` nor
+    /// `wl-copy` is guaranteed on the machine: what is under test is the spawn
+    /// every reader and writer goes through, not the clipboard program, so the
+    /// child here is `sh` — which cannot be missing — and it writes what
+    /// `printenv` printed to a file. `PATH` and the rest ride through the
+    /// removal untouched; the two children are chosen for what they prove.
+    #[test]
+    fn a_clipboard_child_never_sees_mushs_key() {
+        let dir = std::env::temp_dir().join(format!("mush-clipboard-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("MUSH_API_KEY");
+        std::env::set_var("MUSH_API_KEY", "sk-probe-inheritance-0123456789");
+        let read = dir.join("read");
+        let answer = run(
+            "sh",
+            &[
+                "-c".into(),
+                format!("printenv MUSH_API_KEY > {}; true", read.display()),
+            ],
+            Instant::now() + DEADLINE,
+        );
+        let write = dir.join("write");
+        let delivered = deliver(
+            "sh",
+            &[
+                "-c".into(),
+                format!(
+                    "printenv MUSH_API_KEY > {}; cat >/dev/null",
+                    write.display()
+                ),
+            ],
+            &Arc::from("some text"),
+            Instant::now() + DEADLINE,
+        );
+        match previous {
+            Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
+            None => std::env::remove_var("MUSH_API_KEY"),
+        }
+        assert!(
+            matches!(answer, Answer::Nothing),
+            "the reader road ran to its own answer"
+        );
+        assert!(
+            matches!(delivered, Delivered::Taken),
+            "the writer road reached its child"
+        );
+        for (road, path) in [("reader", &read), ("writer", &write)] {
+            let seen = fs::read_to_string(path).unwrap();
+            assert_eq!(seen, "", "the {road} child saw mush's credential: {seen:?}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A reader that pours out more than the cap has the rest drained and

@@ -4,9 +4,14 @@
 //!
 //! Everything here is best-effort: a workspace that is not a repository, or a
 //! `git` binary that is missing, answers `None` rather than failing a caller.
+//!
+//! Every child is started through [`scrub`]: git does not talk to the provider,
+//! so mush's credential is not in the environment it is handed (finding C1).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::secrets::scrub;
 
 /// The line delta of some change set. git's counts are 64-bit, so a diff of
 /// billions of lines is reported, not truncated to `±0` by a failed parse.
@@ -47,13 +52,9 @@ pub struct RepoStatus {
 /// `LC_ALL=C` keeps the output parseable: a localized `--shortstat` would not
 /// match the English words the parser knows, and would read as `±0`.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args).env("LC_ALL", "C");
+    let output = scrub(&mut command).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -87,11 +88,9 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// The one invocation style for mutating verbs: `-C` so the caller names the
 /// repository, and `LC_ALL=C` so a conflict or error reads the same everywhere.
 fn run_named(dir: &Path, name: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("LC_ALL", "C")
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args).env("LC_ALL", "C");
+    let output = scrub(&mut command)
         .output()
         .map_err(|_| GIT_UNAVAILABLE.to_string())?;
     if !output.status.success() {
@@ -998,6 +997,54 @@ mod tests {
         // With a base branch named, the refusal is git's own.
         assert!(worktree_add(&unborn, 7, Some("HEAD")).is_err());
         let _ = fs::remove_dir_all(&unborn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hook is git's own way for a child to say what environment git handed
+    /// it, and it is the evidence that the git children are started through
+    /// [`crate::secrets::scrub`] too (finding C1). The hook's `printenv` is
+    /// written to a file and the hook then exits on `true`, so the commit
+    /// succeeds whatever the probe found — the file is the assertion, not the
+    /// exit status. `core.hooksPath` is pointed at a directory the test owns,
+    /// because a machine-wide hooks path would otherwise decide what runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_child_never_sees_mushs_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = init_repo("hook-env");
+        let hooks = dir.join("test-hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        run(&dir, &["config", "core.hooksPath", hooks.to_str().unwrap()]).unwrap();
+        let seen = dir.join("seen");
+        let hook = hooks.join("pre-commit");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintenv MUSH_API_KEY > {}\ntrue\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The key is put back on the way out, so a failure here does not turn
+        // this binary's other tests into readers of a probe credential.
+        let previous = std::env::var_os("MUSH_API_KEY");
+        std::env::set_var("MUSH_API_KEY", "sk-probe-inheritance-0123456789");
+        fs::write(dir.join("b.txt"), "two\n").unwrap();
+        run(&dir, &["add", "-A"]).unwrap();
+        run(&dir, &["commit", "-qm", "with a hook"]).unwrap();
+        match previous {
+            Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
+            None => std::env::remove_var("MUSH_API_KEY"),
+        }
+
+        let read = fs::read_to_string(&seen).unwrap();
+        assert_eq!(
+            read, "",
+            "the git child handed mush's credential to its hook: {read:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -9,7 +9,9 @@
 //! own process group, output to scratch *files* rather than pipes (a pipe is
 //! only complete once every holder exits, so a command that leaves a background
 //! job behind would pin the agent thread past its timeout), and
-//! `kill -9 -pgid` to take the whole group down.
+//! `kill -9 -pgid` to take the whole group down. One thing is not as it always
+//! was: the child is handed the inherited environment **minus mush's secrets**,
+//! so a command cannot read the provider credential ([`Shell`]).
 //!
 //! The fake scripts end states, output sizes and kills, so the timeout, the
 //! cancellation and the output cap — the three ways a command *stops* — are
@@ -22,6 +24,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 
 use tempfile::NamedTempFile;
 
+use mush_core::secrets::scrub;
 use mush_core::workspace::{tail_for_model, truncate_for_model};
 
 /// What to run, and where.
@@ -89,7 +92,17 @@ pub trait Machine: Send + Sync {
     fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>;
 }
 
-/// The real one: `sh -c`, its own process group, output to scratch files.
+/// The real one: `sh -c`, its own process group, output to scratch files — and
+/// **without mush's secrets**.
+///
+/// A command sees the environment the human's own shell would have handed it —
+/// `PATH`, `HOME`, `LANG`, `EDITOR`, their tooling — minus
+/// [`mush_core::secrets::SECRET_ENV`]: `MUSH_API_KEY` is not in it. The
+/// credential is mush's, its one road is the wire, and this child's output is a
+/// tool result — the store keeps that verbatim and the attach socket hands it
+/// to any local user, so a command that could read the key could put it
+/// somewhere durable in one turn (finding C1). The removal is [`scrub`]'s —
+/// one list, and every child mush starts for itself is taken through it.
 pub struct Shell;
 
 impl Machine for Shell {
@@ -104,6 +117,9 @@ impl Machine for Shell {
             .stdin(Stdio::null())
             .stdout(Stdio::from(out.writer()?))
             .stderr(Stdio::from(err.writer()?));
+        // The command is the model's, the credential is mush's: `Shell`'s doc
+        // says what is taken out and why.
+        scrub(&mut shell);
         // Its own process group, so a signal aimed at mush never lands on a
         // build and cleanup can target everything the command started.
         #[cfg(unix)]
@@ -177,7 +193,7 @@ impl Job for Running {
         let _ = self.child.kill();
         #[cfg(unix)]
         {
-            let _ = Command::new("kill")
+            let _ = scrub(&mut Command::new("kill"))
                 .args(["-9", &format!("-{group}")])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -482,5 +498,96 @@ mod tests {
             !matches!(ended(nameless), End::Exited(_)),
             "an unknown end is not an exit code spelled -1"
         );
+    }
+
+    /// Run one command through the real [`Shell`] and wait for it to end.
+    ///
+    /// The wait is bounded and the job killed on the way out: a command that
+    /// never ends here is a defect in the test, not a hung suite.
+    #[cfg(unix)]
+    fn run_to_end(command: &str, root: &std::path::Path) -> End {
+        use super::{Machine, Shell, ShellCommand};
+
+        let mut job = Shell
+            .spawn(&ShellCommand { command, root })
+            .expect("the real shell starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match job.poll().expect("a status is readable") {
+                Some(end) => return end,
+                None if std::time::Instant::now() >= deadline => {
+                    job.kill();
+                    panic!("`{command}` did not end within 10s");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// `MUSH_API_KEY` set for one test, put back when it ends — panic or not.
+    /// The environment belongs to the whole process, and a probe key left
+    /// behind would be read by every test that runs after this one.
+    #[cfg(unix)]
+    struct KeyInProcess(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl KeyInProcess {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("MUSH_API_KEY");
+            std::env::set_var("MUSH_API_KEY", value);
+            Self(previous)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KeyInProcess {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
+                None => std::env::remove_var("MUSH_API_KEY"),
+            }
+        }
+    }
+
+    /// The key is mush's, not the model's (finding C1). A command run through
+    /// the real [`Shell`] cannot read `MUSH_API_KEY`, even while the process
+    /// that spawned it holds one: the command writes what `printenv` printed to
+    /// a file in the job's root, and the file is empty. The exit status is
+    /// `printenv`'s for a name that is not set — the two halves of "unset",
+    /// where an empty variable would still be a variable.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_never_sees_mushs_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("key");
+        let _key = KeyInProcess::set("sk-probe-inheritance-0123456789");
+        let end = run_to_end(
+            &format!("printenv MUSH_API_KEY > {}", out.display()),
+            dir.path(),
+        );
+        let seen = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            seen, "",
+            "a command read mush's credential out of its environment: {seen:?}"
+        );
+        assert_eq!(end, End::Exited(1), "printenv exits 1 for an unset name");
+    }
+
+    /// The scrub is a removal, not `env_clear`: the command keeps the
+    /// environment the human's own tooling was written against. `PATH` is the
+    /// one every command needs, and it reaches the child byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_keeps_the_environment_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("path");
+        let end = run_to_end(&format!("printenv PATH > {}", out.display()), dir.path());
+        let seen = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            seen.trim_end_matches('\n'),
+            std::env::var("PATH").unwrap(),
+            "the command's PATH is the human's"
+        );
+        assert_eq!(end, End::Exited(0), "printenv found PATH");
     }
 }

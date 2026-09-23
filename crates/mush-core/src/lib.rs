@@ -10,6 +10,7 @@ pub mod git;
 pub mod message;
 pub mod prompt;
 pub mod provider;
+pub mod secrets;
 pub mod session;
 pub mod text;
 pub mod tools;
