@@ -15,9 +15,9 @@
 //! write that fails does not consume its snapshot: the writer keeps it and
 //! tries again on the next wake, and on its own final drain when the app is
 //! dropped, so a full disk costs the human a delay and never the conversation
-//! tail behind it (finding R2). [`SessionSave::flush`] is the other half: the transitions that mean "this
-//! must be on disk" wait for their own write, a cost paid once per human
-//! action instead of once per response.
+//! tail behind it (finding R2). [`SessionSave::flush`] is the other half: the
+//! transitions that mean "this must be on disk" wait for their own write, a
+//! cost paid once per human action instead of once per response.
 
 use std::path::PathBuf;
 #[cfg(test)]
