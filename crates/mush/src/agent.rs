@@ -3561,9 +3561,10 @@ fn run_turns(
         // between, means the model is repeating itself rather than working.
         // This — not a turn count — is the honest reason to stop a run early.
         // Two rounds are exceptions, because neither one moved the world: a
-        // batch the machine *refused* (nothing ran, so nothing is repeating —
-        // finding H13) and a batch whose `wait` slept (the call spent the round
-        // and was told "not yet", which is the whole road back from a lock).
+        // batch *refused* before anything ran (nothing ran, so nothing is
+        // repeating — finding H13) and a batch whose `wait` slept (the call
+        // spent the round and was told "not yet", which is the whole road back
+        // from a lock).
         if !tool_calls.is_empty() {
             let batch = tool_calls
                 .iter()
@@ -3674,13 +3675,18 @@ fn run_turns(
             let named = call.function.name.clone();
             let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
 
+            // Arguments the rewrite in `sanitize_tool_calls` could not read
+            // carry its marker: the line says that, rather than painting the
+            // marker key as if it were a real argument.
+            let label = if args.get(tools::UNREADABLE_ARGUMENTS).is_some() {
+                format!("{named} — the arguments were not valid JSON")
+            } else {
+                format!("{} {}", named, summarize(&args))
+            };
             // An invented name is answered like any other failure, so the batch
             // still gets a tool message for every call.
             let tool = ToolName::parse(&named);
-            actor.ctx.emit(
-                actor.id,
-                AgentEvent::Status(format!("{} {}", named, summarize(&args))),
-            );
+            actor.ctx.emit(actor.id, AgentEvent::Status(label));
 
             let result = match tool {
                 Some(tool) => exec_tool(actor, state, tool, &args, cancel),
@@ -4655,11 +4661,16 @@ impl std::fmt::Display for ToolOutput {
 ///
 /// `Refused` is the machine saying *not now* — the lock is held, the job budget
 /// is full — so nothing ran and nothing changed. `Failed` is the call itself
-/// going wrong. The loop guard reads the difference: a batch of refusals is not
-/// a model repeating itself, and counting it as one killed an integrator and a
-/// fixer whose only mistake was retrying a locked machine (finding H13). Both
-/// variants travel to the transcript as text under `error: `; only the guard
-/// cares which road produced it.
+/// going wrong, whether the tool then ran and errored or the arguments carried
+/// [`tools::UNREADABLE_ARGUMENTS`] and it never ran at all: the model's own
+/// bytes are what cannot be used, so the world will not change until the model
+/// sends a different call. The loop guard reads the difference: a batch of
+/// refusals is not a model repeating itself, and counting it as one killed an
+/// integrator and a fixer whose only mistake was retrying a locked machine
+/// (finding H13), while an unreadable call *must* count — the guard is the only
+/// thing between a model that repeats the same broken arguments and a run that
+/// spends rounds forever. Both variants travel to the transcript as text under
+/// `error: `; only the guard cares which road produced it.
 #[derive(Debug)]
 enum ToolError {
     Refused(String),
@@ -4690,6 +4701,23 @@ fn exec_tool(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<ToolOutput, ToolError> {
+    // Arguments the model sent as something other than a JSON object carry the
+    // rewrite's marker: there is nothing here the model meant, so the call is
+    // refused before the tool match reads any default in its place — the
+    // mangled `list_files` this closes answered with a listing of the whole
+    // workspace root.
+    if args.get(tools::UNREADABLE_ARGUMENTS).is_some() {
+        // `Failed`, not `Refused`: the refusal is the model's own arguments,
+        // not the machine saying *not now*, so the loop guard must count a
+        // batch of them (see [`ToolError`]). A model that repeats the same
+        // broken call is repeating itself — nothing in the world can change
+        // until it sends different bytes — and the guard is what stops it.
+        return Err(ToolError::Failed(
+            "the model's arguments were not valid JSON — this call was not run; \
+             send it again with the arguments as one JSON object"
+                .to_string(),
+        ));
+    }
     // `run_command` is the one tool that can be refused before anything runs
     // (the machine lock, the job budget), so it returns the verdict itself;
     // every other tool either ran or failed. `read_file` owns its output type
@@ -11054,6 +11082,148 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inside, "src/lib.rs:1: fn needle() {}", "{inside}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A tool call whose arguments the model sent as something other than JSON
+    /// is refused before it runs. [`sanitize_tool_calls`] rewrites the broken
+    /// text so the wire keeps carrying a valid object — some servers reject the
+    /// whole message otherwise — and the marker that rewrite leaves is what the
+    /// executor reads: `list_files` has no required field, so before this the
+    /// mangled call ran with `path` defaulted to the workspace root and
+    /// answered with a full root listing, a question the model never asked.
+    #[test]
+    fn a_tool_call_whose_arguments_were_unreadable_is_refused_not_run() {
+        let scripted = Arc::new(
+            Scripted::new()
+                // `tool_call` takes a `Value`, so the unreadable arguments are
+                // built as the raw string a model actually writes them as.
+                .calls(vec![ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "list_files".into(),
+                        arguments: "{oops".into(),
+                    },
+                }])
+                .says("done"),
+        );
+        let (actor, events, _mailbox) = build_actor_about(
+            "unreadable-arguments",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        // An unmistakable file: a listing of the root names it.
+        fs::write(actor.ws.root().join("marker.txt"), "x").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![measured_prompt(&actor), Message::user("look around")];
+
+        let outcome = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(outcome.as_deref(), Some("done"));
+
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the call is answered either way");
+        assert!(
+            result.text().contains("not valid JSON"),
+            "the model is told its arguments were unreadable: {}",
+            result.text()
+        );
+        assert!(
+            !result.text().contains("marker.txt"),
+            "the call did not run: a root listing would have named marker.txt: {}",
+            result.text()
+        );
+
+        // The wire carried a valid object, and the marker on it is what says
+        // the arguments could not be read: not the broken text, and not a bare
+        // `{}` the executor would run `list_files` from.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the batch ran and the model answered");
+        let carried = asked[1]
+            .messages
+            .iter()
+            .flat_map(Message::tool_calls)
+            .find(|call| call.id == "c1")
+            .expect("the second request carries the call");
+        let marker = tools::UNREADABLE_ARGUMENTS;
+        let args: Value =
+            serde_json::from_str(&carried.function.arguments).expect("the rewrite is valid JSON");
+        assert_ne!(
+            carried.function.arguments, "{}",
+            "not a bare `{{}}`, which the executor would run `list_files` from"
+        );
+        assert!(
+            args.get(marker).is_some(),
+            "the arguments carry the marker: {args}"
+        );
+
+        // The line the human reads says the same fact rather than painting the
+        // marker key as a real argument.
+        let status: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Status(what) => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            status.iter().any(|line| line.contains("not valid JSON")),
+            "the row's label tells the fact too: {status:?}"
+        );
+        assert!(
+            status.iter().all(|line| !line.contains(marker)),
+            "and never paints the marker key as a real argument: {status:?}"
+        );
+
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The guard the promise must not open: an unreadable call's refusal is
+    /// `Failed`, not `Refused`, because the model's own arguments are what
+    /// cannot be used — nothing in the world changes until it sends different
+    /// bytes, so a batch of them *is* the model repeating itself. `Refused` is
+    /// exempt from the count (H13, the machine saying *not now*), and a marker
+    /// refusal left in that class would let a model spend rounds forever on the
+    /// same broken call; the loop guard is the only thing that stops one.
+    #[test]
+    fn a_model_that_repeats_an_unreadable_call_is_still_stopped_as_a_loop() {
+        let unreadable = ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "list_files".into(),
+                arguments: "{oops".into(),
+            },
+        };
+        let mut scripted = Scripted::new();
+        for _ in 0..LOOP_ROUNDS + 1 {
+            scripted = scripted.calls(vec![unreadable.clone()]);
+        }
+        let scripted = Arc::new(scripted.says("done"));
+        let (actor, _events, _mailbox) = build_actor_about(
+            "unreadable-loop",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![measured_prompt(&actor), Message::user("look around")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("stopped as a loop"), "{error}");
+        assert_eq!(
+            scripted.asked().len(),
+            LOOP_ROUNDS + 1,
+            "every identical broken call counted, and the guard ended the run"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
