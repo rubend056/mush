@@ -1971,9 +1971,12 @@ fn actor_main(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
 /// F13).
 ///
 /// The rule is the prompt's own sentence — "without one the child works in this
-/// workspace, and only one such child may run at a time" — and it is a fact
-/// about a *directory*: the books are per-parent, and a grandchild is never in
-/// its grandparent's `shared` set. The root spawns shared A, A's run ends while
+/// workspace, where only one shared child may run at a time — the directory's
+/// live writers, tree-wide, not only the children your own books name: a
+/// grandchild working here counts, a child whose run has ended does not, and
+/// your own run is exempt" — and it is a fact about a *directory*: the books
+/// are per-parent, and a grandchild is never in its grandparent's `shared` set.
+/// The root spawns shared A, A's run ends while
 /// *its* shared child B — in the same checkout by construction — is still
 /// running, and the root is free to spawn shared C into it: two writers, and
 /// the guard that says "already runs in this shared workspace" holding a book
