@@ -23,8 +23,10 @@ spec: the spec is the doc comments beside the code, written as the reason, and
   the reason.
 - Anything the code can print is **generated** into the blocks marked
   `<!-- generated: … -->` and checked by `cargo test`, so a stale block is a
-  failing test. Regenerate one with the `MUSH_BLESS_DOCS=1 …` command in its own
-  head, never by hand.
+  failing test. Each block's own head carries the one command that regenerates
+  it (`MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush <the check>`), so a
+  reader of the raw file sees what is generated and how to rebuild it; never
+  edit one by hand.
 
 ---
 
@@ -617,8 +619,9 @@ thing the row's words do, `waiting on results 3s`), `⊘` a cancel in flight or 
 run that landed stopped, so a guard-stop is not dressed as a failure, `✉` a
 result a parent has not read, `✉N` the ones from an agent's own children, `⚮` a
 row whose parent the history window has reaped (it is drawn at the top level like
-a root child, and the mark is what says it is not one), `▶` the focused agent,
-and `⚙N` jobs on their owner's row. A running agent with children out wears *no*
+a root child, and the mark is what says it is not one; how many children a parent
+keeps is `CHILD_HISTORY` in `crates/mush/src/app/tree.rs`), `▶` the focused
+agent, and `⚙N` jobs on their owner's row. A running agent with children out wears *no*
 count of them: the children's own rows say they run, and the title's
 `N waiting` counts the agents at rest with work out. Tool calls are
 `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
@@ -1027,9 +1030,10 @@ the one lock, §5.6); M3 external agents (the attach socket, `mush
 read/agents/focus/edit`).
 
 **Next.** M5 spawn mode: `mush` launches a configured agent in a pty pane with
-`MUSH_SOCKET`/`MUSH_ROOT` injected, so "works with any agent" covers binaries
-that know nothing about mush. M6 polish: transcript search, an optional MCP
-bridge as a separate binary, and per-agent token accounting.
+the attach socket's path and the workspace root injected into its environment,
+so "works with any agent" covers binaries that know nothing about mush. M6
+polish: transcript search, an optional MCP bridge as a separate binary, and
+per-agent token accounting.
 
 M4 (FS watching) is `[OBSOLETE v0.2]`: there are no buffers to merge into, and
 the periodic git snapshot already tells the human what moved. Each milestone ends
