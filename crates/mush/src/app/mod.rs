@@ -3371,6 +3371,12 @@ impl App {
                 // A new endpoint may host a different model with a different
                 // window; re-derive it unless the human stated one (finding A5).
                 let forgotten = self.switch_endpoint(&url);
+                // The endpoint is one of the fields the session stores, and the
+                // session outranks the home config on the next start
+                // (`config::resolve` reads it last), so the switch has to mark
+                // the session dirty or the next start reverts it (finding
+                // R19).
+                self.mark_session_dirty();
                 self.refresh_models();
                 let mut line = format!(
                     "endpoint: {} · {}",
@@ -3736,6 +3742,11 @@ impl App {
             return;
         };
         let forgotten = self.switch_provider(provider);
+        // What a provider writes is stored — its name, its endpoint and its
+        // model — and the session outranks the home config on the next start,
+        // so this has to mark the session dirty or the next start silently
+        // reverts the pick (finding R19).
+        self.mark_session_dirty();
         self.refresh_models();
         self.persist_user_config();
         let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
@@ -3830,6 +3841,11 @@ impl App {
                 // A new model means a new documented window, unless the human
                 // stated one (finding A5).
                 self.cell.edit(|cfg| cfg.set_model(id));
+                // The model is stored, and the session outranks the home
+                // config on the next start: a pick that does not mark the
+                // session dirty is a pick the next start silently reverts
+                // (finding R19).
+                self.mark_session_dirty();
                 self.adopt_advertised_context();
                 self.persist_user_config();
                 self.say(format!(
@@ -14665,6 +14681,90 @@ mod tests {
             text_of(&app).starts_with("provider: custom · "),
             "and the bar names the provider that was picked: {}",
             text_of(&app)
+        );
+    }
+
+    /// The snapshot a command's own choice left for the debounce: the app is
+    /// aged to the debounce and ticked, and the file the writer was handed is
+    /// read back. What a pick has to leave behind is a *stored* field, not a
+    /// mark — the session outranks the home config on the next start
+    /// (`config::resolve` reads it last), so only the file can prove the
+    /// choice survives (finding R19).
+    fn stored_after(label: &str, command: impl FnOnce(&mut App)) -> Arc<Session> {
+        let (mut app, recorder) = app_recording(label);
+        command(&mut app);
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick();
+        let saved = recorder.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the choice must reach the debounce: nothing was handed over"
+        );
+        saved[0].clone()
+    }
+
+    /// A model picked with `/model` is one of the fields the session stores —
+    /// and the session outranks the home config on the next start — so a pick
+    /// that does not mark the session dirty is a pick the next start silently
+    /// reverts (finding R19).
+    #[test]
+    fn a_picked_model_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-model", |app| {
+            app.update(Msg::Models {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                models: vec![
+                    http::Model {
+                        id: "test-model".to_string(),
+                        context: None,
+                    },
+                    http::Model {
+                        id: "picked".to_string(),
+                        context: None,
+                    },
+                ],
+            });
+            run(app, "/model");
+            // The cursor opens on the model in use; the row below it is the pick.
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        });
+        assert_eq!(
+            stored.model, "picked",
+            "the file carries the model that was picked"
+        );
+    }
+
+    /// The same for `/provider`: the name it writes is stored, and a provider
+    /// that keeps the endpoint (`custom`) is used here because one that owns an
+    /// endpoint would put a fetch on the real network — the change the session
+    /// has to carry is the name itself (finding R19).
+    #[test]
+    fn a_picked_provider_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-provider", |app| {
+            app.cell.edit(|cfg| cfg.provider = Provider::DeepSeek);
+            run(app, "/provider custom");
+        });
+        assert_eq!(
+            stored.provider, "custom",
+            "the file carries the provider that was picked"
+        );
+    }
+
+    /// And for `/url`: the endpoint is stored in the session, which the next
+    /// start reads before the home config, so pointing mush elsewhere has to
+    /// mark the session dirty or the next start reverts it (finding R19).
+    #[test]
+    fn a_new_endpoint_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-url", |app| {
+            run(app, "/url http://127.0.0.1:2");
+        });
+        assert_eq!(
+            stored.base_url, "http://127.0.0.1:2",
+            "the file carries the endpoint that was picked"
         );
     }
 
