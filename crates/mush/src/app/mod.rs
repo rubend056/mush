@@ -1249,7 +1249,8 @@ impl App {
     /// transcript, so nothing can go stale between a push and a draw.
     #[cfg(test)]
     pub fn context_used_tokens(&self) -> usize {
-        self.chat.used_tokens_for(self.tree.focused)
+        self.chat
+            .used_tokens_for(self.tree.focused, self.cfg().history_budget())
     }
 
     /// How long ago the git snapshot was read, for the bar to say when it is
@@ -2070,7 +2071,9 @@ impl App {
     pub fn context_meter(&self) -> String {
         let budget = self.cfg().history_budget();
         let fold = mush_core::transcript::compaction_trigger(budget);
-        let used = self.chat.used_weight_for(self.tree.focused);
+        let used = self
+            .chat
+            .used_weight_for(self.tree.focused, self.cfg().history_budget());
         let mark = if self.cfg().context_explicit { "" } else { "~" };
         let used_label = tokens_label(used / BYTES_PER_TOKEN);
         let budget_label = tokens_label(budget / BYTES_PER_TOKEN);
@@ -3518,7 +3521,15 @@ impl App {
 
     /// The conversation as it is stored: the root transcript, every subagent's,
     /// and the endpoint selection it was held against.
+    ///
+    /// Every row is the **bounded view** of its agent's conversation
+    /// ([`Chat::bounded_transcript`]): the same trim the actor's own list gets,
+    /// so the file is bounded by the history budget rather than by the pane's
+    /// record, which keeps every turn a cut dropped. The system prompts are
+    /// left out either way — a prompt names a workspace that may have moved, and
+    /// the actor builds a fresh one on the way back in.
     fn session_snapshot(&self) -> Session {
+        let budget = self.cfg().history_budget();
         // Every subagent, not just the root: without this a relaunch forgot
         // each child's context, and "continue that agent" meant writing the
         // brief again from scratch.
@@ -3570,13 +3581,13 @@ impl App {
                 summary: node.summary.clone(),
                 result_unread: node.result_unread,
                 // The system prompt is regenerated on the way back in, since it
-                // names a workspace that may have moved.
+                // names a workspace that may have moved; everything else is the
+                // bounded view, not the pane's record (see above).
                 messages: self
                     .chat
-                    .transcript(node.id)
-                    .iter()
+                    .bounded_transcript(node.id, budget)
+                    .into_iter()
                     .filter(|message| message.role != "system")
-                    .cloned()
                     .collect(),
             })
             .collect();
@@ -3590,7 +3601,12 @@ impl App {
                 .cfg()
                 .context_explicit
                 .then_some(self.cfg().context_tokens),
-            messages: self.chat.transcript(AgentId::ROOT).to_vec(),
+            messages: self
+                .chat
+                .bounded_transcript(AgentId::ROOT, budget)
+                .into_iter()
+                .filter(|message| message.role != "system")
+                .collect(),
             agents,
             // A failure is the one line worth coming back to; a command's answer
             // is not (see `Chat::stored_notices`).
@@ -3900,7 +3916,7 @@ impl App {
             }
         };
         let budget = self.cfg().history_budget();
-        let room = budget.saturating_sub(self.chat.used_weight_for(target));
+        let room = budget.saturating_sub(self.chat.used_weight_for(target, budget));
         let pending: usize = self
             .chat
             .attachments()
@@ -4110,7 +4126,7 @@ impl App {
         // the conversation the human is looking at and will be sent to that
         // agent, and a child's own transcript is what its next request pays for
         // (`Chat::used_weight_for`).
-        let room = budget.saturating_sub(self.chat.used_weight_for(target));
+        let room = budget.saturating_sub(self.chat.used_weight_for(target, budget));
         if cost.saturating_add(pending) > budget {
             // Past the whole history budget, with the pictures already in the
             // box counted: the system prompt and the opening task are not
@@ -5126,7 +5142,11 @@ mod tests {
             0,
             "no notice for a ghost"
         );
-        assert_eq!(app.chat.used_weight_for(gone), 0, "no weight for a ghost");
+        assert_eq!(
+            app.chat.used_weight_for(gone, app.cfg().history_budget()),
+            0,
+            "no weight for a ghost"
+        );
         assert_eq!(app.tree.rows().len(), rows, "no row came back");
         assert!(!app.tree.has(AgentId(52)), "a ghost's child is not a row");
         assert!(
@@ -5898,7 +5918,7 @@ mod tests {
             AgentId::ROOT,
             Message::user("x".repeat(budget - system - "user".len())),
         );
-        assert_eq!(app.chat.used_weight_for(AgentId::ROOT), budget);
+        assert_eq!(app.chat.used_weight_for(AgentId::ROOT, budget), budget);
         let full = app.context_meter();
         assert!(full.contains(" full"), "{full}");
         assert!(!full.contains(" over"), "{full}");
@@ -5909,10 +5929,74 @@ mod tests {
         // read this state as ordinary and the mark could not be reached in
         // normal operation (the audit's finding).
         app.chat.push_message(AgentId::ROOT, Message::user("!"));
-        assert!(app.chat.used_weight_for(AgentId::ROOT) > budget);
+        assert!(app.chat.used_weight_for(AgentId::ROOT, budget) > budget);
         assert!(budget < app.cfg().context_tokens * BYTES_PER_TOKEN);
         let over = app.context_meter();
         assert!(over.contains(" over"), "{over}");
+    }
+
+    /// A8, the probe: on a window whose fold cannot fit — a fold is refused
+    /// below ≈5.5 k tokens, and `/context` accepts down to 1,024 — the pane's
+    /// copy accumulates every turn the actor's list cut, and the store and the
+    /// meter used to grow with it without bound.
+    ///
+    /// The fix reads a bounded view: `used_weight_for` and `session_snapshot`
+    /// trim a copy of the conversation the way an actor trims its own list, so
+    /// the `ctx` meter reads what the next request will carry and the file
+    /// stays within one turn of the budget. The pane keeps the full record —
+    /// scrolling the human's conversation is what the pane is for.
+    #[test]
+    fn the_store_and_the_meter_hold_a_bounded_view() {
+        let (mut app, _rx) = test_app("bounded-view");
+        // 5,376 tokens is an 8,064-byte budget, just inside the band where the
+        // fold is refused (it fits from ≈5,504): every turn the actor cuts is a
+        // turn the pane used to keep forever.
+        app.cell.edit(|cfg| cfg.set_context(5_376));
+        let budget = app.cfg().history_budget();
+        let conversation = app.tree.conversation();
+        for run in 1..=24 {
+            for message in [
+                Message::assistant(format!("reply {run} {}", "x".repeat(900))),
+                Message::user(format!("turn {run} {}", "y".repeat(900))),
+            ] {
+                app.update(Msg::Agent {
+                    conversation,
+                    id: AgentId::ROOT,
+                    event: AgentEvent::Message(message),
+                });
+            }
+        }
+
+        let pane: usize = app
+            .chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(Message::weight)
+            .sum();
+        let used = app.chat.used_weight_for(AgentId::ROOT, budget);
+        let stored = serde_json::to_string(&app.session_snapshot()).unwrap();
+        let meter = app.context_meter();
+        // The numbers the assertions below pin, printed for a reader running
+        // this with `--nocapture`: the pane's whole record, the bounded view
+        // the meter and the file read, and the file's own bytes.
+        eprintln!(
+            "measured: pane {pane} B, used {used} B of {budget} B, stored {} B, meter {meter}",
+            stored.len()
+        );
+        assert!(pane > 40_000, "the pane keeps the full record: {pane}");
+        assert!(
+            used <= budget,
+            "the meter's number stays within the budget: {used} > {budget}"
+        );
+        assert!(
+            stored.len() < 8_000,
+            "the stored row stays within one turn of the budget: {} B",
+            stored.len()
+        );
+        assert!(
+            !meter.contains(" full") && !meter.contains(" over"),
+            "the meter does not say full or over while the list fits: {meter}"
+        );
     }
 
     /// The meter prints the three numbers the run's decisions are made of:
@@ -5926,7 +6010,7 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(32_768));
         let budget = app.cfg().history_budget();
         let fold = mush_core::transcript::compaction_trigger(budget);
-        let used = app.chat.used_weight_for(AgentId::ROOT);
+        let used = app.chat.used_weight_for(AgentId::ROOT, budget);
         let meter = app.context_meter();
 
         assert!(
@@ -8558,7 +8642,7 @@ mod tests {
         let budget = app.cfg().history_budget();
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(budget / 3)));
-        let room = budget - app.chat.used_weight_for(AgentId::ROOT);
+        let room = budget - app.chat.used_weight_for(AgentId::ROOT, budget);
         // Each picture weighs a quarter of the budget: bytes + path (11) +
         // mime (9).
         let each = budget / 4;
@@ -8701,7 +8785,10 @@ mod tests {
         let (mut app, _rx) = test_app("attach-pending");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(120_000));
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
         // A hair over half the room each, with the path and mime on top: one
         // fits alone, the second makes the pair too heavy.
         let each = room / 2 + 64;
@@ -8735,7 +8822,10 @@ mod tests {
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId(1), app.cfg().history_budget());
         let path = "shots/big.png";
         let bytes = png(room + 1 - 8 - path.len() - "image/png".len());
         // The file lies in both workspaces with these bytes, so the picture is
@@ -8767,7 +8857,10 @@ mod tests {
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId(1), app.cfg().history_budget());
         let bytes = png(room / 2 - 8 - path.len() - "image/png".len());
         for root in [app.ws.root().to_path_buf(), child_root] {
             std::fs::create_dir_all(root.join("shots")).unwrap();
@@ -8834,7 +8927,10 @@ mod tests {
             let (mut app, _rx) = test_app(&format!("attach-boundary-{label}"));
             let_the_model_see(&mut app);
             app.cell.edit(|cfg| cfg.set_context(500_000));
-            let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+            let room = app.cfg().history_budget()
+                - app
+                    .chat
+                    .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
             // A headerless png weighs its bytes (8 + padding) plus its path
             // (8) and mime (9); size it to land on the boundary or a byte past
             // — and write the file, so the gate has the path it weighs.
@@ -8876,7 +8972,10 @@ mod tests {
         let (mut app, _rx) = test_app("attach-measures");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
 
         let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
         let bytes_heavy = Image {
@@ -12080,23 +12179,26 @@ mod tests {
     /// next request will send.
     #[test]
     fn the_meter_measures_the_open_conversation() {
+        // A window no test transcript fills: these tests are about the
+        // arithmetic, not about where the trim lands.
+        let budget = 1 << 20;
         let mut chat = Chat::bare();
         chat.push_message(AgentId::ROOT, Message::user("x".repeat(300)));
-        let root = chat.used_tokens_for(AgentId::ROOT);
+        let root = chat.used_tokens_for(AgentId::ROOT, budget);
         assert!(root > 0);
         assert_eq!(
-            chat.used_tokens_for(AgentId(7)),
+            chat.used_tokens_for(AgentId(7), budget),
             0,
             "nothing has been said to that agent"
         );
 
         chat.push_message(AgentId(7), Message::user("y".repeat(900)));
         assert!(
-            chat.used_tokens_for(AgentId(7)) > root,
+            chat.used_tokens_for(AgentId(7), budget) > root,
             "a longer child conversation weighs more than the root's"
         );
         assert_eq!(
-            chat.used_tokens_for(AgentId::ROOT),
+            chat.used_tokens_for(AgentId::ROOT, budget),
             root,
             "the root's own number is unchanged by a child's"
         );
@@ -12151,12 +12253,14 @@ mod tests {
     #[test]
     fn an_agents_weight_is_its_own_prompt_plus_its_transcript() {
         let (mut app, _rx) = test_app("own-prompt");
+        // A window no transcript here fills: the trim is not this test's fact.
+        let budget = 1 << 20;
         // The root: exactly the conversation the actor is handed.
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(300)));
         let conversation: usize = app.chat.conversation().iter().map(Message::weight).sum();
         assert_eq!(
-            app.chat.used_weight_for(AgentId::ROOT),
+            app.chat.used_weight_for(AgentId::ROOT, budget),
             conversation,
             "the root's number is the conversation it sends"
         );
@@ -12191,7 +12295,7 @@ mod tests {
             .map(Message::weight)
             .sum();
         assert_eq!(
-            app.chat.used_weight_for(AgentId(1)),
+            app.chat.used_weight_for(AgentId(1), budget),
             prompt.weight() + transcript,
             "the child's number is its own prompt plus its transcript"
         );

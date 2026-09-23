@@ -614,13 +614,15 @@ const STALE_CANCEL: Duration = Duration::from_secs(10);
 ///
 /// **No archive.** The reaped transcript is *gone*, not written anywhere: an
 /// archive would be one more lifetime to reason about, and what bounds a stored
-/// transcript is the request-side fold rather than any byte cut — a conversation
-/// is folded at nine tenths of its history budget
-/// (`mush_core::transcript::compaction_trigger`), and a *child's* is folded only
-/// while it runs, so a finished child sits frozen at whatever it reached. The
-/// file's bound is `CHILD_HISTORY × that fold trigger + the root`, and dropping
-/// a row drops one child's frozen transcript from the next save (the human's
-/// decision, §8.21).
+/// transcript is the request-side bound rather than a lifetime — every row a
+/// save writes is the **bounded view** of its agent's conversation
+/// ([`Chat::bounded_transcript`](crate::app::Chat::bounded_transcript)), the
+/// trim to the history budget an actor's own list gets. A fold is one road to
+/// fitting that budget, not the bound itself: the fold is refused on a window
+/// below ≈5.5 k tokens and a finished child is never folded again, and the
+/// store no longer depends on it (finding A8). The file's bound is
+/// `CHILD_HISTORY × that budget + the root`, and dropping a row drops one
+/// child's transcript from the next save (the human's decision, §8.21).
 pub const CHILD_HISTORY: usize = 50;
 
 /// How many of the newest children keep their actor thread.

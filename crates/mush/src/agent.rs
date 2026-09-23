@@ -2328,12 +2328,16 @@ fn fold_does_not_fit_line(cfg: &Config, prompt_tokens: usize, cap: u32) -> Strin
 /// back is the tools' own: the same output is one narrower call away.
 ///
 /// The rewrite lands in the *actor's* copy, so every later request in this
-/// conversation says what happened to the result. The UI's copy — the pane and
-/// the session file — keeps what the tool produced: that is the human's record,
-/// and the difference is deliberate and one-directional, the request the lighter
-/// of the two (see [`Chat::used_weight_for`](crate::app::Chat::used_weight_for)).
-/// Nothing is silent about it either: the run emits one line naming how many
-/// results went and how many bytes they gave back.
+/// conversation says what happened to the result. The UI's copy — the pane's
+/// record, and the bounded view the session stores
+/// ([`Chat::bounded_transcript`](crate::app::Chat::bounded_transcript)) — keeps
+/// what the tool produced: that is the human's record. The difference is
+/// deliberate, and the number the gates and the meter read is the bounded view
+/// rather than the pane's record (`Chat::used_weight_for`), so a shed result is
+/// the one place the view can be heavier than the actor's list — and only in
+/// the newest turn, which a trim cannot cut. Nothing is silent about it either:
+/// the run emits one line naming how many results went and how many bytes they
+/// gave back.
 const SHED_RESULT_NOTE: &str = "\
 [mush: this result was dropped to fit the window — the call it answers is not lost; ask again in \
 a smaller piece (a narrower command, a smaller read) if you need the output]";
