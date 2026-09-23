@@ -661,9 +661,9 @@ are computed in `App`.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `✓`
   finished, `✗` failed, `⚠` a run that was cut off (the process went away with
   it, or the actor's thread did, and nothing was committed), `≡` a conversation
-  being folded, `⧗` a run parked on
-  somebody else's result (`wait` — the icon a glance reads says the same thing
-  the row's words do, `waiting on results 3s`). A running agent
+  being folded, `⧗` a run parked on somebody else's result (`wait` — the icon a
+  glance reads says the same thing the row's words do, `waiting on results 3s`).
+  A running agent
   with children out wears `⏸N` — the count, beside its own phase and never
   instead of it — and `⊘` marks both a cancel in flight and a run that landed
   stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
@@ -903,13 +903,13 @@ conversation dirty, and the file is rewritten at most once a minute — so a too
 result costs the screen nothing — while a sent message, a command that changed
 what is stored, a compaction and a new chat (Ctrl-N's confirming press) are
 written before they return, and quitting writes whatever is still only in
-memory. Quitting therefore
-loses nothing, and a crash can cost at most the last minute of a streamed reply.
-On startup the conversation resumes where it left off. Over a conversation with
-something in it, `Ctrl-N` clears in two steps: the first press says what would
-go and where it is kept (`.mush/session.json.previous`), and the second writes
-that copy and clears; an empty conversation clears on one press, and a copy that
-cannot be written refuses the key.
+memory. Quitting therefore loses nothing, and a crash can cost at most the last
+minute of a streamed reply. On startup the conversation resumes where it left
+off. Over a conversation with something in it, `Ctrl-N` clears in two steps: the
+first press says what would go and where it is kept
+(`.mush/session.json.previous`), and the second writes that copy and clears; an
+empty conversation clears on one press, and a copy that cannot be written refuses
+the key.
 
 It carries every subagent's transcript too, so a relaunch brings the tree back
 with its briefs and its context. It also carries each agent's last **failure**
