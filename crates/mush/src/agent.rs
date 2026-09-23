@@ -11,10 +11,10 @@
 //! sync. An isolated agent works in its own git worktree.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -1141,9 +1141,11 @@ struct ActorState {
     /// where the run's outcome is decided.
     runs: u64,
     /// The children that run in *this* agent's workspace rather than their own
-    /// worktree — including one whose isolation degraded. They are what the
-    /// one-shared-child rule is about: an isolated sibling edits its own tree
-    /// and conflicts with nothing here (audit row 7).
+    /// worktree — including one whose isolation degraded. What the
+    /// one-shared-child rule marks a *child* by; the count the rule takes is
+    /// the directory's, not this book's, because a grandchild is never in it
+    /// ([`Writers`], finding F13). An isolated sibling edits its own tree and
+    /// conflicts with nothing here (audit row 7).
     shared: HashSet<u64>,
     /// The children the history window has reaped are simply absent from
     /// `children`: a report still travelling from one of them is swallowed by
@@ -1363,6 +1365,16 @@ struct Actor {
 }
 
 impl Actor {
+    /// Whether this actor is a *shared* child: one whose runs write in the
+    /// directory its parent owns rather than in a worktree of its own — the
+    /// child the one-shared-child rule counts ([`Writers`], finding F13). The
+    /// root owns its checkout and an isolated child owns its worktree, so
+    /// neither is booked — the sentence promises one such *child*, not one
+    /// writer beside the owner.
+    fn shared_child(&self) -> bool {
+        self.branch.is_none() && self.parent_tx.is_some()
+    }
+
     /// Say one thing about this run to whoever owns this agent, or hand it to
     /// the UI when there is nobody at the other end ([`tell_parent`]).
     fn tell_parent(&self, command: AgentMsg) {
@@ -1786,6 +1798,114 @@ fn actor_main(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     }
 }
 
+/// The directories a delegated child is working in, tree-wide — the fact the
+/// one-shared-child rule needs and one parent's books cannot hold (finding
+/// F13).
+///
+/// The rule is the prompt's own sentence — "without one the child works in this
+/// workspace, and only one such child may run at a time" — and it is a fact
+/// about a *directory*: the books are per-parent, and a grandchild is never in
+/// its grandparent's `shared` set. The root spawns shared A, A's run ends while
+/// *its* shared child B — in the same checkout by construction — is still
+/// running, and the root is free to spawn shared C into it: two writers, and
+/// the guard that says "already runs in this shared workspace" holding a book
+/// that never named B. This is the book that names it.
+///
+/// Keyed by the canonical workspace root, which is the directory the writers
+/// collide in and nothing else: a *shared* child's workspace root is its
+/// parent's, an isolated one's is its own worktree, so the key tells the two
+/// apart by itself. Only a delegated child is booked ([`Actor::shared_child`]):
+/// the root owns its checkout and an isolated child owns its worktree, and the
+/// sentence promises one such *child*, not one writer beside its owner. A
+/// parent's own children are the one thing the book is not asked about —
+/// [`spawn_tool`] has their books and judges them there, because a child's run
+/// starts and ends in the messages it sends its parent, and only the writers
+/// the parent cannot see (a grandchild) need a book of their own.
+///
+/// A `static` rather than a handle carried through [`TreeHandles`]: the writers
+/// are threads of one process, and a revived actor is rebuilt with an `AgentCtx`
+/// of its own ([`revive`]) that no such handle travels through. One process
+/// serves one tree; a test's tree is keyed by its own directory like any other,
+/// so two of them cannot see each other.
+#[derive(Default)]
+struct Writers {
+    /// Canonical directory -> the ids running in it, each one present for as
+    /// long as its run lives ([`WriterGuard`]). A set, so an id that booked
+    /// itself twice is one writer, and the refusal reads its ids in order
+    /// without a second sort.
+    live: Mutex<HashMap<PathBuf, BTreeSet<u64>>>,
+}
+
+/// The process's own book of who is writing where — see [`Writers`].
+static WRITERS: OnceLock<Writers> = OnceLock::new();
+
+fn writers() -> &'static Writers {
+    WRITERS.get_or_init(Writers::default)
+}
+
+/// The book's key: one path per directory. `canonicalize` follows symlinks
+/// (`/tmp` on a mac is one), so the same checkout named two ways is one key;
+/// a path that cannot be resolved — a directory deleted under a dying tree —
+/// is its own name, which only ever adds a book nobody reads again.
+fn writer_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+impl Writers {
+    /// Book this run as a writer of `dir`, for as long as the guard lives.
+    fn writing(&self, dir: &Path, id: u64) -> WriterGuard {
+        let dir = writer_key(dir);
+        self.live
+            .lock()
+            .expect("no writer holds the book while it is poisoned")
+            .entry(dir.clone())
+            .or_default()
+            .insert(id);
+        WriterGuard { dir, id }
+    }
+
+    /// The live writers of `dir` other than `id`, in id order: the count the
+    /// one-shared-child rule is.
+    fn others(&self, dir: &Path, id: u64) -> Vec<u64> {
+        let dir = writer_key(dir);
+        self.live
+            .lock()
+            .expect("no writer holds the book while it is poisoned")
+            .get(&dir)
+            .map(|ids| ids.iter().copied().filter(|writer| *writer != id).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// One run's place in [`Writers`], given up when the run ends — however it ends.
+///
+/// The same guard as [`LiveGuard`], for the same reason: a run that dies on the
+/// way to its ending never reaches a line that would take its name back, and a
+/// writer left in the book is a sibling refused forever with a sentence naming
+/// an agent that is not running.
+struct WriterGuard {
+    dir: PathBuf,
+    id: u64,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        let mut live = writers()
+            .live
+            .lock()
+            .expect("no writer holds the book while it is poisoned");
+        if let Some(ids) = live.get_mut(&self.dir) {
+            ids.remove(&self.id);
+            if ids.is_empty() {
+                // The directory is not a fact once nobody writes in it: a book
+                // of every path a session ever touched is the growth finding
+                // A16 is about, one book over.
+                live.remove(&self.dir);
+            }
+        }
+    }
+}
+
 /// The last act of an actor whose thread died: file the ending the unwinding
 /// skipped, with the two readers a run's ending has.
 ///
@@ -1875,6 +1995,14 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // message order closes it: the parent drains the completion first, then
         // this, and the books end where the child really is. The root has no
         // parent, so it says none of this (`tell_parent`).
+        // And this run's place in the directory, if it writes in somebody
+        // else's: a delegated child with no worktree of its own is what the
+        // one-shared-child rule promises there is one of, and the book has to
+        // hold it *before* the parent is told it is running — a parent that
+        // spawns on that message must see this writer (finding F13).
+        let writer = actor
+            .shared_child()
+            .then(|| writers().writing(actor.ws.root(), actor.id));
         actor.tell_parent(AgentMsg::ChildRunning { id: actor.id });
         // The slot this run holds in the tree's count of running agents. It is
         // held for the whole ending — the commit and both reports — and released
@@ -1882,6 +2010,13 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // the count claiming it is still running (see [`LiveGuard`]).
         let _live = LiveGuard::take(&actor.ctx.live);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
+        // The run is over, so this agent is no longer writing in that directory:
+        // given up here rather than at the end of the ending, because the report
+        // below is what a parent acts on — a parent that hears the ending and
+        // spawns at once must not count a writer that has stopped. (The commit
+        // that follows an *isolated* run writes in a worktree of its own, so it
+        // is nobody else's directory.)
+        drop(writer);
         // How the run ended decides both the commit subject and what the parent
         // is told. A stopped run still has work worth keeping, but its commit
         // must not read like a finished one.
@@ -4335,14 +4470,34 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // sibling edits its own worktree, so a running one must not block a
         // shared spawn — the old guard counted it and then said something false
         // about this workspace (audit row 7).
+        //
+        // The count is the *directory's*, not this parent's: the books hold only
+        // this agent's own children, and a grandchild — a shared child of a
+        // shared child, in the same checkout by construction — is never in them.
+        // A root whose shared child had ended was free to spawn a second writer
+        // into its checkout while the first's own child still worked there, and
+        // the refusal's sentence ("already runs in this shared workspace") was
+        // false of nothing but the books it read (finding F13). [`writers`] is
+        // the tree-wide book that names every live writer of the directory; the
+        // writers this parent's own books name are filtered out of it, because
+        // for *them* the books are the finer answer — they are written where a
+        // child's run starts and ends — and the books already judged them in
+        // the two lines above.
         let mut running_shared: Vec<u64> = state
             .shared
             .iter()
             .copied()
             .filter(|id| state.running.contains(id))
             .collect();
+        running_shared.extend(
+            writers()
+                .others(actor.ws.root(), actor.id)
+                .into_iter()
+                .filter(|id| !state.children.contains_key(id)),
+        );
+        running_shared.sort_unstable();
+        running_shared.dedup();
         if !running_shared.is_empty() {
-            running_shared.sort_unstable();
             let names = running_shared
                 .iter()
                 .map(|id| format!("#{id}"))
@@ -4351,7 +4506,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             return Err(format!(
                 "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
                  may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
-                 wait for it first."
+                 wait for it to finish."
             ));
         }
     }
@@ -4476,8 +4631,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
 
     state.children.insert(id.0, cmd_tx);
     state.running.insert(id.0);
-    // Which children share this workspace: the ones the one-shared-child rule
-    // is about.
+    // Which children share this workspace: this parent's half of the
+    // one-shared-child rule, whose count is the directory's (`Writers`).
     if shares_workspace {
         state.shared.insert(id.0);
     }
@@ -17985,6 +18140,112 @@ mod tests {
         };
         assert!(refused.contains("#1"), "{refused}");
         assert!(refused.contains("shared workspace"), "{refused}");
+    }
+
+    /// The one-shared-child rule is a rule about a *directory*, and the books it
+    /// used to read are one parent's: the root spawns shared #1, #1 spawns
+    /// shared #2 — the same checkout by construction — and ends its own run, and
+    /// the root must not be free to spawn a third writer into that checkout
+    /// while #2 still works there. #2 is never in the root's books, because it
+    /// is #1's child (finding F13).
+    ///
+    /// #2's one reply is held, so its run is what the directory is busy with
+    /// while the root asks again; the request reaching the model is also the
+    /// proof that #2's run booked itself in the tree-wide book.
+    #[test]
+    fn the_shared_workspace_rule_counts_every_live_writer_in_that_directory() {
+        let gate = Arc::new(Gate::new());
+        let model = Arc::new(
+            Scripted::new()
+                // The root: delegate to #1, wait for it, and end its run once
+                // the report is in.
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("#1 done"))
+                .says("heard from my child")
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("spawned agent"))
+                .calls(vec![tool_call("c0b", "wait", json!({}))])
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![tool_call(
+                    "c0a",
+                    "spawn_agent",
+                    json!({ "brief": "delegate this to your own subagent" }),
+                )])
+                // #1: its own shared child, and then the end of its run while
+                // that child works.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("spawned agent"))
+                .says("left my own child running")
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1a",
+                    "spawn_agent",
+                    json!({ "brief": "work in this checkout" }),
+                )])
+                // #2: held, so the directory's one live writer is this run.
+                .when(|asked: &Asked| asked.depth() == Some(2))
+                .held(gate.clone())
+                .says("grandchild done"),
+        );
+        let (actor, events, _mailbox) = scripted_actor("shared-directory", &model);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("delegate the work"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("heard from my child"));
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the grandchild never reached its own run"
+        );
+        assert_eq!(
+            state.children.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "the parent's books name the child it spawned, and no grandchild"
+        );
+        assert!(
+            !state.running.contains(&1),
+            "the child's own run is over while its child works"
+        );
+
+        // The child's child is the writer the old count could not see: the
+        // parent's books hold neither `shared` nor `running` for it.
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "write in this checkout too" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(refused) = refused else {
+            panic!("a second writer in the directory is a failed call, not a memory error");
+        };
+        assert!(
+            refused.contains("#2"),
+            "the refusal names the grandchild's run: {refused}"
+        );
+        assert!(refused.contains("shared workspace"), "{refused}");
+        assert_eq!(
+            state.children.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "and nothing was spawned"
+        );
+
+        // The held writer is let go, so its run ends and its thread leaves.
+        gate.release();
+        let ended = |id: AgentId| {
+            events
+                .events_for(id)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Done))
+        };
+        let deadline = Instant::now() + WAIT;
+        while !ended(AgentId(2)) && Instant::now() < deadline {
+            let _ = events.wait(Duration::from_millis(50));
+        }
+        assert!(ended(AgentId(2)), "the released writer must end its run");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// `spawn_agent` can name its child: the name travels in the `Spawned`
