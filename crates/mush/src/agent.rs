@@ -54,6 +54,12 @@ const LOOP_ROUNDS: usize = 5;
 /// over the turns it reported them on. `None` until a reply carries `usage`: a
 /// server that reports none leaves mush's own bytes-per-token estimate as the
 /// only number there is, and that estimate is what the UI's meter shows.
+///
+/// The counts are `u64`s parsed from the endpoint's own JSON, so `u64::MAX` is
+/// a value an endpoint can send, and every sum here saturates on purpose: a
+/// hostile number must make the run read as over, never wrap to a wrong count.
+/// The same choice [`request_weight`] and [`Image::weight`] make, for the same
+/// reason.
 #[derive(Clone, Copy, Default)]
 struct RunUsage {
     prompt: u64,
@@ -65,21 +71,26 @@ struct RunUsage {
 }
 
 impl RunUsage {
+    /// One reply's counts into the run's, saturating for the reason the struct
+    /// gives: these numbers came off the wire.
     fn add(&mut self, usage: &mush_core::Usage) {
-        self.prompt += usage.prompt_tokens;
-        self.completion += usage.completion_tokens;
+        self.prompt = self.prompt.saturating_add(usage.prompt_tokens);
+        self.completion = self.completion.saturating_add(usage.completion_tokens);
         if usage.total_tokens == 0 {
             self.total_missing = true;
         } else {
-            self.total += usage.total_tokens;
+            self.total = self.total.saturating_add(usage.total_tokens);
         }
     }
 
     /// The line the run reports. A server that omits the total still gets one:
-    /// the two parts are what it counted, and adding them invents nothing.
+    /// the two parts are what it counted, and adding them invents nothing. That
+    /// sum is of endpoint numbers too, so it saturates like the stored ones: a
+    /// run whose parts are both over reads as a saturated count
+    /// (`18446744073709.6M`) rather than as a wrapped one.
     fn line(&self) -> String {
         let total = if self.total_missing {
-            self.prompt + self.completion
+            self.prompt.saturating_add(self.completion)
         } else {
             self.total
         };
@@ -11473,6 +11484,74 @@ mod tests {
         assert_eq!(
             usage[0],
             "the endpoint counted 3.3k prompt + 33 completion tokens this run (3.3k total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// An endpoint's own numbers cannot end a run or cost it its answer: an
+    /// endpoint may send `u64::MAX` in every `usage` field, and the run's sum
+    /// has to saturate — read as over. Wrapping instead would be a panic in a
+    /// debug build and a wrong money number in a release one.
+    #[test]
+    fn a_reply_carrying_u64_max_saturates_the_run_usage_instead_of_panicking() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
+                .with_usage(u64::MAX, u64::MAX, u64::MAX)
+                .says("done")
+                .with_usage(u64::MAX, u64::MAX, u64::MAX),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-max", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("look around")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"), "the run carried on");
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 18446744073709.6M prompt + 18446744073709.6M completion tokens this run (18446744073709.6M total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// The total a run *invents* when a counted reply leaves one out is a sum of
+    /// endpoint numbers too, so it saturates for the same reason: two parts at
+    /// `u64::MAX` must read as over, not as a wrapped total.
+    #[test]
+    fn a_run_invents_a_saturated_total_when_a_reply_omits_one() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
+                .with_usage(u64::MAX, u64::MAX, u64::MAX)
+                .says("done")
+                // The total is left out of this one, so the line invents it.
+                .with_usage(u64::MAX, u64::MAX, 0),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-max-no-total", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("look around")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"), "the run carried on");
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 18446744073709.6M prompt + 18446744073709.6M completion tokens this run (18446744073709.6M total)"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
