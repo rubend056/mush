@@ -26,13 +26,18 @@ pub fn session_path(root: &Path) -> PathBuf {
 }
 
 /// Create `.mush/` and make it invisible to git.
+///
+/// The `.gitignore` is mush's, not the human's: one line, `*`, which ignores
+/// everything in the directory, itself included. It is written on every call
+/// rather than only when absent (finding C5): a hand edit, another tool, or a
+/// repository that ships its own `.mush/.gitignore` used to survive here, and
+/// the whole conversation was then one `git add -A` from the index. The file is
+/// one line and idempotent, so enforcing it costs one small write per start —
+/// and a sticky wrong one is a leak, which is the more expensive of the two.
 pub fn ensure_mush_dir(root: &Path) -> std::io::Result<()> {
     let dir = mushroom_dir(root);
     fs::create_dir_all(&dir)?;
-    let ignore = dir.join(".gitignore");
-    if !ignore.exists() {
-        fs::write(&ignore, SELF_IGNORE)?;
-    }
+    fs::write(dir.join(".gitignore"), SELF_IGNORE)?;
     Ok(())
 }
 
@@ -511,6 +516,60 @@ mod tests {
         ensure_mush_dir(&root).unwrap();
         let ignore = mushroom_dir(&root).join(".gitignore");
         assert_eq!(fs::read_to_string(ignore).unwrap(), "*\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// One git command in `dir`, stdout returned and a failure loud: the test
+    /// below reads a repository the way `git add -A` would.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The store's self-ignore is mush's line, and it is enforced rather than
+    /// suggested: `ensure_mush_dir` used to write it only when the file was
+    /// absent, so a hand edit, another tool, or a repository shipping its own
+    /// `.mush/.gitignore` left the whole conversation in front of `git add -A`
+    /// (finding C5).
+    ///
+    /// The property, not only the bytes: a real repository, one session write,
+    /// and `git status --porcelain` empty.
+    #[test]
+    fn mushs_own_ignore_line_is_enforced_and_git_stays_clean() {
+        let root = std::env::temp_dir().join(format!("mush-session-ignore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ignore = mushroom_dir(&root).join(".gitignore");
+        fs::create_dir_all(mushroom_dir(&root)).unwrap();
+
+        // A file that ignores nothing, and one an earlier tool left empty: both
+        // end up mush's one line.
+        for said in ["!*\n", ""] {
+            fs::write(&ignore, said).unwrap();
+            ensure_mush_dir(&root).unwrap();
+            assert_eq!(
+                fs::read_to_string(&ignore).unwrap(),
+                SELF_IGNORE,
+                "the file mush owns holds mush's line, not {said:?}"
+            );
+        }
+
+        // The property the line is for: `git add -A` sees no conversation.
+        git(&root, &["-c", "init.defaultBranch=master", "init", "-q"]);
+        saying("a conversation git must not see")
+            .save(&root)
+            .unwrap();
+        let status = git(&root, &["status", "--porcelain"]);
+        assert_eq!(status, "", "the store is invisible to git: {status:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
