@@ -1147,13 +1147,18 @@ struct Actor {
     /// The isolated worktree branch this agent works on, if any; children
     /// branch from it so nested work is not lost.
     branch: Option<String>,
-    /// The *name* of the ref this agent's worktree was forked from: the
-    /// caller's `base` argument, or `HEAD` when it gave none. It is kept as a
-    /// name because the run-end sweep asks its first question about the base
-    /// *now* — a hand merge that happened while the run was going moves the
-    /// base's tip onto the branch's work, and re-resolving the name is the
-    /// only way to see it (the revision `worktree_add` was handed at the spawn
-    /// would look like a branch ahead of its base, and mush would stop
+    /// The *name* of the ref this agent's branch is measured against at its
+    /// run's end: the spawning agent's branch, or `HEAD` when that agent has
+    /// none — [`fork_base`], the one spelling the UI's `App::fork_base` derives
+    /// its base with too (finding F9). The spawn's own fork may name another
+    /// ref (the caller's `base` argument); this is the *landing* question, and
+    /// it belongs to the tree the parent's work is in.
+    ///
+    /// It is kept as a name because the run-end sweep asks its first question
+    /// about the base *now* — a hand merge that happened while the run was going
+    /// moves the base's tip onto the branch's work, and re-resolving the name is
+    /// the only way to see it (the revision `worktree_add` was handed at the
+    /// spawn would look like a branch ahead of its base, and mush would stop
     /// reclaiming merged work).
     ///
     /// `None` for an agent with no worktree, and for one revived from a stored
@@ -3834,6 +3839,21 @@ fn release_or_reserve(ids: &Ids, root: &Path, id: AgentId) {
     }
 }
 
+/// The ref a child's branch is measured against at its run's end: the parent's
+/// branch, or `HEAD` when the parent has none (the root, whose workspace is the
+/// checkout).
+///
+/// One spelling for the two roads that ask the run-end question — the actor's
+/// own sweep ([`Actor::base`]) and the UI's [`crate::app::App::fork_base`] — so
+/// "is this run's work merged?" cannot be answered about two different refs
+/// (finding F9). `HEAD` here is the application root's checkout, and the
+/// parent's branch is what `HEAD` means in a *nested* parent's own workspace:
+/// the spawn resolves the model's name in the caller's workspace, so
+/// `base="HEAD"` from an agent on `mush/1` forks from `mush/1`.
+pub(crate) fn fork_base(parent_branch: Option<&str>) -> String {
+    parent_branch.unwrap_or("HEAD").to_string()
+}
+
 fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<String, String> {
     let ctx = &actor.ctx;
     let (parent, depth) = (actor.id, actor.depth);
@@ -3852,28 +3872,40 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // A base is the isolation switch: with one, the child gets its own worktree
     // and branch forked from that ref; without one it shares this workspace.
     // A base is a promise about history, so it is resolved before anything is
-    // created and never silently dropped (finding H7). The resolved id is what
-    // `worktree_add` gets; the *name* is what the actor keeps, because the
-    // run-end sweep asks whether the base contains the branch's work — and a
-    // merge that happened while the run was going moved the base's tip, which
-    // only re-resolving the name can see.
-    let named = args.get("base").and_then(Value::as_str);
-    let base: Option<String> = match named {
-        Some(name) => Some(git::resolve(&ctx.root, name).ok_or_else(|| {
-            format!("unknown base `{name}`: no commit, branch or tag by that name")
+    // created and never silently dropped (finding H7). It is resolved in the
+    // *caller's* workspace — `actor.ws.root()`, the tree the spawning agent's
+    // own work is in — so `HEAD` means this agent's HEAD: a nested child forks
+    // from its parent's HEAD and not from the application root's, which is
+    // someone else's history (finding F9). The object store is shared, so
+    // `worktree_add` still runs from the application root with the resolved id.
+    // `null` is the JSON way of saying nothing and stays absent; any other
+    // non-string is refused, never read as "no base" — a silent drop there is a
+    // shared child in the parent's checkout (finding A7, F12).
+    let named = tools::arg_string_opt(args, "base")?;
+    let base: Option<String> = match named.as_deref() {
+        Some(name) => Some(git::resolve(actor.ws.root(), name).ok_or_else(|| {
+            format!(
+                "unknown base `{name}`: no commit, branch or tag by that name in this agent's workspace"
+            )
         })?),
         None => None,
     };
-    let base_name = named.map(str::to_string);
     let isolated = base.is_some();
+    // The ref this child's branch is measured against at its run's end: the
+    // spawning agent's branch, or `HEAD` for a child of the root — [`fork_base`],
+    // the one derivation the UI's `App::fork_base` makes too, so the actor's
+    // run-end verdict and the UI's sweep cannot answer two questions about one
+    // branch (finding F9). The fork above used the model's own name, resolved
+    // where the model's workspace is; this is the *landing* question, and it
+    // belongs to the tree the parent's work is in.
+    let base_name = isolated.then(|| fork_base(actor.branch.as_deref()));
     // The name the caller chose for the row, trimmed; blank means none, and the
-    // row falls back to its handle from the brief.
-    let title = args
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string);
+    // row falls back to its handle from the brief. A wrongly-typed title is
+    // refused, not silently dropped: the row is how the human finds the child
+    // (finding A7).
+    let title = tools::arg_string_opt(args, "title")?
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty());
     if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
         // the brief exists, so the rule is stated in the tool schema and the
@@ -5141,15 +5173,15 @@ fn run_command(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<String, ToolError> {
-    let command = args
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing `command`".to_string())?;
-    let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
-    let exclusive = args
-        .get("exclusive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let command = tools::arg_string(args, "command")?;
+    let command = command.as_str();
+    // A wrongly-typed field is refused, never defaulted: `exclusive: "true"`
+    // used to run a benchmark beside a sibling's lock — two exclusive commands
+    // interleaved, the one thing the lock exists to prevent — and `detach:
+    // "yes"` used to become a foreground call, a 60 s block and for anything
+    // longer the 120 s kill `detach` promises not to apply (finding A7).
+    let detach = tools::arg_bool(args, "detach", false)?;
+    let exclusive = tools::arg_bool(args, "exclusive", false)?;
     let registry = actor.ctx.registry.clone();
     // Two decisions, both made *before* a process exists: whether this command
     // may use the machine at all (the lock), and whether a long one has
@@ -12010,6 +12042,122 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A wrongly-typed `exclusive` is refused, never read as false: with #2
+    /// holding the machine, `exclusive: "true"` used to run the benchmark
+    /// beside the lock — two exclusive commands interleaved, the one thing the
+    /// lock exists to prevent (finding A7). The refusal is the argument's own
+    /// sentence, and the command never reaches the machine.
+    #[test]
+    fn a_wrongly_typed_exclusive_is_refused_not_read_as_false() {
+        // No script on the machine: a command that ran at all spent the
+        // refusal on nothing.
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) =
+            scripted_tools_actor("exclusive-wrong-type", machine.clone(), clock);
+        let actor = Actor {
+            id: AgentId::ROOT.0,
+            ..actor
+        };
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        for wrong in [json!("true"), json!(1), json!([])] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "cargo bench", "exclusive": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed argument is a failed call, not a lock refusal");
+            };
+            assert!(
+                why.contains("`exclusive` must be true or false"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            machine.spawned().is_empty(),
+            "nothing ran beside the lock: {:?}",
+            machine.spawned()
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "and the refusal took nothing from the holder"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A wrongly-typed `detach` is refused, never read as false: `detach:
+    /// "yes"` used to become a foreground call — a sixty-second block, and for
+    /// anything longer the 120 s kill `detach` promises not to apply (finding
+    /// A7). The refusal names the field and the shape it wants, and nothing is
+    /// started.
+    #[test]
+    fn a_wrongly_typed_detach_is_refused_not_read_as_foreground() {
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) = scripted_tools_actor("detach-wrong-type", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        for wrong in [json!("yes"), json!(1), json!([])] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "serve", "detach": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed argument is a failed call");
+            };
+            assert!(
+                why.contains("`detach` must be true or false"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            machine.spawned().is_empty(),
+            "no foreground call took the detach's place: {:?}",
+            machine.spawned()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A `command` that is present but not a string is refused with its own
+    /// shape, not read as a missing field: "missing `command`" was the sentence
+    /// a model sending `{command: 7}` read, which tells it to add a field it
+    /// did send (finding A7's class, in `arg_string`).
+    #[test]
+    fn a_wrongly_typed_command_is_refused_not_read_as_missing() {
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) = scripted_tools_actor("command-wrong-type", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": 7 }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("a wrongly-typed command is a failed call");
+        };
+        assert_eq!(why, "`command` must be a string; got 7", "{why}");
+        assert!(machine.spawned().is_empty(), "nothing ran");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A job mush *killed* is news: four hours of silence or a run past the
     /// output limit is a reason to act, and the line saying why must reach the
     /// owner's run. A *stop* is the human's doing — the line waits in the
@@ -15955,6 +16103,139 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `base="HEAD"` means the *caller's* HEAD, not the application root's: a
+    /// nested child forks from its parent's worktree, so its history contains
+    /// the parent's own commit (finding F9). The base used to resolve in the
+    /// main checkout, silently starting the child from someone else's history —
+    /// the two HEADs really differ here, and the reply names the wrong one.
+    #[test]
+    fn a_nested_base_head_forks_from_the_parents_worktree() {
+        let (actor, events, _mailbox) = recording_actor("nested-base-head");
+        let root = actor.ctx.root.clone();
+        let git = |args: &[&str]| git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        // The parent's own worktree on `mush/1`, with one commit of its own.
+        git(&["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"]);
+        let parent_ws = git::worktree_path(&root, 1);
+        fs::write(parent_ws.join("parent.txt"), "parent\n").unwrap();
+        git_in(&parent_ws, &["add", "-A"]);
+        git_in(&parent_ws, &["commit", "-qm", "mush #1: the parent's work"]);
+        let parent_head = git_rev_parse(&parent_ws, "HEAD").expect("the parent has a HEAD");
+        assert_ne!(
+            parent_head,
+            git_rev_parse(&root, "HEAD").unwrap(),
+            "the two HEADs really differ: the fork revision below cannot be a coincidence"
+        );
+
+        // The spawning agent is the nested parent: its workspace is its own
+        // worktree, which is what `HEAD` must be read in.
+        let parent = Actor {
+            id: 1,
+            ws: Workspace::new(&parent_ws).unwrap(),
+            branch: Some("mush/1".to_string()),
+            ..actor
+        };
+        // The parent's own branch took id 1, so the child must draw 2.
+        parent.ctx.ids.reserve_agents(2);
+        let mut state = ActorState::default();
+        let report = exec_tool(
+            &parent,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "build on the parent's work", "title": "nested head", "base": "HEAD" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(report.contains("on mush/2"), "{report}");
+
+        // The child forked from the parent's HEAD, and its history contains the
+        // parent's own commit — not just the base the root happens to sit on.
+        let child_ws = git::worktree_path(&root, 2);
+        assert_eq!(
+            git_rev_parse(&child_ws, "HEAD"),
+            Some(parent_head.clone()),
+            "the child's fork revision is the parent's HEAD (the application root's is {})",
+            git_rev_parse(&root, "HEAD").unwrap()
+        );
+        assert!(
+            report.contains(&parent_head[..7]),
+            "the reply names the parent's commit: {report}"
+        );
+        assert!(
+            git_answers(
+                &child_ws,
+                &["merge-base", "--is-ancestor", &parent_head, "HEAD"]
+            ),
+            "the parent's commit is in the child's history"
+        );
+        let fork = events
+            .events_for(AgentId(1))
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::Spawned { fork, .. } => fork,
+                _ => None,
+            });
+        assert_eq!(
+            fork.as_deref(),
+            Some(parent_head.as_str()),
+            "the row's fork revision is the parent's HEAD too"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The actor and the UI derive a child's base the same way (finding F9):
+    /// the parent's branch, or `HEAD` when the parent has none — one spelling
+    /// ([`fork_base`]), so the actor's run-end sweep and the UI's reclaim ask
+    /// their question of the same ref. The nested road's `HEAD` is the parent's
+    /// own workspace HEAD, which is exactly the branch this names.
+    #[test]
+    fn the_actor_and_the_ui_agree_on_the_base() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "agree-on-base",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        let git = |args: &[&str]| git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"]);
+        let parent_ws = git::worktree_path(&root, 1);
+        fs::write(parent_ws.join("parent.txt"), "parent\n").unwrap();
+        git_in(&parent_ws, &["add", "-A"]);
+        git_in(&parent_ws, &["commit", "-qm", "mush #1: the parent's work"]);
+        let parent_head = git_rev_parse(&parent_ws, "HEAD").unwrap();
+
+        // The UI's road: the child's base is its parent's branch...
+        let ui_base = fork_base(Some("mush/1"));
+        assert_eq!(ui_base, "mush/1");
+        // ...and the actor's road reads `HEAD` in the caller's own workspace;
+        // both are the same revision.
+        assert_eq!(
+            git::resolve(&root, &ui_base).as_deref(),
+            Some(parent_head.as_str()),
+            "the UI's base resolves to the parent's HEAD"
+        );
+        assert_eq!(
+            git::resolve(&parent_ws, "HEAD").as_deref(),
+            Some(parent_head.as_str()),
+            "and so does `HEAD` as the spawning agent's workspace sees it"
+        );
+        // The root has no branch: both roads fall back to the application
+        // root's `HEAD`, where the root's own work is.
+        assert_eq!(fork_base(None), "HEAD");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A child actor publishes the prompt its own history opens with, before
     /// its thread runs: the app weighs that prompt for the child — the meter
     /// and the attach gate read it — and only the child's builder knows it,
@@ -16030,6 +16311,93 @@ mod tests {
         };
         assert!(error.contains("unknown base"), "{error}");
         assert!(state.children.is_empty(), "nothing may be spawned");
+    }
+
+    /// A wrongly-typed `base` is refused, never read as "no base":
+    /// `{base: ["main"]}` — or any non-string — used to spawn a *shared* child,
+    /// whose edits land in the parent's checkout while the parent believes they
+    /// are in a worktree (finding A7, F12). `null` is the JSON way of saying
+    /// nothing, so it still means absent: the positive twin, one shared child,
+    /// no worktree.
+    #[test]
+    fn a_wrongly_typed_base_is_refused_never_read_as_no_base() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-base-wrong-type",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        for wrong in [json!(7), json!(["main"]), json!(true)] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::SpawnAgent,
+                &json!({ "brief": "b", "title": "a wrong base", "base": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed base is a failed call");
+            };
+            assert!(
+                why.contains("`base` must be a string"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            state.children.is_empty(),
+            "a refused base spawns nothing — least of all a shared child in this checkout"
+        );
+
+        // The positive twin: `null` is absent, and absent means shared.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "no base", "base": null }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("spawned agent #1"), "{report}");
+        assert!(
+            !report.contains("on mush/"),
+            "no base means the shared workspace, not a worktree: {report}"
+        );
+        assert!(state.shared.contains(&1), "the child shares this checkout");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A wrongly-typed `title` is refused, never silently dropped: the row is
+    /// what the human finds a child by, and `{title: 7}` used to read as "no
+    /// title" while the schema requires one — the same silent default as a
+    /// wrongly-typed `base`, one row's name rather than a whole worktree
+    /// (finding A7).
+    #[test]
+    fn a_wrongly_typed_title_is_refused_never_silently_dropped() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-title-wrong-type",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": 7 }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("a wrongly-typed title is a failed call");
+        };
+        assert!(why.contains("`title` must be a string"), "{why}");
+        assert!(state.children.is_empty(), "nothing may be spawned");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A child the parent resumed with a message counts as running again: the
@@ -16409,6 +16777,18 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Whether git exits 0 in `dir` — `merge-base --is-ancestor` answers on its
+    /// exit code, not on a line.
+    fn git_answers(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     fn git_rev_parse(root: &Path, rev: &str) -> Option<String> {

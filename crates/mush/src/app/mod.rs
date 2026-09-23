@@ -1114,11 +1114,7 @@ impl App {
             let Some(branch) = node.branch.clone() else {
                 continue;
             };
-            let base = node
-                .parent
-                .and_then(|parent| self.tree.node(parent))
-                .and_then(|parent| parent.branch.clone())
-                .unwrap_or_else(|| "HEAD".to_string());
+            let base = self.fork_base(node.id);
             if !self.in_flight(node) && !waking.contains(&node.id) {
                 sweep.push((node.id, base.clone(), node.fork.clone()));
             }
@@ -1235,16 +1231,21 @@ impl App {
             .unwrap_or(true)
     }
 
-    /// The ref an agent's branch was forked from: its parent's branch, or `HEAD`
-    /// for a child of the root — the same derivation the git read used, asked
-    /// again at the moment the removal happens.
+    /// The ref an agent's branch is measured against at its run's end: its
+    /// parent's branch, or `HEAD` for a child of the root — [`agent::fork_base`],
+    /// the one spelling the actor's own sweep derives its base with too, so the
+    /// two roads ask one question about one branch (finding F9). `HEAD` here is
+    /// the root checkout's `HEAD`: a top-level child forks from it, and a
+    /// *nested* child's `HEAD` — the parent's own, resolved in the parent's
+    /// workspace — is the parent's branch this names.
     fn fork_base(&self, id: AgentId) -> String {
-        self.tree
+        let parent_branch = self
+            .tree
             .node(id)
             .and_then(|node| node.parent)
             .and_then(|parent| self.tree.node(parent))
-            .and_then(|parent| parent.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string())
+            .and_then(|parent| parent.branch.as_deref());
+        agent::fork_base(parent_branch)
     }
 
     /// What the open conversation weighs in tokens — the unit the window is
