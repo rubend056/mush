@@ -417,8 +417,8 @@ struct Selecting {
     /// A `Cell` because only the frame knows the pane's measure. The cursor is
     /// the state the keys own; where the pane can show it depends on a width and
     /// a height the keys never see, so the frame places the window as it paints
-    /// and leaves the cursor alone. The placement is idempotent, and one a fold
-    /// or a resize left behind is put right by the next frame or key.
+    /// and leaves the cursor alone. The placement is idempotent, and one a
+    /// resize left behind is put right by the next frame or key.
     top: Cell<(usize, usize)>,
 }
 
@@ -1402,8 +1402,11 @@ impl Chat {
     /// the mode left behind with it.
     pub fn select_apply(&mut self, on: AgentId, key: SelectKey) -> Option<Copied> {
         let Some(cursor) = self.clamped_cursor(on) else {
-            // A fold took the lines the cursor was over: the mode has nothing
-            // left to stand on, and leaving is the only honest answer.
+            // The transcript under the mode has no line left to stand on.
+            // `replace_transcript` drops the mode with the rows it replaces, so
+            // this is the guard for every other road — an agent reaped out from
+            // under the pane, or a state a test built — and leaving is the only
+            // honest answer.
             self.select = None;
             return None;
         };
@@ -1462,11 +1465,12 @@ impl Chat {
         }
     }
 
-    /// The cursor as the transcript is *now*: a fold can leave the state
-    /// pointing at a message or a line that is gone, and a key must not index
-    /// past the end. The nearest line that still exists is the honest clamp —
-    /// and `None` when there is no source line left at all, which drops the
-    /// mode rather than leaving a cursor over nothing.
+    /// The cursor as the transcript is *now*: a transcript can shrink under a
+    /// state that still points into it — a reaped conversation, or a state a
+    /// caller built — and neither a key nor a frame may index past the end. The
+    /// nearest line that still exists is the honest clamp — and `None` when
+    /// there is no source line left at all, which drops the mode rather than
+    /// leaving a cursor over nothing.
     fn clamped_cursor(&self, on: AgentId) -> Option<(usize, usize)> {
         let select = self.select.as_ref().filter(|select| select.agent == on)?;
         let transcript = self.transcript(on);
@@ -1754,7 +1758,7 @@ impl Chat {
             return (body, cut);
         }
         // The window the state carries no longer shows the cursor: the terminal
-        // was resized, the transcript moved under it (a fold), or the cursor's
+        // was resized, the transcript moved under it, or the cursor's
         // own line is behind a tool result's cap. Put it where the pane can hold
         // it — the cursor's line at the top when it is above the window, at the
         // bottom when it is below — and leave the placement where the next
