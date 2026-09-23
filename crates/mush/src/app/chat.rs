@@ -6748,7 +6748,7 @@ mod tests {
         let box_span = rows[0]
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == "☐")
+            .find(|span| span.content.as_ref() == "☐ ")
             .expect("the box");
         assert_eq!(box_span.style.fg, Some(Color::Green));
         assert!(
@@ -6846,17 +6846,14 @@ mod tests {
                     UnicodeWidthStr::width(row.as_str())
                 );
             }
-            // The view's margin on a wrapped row is the mark's own columns;
-            // strip it so the check reads the reply's words and not the
-            // layout the pane wraps every voice in.
-            let lead = if width >= "mush › ".width() + MIN_BODY {
-                "mush › ".width()
-            } else {
-                0
-            };
+            // The view's margins on a wrapped row are layout: the mark's own
+            // columns on a continuation of the voice, and a list item's
+            // marker width on a continuation of the item ([`wrap_block`]).
+            // Trim each row's leading layout so the check reads the reply's
+            // words rather than the columns the pane hangs them in.
             let flat: String = painted
                 .iter()
-                .map(|row| row.strip_prefix(&" ".repeat(lead)).unwrap_or(row))
+                .map(|row| row.trim_start())
                 .collect::<Vec<_>>()
                 .concat();
             assert!(
