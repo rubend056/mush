@@ -63,7 +63,8 @@ Everything can be changed at runtime from the chat — no restart:
 - `/url http://host:port` — point at any endpoint. `https://` works too (TLS
   via rustls).
 - `/key <secret>` — set the API key. Shown masked, and saved to the home
-  config file (never to the workspace).
+  config file (never to the workspace). A key read from `MUSH_API_KEY` stays in
+  the environment — mush never copies it into that file.
 - `/models` — refresh the model list for the current endpoint.
 - `/context` — say the window and the road it came by; `/context N` states one
   for this workspace (remembered in `.mush/session.json`), and `/context auto`
