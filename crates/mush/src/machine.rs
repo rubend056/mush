@@ -33,6 +33,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use tempfile::{Builder, NamedTempFile};
 
 use mush_core::secrets::scrub;
+use mush_core::whole_disk;
 use mush_core::workspace::{tail_for_model, truncate_for_model};
 
 /// What to run, and where.
@@ -168,6 +169,17 @@ pub struct Shell;
 
 impl Machine for Shell {
     fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String> {
+        // The whole-disk walk guard, before anything exists: every command
+        // mush starts comes through here — a `run_command`, a `detach: true`
+        // job, a handover to the registry — so no tool argument and no road
+        // can skip the one door. A refusal is this spawn's `Err`, the road a
+        // spawn failure already travels: the command's own result sentence
+        // (`error: …`), built by `mush_core::whole_disk`. Nothing is created
+        // and no shell runs, so a command that would walk the disk costs the
+        // machine nothing at all.
+        if let Some(refusal) = whole_disk::refusal(cmd.command, cmd.root) {
+            return Err(refusal);
+        }
         let out = Scratch::new("out")?;
         let err = Scratch::new("err")?;
         let mut shell = Command::new("sh");
@@ -793,6 +805,41 @@ mod tests {
             !matches!(ended(nameless), End::Exited(_)),
             "an unknown end is not an exit code spelled -1"
         );
+    }
+
+    /// The human's gate: a `find /` — however a `cd` or a wrapper spells it —
+    /// is refused at the one door every command goes through, before a scratch
+    /// file exists and before a shell is started. The command is the shape in
+    /// question with `-maxdepth 0`, so the test itself never walks anything:
+    /// before this guard it ran through here and printed `/` with exit 0.
+    #[cfg(unix)]
+    #[test]
+    fn the_shell_refuses_a_walk_of_the_whole_filesystem() {
+        use super::{Machine, Shell, ShellCommand};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let command = format!("cd / && find / -maxdepth 0 > {}", out.display());
+        let refusal = match Shell.spawn(&ShellCommand {
+            command: &command,
+            root: dir.path(),
+        }) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("a whole-disk walk must be refused"),
+        };
+        assert!(
+            refusal.contains("whole filesystem") && refusal.contains("`find . -name"),
+            "the refusal names what was refused and the road that works: {refusal}"
+        );
+        assert!(!out.exists(), "no shell ran, so nothing was printed");
+
+        // The control: the same shape rooted in the workspace still runs.
+        let end = run_to_end(
+            &format!("find . -maxdepth 0 > {}", out.display()),
+            dir.path(),
+        );
+        assert_eq!(end, End::Exited(0));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), ".\n");
     }
 
     /// Run one command through the real [`Shell`] and wait for it to end.
