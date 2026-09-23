@@ -34,7 +34,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   spent. (Open, unchanged.) The A audit found a concrete instance worse than
   "not visible while spent": the endpoint's own counts are reported on no road
   a run can end by except a clean, tool-free end, and a fold's usage is dropped
-  (A6, still open, §8.52).
+  — **✅ that instance is closed by `d710c2e` (§8.83):** every ending reports the
+  endpoint's own numbers (`run_turns` owns the accumulator, a fold's usage
+  included, and an idle fold says “for this fold”). What H12 still owes is the
+  live half: a run's cost on screen while it is being spent, not at the end.
 - **H16, residual** — the byte cut is gone (§8.25); what bounds the *file* is the
   history window (`CHILD_HISTORY = 50`) applied by `App::reap_history`, so the
   store only ever writes live tree nodes. The per-second deep copy of every kept
@@ -138,6 +141,17 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   the process, proved with a SIGKILLed holder, and the tests `remove_dir_all`
   their root before taking it — so the shapes left are `open`/`flock` failing
   before the lock (ENOSPC/EMFILE) and the wall-clock shape stands (§8.52).
+  **✅ closed by `926a12a` (§8.83, H58):** the lock's refusal now calls the pid
+  the lock file's last known holder, and the one-off failure's shape was the
+  one the E audit did not name — a `fork` copying the process's open lock
+  descriptions into a child, kept until the child execs, so the sibling tests'
+  drop-and-reacquire assertions failed on a free lock (16–17 of 20 runs red with
+  the child forked inside the dead-holder test, 12 of 12 green without it). The
+  dead pid is taken once at the first `root()` call, before any test can hold a
+  lock, and 25 of 25 runs of `cargo test -p mush lock::tests` are green. The
+  `open`/`flock` shape (ENOSPC/EMFILE) stands as an environment failure a bool
+  assertion would mis-blame on the lock; the wall-clock shape is the suite's
+  known load flake.
 - **H29** — ✅ settled by the third read (the file-tool wave's audit, §8.36), and by
   reading rather than a test, because there is no race to drive: no road leads
   into `Registry::launch`'s `Machine` arm with a *sibling* holding the lock.
@@ -275,8 +289,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   never pruned" — is measured now: 1,000 jobs left `done_jobs` and
   `delivered_jobs` each holding 1,000 entries (61,893 bytes) and 1,000
   `forget_child` calls left `forgotten` at 1,000, while the registry's own
-  `MAX_JOBS + JOB_HISTORY = 16` pruning has no twin in the actor's books (A16,
-  still open, §8.52).
+  `MAX_JOBS + JOB_HISTORY = 16` pruning has no twin in the actor's books (A16 —
+  **✅ closed by `d8ae94d`, §8.83:** the job books stop at `2 * jobs::MAX_JOBS`,
+  an undelivered report is never dropped, and the `forgotten` set is gone with
+  its absence as the tombstone, H57).
 - **H35** — ✅ fixed by `b50a4ef`, with the end-to-end shape in `258ffb5`
   (§8.39): a child restored from a stored session was revived with a dead
   parent channel (`App::restore_agents` passed `parent: None`), and nothing
@@ -537,24 +553,120 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   reclaim rule pays this deliberately (H10's trade); what is owed is a discard
   road — from the row or a command — or a sweep that can tell "compiled" from
   "delivered".
+- **H54** — ⬜ open, the arithmetic half of F7, named and left by `efd5213`
+  (§8.83): the spawn cap counts every worktree against `HEAD`
+  (`git::unlandable`), while the sweep asks each node against the branch its own
+  parent holds and the fork it was created at (`App::reclaim_worktrees`), so a
+  nested child merged into its parent's branch is counted unlandable and the
+  refusal hands the model a false fact. The sentence now says exactly what was
+  measured; the count is unchanged, and the audit's
+  `a_nested_child_merged_into_its_parent_is_not_counted` is owed to whoever gives
+  the spawn road the tree's base/fork pairs — `App` holds them
+  (`AgentNode::branch`, `fork`), the spawn road is an actor thread with no handle
+  on it, and the fix is a handle or a pre-computed set of pairs handed to
+  `spawn_tool`, not a second count beside `unlandable`.
+- **H55** — ⬜ open, F13's other half, named and left by `d7f12a2` (§8.83): the
+  guard counts every live writer of a directory now, but the sentence that
+  promises the rule — `mush-core/src/prompt.rs:58`'s "only one such child may run
+  at a time" — is still the per-parent claim, and so are the doc at
+  `agent.rs:1806` and the manual's `README.md:154`/`docs/mush.md:895`. The exact
+  sentence says the rule counts writers in the directory and that a shared child
+  may still delegate into the tree its own run is in; `prompt.rs` is the human's
+  file.
+- **H56** — ⬜ open, B12's second half, named and left by `fe83f8a` (§8.83): the
+  deserializer is as loose as its doc, but a reply that still does not parse ends
+  the run with `could not parse model response` (`agent.rs`'s
+  `ModelError::Malformed` arm) where the audit asks for a refusal the model can
+  answer — the shape the `ModelError::Status` arm already gives a 400. Belongs in
+  `agent.rs`'s request-error classification, with the acceptance test that a
+  malformed reply is answered rather than fatal.
+- **H57** — ✅ decided by `d8ae94d` (§8.83), recorded because the audit proposed
+  the opposite: A16's `forgotten` set is gone and the absence of a book *is* the
+  tombstone; the audit's "drop a tombstone once no in-flight report can name it"
+  is refused in `ActorState::children`'s doc — a parent cannot observe the child
+  actor's death (the tree drops its sender, but the child holds its own `my_tx`
+  and its thread may still send), so a parent-side drop would either swallow a
+  real report or stay as unbounded as the set it replaced. A late report from an
+  id no book names is still swallowed, pinned by the forget tests.
+- **H58** — ✅ fixed by `926a12a` (§8.83): E8's sentence calls the pid the lock
+  file's last known holder — the flock is the lock — and the one-off
+  `lock::tests` failure H28 recorded is not a stale `/tmp` lock (`flock` dies
+  with the fd and the process, the file is never unlinked, and every test removes
+  its root before acquiring) but a `fork` copying open lock descriptions into a
+  child (CLOEXEC closes them only at exec): 16–17 of 20 runs red with the child
+  forked inside the dead-holder test, 12 of 12 green without it. The dead pid is
+  now taken once, at the first `root()` call, before any test can hold a lock,
+  and 25 of 25 runs of the filter are green. What stands is the other shape:
+  `acquire` failing *before* the flock (ENOSPC, EMFILE) is mis-blamed by the bool
+  assertion — an environment failure, not the lock.
+- **H59** — ⬜ open, named and left by `11ad7dd` (§8.84): the attach printers are
+  defanged (C8), but they still `print!`, so a broken pipe panics rather than
+  returning an error — the old road's failure shape, kept deliberately in that
+  commit. Belongs in `main.rs`'s printer road, where the answer a closed pipe
+  deserves is the one the TUI's own writes give.
+- **H60** — ⬜ open, the schema reserve and its coupling, named by `09c9446` and
+  `7106564` (§8.78) and `c96aae1` (§8.84): `tool_schemas()` sits at 5,985 bytes
+  against `SCHEMA_TOKENS * 3 = 6,000`; B16's fuller sentence does not fit, and
+  F14's description and F4's 8 MiB sentence are terse for the same reason.
+  Raising `SCHEMA_TOKENS` is not free — it feeds `request_reserve` and
+  `fold_request_fits`, and at 2,100 it stops `agent.rs`'s
+  `compaction_folds_overflowing_history_into_a_summary` (a 6,000-token window)
+  from folding at all — and the 8 MiB number cannot be read from its one home
+  (`jobs::CMD_OUTPUT_LIMIT`) because `mush` depends on `mush-core` and not the
+  reverse. Owed to the pass that owns `prompt.rs` and `agent.rs`: spend the
+  reserve, move the constant, or split the schemas per road.
+- **H61** — ✅ a design boundary stated by `6e7dac4` (§8.82): `/context auto`
+  gives up *this workspace's* statement (the session layer's) and
+  `Config::forget_context` drops the road before `rederive_context`; a window
+  stated in the home file is a different layer (CLI > env > session > home) that
+  only a fresh resolve re-reads, and mush never edits that file. `/context auto`
+  therefore cannot forget a home-config window for good, and the start-up chain
+  says so by re-reading the statement.
+- **H62** — ✅ a design boundary stated by `d85cfd1` and `9430058`
+  (§8.81–§8.82): a window stated in the home file is machine-global —
+  `UserConfig::context` applies to every workspace on the machine — which is why
+  the session's per-workspace statement is the more specific one and waits above
+  it, and why `/context N` writes the session and not the home file. A human
+  cannot state one window for one workspace through the home file.
+- **H63** — ⬜ open, the test suite's scratch roots, measured at `7338d81`:
+  every test's scratch root is `mush-<label>-<pid>` (one helper per module:
+  `workspace::tests::temp_workspace`, `agent::tests::scratch_dir`,
+  `app::tests::test_app`, `lock::tests::root`, and the rest), their
+  `remove_dir_all` runs *before* `create_dir_all` and never after, and the suite
+  leaves them behind. `find /tmp -maxdepth 1 -name 'mush-*' -type d` counts
+  **16,084 directories** (plus 1,804 files) from **100 distinct process ids**,
+  **99 of them dead**; 12,494 of the directories belong to dead pids, and the
+  trees hold **≈2.1 GiB** of `/tmp`'s 2.9 GiB. The count is a snapshot that grows
+  with every test run; a larger reading given for this row (25,541 directories,
+  375 pids, ≈4.3 GiB) could not be reproduced at this base. The fix belongs in
+  the tests' scratch-root helpers — one `Scratch` type whose `Drop` removes the
+  root, or one helper they all call — and a child is being sent for it.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
-have added `R30`–`R73` to it as open rows — each row carries its price, and
-the commit that closed it once it lands (`R37`, `R39`, `R41` and `R44` were
-closed by the store wave, §8.70).
+have added `R30`–`R73` to it as open rows — each carries its price and, once
+closed, the commit that closed it: `R37`, `R39`, `R41` and `R44` by the store
+wave (§8.72); `R60` by `1afa368` and `R72` by `d56a10c` (§8.80); `R66`'s live
+defect by `9f0a12c` (§8.81, its one-`enter` refactor deliberately not done —
+§8.76).
 
 The two §6 interactions with H9 are closed: an attach op no longer disarms the
 human's armed quit (`626ac3d`), and a stopped agent that owns a live job is
 named as stopped (`cc7aae3`).
 
-**The campaign the record now carries.** §8.51–§8.71 write down the six blind
-audits (104 findings: 0/8/15, 0/6/10, 0/7/5, 2/4/20, 0/3/7, 0/6/11), the ~20 fix
-waves that answered them and the four duplication passes that followed. Their
-closure sheet is §8.52: **46 fixed, 1 partial, 57 open**, with every finding's
-status, commit and pinning tests; the ledger deltas the audits owed are on H12,
-H16, H21, H27, H28, H30, H34 and H35, the narrowed B23/B27 retry class is on
-those rows in §2.75, and H49–H53 are the rows the campaign opened.
+**The campaign the record now carries, and the wave that finished its queue.**
+§8.51–§8.71 write down the six blind audits (104 findings: 0/8/15, 0/6/10,
+0/7/5, 2/4/20, 0/3/7, 0/6/11), the ~20 fix waves that answered them and the four
+duplication passes that followed; §8.72–§8.86 carry the wave that closed the rest
+of the queue — 45 findings and one half of three more — plus the output view, the
+wire's one deadline, the human's window report, `/context` and the quieter
+cursor. Their closure sheet is
+§8.52, whose head names the snapshot: **91 fixed, 4 partial (A19, B12, F7, F13),
+9 open (A13, A14, A15, A18, A21, A22, C7, F3, F17)**. The ledger deltas the
+audits owed are on H12, H16, H21, H27, H28, H30, H34 and H35 (H28 is closed by
+`926a12a`, H58), the narrowed B23/B27 retry class is on those rows in §2.75,
+H49–H53 are the rows the campaign opened, and H54–H63 are the rows this wave
+opened or settled.
 
 ---
 
@@ -650,8 +762,9 @@ again. The row's finding stands; the retried class does not. |
 | B27 | **A framing error on the wire kills a run, and blames the endpoint.** Observed live: an agent's run died with `the endpoint's reply was refused: malformed chunk size: ""` — `read_chunked`'s error for an empty chunk-size line (`http.rs:864-899`). B23's retry covers *transport* failures and B25 covered signals; a chunk-framing failure is `InvalidData`, so it is classified as a body the endpoint deliberately sent: it is neither retried nor questioned. The stray empty line is at least as likely to be *our own* leftover framing — a kept connection returned to the pool with its chunked body unconsumed after an early stop — as the endpoint's opinion, which makes the diagnosis wrong as well as the verdict. And the run's death reaches its parent only when something later asks for the child's state, so a run can be dead for a while before anyone is told. | ✅ | closed by `c5694f1` (merged `7e0440f`), and the row's suspicion was half right: the break *was* ours, but it was not a pooled connection — `read_chunked` read a chunk-size line with `unwrap_or_default()`, so an EOF met where a size was expected became an empty size line, and `InvalidData` was classified as a refusal. Now a framing break is its own class (`http.rs::Framing`, `body_cut_off()`) mapped **before** the `InvalidData → Refused` arm, so a body past the 80 MB cap stays a refusal and is never retried, while `retrying` repeats `Transport | Framing` on a fresh connection and never a cancellation or a status the endpoint chose; the wording says the reply broke instead of blaming a refusal, and a non-focused child's failure now lands on the bar. The unusable-body/poisoned-pool hypothesis was refuted rather than fixed, and recorded in the `Pool`/`exchange` docs so it is not re-opened. **Narrowed and
 still classed at `38d0438`:** the same commit (`b6a59c3`, §8.58) drops the
 framing retry this row describes, so `retrying` repeats `Unsent` only; and the
-class survives one road over — a hex-parsable chunk size past the body cap is
-still diagnosed as the endpoint's refusal (A10, still open, §8.52). |
+class's last road was closed by `729e8fc` (§8.79): a hex-parsable chunk size
+past the body cap is now a `Framing` break naming the size claim and the cap,
+never the endpoint's refusal. |
 
 ## 3. The contract bug that started this file
 
@@ -4377,13 +4490,16 @@ the record and are re-pointed at the sections that answer them:
   by `3a37c02`, §8.66).
 - **H12** — per-agent token accounting has an instance worse than "not visible
   while spent": the endpoint's own counts are not reported at the end either,
-  on four of the roads a run can end by (A6, still open, §8.52).
-- **H34's parenthetical** — "`done_jobs` is never pruned" is now measured (A16,
-  still open, §8.52).
-- **B27's class** survives one road over: a hex-parsable chunk size past the
-  body cap is still diagnosed as the endpoint's refusal (A10, still open,
-  §8.52), and the retry B27's row describes was narrowed to `Unsent` on purpose
-  (§8.58).
+  on four of the roads a run can end by — **✅ that instance is closed by
+  `d710c2e` (§8.83):** `run_turns` reports every ending, and a fold's usage is in
+  the line.
+- **H34's parenthetical** — "`done_jobs` is never pruned" is now measured (A16 —
+  **✅ closed by `d8ae94d`, §8.83** — and the ledger's own A16 row is §8.83's).
+- **B27's class** survived one road over: a hex-parsable chunk size past the
+  body cap was still diagnosed as the endpoint's refusal (A10 — **✅ closed by
+  `729e8fc`, §8.79:** the claim is now `Framing`, and its words are the size
+  claim and the cap), and the retry B27's row describes was narrowed to
+  `Unsent` on purpose (§8.58).
 - **H21** — its fix does not survive a restart: a restored agent carries no fork
   revision, and `git::landing` answers `Merged` when it cannot ask, so a
   read-only child that never committed is stored as landed (C audit, §8.52).
@@ -4429,10 +4545,10 @@ merged `a2a8267`) landed before the audit file did, and §8.53 is its section.
 
 **Where the closures live.** The audits are left exactly as found — no status
 column was turned and no finding was marked fixed inside them. Every one of the
-104 findings, its severity and its status at `38d0438` is in §8.52, and the
-sections after it are the waves that changed those statuses. Findings the waves
-did not fix are not papered over: they are ⬜ in that table with the site that
-still holds them at this base.
+104 findings, its severity and its status is in §8.52, whose head names the
+snapshot it reflects, and the sections after it are the waves that changed those
+statuses. Findings the waves did not fix are not papered over: they are ⬜ in
+that table with the site that still holds them at this base.
 
 ---
 
@@ -4440,51 +4556,53 @@ still holds them at this base.
 
 The audits are the queue; this is its closure sheet. Every finding is listed by
 its own id, in its own audit's order, with the severity the audit gave it and its
-status at `38d0438`. **✅** names the commit(s) that fixed it — each verified
-against the commit's own body and the finding's text, and each pinned by the
-tests the wave sections name. **⬜** means the defect is still in the tree at
-this base; the site named is where the code still is, re-read for this record
-rather than taken from the audit. **🔄** is a partial fix, with each half said.
-A finding the audit marked *suspected* stays suspected here.
+status at **`7338d81`** — the sheet was written at `38d0438` (§8.51), and every
+wave since has moved the statuses it closed, with the section that closes it in
+the ✅ cell. **✅** names the commit(s) that fixed it — each verified against the
+commit's own body and the finding's text, and each pinned by the tests the wave
+sections name. **⬜** means the defect is still in the tree at this base; the site
+named is where the code still is, re-read for this record rather than taken from
+the audit. **🔄** is a partial fix, with each half said. A finding the audit
+marked *suspected* stays suspected here.
 
-The counts: **46 fixed by this campaign, 1 partial, 57 open** — 2 blockers and
-34 majors among the 104, of which both blockers and 31 majors are fixed. The
-open set is three majors — A3 (a finished job's unread report behind a machine
-hold), A6 (the cost numbers missing where money was spent) and F6 (a dead actor
-thread invisible) — and 54 minors, mostly the ones the audits ranked last. A10,
-the one road of B27's class that survives, is among them.
+The counts: **91 fixed, 4 partial (A19, B12, F7, F13), 9 open** — 2 blockers and
+34 majors among the 104, of which both blockers and all 34 majors are closed. The
+open set is nine minors: A13, A14, A15, A18, A21 and A22 (agent-and-wire), C7
+(secrets-session-config), F3 and F17 (contract-and-git). The three majors left
+open at `38d0438` — A3, A6 and F6 — closed in §8.73–§8.83, with D19, A9, A10,
+D7–D18, D20–D26, B13, B14, B16, C8, C10–C12, E6, E8–E10 and F2, F4, F5, F14–F16.
 
 ### agent-and-wire (`docs/audits/agent-and-wire.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | A1 | major | a response header line with no newline is read without a bound; the process can be OOM-killed by its own endpoint | ✅ `0747460` (§8.58) |
 | A2 | major | a request the endpoint already received is sent again, and the 600 s deadline re-arms per attempt | ✅ `190886c` + `b6a59c3` (§8.58) |
-| A3 | major | a finished job's unread report is parked behind a sibling's machine hold for the full 600 s — H13's blindness, for jobs | ⬜ open — `agent.rs:4232` (`unread_result` asks only the child book) |
+| A3 | major | a finished job's unread report is parked behind a sibling's machine hold for the full 600 s — H13's blindness, for jobs | ✅ `c86b8c0` (§8.79) |
 | A4 | major | an event for an id the UI reaped re-created that agent's transcript, and a false failure survived every restart | ✅ `66dba03` (§8.66) |
 | A5 | major | the `✉` re-arm also pinned the child's thread and exempted its node from the history window | ✅ `4702c94` (§8.66) |
-| A6 | major | the endpoint's own token counts are reported only on a clean, tool-free end, and a fold's usage is dropped | ⬜ open — `agent.rs:98`, one call site at `2852` |
+| A6 | major | the endpoint's own token counts are reported only on a clean, tool-free end, and a fold's usage is dropped | ✅ `d710c2e` (§8.83) |
 | A7 | major | `exclusive`, `detach` and `base` are silently defaulted when the JSON type is wrong | ✅ `d8a1a04` (§8.65) |
 | A8 | major | the pane's copy is never trimmed, so on a window whose fold cannot fit the session file and the meter grow without bound | ✅ `3a37c02` (§8.66) |
-| A9 | minor | `RunUsage` adds endpoint-supplied `u64`s with `+=`; a debug-build actor panics mid-run, a release one prints a wrong number | ⬜ open — `agent.rs:68-70` |
-| A10 | minor | a hex-parsable chunk size past the cap is classified as the endpoint's refusal, so a wire break that would be retried kills the run — B27's class, one road over | ⬜ open — `http.rs:1109` |
-| A11 | minor | `status` is a big-text road that ignores `result_cap` and `turn_room` (8,197 bytes at an 8 K window) | ⬜ open — `agent.rs:4555` |
+| A9 | minor | `RunUsage` adds endpoint-supplied `u64`s with `+=`; a debug-build actor panics mid-run, a release one prints a wrong number | ✅ `330fe61` (§8.79) |
+| A10 | minor | a hex-parsable chunk size past the cap is classified as the endpoint's refusal, so a wire break that would be retried kills the run — B27's class, one road over | ✅ `729e8fc` (§8.79) |
+| A11 | minor | `status` is a big-text road that ignores `result_cap` and `turn_room` (8,197 bytes at an 8 K window) | ✅ `a8851e8` (§8.83) |
 | A12 | minor | `write_file` read the whole file it was about to replace, to answer its line count (128 MiB → +262 MB peak RSS) | ✅ `273ada0` (§8.60) |
-| A13 | minor | the pane re-parses every visible tool call's whole argument JSON on every frame (2 MB → 9.68 ms per call, per frame) | ⬜ open — `chat.rs:2553` |
-| A14 | minor | the idle fold drains the mailbox like an in-run one, swallowing a command that means "start a run" | ⬜ open — `agent.rs:1705`, `3058` |
-| A15 | minor | parking a child kills the jobs it started, and `park_history`'s doc says parking ends "the thread and nothing else" | ⬜ open — `app/mod.rs:3521` |
-| A16 | minor | `done_jobs`, `delivered_jobs` and `forgotten` grow for the life of an actor (1,000 jobs → 61,893 bytes) | ⬜ open — `agent.rs:975-995` |
-| A17 | minor | `LOST_POOL`'s doc says the oldest lost number is forgotten; the code drops the newest | ⬜ open — `ids.rs:152-158` |
-| A18 | minor | the dropped-turns note is put back in its place only for the root | ⬜ open — `agent.rs:1832` |
-| A19 | minor | three sentences that claim more than the code does: a repeated dropped-images notice, a shed note's promise, two `null`s | 🔄 `d8a1a04` fixed the `arg_string` "missing" misdiagnosis; the notice repeats every request, `SHED_RESULT_NOTE`'s doc overclaims, `wait({"on": null})` is still refused (§8.65) |
+| A13 | minor | the pane re-parses every visible tool call's whole argument JSON on every frame (2 MB → 9.68 ms per call, per frame) | ⬜ open — `chat.rs:2708` (`tool_label`), `agent.rs:6370` (`summarize_args` parses per frame) |
+| A14 | minor | the idle fold drains the mailbox like an in-run one, swallowing a command that means "start a run" | ⬜ open — `agent.rs:2117` (`wait_for_work`), `3666` (`compact_now`), `3806` (`drain_mailbox`) |
+| A15 | minor | parking a child kills the jobs it started, and `park_history`'s doc says parking ends "the thread and nothing else" | ⬜ open — `app/mod.rs:3841` (`park_history`) |
+| A16 | minor | `done_jobs`, `delivered_jobs` and `forgotten` grow for the life of an actor (1,000 jobs → 61,893 bytes) | ✅ `d8ae94d` (§8.83, H57) |
+| A17 | minor | `LOST_POOL`'s doc says the oldest lost number is forgotten; the code drops the newest | ✅ `3483c4e` (§8.83) |
+| A18 | minor | the dropped-turns note is put back in its place only for the root | ⬜ open — `agent.rs:2236` (`adopted`), `app/mod.rs:2656` (`AgentMsg::Run` reaches only the root) |
+| A19 | minor | three sentences that claim more than the code does: a repeated dropped-images notice, a shed note's promise, two `null`s | 🔄 `d8a1a04` fixed the `arg_string` "missing" misdiagnosis (§8.65); the notice still repeats every request (`agent.rs:2678`), `SHED_RESULT_NOTE`'s doc still overclaims (`agent.rs:2758`), `wait({"on": null})` is still refused (`agent.rs:5292`) |
 | A20 | minor | a finished tool's label stuck through the next model call | ✅ `9a4dbbf` (§8.53) |
-| A21 | minor | two `expect("workspace root must exist")` sit on the UI thread (suspected) | ⬜ open — `agent.rs:1324`, `1435` |
-| A22 | minor | after a restore the job space restarts at `#c1` while the restored transcript still names old `#cN` lines (suspected) | ⬜ open — `session.rs:194-256`, `ids.rs:87` |
-| A23 | minor | cleanup is process-group-only; the doc claims "everything the command started" | ⬜ open — `machine.rs:149` |
+| A21 | minor | two `expect("workspace root must exist")` sit on the UI thread (suspected) | ⬜ open — `agent.rs:1495` (`root_actor`), `1606` (`revive`) |
+| A22 | minor | after a restore the job space restarts at `#c1` while the restored transcript still names old `#cN` lines (suspected) | ⬜ open — `ids.rs:122` (the counter starts at 1 every start), `app/mod.rs:961` (`restore_agents`), `mush-core/src/session.rs` (no job counter stored) |
+| A23 | minor | cleanup is process-group-only; the doc claims "everything the command started" | ✅ `d4c596c` (§8.83; `jobs.rs:483`'s sentence left, §8.86) |
 
 ### tools-and-workspace (`docs/audits/tools-and-workspace.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | B1 | major | every write rebuilds the file at mode 0600, and a 0444 file is replaced anyway | ✅ `580e1f4` (§8.55) |
 | B2 | major | a symlinked file is replaced, not written through: the edit lands in the wrong place | ✅ `1e08673` (§8.55) |
@@ -4497,15 +4615,15 @@ the one road of B27's class that survives, is among them.
 | B9 | minor | `rel()` rewrites a real name's backslash into a separator: a listed path the model cannot open | ✅ `b13aeed` (§8.69) |
 | B10 | minor | `edits_arg` silently defaults a wrongly-typed `replace_all` | ✅ `d8a1a04` (§8.65) |
 | B11 | minor | the attach socket has no bound anywhere: line, threads, or idle time | ✅ `1bd5e2a` (§8.67) |
-| B12 | minor | `Message`'s deserializer is stricter than its own doc, and a refused reply ends the run | ⬜ open — `message.rs:117`, `128`, `204` |
-| B13 | minor | `.mush/paste/` is never pruned | ⬜ open — `workspace.rs:847`, `1724` |
-| B14 | minor | the markdown view's rows are not the plain wrapper's rows for non-ASCII whitespace (8,823 divergences in a fuzz) | ⬜ open — `text.rs:235` vs `741` |
+| B12 | minor | `Message`'s deserializer is stricter than its own doc, and a refused reply ends the run | 🔄 `fe83f8a` made the deserializer as loose as its doc, pinned by `a_loose_reply_is_still_a_reply` (§8.83); a reply that still does not parse ends the run at `agent.rs:3070` (H56) |
+| B13 | minor | `.mush/paste/` is never pruned | ✅ `a534d35` (§8.78) |
+| B14 | minor | the markdown view's rows are not the plain wrapper's rows for non-ASCII whitespace (8,823 divergences in a fuzz) | ✅ `7da2cdd` (§8.80) |
 | B15 | minor | `sanitize` keeps the bidi marks, and the invisible set is wider than the doc says | ✅ `dd23693` (§8.69) |
-| B16 | minor | the read-modify-write window (suspected): a sibling's edit between the read and the rename is silently reverted | ⬜ open — `agent.rs:5145` |
+| B16 | minor | the read-modify-write window (suspected): a sibling's edit between the read and the rename is silently reverted | ✅ `7106564` (§8.78) |
 
 ### secrets-session-config (`docs/audits/secrets-session-config.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | C1 | major | every shell, git child and clipboard child inherits `MUSH_API_KEY` | ✅ `579619f` + `b6ef169` + `199858a`, merged `9e6ac54` (§8.54) |
 | C2 | major | a typo in the home config's `provider` is silently ignored, and the key goes to the LAN endpoint | ✅ `072d655` (§8.64) |
@@ -4513,16 +4631,16 @@ the one road of B27's class that survives, is among them.
 | C4 | major | `Ctrl-N` writes an empty conversation over the human's own | ✅ `d505d9e` (§8.57) |
 | C5 | major | the store's self-ignore is created only if absent, never enforced | ✅ `a9a2f09` (§8.57) |
 | C6 | major | `/provider` sends the current key to the vendor's endpoint, then saves it as that vendor's | ✅ `fa28769` + `df781fd` (§8.64) |
-| C7 | minor | a key with a newline injects header lines into the request | ⬜ open — `http.rs:463` writes it raw |
-| C8 | minor | the attach printers emit control sequences | ⬜ open — `main.rs:466` (`escape_line`), `488` |
+| C7 | minor | a key with a newline injects header lines into the request | ⬜ open — `http.rs:518` writes it raw |
+| C8 | minor | the attach printers emit control sequences | ✅ `11ad7dd` (§8.84) |
 | C9 | major | the restore trusts the file's agent ids: `id: 0` replaces the root, a duplicate replaces a row, `u64::MAX` panics | ✅ `7d80582` (§8.57) |
-| C10 | minor | the fold's refusal echoes the endpoint's whole body into a notice | ⬜ open — `agent.rs:3150-3153` |
-| C11 | minor | an environment key is silently copied into the home config by an unrelated command | ⬜ open — `app/mod.rs:2987` |
-| C12 | minor | `--print-config` cannot answer the image gate | ⬜ open — `main.rs:679` (`describe` has no vision row) |
+| C10 | minor | the fold's refusal echoes the endpoint's whole body into a notice | ✅ `8121e78` (§8.83) |
+| C11 | minor | an environment key is silently copied into the home config by an unrelated command | ✅ `d338355` (§8.84) |
+| C12 | minor | `--print-config` cannot answer the image gate | ✅ `b1ee2f0` (§8.84) |
 
 ### tui (`docs/audits/tui.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | D1 | **blocker** | a fold under the select mode panics the frame | ✅ `15e6d9e` + `35404e4` (§8.56, H49) |
 | D2 | **blocker** | two rows of one id lose a painted row, and a real key then panics the pane | ✅ `6833275` (§8.56, H50) |
@@ -4530,63 +4648,63 @@ the one road of B27's class that survives, is among them.
 | D4 | major | a command road blocks the UI thread on the endpoint: measured 10.036 s | ✅ `0951b85` (§8.63) |
 | D5 | major | at a short terminal the box paints its attachments with the rows the line being typed needed | ✅ `61ec689` (§8.63) |
 | D6 | major | a stored session's `base_url` re-points the endpoint and the home key follows it | ✅ `fa28769` + `df781fd` (§8.64) |
-| D7 | minor | a reap keeps the cursor's index, so the selected agent changes with no keystroke | ⬜ open — `tree.rs:1490` |
-| D8 | minor | a reclaimed worktree keeps its branch stat on the row and in the title | ⬜ open — `tree.rs:904` |
-| D9 | minor | an orphan row is indented by its stored depth | ⬜ open — `ui.rs:153` |
-| D10 | minor | a status can erase `⊘ cancelling…` (suspected race) | ⬜ open — `tree.rs:977`, `1005` |
-| D11 | minor | the chat pane's title is the one title with no elision rule | ⬜ open — `ui.rs:284` |
-| D12 | minor | a resize with `/notes` or `/help` open clips every row of the report | ⬜ open — `app/mod.rs:3148`, `3176` |
-| D13 | minor | zen's Chat arm re-derives the message box, and the `at_every_size` pin checks two sizes | ⬜ open — `screen.rs:415-422` |
-| D14 | minor | a reply of only fence lines is an invisible turn, and the select cursor has no row | ⬜ open — `chat.rs:597`, `3350-3353`, `746` |
-| D15 | minor | a held reading comes back from the dead after a fold | ⬜ open — `chat.rs:366` |
-| D16 | minor | an agent whose actor published its prompt but has no transcript weighs 0 | ✅ `3a37c02` (§8.66, sideways — the commit is A8's) |
-| D17 | minor | the module doc's "News" row is false for a stopped run | ⬜ open — `chat.rs:1393` |
-| D18 | minor | a focus change under the select mode makes `Enter` copy nothing, silently | ⬜ open — `chat.rs:1687`, `app/mod.rs:2831` |
-| D19 | minor | a control character in a URL reaches the request line | ⬜ open — `config.rs:393` |
-| D20 | minor | a paste that merges graphemes leaves the cursor past the end, and one `Backspace` is swallowed | ⬜ open — `input.rs:54-58` |
-| D21 | minor | the config cell's doc claims the copies cannot differ; a handle learn strands the UI | ⬜ open — `settings.rs:124`, `188` |
-| D22 | minor | an empty key is "set", "(none)" and an empty Bearer | ⬜ open — `app/mod.rs:2942`, `main.rs:701`, `http.rs:462` |
-| D23 | minor | the `/help` table's description column collapses at the floor | ⬜ open — `commands.rs:199-213` |
-| D24 | minor | `Ctrl-Y` under zen with the tree full-screen opens a mode the frame cannot paint | ⬜ open — `chat.rs:1554` |
-| D25 | minor | the "several agents running" line names `Enter`, which never stops anything | ⬜ open — `app/mod.rs:4538` |
-| D26 | minor | `Msg::Git` carries no conversation stamp (suspected) | ⬜ open — `app/mod.rs:73-84`, `1497` |
+| D7 | minor | a reap keeps the cursor's index, so the selected agent changes with no keystroke | ✅ `39576fd` (§8.81) |
+| D8 | minor | a reclaimed worktree keeps its branch stat on the row and in the title | ✅ `7ce13c8` (§8.81) |
+| D9 | minor | an orphan row is indented by its stored depth | ✅ `c884a8c` (§8.81) |
+| D10 | minor | a status can erase `⊘ cancelling…` (suspected race) | ✅ `c848deb` (§8.81; the tree half — `tree.rs`'s setters refuse `Phase::Cancelling`; the actor's check-then-emit window stays suspected) |
+| D11 | minor | the chat pane's title is the one title with no elision rule | ✅ `f749e71` (§8.80) |
+| D12 | minor | a resize with `/notes` or `/help` open clips every row of the report | ✅ `d018a2f` (§8.80) |
+| D13 | minor | zen's Chat arm re-derives the message box, and the `at_every_size` pin checks two sizes | ✅ `bc581ba` (§8.80) |
+| D14 | minor | a reply of only fence lines is an invisible turn, and the select cursor has no row | ✅ `aa0245b` (§8.80) |
+| D15 | minor | a held reading comes back from the dead after a fold | ✅ `942e4b5` (§8.80) |
+| D16 | minor | an agent whose actor published its prompt but has no transcript weighs 0 | ✅ `3a37c02` (§8.66) closed the mechanism; the false sentence beside it by `a7c579d` (§8.80) |
+| D17 | minor | the module doc's "News" row is false for a stopped run | ✅ `fa7b1f1` + `bdbb484` (§8.81) |
+| D18 | minor | a focus change under the select mode makes `Enter` copy nothing, silently | ✅ `3a51fea` (§8.81) |
+| D19 | minor | a control character in a URL reaches the request line | ✅ `4f7793c` (§8.79; the TUI's `/url` arm refuses without a sentence, §8.86) |
+| D20 | minor | a paste that merges graphemes leaves the cursor past the end, and one `Backspace` is swallowed | ✅ `9134ad4` (§8.81) |
+| D21 | minor | the config cell's doc claims the copies cannot differ; a handle learn strands the UI | ✅ `25ec885` (§8.81) |
+| D22 | minor | an empty key is "set", "(none)" and an empty Bearer | ✅ `a26f165` (§8.81) |
+| D23 | minor | the `/help` table's description column collapses at the floor | ✅ `1afa368` (§8.80, ledger `R60`) |
+| D24 | minor | `Ctrl-Y` under zen with the tree full-screen opens a mode the frame cannot paint | ✅ `a5dbed2` (§8.80) |
+| D25 | minor | the "several agents running" line names `Enter`, which never stops anything | ✅ `4bbef67` (§8.81) |
+| D26 | minor | `Msg::Git` carries no conversation stamp (suspected) | ✅ `e87af91` (§8.81) |
 
 ### processes-and-jobs (`docs/audits/processes-and-jobs.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | E1 | major | a killed mush leaves every process group running | ✅ `a68eea0` (§8.61) |
 | E2 | major | the workspace lock is a file the file tools replace: two mushes on one store | ✅ `0d45ffd` + `5714052` (§8.62) |
 | E3 | major | a command that backgrounds a child escapes the registry, the ceiling and the quit | ✅ `8891ec9` (§8.62) |
 | E4 | minor | a panicking actor drops its hold without killing (mechanism proven, trigger suspected) | ✅ `deaf586` (§8.61) |
 | E5 | minor | the scratch file is removed only by `Drop`: a mush that does not unwind leaves `/tmp/mush-cmd-*` behind, with an orphan writing into it | ✅ `e7834a2` (§8.61) |
-| E6 | minor | `Running::kill` fires `kill -9 -<pgid>` unconditionally: the second call aims at a freed group, and the failure is silent | ⬜ open — `machine.rs:216-228` |
+| E6 | minor | `Running::kill` fires `kill -9 -<pgid>` unconditionally: the second call aims at a freed group, and the failure is silent | ✅ `3bb1a5b` (§8.77) |
 | E7 | minor | the session writer's `flush` has no deadline and no liveness check | ✅ `bbff494` (§8.67) |
-| E8 | minor | the lock's one sentence to a human can name a dead pid, and the recorded flake cannot be a stale lock | ⬜ open — `lock.rs:130`, `151`, `135` |
-| E9 | minor | a handed-over job's age starts at the handover | ⬜ open — `jobs.rs:1195`, `1226` |
-| E10 | minor | the global panic hook restores the terminal from any thread | ⬜ open — `main.rs:1232` |
+| E8 | minor | the lock's one sentence to a human can name a dead pid, and the recorded flake cannot be a stale lock | ✅ `926a12a` (§8.83, H58) |
+| E9 | minor | a handed-over job's age starts at the handover | ✅ `a07834a` (§8.77) |
+| E10 | minor | the global panic hook restores the terminal from any thread | ✅ `67bc041` (§8.77) |
 
 ### contract-and-git (`docs/audits/contract-and-git.md`)
 
-| # | severity | the defect | status at `38d0438` |
+| # | severity | the defect | status at `7338d81` |
 |---|---|---|---|
 | F1 | major | a run whose only work is in an ignored path reads "clean — nothing changed", and is then deleted | ✅ `8b029f0` (§8.59) |
-| F2 | minor | `commit.gpgsign` stops every commit, and the doc says it cannot | ⬜ open — `git.rs:855-874` |
-| F3 | minor | the dropped-turns note is identified by its text, so a user line that *is* it becomes the note | ⬜ open — `transcript.rs:474` |
-| F4 | minor | `run_command`'s schema describes a cut where the code kills the command | ⬜ open — `prompt.rs:241` |
-| F5 | minor | a child's worktree has no submodule contents, and the child is not told | ⬜ open — `git.rs:470` |
-| F6 | major | a dead actor thread is invisible: a row that spins, a parent that waits 600 s, a corpse handed back as "parked" (suspected) | ⬜ open — `agent.rs:1605`, `app/mod.rs:3542` |
-| F7 | minor | the spawn cap's arithmetic is not the sweep's, and its sentence claims more than it measured | ⬜ open — `git.rs:790`, `agent.rs:3838` |
+| F2 | minor | `commit.gpgsign` stops every commit, and the doc says it cannot | ✅ `ce06a83` (§8.78) |
+| F3 | minor | the dropped-turns note is identified by its text, so a user line that *is* it becomes the note | ⬜ open — `transcript.rs:474` (`is_dropped_note`) |
+| F4 | minor | `run_command`'s schema describes a cut where the code kills the command | ✅ `c96aae1` (§8.84) |
+| F5 | minor | a child's worktree has no submodule contents, and the child is not told | ✅ `414e477` (§8.78) |
+| F6 | major | a dead actor thread is invisible: a row that spins, a parent that waits 600 s, a corpse handed back as "parked" (suspected) | ✅ `98d7060` + `13b2689` (§8.73) |
+| F7 | minor | the spawn cap's arithmetic is not the sweep's, and its sentence claims more than it measured | 🔄 `efd5213` corrected the sentence and the doc — the cap counts against `HEAD` and says so (`git.rs:852` `unlandable`, `agent.rs:4336` `too_many_worktrees`, the count at `agent.rs:4526`) (§8.83); the arithmetic half is still owed to the UI tree (H54) |
 | F8 | major | a run-end commit in a workspace that is no longer a worktree commits the human's own checkout | ✅ `0e506f2` + `d70c768` (§8.59) |
 | F9 | major | `base="HEAD"` is resolved in the application's root, not the spawning agent's workspace | ✅ `6f47149` (§8.65, H7's class) |
 | F10 | major | an agent id returns to the pool after a partial `worktree add` | ✅ `ac12012` (§8.59) |
 | F11 | major | an isolated spawn is refused in a workspace that is a subdirectory of a repository, with a false reason | ✅ `34b647b` (§8.59) |
 | F12 | minor | a wrongly-typed `base` silently drops isolation | ✅ `d8a1a04` (§8.65) |
-| F13 | minor | the one-shared-child rule is a per-parent book, so "this workspace" can hold two live writers | ⬜ open — `agent.rs:3944` |
-| F14 | minor | `title` is required by the schema, optional in the code, and not bounded to one line | ⬜ open — `prompt.rs:262`, `agent.rs:3931` |
-| F15 | minor | `parse_commit_subject` is not the inverse when the failure text contains `"): "` | ⬜ open — `agent.rs:407` |
-| F16 | minor | `has_commits`'s "no commits yet" refusal is unreachable from the spawn road | ⬜ open — `git.rs:450` |
-| F17 | minor | a failed commit is a row tail the next run clears, not the transcript line its doc claims | ⬜ open — `agent.rs:1636`, `app/mod.rs:1758` |
+| F13 | minor | the one-shared-child rule is a per-parent book, so "this workspace" can hold two live writers | 🔄 `d7f12a2` counts every live writer of the directory (`WriterGuard`, the count keyed by canonical root) (§8.83); the sentence at `mush-core/src/prompt.rs:58` and `agent.rs:1806` still claims the per-parent rule (H55) |
+| F14 | minor | `title` is required by the schema, optional in the code, and not bounded to one line | ✅ `09c9446` made the schema optional and one-line (§8.78) + `74ad1de` folds the title in `spawn_tool` (§8.83) |
+| F15 | minor | `parse_commit_subject` is not the inverse when the failure text contains `"): "` | ✅ `02b002f` (§8.83) |
+| F16 | minor | `has_commits`'s "no commits yet" refusal is unreachable from the spawn road | ✅ `7a01569` (the git door, §8.78) + `c71be60` (the spawn road, §8.83) |
+| F17 | minor | a failed commit is a row tail the next run clears, not the transcript line its doc claims | ⬜ open — `agent.rs:295` (`Work::status_line`), `app/mod.rs:1914` (`AgentEvent::Status` arm) |
 
 ---
 
@@ -4927,8 +5045,9 @@ on the test's deadline), `a_cut_off_body_on_a_real_wire_is_final_and_asked_once`
 retry on a connection reset and B27's on a broken frame — both happen *after*
 the request went out, which is the ruling's cost; the run ends and the human can
 ask again. B23's and B27's rows in §2.75 carry that narrowing now. The audit's
-A10 survives it: a hex-parsable chunk size past the body cap is still diagnosed
-as the endpoint's refusal (§8.52), and A2's own remaining cost — the endpoint
+A10 was left open here: a hex-parsable chunk size past the body cap was still
+diagnosed as the endpoint's refusal — closed by `729e8fc` (§8.79), which makes
+the claim a `Framing` break. A2's own remaining cost — the endpoint
 may have run the call even though mush never saw the answer — is the price paid
 so a human is never billed twice.
 
@@ -5724,6 +5843,8 @@ code's other half. No `cargo test` was run for this record pass: it changes no
 line under `crates/`.
 
 **The scoreboard.** 46 of the 104 findings fixed, 1 partial (A19), 57 open;
+the sheet's head moved to 91/4/9 by §8.72–§8.85, and the drift below is re-read
+in §8.86;
 H49–H53 are the queue's new rows, and the status moves the audits' ledger deltas
 owed are on H12, H16, H21, H27, H28, H30, H34 and H35, with the narrowing of
 B23/B27's retry class on those rows in §2.75. The three open majors are A3, A6
@@ -5749,7 +5870,8 @@ images go with their turn (§8.43); and a paste from any location survives a
 restart (§8.43).
 
 **Recorded, not changed: the living docs the campaign made false.** The record
-names them so a drift pass can repair them, and it does not edit them. `README.md`
+names them so a drift pass can repair them, and it does not edit them; §8.86
+re-reads the list at `7338d81`. `README.md`
 **234–245** still describes the three-attempt transport retry and the half-hour
 worst case that `190886c` and `b6a59c3` (§8.58) removed: the retried class is
 `Unsent` only and one ask spends one 600 s deadline. `README.md:189`,
@@ -5773,3 +5895,1707 @@ listing caps "went with the file tools" where they came back (§8.36); and
 is the per-parent book F13 is still open about. The two test-visible items of
 §8.50 are repaired above in the record, not in the manual: `f915022`'s stop and
 the fold (§8.68).
+
+---
+
+## 8.72 One number, one directory, one copy: the store report's four extractions (`1fd1933`, `ce315a2`, `0348028`, `0b42d69`, merged `1e07c2e`)
+
+The four duplication passes landed as documents (§8.70), and the first landings
+to answer one of them are the store report's cheapest rows: `docs/dedup/store-workspace-cli.md`'s
+ranked extractions, carried in `docs/refactor.md` §11 as `R39`, `R44`, `R37`
+and `R41` (in landing order) — each now with the landed shape and commit rather
+than the proposed one. Two are the live contradictions that report named in its
+own closing list (the flag and the paste path); the other two are the ranked
+rows: one shape written twice, one race found by reading.
+
+**The flag and the variable read one number (`1fd1933`; `R39`, the report's
+`--context` contradiction).** `--context` trimmed nothing while `MUSH_CONTEXT`
+trimmed, so the same statement was read two ways: measured, `mush --print-config
+--context " 8192" ws` exited 1 with `` --context needs a token count, got
+` 8192` ``, while `MUSH_CONTEXT=" 8192" mush --print-config ws` printed `window
+8192 tokens (stated)`. `config::parse_context(value, road)` is the one read;
+`parse_context_env` is the environment's name for it, and `main.rs`'s arm calls
+it with `--context`, so both doors trim and both refuse by the same rule, each
+sentence naming the road that carried the value. Pinned by
+`the_context_flag_and_the_variable_read_one_number_one_way`: 8192, ` 8192`,
+`8192 ` and ` 8192 ` agree from the flag and from the environment, and `8k` is
+refused by both. **Recorded, not changed:** `parse_context_hint`'s `MIN..=MAX`
+stays its own bound — the environment is a human's statement with a floor it can
+be clamped to, while a window read out of an endpoint's complaint outside that
+range is evidence of a misparse, not a window.
+
+**A paste's refusal names the file that is there (`ce315a2`; `R44`).** The paste
+directory was spelled four ways and two of them lied: an `Image` carried
+`.mush/paste/<name>`, while both write failures said `cannot write .mush/<name>`
+(`workspace.rs:855` and `:1741` at the report's base) for a file that is at
+`.mush/paste/<name>` — a message a human is meant to act on, pointing at a file
+that is not there. `workspace::PASTE_REL` is now the one spelling, with
+`paste_dir(root)` and `paste_rel(name)` for the two shapes a road needs: the
+directory the writer creates, the path an `Image` carries, and the refusal a
+failed write gives. Pinned by
+`a_paste_that_cannot_be_written_names_the_paste_directory` — with `.mush/paste`
+occupied by a file, the create refusal reads `cannot create .mush/paste: …` and
+the name-making refusal reads
+`cannot write .mush/paste/pasted-1700000000000.png: …`. **Recorded, not
+changed:** `IMAGE_FILE_CAP` and `SEARCH_FILE_CAP` both hold 2 MiB and stay two
+caps — one bounds what mush puts on the wire, the other what a walk opens in
+memory.
+
+**The copy beside a file is numbered by one road (`0348028`; `R37`).**
+`session::keep_unreadable` and `userconfig::keep_unparsable` each wrote the same
+eight-line name search, identical character for character, and each spelled the
+bound `100` — so the two could disagree about which `.bak.N` is the second
+accident. `workspace::backup_name(path)` is now the one road, beside
+`atomic_write`: the first free `<path>.bak`, then `.bak.2`, … up to
+`workspace::BACKUP_TRIES`, one const for both callers. Each caller keeps its own
+rename and its own reason for the copy (a conversation that must not be lost, a
+key that must not be replaced) in its own doc. Pinned by
+`a_backup_name_is_the_first_free_one_beside_the_file` (the numbering and the
+bound), `keeping_a_second_unreadable_session_does_not_overwrite_the_first`,
+`a_session_that_cannot_be_kept_still_names_the_file` and
+`a_second_unparsable_config_does_not_overwrite_the_first`; the “every backup
+name beside the file is taken” refusal now carries the full path on both roads.
+**Recorded, not changed:** `session::Stored` and `userconfig::Loaded` stay two
+vocabularies for one three-way fact — the session's must not be flattened (that
+flatten is what overwrote a lost conversation), while the config's may be (a
+missing file and an empty one are the same defaults, and only the complaint
+carries news).
+
+**Search reads under its cap like the other two readers (`0b42d69`; `R41`).**
+`search` checked `SEARCH_FILE_CAP` from the stat and then called `fs::read`,
+which has no bound — the one reader of the three that could load a file that
+grew behind its own stat (`whole_read` takes `READ_FILE_CAP + 1`, `image_at`
+takes the cap's remainder). The window is a race, so this is not a live bug, but
+it is one question — how much of a file may be read — answered two ways by two
+roads. `read_bounded(path, cap)` is now the read — `File::open` plus
+`take(cap + 1)` — so a file that grew past the stat is caught by its length and
+counted a skip. Pinned by `a_bounded_read_stops_at_the_cap`: a file of 4,096
+bytes read with a cap of 1,024 comes back 1,025 bytes long, the length that says
+“past the cap”, while a file inside the cap is read whole. The search tests are
+unchanged.
+
+---
+
+## 8.73 A thread that dies files its own ending (F6, `98d7060` + `13b2689`, merged `0839fcf`)
+
+The first of the three majors §8.71 named as still open to close — and the one
+whose evidence an unwinding thread destroys, because the panicking actor is the
+very thread that would have reported.
+
+**What was true.** A panic inside an actor's body unwinds the thread, and the
+unwinding skips both readers of that run's ending. The UI is a phase behind for
+good — it keeps painting the last thing it was told, a row that spins forever.
+The parent is never told, so a `wait` burns its whole 600 s cap on a child that
+can never report and a listing says `◐ running` for the rest of the session, and
+the slot the run held in `ctx.live` is never given back, so `MAX_AGENTS` refuses
+a spawn with a sentence that is false and that no `wait` can clear. The audit's
+probe (a model client that panics mid-reply) measured it verbatim:
+
+```
+the parent heard: [ChildRunning { id: 7 }]
+the UI was told: [Running { cancel: false }, Thinking]
+the run held slot(s) [1]; the tree's count is now 1
+the parent's listing: #7 ◐ running on mush/7
+the wait answered: "wait timed out — #7 still running" after 600s
+control message: "…its actor was parked, so mush is waking one…"
+```
+
+**The fix.** `actor_main` is now a wrapper: it catches a death where it happened
+and files it as the ending it is — `Outcome::CutOff`, on the road a stopped or
+reaped run takes (`tell_parent`, under `CUT_OFF_RUN`, the number no actor can
+report) and as one `AgentEvent::CutOff` carrying the payload, which is the only
+record of what broke (the process-wide hook restores the terminal and nothing
+else). A cut-off is not `Failed` — nothing the model did broke, and a failure is
+a result a `wait` may hand over — and not `Stopped`: there is no actor left to
+resume. The UI's half is the row (a new `AgentTree::cut_off`, the phase whose own
+doc says the run never ended) plus the pane's sentence and the jobs the vanished
+owner left, all of it written once in `App::note_cut_off`, shared with
+`report_cut_off`, which stays the road for an actor that was already gone and
+left nobody to file anything. The slot is a `LiveGuard` whose `Drop` decrements,
+because the road that would have written the count down is the road the panic
+skips: the ending and the slot are the two things an unwinding thread leaves
+unsaid. After, the same probe: one `ChildDone { run: u64::MAX, outcome: CutOff
+}`; the same listing reads `✉ #7 ⚠ cut off — the run never ended; nothing was
+committed`; the same wait answers at once and costs no part of the cap; the count
+is 0 and the thread's join is clean.
+
+**A corpse is not a parked child (`13b2689`).** A mailbox with no actor behind it
+is what a parked child leaves and also what a child whose thread died leaves, and
+the two roads that answer a parent about that mailbox — `control message` and
+`control stop` — read the send failure as a park: the audit's probe read the
+words back, `its actor was parked, so mush is waking one: this resumes it`. The
+failed send cannot settle it (a park ends the thread too, and the parent holds
+no handle on the child's thread); what settles it is the ending the child filed
+before it went: `actor_gone` reads the parent's own books, and a cut-off is the
+one ending only a vanished actor reports, while `App::park_history` only ever
+reclaims a thread at rest. A stop on a corpse says there is nothing left to
+stop; a message says the child is gone, not parked, and that a revived child
+resumes from the copy of the conversation on screen rather than from where the
+dead run left it. The prose that claimed a failed send *is* a park is corrected
+where it lived: `park_history`'s “the send is the whole probe” and its “Already
+parked” arm, `App::deliver_to_actor`'s, and the three doc comments that read an
+empty mailbox as a park alone (`AgentEvent::ChildAsleep`, `hand_to_ui`,
+`agent::gone`).
+
+**Pinned by** `an_actor_thread_that_dies_mid_run_is_reported_cut_off` (the
+ending, the slot and the UI's telling, extended by `13b2689` to assert that both
+control roads' answers never say “parked”),
+`a_thread_that_dies_without_a_reporting_road_leaves_the_count_where_it_found_it`
+(the guard alone; the root has no reporting road at all) and
+`a_dead_actors_row_says_cut_off_and_the_ui_files_no_second_ending` (the row, the
+notice, and that the UI adds no second filing to the parent).
+
+**Recorded, not changed.** The cut-off is filed under `CUT_OFF_RUN` because the
+dead run cannot know its own number; the payload the panic carried stays the
+only account of it (the terminal hook restores the terminal and files nothing);
+and a park is still the one thing a failed send can also mean, told apart by
+what the dead thread reported rather than by the send.
+
+---
+
+## 8.74 `Ctrl-O`: the output view, and the fold's zero (`f43a1de` + `6c5b7d2`, merged `1ab5a9b`)
+
+A key that was bound to nothing and a fold state that did not exist; the two
+halves landed as one branch because the view is not paintable without the second.
+
+**Zero is the fold's own state (`f43a1de`).** `Fold::with(Kind::Result, 0)` was
+not “paint no row of this kind”: it painted `  … +3 more lines` for a three-line
+success, a failed result painted its `! error: …` row *plus* `    … +2 more
+lines`, and the select mode still gave the block one stop per source line,
+because `Stops::of` only knew “every line” and “a tail”. Now
+`Fold::without_output` is the state: the three output kinds — a tool's result,
+mush's report about a child or a job, the brief a child's pane opens with — go
+to no rows, and `folded_rows` paints no `…` for a kind with no rows, because the
+elision row is part of showing a block and this state has no head for it to stand
+behind. The one row such a block keeps is the failure row `Fold::shown` never
+gives up — the result's `  ! error: …`, the report's `· #1 failed: …` first line
+— painted alone, and a hidden block has no stop at all while the failure keeps
+one with no tail. `Fold::with`'s `#[cfg(test)]` gate came off, because the view
+is its first runtime caller, and `Chat` holds the view (`output`, `painted_fold`)
+as one flip for every pane. Pinned by
+`ctrl_o_hides_and_shows_command_output` (the `⚙` labels and every other row
+untouched, the same rows back on the second press),
+`ctrl_o_never_hides_a_failure`, `ctrl_o_keeps_the_folds_numbers_in_the_shown_state`
+and `ctrl_o_leaves_no_stop_over_a_hidden_block`.
+
+**The key is the output view (`6c5b7d2`).** `Ctrl-O` was unbound — the keymap's
+`Ctrl-` block had no `o` arm, so the key fell through to `Intent::Ignore`. It is
+now the output view in the family of `Ctrl-T`'s reasoning and `Ctrl-F`'s zen: an
+app-wide intent, so it works from either pane and over a picker or the select
+mode, and it sits above both in `key`. The view is not said and not stored:
+measured at the app level, the press leaves the bar empty, the transcript at the
+same length and `session_dirty_at` still `None`, and a fresh `App` on the same
+directory paints the tool result again, with the pane's rows back exactly (the
+same `…`, the same eight wrapped rows) on the next press. The `KEYS` row both
+help surfaces read is “show or hide tool output, reports and briefs (a failure
+always shows)”, and the failure exemption is the fold's, not the handler's.
+Pinned by `ctrl_o_is_a_view_and_is_not_stored` (a real `Ctrl-O` through the key
+table) and the `Ctrl-O` row of
+`the_app_keys_work_from_every_pane_and_over_a_picker`.
+
+**Recorded, not changed.** A hidden block still holds its bytes — the view is a
+fold, not a cut — and the select mode's stops follow the painted rows, so a
+hidden block offers nothing to copy.
+
+---
+
+## 8.75 A wire phase cannot outlive the call's deadline (`1dbea62`, merged `18f2afb`)
+
+The first of the two divergences the actor duplication report named, and the one
+whose rule sounded already settled: “the attempt's deadline is
+computed twice and three syscall timeouts ignore the budget they were handed, so
+‘one ask spends one deadline’ is false on that road and a Stop can land late”
+(`docs/dedup/actor-tools-wire.md`, §8.70). The commit answers it without a new
+name — the deadline already had a home, and the phases were the ones ignoring it.
+
+**What was true.** `CONNECT_TIMEOUT` (5 s), `WRITE_TIMEOUT` (30 s) and
+`RESOLVE_TIMEOUT` (10 s) were schedules of their own: `model.rs::retrying` hands
+each attempt only what is left of the logical call's one deadline, and then the
+name lookup, the connect and the write could each spend their own constant on
+top. A stalled write was the shape that hurt: the request went out through
+`write_all`, whose only bound was the connection's 30 s `SO_SNDTIMEO`, and a peer
+that trickled its receive window kept it looping past even that; the watch was
+never consulted during a write, so a Stop landed with it. Measured with a 300 ms
+call deadline, a 16 MiB body, and a listener that accepts and then never reads:
+
+```
+before  90.86 s, `WouldBlock` marked `Unsent` (through `model.rs`,
+        `ModelError::Unsent` — a class `retrying` asks again)
+after    0.31 s, `TimedOut` "the endpoint stopped responding", unmarked
+        (`model.rs`'s `transport()`: `ModelError::Transport`)
+```
+
+The connect against a route that swallows the SYN (`10.255.255.1`) read 5.05 s
+`TimedOut` marked `Unsent` before and 0.30 s `TimedOut` unmarked after.
+
+**The fix.** The rule has one home — `Watch`, the value that owns the deadline —
+and one spelling: every per-phase bound is the smaller of its own ceiling and
+what is left of the call (`Watch::left`). `CONNECT_TIMEOUT` is taken per address,
+the write re-sets the socket's own timeout before every chunk and checks the
+watch between them, and the lookup's wait ends at `min(RESOLVE_TIMEOUT, left)`; a
+phase that spends the budget answers in the sentence the read deadline already
+used (`Watch::spend`), and the two roads that would wrap it in `Unsent` —
+`request`'s opener and `exchange`'s write — pass a spent call through, so the
+layer above classifies it as the deadline it is, never as a failure to ask again
+with nothing left. `ReadWrite` gained `set_write_timeout` because a kept
+connection carries the ask that opened it, so the bound must be set per ask, not
+per connection, and the three constants now say outright that they are ceilings,
+not schedules. Pinned by `no_phase_outlives_the_calls_deadline` (lookup, connect
+and write each ended at the call's deadline, the lookup through the opener's own
+`Watch` on a fake clock because `connect`'s resolver has no seam for a lookup
+that never answers), `a_stop_lands_while_a_write_stalls` (the Stop is the answer,
+read as the write returns at the deadline, not 30 s later) and
+`a_healthy_call_is_not_cut_by_the_ceilings` (a listener that reads the whole
+request and answers still succeeds well inside them).
+
+**Recorded, not changed.** The report's second divergence — the output cap
+applied at two levels with one name, `Job::output`/`tail` capping each stream
+while `preview` caps the joined text, so one command can hand back up to twice
+the cap as a foreground result and cap as a job while `preview`'s doc claims
+“exactly as a foreground result reads” — is not this commit's; it stays an open
+row in `docs/refactor.md` §11.
+
+---
+
+## 8.76 The four blind passes enter the ledger, and the record's own paragraphs catch up (`0fe6e22`, `47e6f87`, `f79e182`, merged `8b0fc6d`; `706b64e`; `49f0619`)
+
+A docs-only landing with its own follow-ups, recorded because the ledger it
+touches is where §8.70's queue lives.
+
+**The passes are rows now (`0fe6e22`).** The four duplication reports became the
+seventh through tenth reviews in `docs/refactor.md` §11, and their ranked
+findings became rows `R30`–`R73`, one row per item, in discovered order. The
+rows carry the reports' estimates and risk sentences, with the premises
+re-verified against the tree at `38d0438` and the stale ones corrected in the row
+to say so: the pane pass read a tree before the elided-tail and fold waves; the
+app pass's field and guard counts were off; the actor pass's failure sentences
+are five and not four; the store pass's six-places count is trimmed by the flag
+table already there. The four store rows closed by `mush/84` (merge `1e07c2e`,
+§8.72) were entered with the landed shape and commit — `1fd1933`, `ce315a2`,
+`0348028`, `0b42d69` — and the four app findings that spend lines rather than
+save them are marked judged, with the invariant each buys. The live defects the
+reports named entered as rows too: `nudge_failed` restoring a phase without its
+clock, `picker_width` overflowing `u16` above 1092 columns, the parker and the
+reaper counting different populations, the store's flag-versus-environment and
+paste-path contradictions (both since closed), and the actor's
+budget-versus-timeout divergence.
+
+**The ledger's anchor is the census (`47e6f87`).** `scripts/census.py` at
+`38d0438` — 79,208 lines, prod 18,232 — was added above the new rows as the tree
+they were checked against, in the reports' own production-only currency
+(2,644 / ≈4,600 / 4,865 / 4,800); the older `b8d8baa` sentence was left as the
+census the reviews before these read rather than overwritten. `f79e182` is one
+sentence of the same work: the fourth review named `first_backup` for the `.bak`
+name's one home, and the symbol that exists since `0348028` is
+`workspace::backup_name`.
+
+**The record's own two corrections.** `706b64e` corrected the paragraph after H53
+in this file, which still said `docs/refactor.md` §11 was “the ledger of a queue
+closed except `R6`” — true when §8.49 was written, false since the four passes
+landed; it now names the passes and the four rows the store wave closed. (The
+same paragraph's pointer said the store wave was §8.70; §8.72 is the wave, and
+this pass re-points it.) `49f0619` rewrote §8.70's concluding paragraph, which
+had stated what extraction cannot reach as if a size goal were the measure,
+while the four reports' own conclusion is about the residue — policy, not
+deletable duplication — and the decisions they want instead: a table, one
+delivery owner, behaviour calls.
+
+**Recorded, not changed.** The record writes no duplication rows of its own:
+§11 is their one ledger, and where this pass closed one — `R60` (
+`1afa368`, §8.80), `R72` (`d56a10c`, §8.80), `R66`'s live defect
+(`9f0a12c`, §8.81, its one-`enter` refactor deliberately not done) — that file
+carries the closure.
+
+---
+
+## 8.77 The group, the age and the terminal (E6, E9, E10, `3bb1a5b`, `a07834a`, `67bc041`, merged `bb22b03`)
+
+Three minors of the process audit that share one shape: a fact the code knew was
+not the fact a reader (a signal, a clock, a panic hook) was handed.
+
+**A group is signalled once, in process (`3bb1a5b`; E6).** `Running::kill` fired
+`Command::new("kill")` with `-9 -<pgid>` on every call and discarded the
+subprocess's `ExitStatus`. Measured with a `PATH` shim that logs every
+invocation, around a real `sh` command holding a spinning member in its group:
+
+```
+kill -9 -3997322
+kill -9 -3997322
+PROBE group after two kills: [3997323]
+```
+
+The first call is safe — the leader is unreaped, so the id is still the
+command's — but the second aims at a group `wait` has already freed, where the
+kernel may have handed the number to a process group mush never started. With the
+shim answering what a machine without a working `kill` answers (`exit 127`), the
+member survived the kill silently: the one road that took a group mush started
+was a fork/exec `PATH` can hide. The second call is a no-op now (`Running.killed`),
+the signal is the syscall itself (`rustix::process::kill_process_group`,
+`ESRCH` read as “already gone”), and anything else is owed once through
+`Job::kill_failure`, which the job's own watch thread puts in the window its
+owner reads — the note `watch` already carries. `end_group`'s group call goes the
+same road, keeping E3's rule that only a group with a member is signalled: a
+member is proof the id is still the command's. Pinned by
+`a_second_kill_signals_nothing` (with the shim delegating to the real `kill`, two
+`kill()` calls end the group, leave the shim's log empty and report nothing),
+`a_kill_without_the_kill_program_still_ends_the_group` (the shim answers
+`exit 127` and the group dies anyway) and
+`a_failed_kill_leaves_one_sentence_in_the_window` (a scripted kill that cannot
+end the group puts exactly one sentence in the completion and in `status`).
+
+**A handed-over job keeps the age of its tool call (`a07834a`; E9).** `Launch`
+carried no start time, so `Registry::launch` stamped `started: self.clock.now()`
+and handed the watch thread a second, slightly later reading of the same clock at
+the moment the command *became* a job — a command that ran for most of
+`CMD_DETACH_AFTER` as a tool call was reported as new. Measured with a scripted
+command and a fake clock held for 59 s before the handover, the row read
+`age after a 59 s tool call: 0ns` and the completion line `#c1 done: exit 0 · 0s
+· cargo build`. The instant is now stamped where the command is *held* —
+`Registry::hold` already reads `self.clock`, so `Foreground` keeps `started`,
+`Launch::held` carries it, and `launch` uses it for both the record and the watch
+thread — and the record's own words (“the moment it was handed”) are then true,
+while a command that was *started* as a job is still stamped at its one door into
+the registry. Pinned by
+`a_handed_over_job_keeps_the_age_of_its_tool_call`: with the job's thread held off
+its handle, a 59 s hold hands over and the row's age is exactly 59 s, and the
+completion line says `· 59s ·` rather than `· 0s ·` (fails on the old stamping
+with `left: 0ns, right: 59s`).
+
+**Only the terminal's own thread's panic restores the modes (`67bc041`; E10).**
+`install_panic_hook` ran `restore_terminal_modes()` for every panic in the
+process, and mush has a thread per agent (`mush-agent-{id}`), per job
+(`mush-job-{id}`) and one for the session writer: a worker's death wrote the mode
+escapes to the human's terminal while the UI thread kept painting frames into a
+screen that was no longer mush's. Measured with a probe that installed the hook
+and panicked on a thread named `mush-job-1`, the test process's stdout carried
+`^[[?1049l^[[?2004l^[[?1006l^[[?1015l^[[?1003l^[[?1002l^[[?1000l` —
+`LeaveAlternateScreen` and every mode reset, from behind the human's back. The
+hook now captures the terminal thread's `ThreadId` where it is installed and
+compares `thread::current().id()` in the hook, so only that thread's panic
+restores; a worker's panic has its own roads and needs no terminal (a job's
+thread ends its process group, the writer marks itself dead) and the panic
+message still goes to stderr through the previous hook. The escapes themselves
+move behind `restore_mode_sequences`, a small `Write` seam, so the test reads
+them rather than relying on a screen. Pinned by
+`a_worker_panic_leaves_the_terminal_alone`: with the hook installed for the test's
+own thread, a panic on a `mush-job-1` worker writes no escape sequence at all,
+and a panic on the owning thread writes `?1049l`/`?2004l`.
+
+---
+
+## 8.78 The put-away commit and five more of the tools/contract tail (F2, F16, F5, B13, F14, B16, `ce06a83`, `7a01569`, `414e477`, `a534d35`, `09c9446`, `7106564`, merged `6a8dba9`)
+
+Six minors — five of the contract-and-git audit and one of tools-and-workspace —
+landed as one branch. The merge body names F15 as left for the `agent.rs` wave;
+that wave is §8.83.
+
+**A signing configuration cannot stop the put-away commit (`ce06a83`; F2).**
+`commit_all` supplies the identity and `--no-verify`, so its doc promised a commit
+that “does not depend on the human's identity and never runs their commit hooks”
+— but `commit.gpgsign` is neither a hook nor the identity, and a machine that
+signs every commit by default stopped every isolated run's put-away commit. The
+audit's probe, run here before the fix:
+
+```
+commit_all -> Err("fatal: cannot exec '/nonexistent/mush-no-gpg': No such
+file or directory\nerror: gpg failed to sign the data: … fatal: failed to write
+commit object")
+```
+
+with `commit.gpgsign=true` and a `gpg.program` that is not there, and the code's
+own command line against `gpg.program=/bin/false` exits 128. The work is not
+lost, but the parent reads an error instead of a revision, and a worktree
+correctly kept for holding it is counted by `unlandable` — so a signing config
+spends `MAX_WORKTREES` slots, one per child, and the human is refused spawns for
+a git setting. `-c commit.gpgsign=false` is now part of the argv (`-c` outranks
+both the repository's and the human's config), and the doc names signing beside
+the identity and the hooks: signing is configuration, and this flag is the only
+reason the promise can be kept. Pinned by
+`a_signing_config_does_not_stop_the_commit` (a repository with
+`commit.gpgsign=true` and no signer answers `Commit::Made`, `subject_of` reads
+the subject back, and the worktree is clean — green after the flag, the `Err`
+above without it).
+
+**An unborn repository refuses a base worktree with its reason (`7a01569`; F16's
+git half).** `worktree_add`'s “the repo has no commits yet — commit first or drop
+isolated” fired only when `base` was `None`, and the same `match` evaluated
+`has_commits(dir)` in the other case anyway and threw the answer away — one
+`rev-parse` per isolated spawn whose only effect was to be discarded. Before,
+with the audit's probe at the Rust level:
+`worktree_add(&unborn, 9, Some("HEAD")) -> Err("fatal: invalid reference: HEAD")`;
+after, the same call answers `the repo has no commits yet — commit first or drop
+isolated`. The gate is now the repository's own state, asked first and once
+(`can_branch_from`): an unborn repository refuses a base the same way it refuses
+no base, and nothing is made before the refusal. Pinned by
+`a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason` (both roads,
+and no `.mush/` made). **Residual, plainly:** on the production road `spawn_tool`
+resolved `base` before this function was reached, so the *spawn* a human saw in a
+fresh `git init` still said `` unknown base `main`: no commit, branch or tag by
+that name `` — an `agent.rs` change this branch could not make; it landed as
+`c71be60` (§8.83), and the audit's `a_base_spawn_in_a_repo_without_commits_refuses_with_that_reason`
+is pinned there.
+
+**A new worktree is given its submodules (`414e477`; F5).** `git worktree add`
+is a checkout of refs, not a copy of the tree, and it does not populate
+submodules (git 2.55 has no `--recurse-submodules` for it): a base tree that
+records one leaves an empty directory in the child's checkout, and
+`git status --porcelain` is empty, so nothing on any surface said the tree was
+incomplete. Measured with a repository holding one local submodule, before:
+the checkout had `lib/sub` with 0 entries, `git status --porcelain` read `""`
+(clean), and `fs::read_to_string(path.join("lib/sub/s.txt"))` was `NotFound`;
+after, `s.txt` is there at the recorded commit and the status is still clean.
+`populate_submodules` runs `git submodule update --init --recursive` in the new
+checkout when it carries a `.gitmodules`, so an ordinary spawn spends no process
+on the question. It is deliberately best-effort: the branch and the refs are
+right, and a submodule that cannot be fetched (no network, a private remote, a
+protocol the human's git refuses for submodules) must not lose the worktree a
+spawn is standing on. Mush does not touch `protocol.file.allow` to help — a
+repository must not be able to make mush clone a local path; the test allows the
+`file` transport through git's own `GIT_ALLOW_PROTOCOL`. The child's prompt now
+carries the one sentence the audit asked for either way — a worktree is a
+checkout of refs, not a copy of the parent's tree — with the road for a submodule
+that is still empty (`git submodule update --init`), and only an isolated child
+reads it. Pinned by `a_submodule_repo_gets_its_submodules_in_the_new_worktree`
+and `subagent_prompt_names_an_isolated_worktree`. **Residual:** the spawn *reply*
+cannot name a submodule fetch that failed — that string is built in `agent.rs` —
+so the child's own prompt names the road it would run by hand.
+
+**The paste directory is pruned as it is written (`a534d35`; B13).** Every
+pasted picture — the clipboard road, the pasted-path road and the app's carry —
+was written once and never removed: no `remove_file` touched `.mush/paste/`, the
+audit's probe wrote 5 pastes and left 5 files, and the directory is invisible to
+`git status` (`.mush/.gitignore`), so only `du` ever said so. The same probe as a
+test, before the fix, read “after 4 pastes and the write road's own: 4 files in
+.mush/paste”; after it: 2, the run's two live pictures and nothing older.
+`Workspace` now records when it was opened (`opened`, unix millis, set in `new`),
+and `write_pasted_image` — the one write door every paste road ends at — prunes
+as it writes. Two facts decide a candidate, both read from the name the writer
+gave the file (`paste_moment`): a paste whose moment is at or after this
+workspace's own open is *this run's*, and a live transcript's images are exactly
+that, so it is never a candidate however long the run has been going; a paste
+older than `PASTE_MAX_AGE_MILLIS` (a day) is one an earlier run left behind, and
+past this run's own pictures it is the history a prune takes. That is the
+conservative form of “never remove one the live transcript still points at”: the
+workspace cannot see a transcript, and the run's start is the line it can draw
+without one. A file whose name is not `pasted-<moment>.<ext>` (a human's file in
+the directory) and a directory named like a paste are both left alone, and the
+file just written is passed to the prune so it is never a candidate even if the
+clock moved backwards between the write and the prune. The age is read out of the
+name rather than the mtime, because the name is the moment the writer chose and
+the one every road (and a test) can read, while an mtime is a second fact that
+can disagree with it. Pinned by
+`the_paste_directory_is_pruned_but_not_under_a_live_image`: a run opened three
+days ago, two pastes from a run that ended before it, one the run itself pasted
+on its first day (older than a day, still named by its transcript), then the
+write-road prune — the two old ones gone, the run's two still there, the
+directory down to 2 entries.
+
+**The spawn schema's title is optional, and one line (`09c9446`; F14's schema
+half).** The spawn schema required `title` while the code treats it as optional:
+`spawn_tool` reads it with `arg_string_opt`, trims it, and lets a missing or
+blank one leave the row with a handle derived from the brief — so the model was
+made to pay for a field the code degrades gracefully without, and the schema's
+sentence (“A 3 word description of this agent's brief.”) did not say the one
+thing the row's painter makes true. The schema now says what the code does:
+`required` is `["brief"]`, and the description is “A 3 word, one-line
+description of the brief.” Pinned by
+`the_spawn_schemas_title_is_optional_and_named_as_one_line`. The wording is terse
+because the schema reserve is: `tool_schemas()` was 5,945 bytes against the
+`SCHEMA_TOKENS * 3` budget of 6,000, and this change is net −8 bytes. **Residual,
+plainly:** the finding's proven half — a `title` holding a newline still reached
+a one-line row, because `text::truncate` keeps it — is fixed in `spawn_tool`, in
+`agent.rs`, which this branch could not edit; it landed as `74ad1de` (§8.83),
+with `a_title_with_a_newline_cannot_reach_a_one_line_row`. The sentence this
+commit made stale — `agent.rs:18071`'s “while the schema requires one” — was
+named for the pass that owns `agent.rs` and is still there at this base.
+
+**The edit road names its read-modify-write window (`7106564`; B16).**
+`edit_file` reads a file, transforms the text in memory and writes the whole
+result back; nothing between the two calls checks that the file is still what was
+read, so a change another writer lands in the window — a sibling agent in a
+shared checkout, or the human's editor — is silently gone. B16 was *suspected*
+(the window was staged by hand, not driven inside one call); the staged shape is
+now a test and the outcome deterministic:
+
+```
+write "line one\n" · read_file -> "line one\n" · another writer lands
+"line one\nline 2\n" · edit_text_many + write_file
+final bytes: "LINE ONE\n"      (the other writer's line is gone)
+```
+
+The decision is the audit's first road — accept it and say so — not the second (a
+conditional write, which would take the file's stat compared across the caller's
+two calls and so lives in `agent.rs`'s `edit_tool`, a file this branch could not
+edit). `tools::edit_text_many`'s doc carries the reason: the `current` it
+transforms is the text the caller read, the read and the write are the caller's
+two calls, and a transform cannot compare-and-swap across them. The model-facing
+half is `edit_file`'s description: “Applied to the file as read: a concurrent
+change is lost.” It is terse because the schema reserve is: the clause took
+`tool_schemas()` from 5,945 to 5,996 of 6,000, the fuller sentence does not fit,
+and raising `SCHEMA_TOKENS` is not a free move — it feeds `request_reserve` and
+`fold_request_fits`, and at 2,100 it stops `agent.rs`'s
+`compaction_folds_overflowing_history_into_a_summary` (a 6,000-token window) from
+folding at all. Pinned by
+`an_edit_written_from_a_stale_read_loses_the_other_writers_change`.
+
+---
+
+## 8.79 A finished job's line, and three more of the wire's edges (A3, A9, A10, D19, `c86b8c0`, `330fe61`, `729e8fc`, `4f7793c`, merged `4283cdb`)
+
+Four findings from three audits: A3, one of the three majors §8.71 named as still
+open, and three minors — two of the wire (A9, A10) and one of the TUI (D19).
+
+**A finished job's line is not parked behind a sibling's hold (`c86b8c0`; A3).**
+`wait_tool`'s machine gate asked `unread_result`, which looked at children only,
+on the premise its doc gave — “a job's line … was folded into the transcript when
+the job ended (`note_job`), so handing it over again is a recap”. That premise is
+false: `note_job` *records* the report, and the fold into the transcript happens
+at a message boundary (`fold_completions`), while the mid-call poll that runs
+inside a wait (`drain_signals`) records without folding. A job that ends while a
+`wait` is in the same batch — exactly `[run_command{detach:true}, wait]` —
+therefore leaves a line nobody has read, and the wait slept to its deadline
+before handing it over. Staged with a throwaway probe (one finished job in
+`done_jobs`, nobody has read its line, and a sibling's `take_machine(2, "cargo
+bench")`), then `exec_tool(Wait, {})` on an `Advanceable` clock:
+
+```
+before: elapsed=600s, answer = "#c1 done: …" + "wait timed out — #2's
+        exclusive command (cargo bench) still holds the machine; …"
+after:  elapsed=0ns,  answer = "#c1 done: …" + "the machine is still held
+        by #2's exclusive command (cargo bench) — wait again to wait it out,
+        or work without the shell"
+```
+
+Up to ten minutes of the human's wall clock, and the model was handed the result
+only once its run no longer had the time to use it — H13's blindness one id space
+over. The identical *child* shape already answered at once; the job half was the
+missing predicate, so `unread_result` now counts an undelivered job line the way
+the entry guard already did (`!delivered_jobs.contains(job)`), and the two
+comments that carried the false premise say what is true: a *delivered* job line
+is the recap `wait_digest` refuses to repeat, an undelivered one is a result.
+Pinned by `a_finished_job_is_handed_over_before_the_machine_is_waited_out` (the
+line and the lock, exactly the child twin's shape, `clock.elapsed() == ZERO`, and
+the delivery mark set so the line cannot travel twice; on the old predicate the
+clock reads 600 s).
+
+**An endpoint's numbers cannot overflow the run's usage line (`330fe61`; A9).**
+`RunUsage::add` folded the endpoint's own `usage` fields with `+=`, and `line`
+summed two of them with `+`. `Usage`'s fields are plain `u64`s parsed from the
+wire, so `u64::MAX` is a value an endpoint can send. Measured with a throwaway
+scripted probe (two replies, all three fields `u64::MAX`, both profiles):
+
+```
+debug: the second request died, `attempt to add with overflow` at
+       crates/mush/src/agent.rs:69:9 — the audit's own line,
+       `self.prompt += usage.prompt_tokens`.
+release: `the endpoint counted 18446744073709.6M prompt + 18446744073709.6M
+       completion tokens this run (18446744073709.6M total)`; and a second
+       probe (`u64::MAX` then `1`) read `0 prompt + 0 completion … (0 total)`
+       — a run of 1.8e19 tokens reported as zero, silently.
+```
+
+After the fix both profiles report the saturated line and the run carries on to
+return its answer. Every sum saturates now: the three in `add` (`total` only when
+the reply sent one) and the invented total in `line`. The counts are the
+endpoint's own JSON; a sum of a hostile number has to read as over, never wrap to
+a wrong number — the same choice `request_weight` and `Image::weight` already
+make, for the same reason, written on `RunUsage` and beside the arithmetic.
+Pinned by `a_reply_carrying_u64_max_saturates_the_run_usage_instead_of_panicking`
+and `a_run_invents_a_saturated_total_when_a_reply_omits_one`, both in debug and
+`--release`. **Recorded, not changed:** `docs/audits/agent-and-wire.md`'s blind
+spot bullet still reads as open; docs were out of this change's reach.
+
+**A chunk-size claim past the cap is framing, not a refusal (`729e8fc`; A10).**
+`read_chunked` answered a chunk-size line past `MAX_BODY_BYTES` with
+`body_too_large()` — `InvalidData`, and so `ModelError::Refused`, the sentence a
+healthy endpoint is blamed with for an answer too big. A garbled size line that
+still parses as hex (`FFFFFFFF`) lands in exactly that arm. Measured with the
+audit's reply (`HTTP/1.1 200 OK` + `Transfer-Encoding: chunked` +
+`FFFFFFFF\r\nhello\r\n0\r\n\r\n`) through the in-memory harness and a loopback
+`HttpModel` under `retrying`:
+
+```
+before  is_framing=false  "the response body is larger than 83886080 bytes"
+        error=Refused(…)                    connections=1
+after   is_framing=true   "a chunk size of 4294967295 bytes would put the body
+        past the 83886080-byte body cap"    error=Framing(…)  connections=1
+```
+
+What the run says changes with the class: before, “the endpoint's reply was
+refused: the response body is larger than 83886080 bytes”; now, “the reply from
+<url> broke before it could be read: a chunk size of 4294967295 bytes would put
+the body past the 83886080-byte body cap”. The finding's “would be retried” is
+not what the code does, and `connections=1` before and after is the measurement
+of it: `retrying` repeats only `ModelError::Unsent` (A2's fix), so `Framing` is
+as final as `Refused` was — the class change moves the blame, not the number of
+asks. The cap check in `read_chunked` now raises `framing(…)` with the claimed
+size and the cap in its words, because a chunk-size line *is* the framing: the
+endpoint never handed over the bytes it claimed, and a garbled line and an
+honest 4 GiB chunk are the same bytes to mush — it only ever has the claim, so
+it reports the claim. `Content-Length`- and end-of-stream-framed bodies keep
+`body_too_large()`: there the size is the answer's own, written in the endpoint's
+own head, and the refusal is mush's to make. Pinned by
+`a_chunk_size_claim_past_the_cap_is_framing_not_the_endpoints_refusal` and the
+strengthened `an_oversized_body_is_refused` (the `Content-Length` half asserts
+`!is_framing` and the refusal's own sentence, so the two roads' classes are
+pinned apart). Two doc-only sentences in `model.rs`'s `Framing`/`Refused` class
+docs are corrected to include the new species and to stop claiming that every
+over-cap body is a `Refused`; no classification or retry code changed.
+**Recorded, not changed:** a chunked body that *really* is over the cap is a
+`Framing` break too, since mush cannot tell an honest 4 GiB size from a garbled
+hex line, while a `Content-Length`-framed body that size stays a plain refusal.
+
+**A URL with a control character is refused at every door (`4f7793c`; D19).**
+`Config::base_url` is written into the request line raw, and no door checked what
+may be in it: `normalize_url` trimmed the ends only. Staged with a throwaway
+probe: before, every door stored
+`http://host.test:8078/v1\r\nX-Injected-By-Url: yes` (`MUSH_URL`, `--url`, the
+home config, a stored session and `set_base_url` all answered it), and a request
+built from it reached the wire as a head the value had a hand in —
+`POST /v1/chat/completions\r\nX-Injected-By-Url: yes HTTP/1.1\r\n…`. After, the
+same value through every door: `MUSH_URL` falls back (`http://rubendpc:8078`),
+`--url` refuses (`--url contains a control character (\r) — check the value`),
+the home config refuses naming its path, a session is a notice with the endpoint
+in force kept, and `set_base_url` leaves the endpoint unchanged. One door,
+`checked_url`, does the checking, in the shape `parse_context` gives the window:
+refused by name, with the offending character as its *escape* (`\r`) rather than
+echoed as itself, because the refusal is a line mush prints at the human's
+terminal. `MUSH_URL` reads it through `parse_url_env`, beside the other
+environment readers. A session is a notice rather than a start-up failure, for
+the reason C2 gives one: that file belongs to a workspace rather than to a
+human's hands, and a corrupted endpoint must not take the TUI down — it is simply
+not used, and the endpoint left in force is named. The home config's own header
+line now says a control character in `base_url` is refused, because that file is
+the one door a human opens by hand. Pinned by
+`a_url_with_a_control_character_is_refused_by_every_door`, while the newline a
+pasted block trails is still trimmed. **Recorded, not changed:** the TUI's
+`/url` arm still accepts any non-empty text, so a human who types or pastes a URL
+with a control character is refused *without a sentence* — `set_base_url` drops
+it and the ack names the endpoint actually in force; and the key's own door (C7)
+is still open, `MUSH_API_KEY` and `/key` accepting a control character that
+`http.rs` writes raw.
+
+---
+
+## 8.80 The chat pane's title elides, the popup re-wraps, and zen keeps the box's rows (D11–D16, D23, D24, B14, R72, `f749e71`, `d018a2f`, `bc581ba`, `aa0245b`, `942e4b5`, `a7c579d`, `1afa368`, `a5dbed2`, `7da2cdd`, `d56a10c`, merged `bc3d83d`)
+
+Ten commits: nine of the TUI audit's minors, one tools-and-workspace fuzz, and
+one ledger row that was a real narrow defect. Each is a fact one surface computed
+differently from the surface beside it.
+
+**The chat pane's title elides like every other title (`f749e71`; D11).** The
+chat's title was built by pushing clauses onto a string and handed to
+`Block::title`, the one title on screen no arithmetic fitted to its pane. The
+audit's probe, a 40-column terminal with `Ctrl-Y` open and six lines hidden:
+`title=" agent #12 · Enter copies · Esc leaves · +6 more lines · /notes "`,
+`width=64 room=38`, and `painted_border="┌ agent #12 · Enter copies · Esc
+leaves┐"` — the count of hidden lines and `/notes`, the pane's own way of saying
+what it hides, were cut mid-word by the border. The title is now built as whole,
+space-terminated clauses and routed through `screen::elide`, the same rule the
+agents pane's title and the bar's facts line already read, so a clause that does
+not fit is dropped whole and the pane's own name is the floor; `elide` is
+`pub(super)`, with the conversation pane named as its third reader. At the same
+40×10 the frame paints ` agent #1 · +6 more lines · /notes ` (31 ≤ 38) when not
+selecting and ` agent #1 · Enter copies · Esc leaves ` (37 ≤ 38) while selecting
+— the count clause dropped whole rather than cut, and the mode's line (which is
+first because it is the newest thing about the pane) kept in full. Pinned by
+`no_pane_title_paints_past_its_pane`: a 12-agent tree, a child focused with a
+select mode, a held reading and six hidden notes, every size and both focuses and
+the zen view, every title asserted within its pane.
+
+**A resize re-wraps an open popup (`d018a2f`; D12).** `/notes` and `/help` wrap
+their rows to `picker_text_width(term_width)` when they open, and `set_term_size`
+recorded the new size without re-wrapping: the popup kept the rows of the size it
+was opened at. The audit's probe — a report opened at 200 and painted at 60 —
+read forty columns cut off every row and the tail reachable only after closing
+and reopening; the sweep's comment claimed a resize “opens them again for each
+size”, it did not, and the sweep's `reopen` hook had already gone unused.
+`App::set_term_size` now re-wraps an open popup when the *width* changed:
+`/notes` re-reads `chat.notes_report` for the popup's own agent (carried on
+`Picker`, so the report cannot follow a focus that moved under it), `/help`
+re-derives `help_notice`, and both wrap at the new `picker_text_width`. The model
+and provider lists are one label per row and are left alone; the cursor keeps its
+place in the list, clamped to the list the new width made — a row index cannot
+promise more across a re-wrap — and the dead `reopen` hook and its false comment
+are gone from the sweep. After, at 60×17 with the popup open from 200: the tail
+is painted, every row fits the 34-column list, and the rows are exactly the ones
+a reopen produces. Pinned by `a_resized_popup_is_rewrapped_not_clipped`, for both
+`/notes` and `/help`.
+
+**Zen hands the message box the two-pane split's rows (`bc581ba`; D13).** The zen
+Chat arm ran `chat_pane` again over the frame above the bar —
+`Layout::vertical([Min(3), Length(input_rows())]).split(...)` on a taller area
+than the two-pane chat column — while the zen Agents arm reused the two-pane
+split's box rows. At the audit's 40×12 with a four-line draft (`input_rows` 6)
+the probe measured `two.box={ y: 6, height: 5 }  zen_chat.box={ y: 5, height: 6
+}` before and `two.box={ y: 6, height: 5 }  zen_chat.box={ y: 6, height: 5 }`
+after — the box moved up a row and grew one when the tree gave up its rows,
+against the record's promise that the view “moves the frame and not the
+conversation”. At 40×10, where the six-row column cannot hold the box's ask and
+the transcript's floor, the two-pane box is three rows and the re-derivation
+handed it all six of the nine zen rows. `App::screen` now computes the chat
+column's split once and all three arms read it; `chat_pane` is gone — it was the
+second split — and the comments that claimed the Agents arm was “its own split,
+not a re-derivation” now describe the one split both arms read. Pinned by
+`zen_keeps_the_boxes_rows_at_every_size`: at 40×12, 40×10, 60×17 and 79×24, with
+a four-line draft, `zen.input`'s y and height equal the two-pane box's in both
+focuses.
+
+**A reply of only a fence is a visible turn (`aa0245b`; D14).** `markdown_rows`
+removes the fence lines of a fenced block — scaffolding a human does not read —
+and it did that for a block with no body too, where the fence lines are the whole
+of what the model wrote. Staged at the pre-fix code, the audit's probe read
+`"```"` with `rows=[]`, `select=None` and the title still advertising `Enter
+copies`; `"```\n```"` the same; and a cursor stepped onto a fence line inside a
+block that has a body gave `select=None` too (`painted` returned `None` both for
+“no mode” and for “mode with no visible row”, the confusion the audit names). Two
+halves, one fact: `mush_core::text`'s `markdown_rows` is now one walk that also
+answers `markdown_row_counts` — the per-source-line row map — so a fenced block
+whose body says nothing paints its fence lines as text; and `chat`'s `mark_rows`
+takes the counts from that walk instead of restating the fence rule (the
+restatement is what made the two row counts drift), while `cursor_row` falls back
+to the nearest painted row of the cursor's own message, so a source line the view
+paints no row for still paints a cursor. The copy reads the stop, not the row, so
+the fence bytes are still what `Enter` copies. After, `"```"` paints
+`mush › ``` `, `start_select` finds a row, and stepping onto every fence line
+keeps `select=Some([…])`. Pinned by
+`a_reply_of_only_a_fence_is_not_an_invisible_turn`,
+`the_select_cursor_has_a_row_on_every_line_lines_of_names` and the walk's map in
+`a_fence_hides_its_lines_and_marks_the_code_between_them`.
+
+**A fold drops the pane's reading (`942e4b5`; D15).** `Reading::Holding` names a
+window by `(offset, up_to)` — up_to being the transcript's length when the human
+scrolled away — and `replace_transcript` left it in place. `held` refused it for
+one frame (up_to > messages), and the growth back past the old up_to resurrected
+it: a window belonging to a conversation that no longer existed, which the title
+then read as the pane's live position. Staged with the drop removed, the pin
+reads exactly the audit's line: `after_fold=" mush "`,
+`after_growth=" mush · scrolled ↑3 rows · PgDn "`. The fix is the audit's: drop
+`reading` for the agent inside the one road that replaces a transcript, beside
+the select mode it already drops for the same reason one step out. What is left
+of `held`'s bound is the backstop under the rule — a transcript shorter than the
+one the window was taken in, from a road nobody has written — and its doc now
+says that instead of claiming a fold can leave a reading pointing past the end.
+Pinned by `a_fold_puts_every_pane_back_at_the_bottom`, which also checks that
+another conversation's reading is not the root's fold's to drop.
+
+**A published prompt weighs with nothing said (`a7c579d`; D16).** The audit's
+D16 measured the window between the two events an actor's first turn is made of,
+and the number was right for the code it read: at the audit's base
+`used_weight_for` returned 0 for an agent with no transcript entry, *before* the
+prompt was weighed, so the meter and the attach gate read 0 while the next
+request would carry the prompt (`P4 used_weight_for(#1)=0 prompt weight=3006`,
+`after one line: 3012`). The bounded-view rewrite (`3a37c02`, after the audit's
+base) had already closed the mechanism: the sum is taken over
+`bounded_transcript`, which opens with `system_for(id)` whatever the transcript
+holds. Staged the old early return in that function and the new pin fails exactly
+as the audit wrote it (left 0, right 3006); with it gone, `used_weight_for(#1)`
+is 3,006 for the published prompt alone and 3,012 after the first `user("hi")`
+(3,006 + 6). What was still false is the sentence beside the code — “An agent
+whose prompt has not been published, or that has no transcript at all, weighs
+nothing” — so that is what this commit fixes, with the window named and the
+lesson kept: a request that will carry a whole system prompt is never priced at
+0. Pinned by
+`an_agent_whose_actor_said_its_prompt_weighs_it_even_with_nothing_said`.
+
+**One column rule for the help tables (`1afa368`; D23, and ledger row `R60`).**
+The `/help` popup wraps its tables to `picker_text_width`, 34 columns at the
+40-column floor, and both tables reserved `4 + longest left cell + 2` of it for
+the left column whatever that left the description: the command table's column
+was one column wide (`4 + 27 + 2`), so every description wrapped to one character
+per row — the audit's probe read `/provider [deepseek|custom]  s` / `w`. Measured
+on this tree at width 34: the whole notice was 563 lines, the command table a
+column of `s` / `w` fragments. The audit's parenthetical — “as the key table
+already does” — is not true of the code it read: `help_table_at` had the same
+`4 + w + 2` arithmetic and the same collapse (nine columns there, one in the
+commands table), so the rule is fixed for both tables, not copied from one. The
+fix is one shared `mush_core::text::columns(left, left_width, description,
+width)` beside `wrap_text` — the column arithmetic `R60` names, entered here
+because two tables read it: the two-column shape while the description column is
+at least `MIN_DESCRIPTION_COLUMNS` (16 — a readability judgement, and one number
+because both tables read it), and otherwise the description hangs under its own
+left cell, wrapped at the table's four-space indent and the surface's whole
+width. `commands::table_at` and `keys::help_table_at` are loops over it;
+`usize::MAX` (`--help`) is unaffected, since the column shape holds. After, at
+width 34: 136 lines, longest 33, and the shapes the pin reads:
+
+```
+/provider [deepseek|custom]
+switch provider, or pick one
+from a list
+Ctrl-Q
+quit (a second press confirms
+while work is running)
+```
+
+Pinned by `the_help_picker_keeps_a_readable_description_column`, which renders
+both tables at the popup's floor width and asserts the hung shape, the absence of
+one-character description rows, and that every row of the notice fits the surface
+it is painted in.
+
+**`Ctrl-Y` with the chat pane hidden says so (`a5dbed2`; D24).** `Ctrl-Y` is
+app-wide and `App::select_key` asked the chat for a cursor over `tree.focused`
+whatever the layout was. In the zen view with the tree full-screen the chat pane
+is the message box alone — `ChatPane::transcript` is `None`, the chat's rect has
+no rows — so the key opened a modal mode the frame cannot paint. The audit's
+probe: a reply, `Tab` to the tree, `Ctrl-F`, `Ctrl-Y` → no row holds the reply,
+`app.chat.selecting() == true`, and no line says a mode took the keyboard. The
+mode owned the keyboard, painted no cursor, and a letter was swallowed with
+nothing on screen saying why. The key now refuses before the chat is asked, with
+the same shape as the empty-pane answer: `the chat pane is hidden — Tab shows it,
+then Ctrl-Y`, written to the bar; inside the pane that does paint the transcript
+the mode opens exactly as before. Pinned by `ctrl_y_with_the_chat_hidden_says_so`
+(the refusal, the line, that `j` still moves the tree's cursor, and that `Tab` to
+the chat pane then opens the mode).
+
+**The markdown wrap keeps non-ASCII whitespace like the plain wrapper
+(`7da2cdd`; B14).** `markdown_rows`' doc claimed its rows were “the rows the
+plain wrapper would have made for the same text, with the styles attached”, but
+`wrap_capped` trimmed the tail a space break leaves with `trim_start()` — which
+eats *any* Unicode whitespace — while `wrap_runs` removes only literal spaces. A
+break that landed before a no-break space therefore dropped the NBSP from the
+plain wrapper's rows and kept it in the view's. Measured with the audit's fuzz
+over the alphabet {a, b, ' ', U+00A0, U+3000, U+2028, tab}, lengths 1–5, widths
+1–6, 19,607 texts: **8,823 divergences**, e.g.
+`DIVERGE " \u{a0}a" @ 2: wrap=["", "a"] view=["", "\u{a0}a"]`. The plain
+wrapper was the road losing text the pane could show. A break trims **the spaces
+it broke at**, and only those: the tail begins at the space the row ended on, so
+every other character of it is the text's own — a no-break space, an ideographic
+space or a line separator is not a space to break at, so it is not one to delete.
+`wrap_capped` now trims with `trim_start_matches(' ')`, the tail rule `wrap_runs`
+already had: one rule, two spellings, no character dropped, and the two wrappers
+cannot disagree about where a row ends or what it holds. The same fuzz measures
+**0 divergences** after the fix, and `markdown_rows`' doc now says exactly what
+the wrap is — the same break points, tab stop and tail on every break, a no-break
+space included. Pinned by `a_plain_message_wraps_exactly_like_wrap_text`, whose
+alphabet and text generation are the fuzz's.
+
+**A share of the terminal is one integer type (`d56a10c`; R72).** `picker_width`
+computed `terminal_width * 60` in `u16`, while `agents_columns` computed the same
+share in `u32`. Above 1092 columns the `u16` multiply overflows: a debug build
+panics on it, and a release build wraps, which the clamp then quietly turns into
+the popup's floor. Measured, before, in the debug test build:
+`picker_width(1093) panics at crates/mush/src/app/screen.rs:78: "attempt to
+multiply with overflow"`; after, `picker_width(1093)` is 80 — 60% is 655, clamped
+to `PICKER_MAX_WIDTH`. Both shares now go through one `share(whole: u16,
+percent: u32, min: u16, max: u16) -> u16`, whose multiply is done in `u32` and
+whose product is clamped to the same constants as before;
+`agents_columns` keeps its `.min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))`
+after the share's clamp, and the picker's floor and ceiling are unchanged. Pinned
+by `no_share_of_a_terminal_overflows_its_integer`: from 40 to 2000 columns, both
+functions must not panic and must equal the natural share computed in `u32`,
+clamped.
+
+---
+
+## 8.81 The tree, the input and the keys — the wave's minors, and a window that says its road (D7–D10, D17, D18, D20–D22, D25, D26, R66, `39576fd`, `7ce13c8`, `c884a8c`, `c848deb`, `9f0a12c`, `fa7b1f1`, `3a51fea`, `9134ad4`, `25ec885`, `a26f165`, `4bbef67`, `e87af91`, `9430058`, `bdbb484`, merged `93f7932`)
+
+Fourteen commits assembled into one landing through three merges — `4547faf`
+for the tree's five minors, `aad2552` for the session's News row, the select
+mode's pane, the many-agents line and the git stamp, `680c99e` for the window's
+road and the cell's two copies — and merged into master by `93f7932`, with
+`bdbb484` on top. Eleven are TUI-audit minors, one is a refactor row whose lie
+the ledger had already named (`R66`), one is the human's live report about
+the context window, and one (`bdbb484`) is a sentence in that report's own
+section.
+
+**A reap keeps the cursor on the agent it named (`39576fd`; D7).** `reap` held
+the cursor as an index into `rows()`, and the rows it sweeps are dropped from the
+oldest end — the end *above* the cursor — so the same index named a different
+agent once the sweep was over. The audit's probe (51 finished children, ten `j`s,
+then a reap of the past-history set) read `cursor index=10 before=Some(AgentId(10))
+after=Some(AgentId(11))`: the selection moved with no keystroke. `reap` now
+records `cursor_id()` before the retain and points the cursor back at it with
+`point_cursor_at` afterwards, and the clamp in `repair_focus` is only the
+fallback for a cursor whose own agent went with the reap. Pinned by
+`reaping_keeps_the_cursor_on_the_agent_it_named`.
+
+**A reclaimed worktree drops its branch stat (`7ce13c8`; D8).** `mark_reclaimed`
+cleared the branch and `kept` but left the id's entry in `agent_stats`. The row
+paints that entry beside the branch name and the pane title sums every value in
+the map, so a worktree the sweep reclaimed kept a `+3−1` that described a branch
+nobody has any more: the probe read the row before as
+`   ✓ #1 port  mush/1 +3−1  did it     ││` with `Σ +3 −1`.
+The fresh stat map is installed before the sweep decides, which is why a worktree
+the same pass reclaims left its figure behind. One removal fixes both readers,
+because the tree owns the map: the stat goes with the branch it described.
+Pinned by `a_reclaimed_worktree_leaves_no_branch_stat`; `screen.rs` is untouched.
+
+**An orphan row is painted at the top level (`c884a8c`; D9).** `ui.rs` indents a
+row by `"  ".repeat(row.depth)`, and `screen.rs`'s `row` set that from
+`node.depth` — where the agent was *spawned*, a fact the actor's system prompt
+and the `MAX_DEPTH` spawn limit read and one the row must not rewrite. But
+`rows()` has always ordered a node whose parent is not in the tree as a
+top-level row, so the painted order and the painted indent were two spellings of
+the nesting: a reaped parent left its children indented over nothing (the probe:
+`     ✓ #2 2  done` with no `#1` row on screen, against ` ✓ #2 2  done` after).
+`AgentTree::painted_depth` derives the indent from the same painted chain
+`rows()` orders by — zero when `parent_in_tree` is none, else one more than its
+painted parent's — and `screen.rs`'s `row` is the one line that reads it. The
+stored depth stays what it is, so the prompt, the spawn limit and a stored
+session are untouched. Pinned by
+`a_row_without_a_painted_parent_is_painted_at_the_top_level`.
+
+**A status never erases the cancelling mark (`c848deb`; D10).** `activity` and
+`thinking` refused to replace a fold and nothing else, and a `Cancelling` phase
+passes both existing guards (`is_busy`, “not a fold”). The actor checks the
+mailbox and then emits its status, so a Stop that landed in that window was
+overwritten by the label already in the actor's hand: the probe read `after
+Ctrl-C: Cancelling`, then `tree.activity(id, "edit_file src/a.rs")` →
+`Activity("edit_file src/a.rs")`, `tree.thinking(id)` → `Thinking`, and
+`expire_cancels()` → `false`. Both setters now refuse `Phase::Cancelling` exactly
+as they refuse a fold: `⊘ cancelling…` is the human's own keystroke's feedback on
+the row they are watching, and erasing it also makes the stale-cancel backstop
+never fire, because `expire_cancels` only retires a phase still `Cancelling`.
+Pinned by `a_status_never_erases_the_cancelling_mark`. **Recorded, not changed:**
+the race in `agent.rs`'s check-then-emit window itself remains suspected — this
+closes the tree half the audit proved.
+
+**A failed nudge restores the phase's clock (`9f0a12c`; R66).** `nudge` rewrote
+`phase` to `Thinking` and restarted `since`, and `nudge_failed` wrote back only
+`node.phase = was` — against its own doc, “Put the row back exactly as it was”. A
+row that had been saying `waiting on results 4m` came back saying `0s`, because
+the clock of the failed nudge stayed on it: the probe read
+`age(id, 240s), nudge, nudge_failed -> since.elapsed() = 3.9µs (0s)` before and
+`since.elapsed() = 4m` after. `nudge` now returns `Option<Replaced>` — the phase
+it displaced *and* the instant that phase began — and `nudge_failed` writes both
+back; the value is a small `pub struct` because `nudge` is `pub`, and `app/mod.rs`'s
+one call site passes it opaquely through. Pinned by
+`a_nudge_that_cannot_be_delivered_restores_the_previous_phase_and_its_clock`.
+**Recorded, not changed:** the ledger's broader `AgentNode::enter(phase)`
+refactor of the eleven setters is deliberately not done here; this closes the
+defect only.
+
+**A stopped run is news on the run, not a line the session owes (`fa7b1f1`, with
+the sentence corrected by `bdbb484`; D17).** The module doc said **News** — “a
+failure, a run mush stopped” — “is written to the session so a restart still says
+what broke”, while `stored_notices` keeps `NoticeKind::Error` only; probed on the
+base, driving the two lines one loop guard writes, `P3 kind=Some(Stopped)
+stored_notices=0`. The code is right and the sentence was the defect: a stop must
+not come back as a red `!` — nothing the model did broke — and the stop is not
+lost across a restart either, because the session stores the row's status. The
+sentence now says that: only the failure is the half written to the session,
+because that is the line a restart owes; a stop is news on the run that stays on
+the row, and no clock takes either away. Pinned by
+`a_stopped_run_is_either_stored_as_a_stop_or_not_claimed_to_be`. `bdbb484` is
+that pin's own correction: the repair's sentence said a stop is carried across a
+restart by the session's stored status, which is true of a stop the human asked
+for (`AgentEvent::Stopped` → `Phase::Stopped` → `StoredStatus::Stopped`) but not
+of the loop-guard stop the finding is about — that one ends as the run's error
+(`tree.fail` writes `Phase::Failed(guard words)`, the snapshot stores
+`StoredStatus::Failed`), so the “restart still says what broke” half is false for
+that half of the same arm. Two sentences, one fact: what a restart reads for a
+stop is the status the run stored, and for the loop guard that status is the
+error it ended with — no behaviour change, the same test.
+
+**A focus change under the select mode says the selection is gone (`3a51fea`;
+D18).** `attach::Op::Focus` reaches `attach_focus`, which moves the pane, and the
+select mode was left standing over the old agent: `select_apply`'s clamp filters
+on `select.agent != on` (where `on` is the *new* `Tree::focused`), so the first
+key after the move — `Enter` — cleared the mode, copied nothing and said nothing.
+The probe, the mode open on the root's pane and a client focusing #1, read
+`copied_none=true selecting=false line="agent #1: lexer"` (before `""`) — the
+selection eaten with no line, while `Ctrl-Y` was a no-op and `Enter` copied
+nothing. A focus that actually moves the pane now drops the mode and says so in
+the bar (“selection dropped — the pane moved to agent #1”), and `Enter` with no
+line left under the mode refuses out loud too (“nothing to copy — the selection
+is gone”), because that road is reachable without a focus change (a reap moves
+the pane under it). `Chat::selecting_agent` is the one new small accessor: the
+app has to tell “the mode already names the pane the human reads” from “the pane
+moved under it”. Pinned by
+`a_focus_change_under_the_select_mode_either_follows_it_or_says_it_left`.
+**Recorded, not changed:** the human's own `Tab` road still cancels silently —
+there the human pressed the key that moved the pane, and `attach_focus`'s doc
+says why the two roads differ.
+
+**A merged paste leaves the cursor in the box (`9134ad4`; D20).** `Input::insert`
+advanced the cursor by the *paste's* grapheme count, not the result's. A skin-tone
+modifier or a regional indicator joins the cluster before it, so the cursor
+landed one past the end of the box and `backspace` — which computes both byte
+positions past the end — deleted nothing on the first keystroke. The audit's
+probe, reproduced before the fix: `cursor=2 graphemes=1 text="x🏽"`, then
+`after one Backspace: text="x🏽" cursor=1` (it deleted nothing); after:
+`cursor=1 graphemes=1 text="x🏽"`, `after one Backspace: text=""`. The invariant
+the module's doc states is that edits land on grapheme boundaries, and the cursor
+is the position the next edit lands at, so it is clamped into the result as well
+as advanced across it. Pinned by
+`a_paste_that_merges_with_the_grapheme_before_it_leaves_the_cursor_in_the_box`.
+
+**A learn decision cannot leave the two copies apart (`25ec885`; D21).** The
+audit's probe, on a cell whose UI copy sat at 128000 while the shared cell had
+learned 16000 through a handle: `PROBE after the actor's handle learns:
+ui=128000 actors=16000`; `PROBE after the 4000 complaint: ui learned=false
+ui=128000 actors=4000`. The UI's learn was judged against its own frame-cached
+copy, so a 4k complaint the cell in force had already taken was refused by the
+side that paints the bar and the tool caps: two windows in one tree, one of them
+stranded. `ConfigCell::learn_context` now judges and writes through the shared
+cell — the copy every request is built from — and reads the resulting window back
+into the UI's copy whatever the answer; the handle's raw write is private
+(`learn_window`), and `learn_context` takes the announcement as a closure it
+calls exactly when the number landed, so `AgentCtx::learn_context` (agent.rs, the
+one call site) cannot learn a window the UI never hears about. After, the same
+probe reads `ui=4000 actors=4000` and the acceptance reads `ui learned=true
+ui=4000 actors=4000`. Pinned by `the_two_copies_agree_or_the_number_is_refused`.
+
+**An empty key in the home file is no key (`a26f165`; D22).** A hand-edited
+`api_key: ""` in the home config was copied into the resolved config as
+`Some("")`, and three surfaces then disagreed about one state: the probe read
+`PROBE resolved api_key = Some("")`; `/key` would say “api key set (••••…)”,
+`--print-config` said “(none)”, and a request carried `Authorization: Bearer`
+with nothing after it. The file's road was the only one to that state —
+`MUSH_API_KEY=""` is already dropped by `env_nonempty` — so the home layer
+filters the empty string where it is read, and the three surfaces agree
+(`PROBE resolved api_key = None`): `/key` takes its “no api key” arm,
+`--print-config` still says `(none)`, and no request carries an empty Bearer.
+Pinned by `an_empty_config_key_is_no_key`.
+
+**The several-agents line names `c`, not `Enter` (`4bbef67`; D25).** `Ctrl-C`
+with several agents busy and the focused one not among them said “Enter picks one
+to stop”. `Enter` is `Intent::Send` in the chat pane and `Intent::TreeFocus` in
+the tree — it sends the box's draft, or makes a row's transcript visible, and
+stops nothing (proven by the key table). The probe, two runs in flight and the
+root focused, read `P25 line="2 agents running · Enter picks one to stop · Ctrl-X
+stops them all"`. The line now names the road that really stops: `c` in the
+agents pane stops the row under the tree's cursor, and `Ctrl-X` still stops every
+running agent. It is 68 columns, inside the bar's one row at 80×24 once the badge
+takes its seven, so nothing of it is elided. Pinned by
+`the_many_agents_line_names_a_key_that_stops`.
+
+**A git read from the old chat does not touch the new tree (`e87af91`; D26,
+suspected).** `Msg::Git` was the one off-thread message with no conversation
+stamp, while `Msg::Agent`, `Msg::Clipboard` and `Msg::Copied` all carry one: a
+read in flight across `Ctrl-N` landed in the new tree. `adopt_git` filters the
+stats by `tree.has(id)` — an id test, not an identity test, and the ids restart
+with the tree — `sweep_worktrees` acts on a snapshot taken from the old tree, and
+`git_in_flight` was cleared from under whatever read the new tree started.
+Suspected only (mechanism read, not raced). Probed on the base, a fresh chat, an
+id the new tree holds too, and the old read delivered by hand:
+`P26 agent_stats={AgentId(1): Stat { files: 4, added: 40, removed: 4 }}
+git=Some("the old tree's branch") git_at=true in_flight=false`. The read is stamped
+in `refresh_git` with the tree's conversation, captured before the worker starts,
+and `update` drops one that is not the tree's, the way it drops a stale
+`Msg::Clipboard`; `adopt_git` therefore only ever adopts this tree's own read, and
+its `tree.has` filter stays for the narrower case it was written for (a reap
+between the read and the adoption). `new_chat` clears `git_in_flight` before
+asking again: a read in flight belongs to the tree that just died, and the flag
+left up would refuse this ask — and every later one — behind a read whose answer
+the new tree will never adopt. Pinned by
+`a_git_read_from_the_old_chat_does_not_touch_the_new_tree`.
+
+**A window carries the road it came by (`9430058`; the human's live report).**
+Two mush sessions on the same config painted `~1M` and `~500k` in the `ctx` line,
+and nothing in the frame or in `--print-config` could say which road each number
+had taken — the `~` only meant “the human stated none”. Three roads arrive
+unstated (mush's model table, the endpoint's model list, the endpoint's refusal)
+and only a stated one is ever stored, so two directories can legitimately
+disagree forever. The probe, one config per road:
+
+```
+before
+table:      mark "~", 8192   = "8192 tokens (assumed from the model or the provider)"
+advertised: mark "~", 500000 = "500000 tokens (assumed from the model or the provider)"
+complaint:  mark "~", 4000   = "4000 tokens (assumed from the model or the provider)"
+after
+table:      mark "~", 8192   = "8192 tokens (assumed from mush's model table)"
+advertised: mark "≈", 500000 = "500000 tokens (advertised by the endpoint's model list)"
+complaint:  mark "≤", 4000   = "4000 tokens (named by the endpoint in a refusal)"
+stated:     mark "",  32768  = "32768 tokens (stated by the human)"
+```
+
+`WindowSource` moves into `mush-core`'s config, beside the window it describes,
+with `Stated` and `Table` added; `Config` stores the source where
+`context_explicit: bool` was and derives `context_explicit()` from it, so a
+second flag cannot disagree. `set_context` records `Stated`,
+`adopt_context(tokens, source)` records the road it was told and refuses a stated
+window, and `rederive_context`/`Config::new`/`Config::from_env_layer` record
+`Table`, with the session/home window application going through `set_context`.
+`settings.rs` re-exports the type, so `crate::app::WindowSource`,
+`crate::app::settings::WindowSource` and agent.rs's import keep their names;
+`believable` keeps its policy and documents that `Stated` and `Table` are not
+learnable numbers. The meter's mark is per road — `~` the table, `≈` the model
+list, `≤` a refusal, none the human's own — from one `window_mark` both surfaces
+paint, so each is one display column and the meter keeps its width at 80×24,
+while the words live in `--print-config`. Pinned by
+`each_road_a_window_came_by_is_named_in_the_meter_and_in_print_config` and
+`the_meter_marks_each_road_a_window_came_by`. **Recorded, not changed:** the
+files outside the commit's brief are named in its body (http.rs's ignored live
+test's `Config` literal, agent.rs's one `context_explicit` reader).
+
+---
+
+## 8.82 `/context` is a command again, and says the road the window came by (`00f2433`, `d91586c`, `d85cfd1`, `6e7dac4`, merged `c7298ab`)
+
+The human's ask, answered one layer down: §8.81's marks tell a reader *that* a
+window took some road, but a mark is one display column and cannot be read, and
+the command that once asked which road had been cut with the git wrappers
+(`ad5b791`, “the meter is on screen”). Four commits bring it back, with the words
+beside the roads they name.
+
+**The words live beside the road (`00f2433`).** `--print-config` carried the four
+sentences in a `match` of its own, and `/context` asks for the same four; two
+copies is how two surfaces come to describe one window differently. They move to
+`WindowSource::words`, beside the roads they name, and `describe` reads them.
+Measured through the dump itself, one config per road: `8192 tokens (assumed from
+mush's model table)`, `500000 tokens (advertised by the endpoint's model list)`,
+`4000 tokens (named by the endpoint in a refusal)`, `32768 tokens (stated by the
+human)` — unchanged output, now from one definition. Pinned by
+`each_road_a_window_came_by_is_named_in_the_meter_and_in_print_config`, which
+goes through the one definition.
+
+**`/context` is a command again (`d91586c`).** With no argument it answers from
+`WindowSource::words`: the probe, a real app on the shipped 8192-token default
+window, read `/context` → `` unknown command: /context — /help lists them ``
+before and `ctx ~8.2k · assumed from mush's model table` after, with the window
+and its road unchanged and now sayable; `/help` and `mush --help` gained the row
+`/context  say the window's size and the road it came by` (both read `COMMANDS`,
+so there is no separate list to forget). The argument is read where the usage
+line is written: a line with one is refused until the commits that answer it
+land, so help cannot advertise a shape the parser does not take. Pinned by
+`the_context_command_names_the_road_the_window_came_by`, with
+`every_command_in_the_table_parses` and
+`the_help_lists_exactly_the_commands_the_parser_knows` walking the new row in
+both directions.
+
+**`/context N` states a window this workspace remembers (`d85cfd1`).** The
+setter half: a token count, read by the one reader `--context` and `MUSH_CONTEXT`
+use (`config::parse_context`), written through the cell's one edit door so the
+meter's copy and every actor's handle move in one write, and flushed before the
+bar promises anything — the session is what remembers a stated window. The probe,
+a real app on the shipped default: before, `/context 8192` →
+`Err(Unknown("/context"))`, the bar said nothing, the session file's `context`
+was absent (`None`); after, `/context 32000` made the bar read `ctx 32k (set) ·
+stated by the human — this workspace will remember it`, the window became 32000
+tokens, road `Stated`, in a handle taken before the command as well, the session
+file carried `"context": 32000`, and the startup chain (`resolve_with`) read it
+back as a stated 32000-token window. `/context 8k` is refused with ``/context
+needs a token count, got `8k` `` — the sentence the flag and the variable print,
+road named. Pinned by
+`the_context_command_states_a_window_and_the_workspace_remembers_it` (save/load
+through the real writer, then the startup resolution) and
+`a_context_argument_that_is_not_a_number_is_refused_by_name`.
+
+**`/context auto` gives the statement up (`6e7dac4`).** The road back from the
+trap the human hit — a workspace that remembers a number forever. `auto` drops
+this workspace's statement and derives the window again (`Config::forget_context`,
+which gives the road up *before* asking `rederive_context`, because that call
+leaves a window the human stated alone). The stored statement goes with it: the
+snapshot writes the session's `context` only while the road is `Stated`, so the
+flush after the edit is what writes the field away, and a restart reads no
+statement at all. The probe: `/context 32000`, then `/context auto` made the bar
+read `ctx ~8.2k · assumed from mush's model table — the statement is forgotten`,
+the window became 8192 tokens, road `Table`, the session file's `context` went
+from `Some(32000)` back to `None`, and the startup chain derived the table's
+window instead of reading the number back as a statement. Pinned by
+`context_auto_returns_the_workspace_to_the_derived_window_and_forgets_the_statement`,
+with the word's letter-blind read in `arguments_parse_the_way_the_executor_uses_them`
+(`/context AUTO` is the same ask).
+
+**The two design boundaries this command rests on, stated because neither is
+visible in one commit.** First, `/context auto` does not touch a home-config
+statement: `auto` gives up *this workspace's* statement — the session layer's —
+and the home file's window is a different layer (CLI > env > session > home) that
+only a fresh resolve re-reads and that mush never edits. Second, a window stated
+in the home file is machine-global: `UserConfig::context` is a statement that
+applies to every workspace on the machine, which is why the session's own
+statement is the more specific one and waits above it — a human cannot state one
+window for one workspace through the home file.
+
+---
+
+## 8.83 The actor's leftovers — usage on every ending, bounded big-text roads, and the books stop growing (`d710c2e`, `a8851e8`, `8121e78`, `02b002f`, `c71be60`, `74ad1de`, `efd5213`, `d8ae94d`, `d7f12a2`, and from the grandchild the merge carried `fe83f8a`, `3483c4e`, `d4c596c`, `926a12a`; merged `b54d9fc`, the grandchild by `1995b54`)
+
+The wave that finishes the audits' queue: A6 — the last of the three majors
+§8.71 named as open — A11, A16, A17, A23, C10, E8, F7's sentence half, F13's
+guard half, F14's newline half, F15, F16's spawn half and B12's deserializer
+half. One branch landed it, and the `agent.rs`-owning grandchild came in through
+`1995b54` and the merge `b54d9fc`.
+
+**Every ending reports the endpoint's own token counts (`d710c2e`; A6).**
+`report_usage` had exactly one call site — the clean, tool-free end of
+`run_loop` — and `compact_history` read its own reply for the summary's text and
+never for `usage`, though the fold re-sends the whole history and is usually the
+run's largest call. Measured before: a run whose fold the endpoint counted at
+9,000 prompt + 100 completion and whose final reply reported 7/5/12 had the one
+line read “the endpoint counted 7 prompt + 5 completion tokens this run (12
+total)” — the fold absent; a run cancelled after a call the endpoint counted at
+4,040/0 had notices `[]`. After: “9k prompt + 105 completion … (9.1k total)” and
+“4k prompt + 0 completion … (4k total)”; a `/compact` from rest — a fold no run
+owns — reports “… for this fold (1.3k total)”, because “this run” would name a
+run that does not exist. The report now lives on a `run_loop` wrapper around the
+turn loop (`run_turns`), so the accumulator survives every road out of the loop,
+and `compact_history` feeds the same accumulator the run's replies feed; the idle
+fold reports itself with `fold_line`. Pinned by
+`a_fold_and_the_final_reply_both_report_the_endpoints_counts`,
+`a_cancelled_run_still_reports_what_the_endpoint_counted` and
+`an_idle_fold_reports_the_endpoints_own_counts_for_this_fold`.
+
+**`status` is a big-text road and answers to `result_cap` (`a8851e8`; A11).**
+`result_cap`'s doc names every big-text road — “a command's output, a file read, a
+listing, a search” — and `run_loop` spends the shared `turn_room` with each
+result's weight, but `status_tool` returned the registry's own listing whole,
+bounded only by `jobs::STATUS_WINDOW` plus each job's headline. Measured: an 8 K
+window (budget 12,288, `cmd_cap` 2,458) with four jobs whose output windows the
+registry shares out of `STATUS_WINDOW` gave **6,589 bytes** of status, 2.7× the
+turn's whole room (the audit's ended-jobs probe of the same window read 8,197).
+After: ≤ `result_cap` plus the `truncate_for_model` marker, which says what it
+kept and how to ask narrower. Pinned by
+`a_status_listing_is_bounded_by_the_turns_result_cap`.
+
+**The fold's refusal is bounded like the run's (`8121e78`; C10).** The run's own
+refusal arm truncates what the endpoint said to 600 columns
+(`truncate(&body, 600)`); the fold's arm handed the whole body into an
+`AgentEvent::Notice`, and a body is bounded only by `http.rs`'s `MAX_BODY_BYTES
+= 80 MiB`. Measured: a `/compact` against a scripted 500 whose body is 1 MiB
+emitted a notice of **1,048,622 bytes** (wrapped and painted; `/notes` re-wraps
+it); after, the endpoint's status and 600 columns of its words, cut with the `…`
+`truncate` adds, ~640 bytes. Pinned by `a_folds_refusal_is_bounded_like_the_runs`.
+
+**A failed commit subject round-trips any error text (`02b002f`; F15).**
+`commit_subject` closes the failure head with `"): "` and `parse_commit_subject`
+split on the *first* `"): "` (`split_once`). An error that itself carries the
+sequence — an endpoint's `refused (429): slow down` — puts the parser's delimiter
+inside the head, so the row's brief is the error's tail: the subject is the only
+record a leftover row has of its task. Measured before:
+`commit_subject(7, "port the parser", Failed("the endpoint refused (429): slow
+down"))` parsed back as brief `"slow down): port the parser"`; after, the brief is
+`port the parser` for that error and every text in the fuzz list — a bare
+`"): "`, backslashes, a text that already holds the escape's own output, a brief
+that itself holds `"): "`, and a CJK error cut at 40 columns. The error is
+written through `escape_subject` (every backslash doubled, then `"): "` marked by
+a backslash before its `)`) and read back through the exact inverse
+`unescape_subject`; the delimiter is the first `"): "` with an *even* run of
+backslashes before it (`split_subject_head`), so `rsplit_once` is not needed and
+a brief holding `"): "` cannot swallow the head. Pinned by
+`the_commit_subject_round_trips_for_any_error_text`.
+
+**A base spawn in an unborn repo reads that reason (`c71be60`; F16's spawn half).**
+`spawn_tool` resolved the `base` name before `worktree_add` ever asked
+`has_commits`, so a fresh `git init` answered `` unknown base `main`: no commit,
+branch or tag by that name in this agent's workspace `` — git's word about a name
+that could never resolve, sending a human looking for a typo instead of a commit.
+The two states that refuse before any name matters — no repository, no commit —
+are now one gate in git.rs (`can_branch_from`), shared by `worktree_add` and by
+the spawn road, which asks it *before* resolving the name so the refusal costs no
+resolve. Measured before, the same call on a fresh `git init -b main` returned the
+“unknown base” line; after, `the repo has no commits yet — commit first or drop
+isolated`, nothing created, no id drawn, and a non-repository reads `not a git
+repository` — the state's own sentence. Pinned by
+`a_base_spawn_in_a_repo_without_commits_refuses_with_that_reason` and
+`a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason`, with the
+wording pinned by `a_named_base_is_resolved_before_anything_is_created`.
+
+**A title is folded to the row's one line (`74ad1de`; F14's newline half).**
+`spawn_tool` trimmed the model's `title` and took anything non-empty, and the tree
+row is one line painted through `truncate`, which keeps `\n` and `\t`:
+`title: "parser\nport"` reached a one-line painter. Measured before, the `Spawned`
+events carried `["parser\nport the lexer", "parser\tport"]`; after,
+`["parser", "parser port"]` — `first_line`, the house's one home of “a brief or
+title read as one row” (refactor `R11`), collapses whitespace runs and drops a
+second line. Pinned by `a_title_with_a_newline_cannot_reach_a_one_line_row`.
+
+**The spawn cap counts against HEAD, and says so (`efd5213`; F7's sentence half).**
+`unlandable` asks every worktree `probe(root, id, "HEAD", _, None)`, while the
+sweep that takes worktrees asks each node against the branch its own parent holds
+and with the fork it was created at. For a nested child the two differ, so a full
+cap handed the model a false fact (“each holds an unmerged branch”), a remedy
+already done (“merge or delete its branch”), and no way to tell the real
+unlandable id from the counted landable one. Reproduced with the audit's probe
+(ids 9/10 — a parent `mush/9` with a commit, a child `mush/10` forked from it and
+merged back): the sweep's question `Landable(Merged)`, the cap's count both on
+disk `[9, 10]`, the sweep's deed `Removed { branch_kept: Some("mush/10"),
+landing: Merged }`, the cap's count after `[9]`. The arithmetic half cannot be
+fixed on this side of the door: the sweep's facts — each node's base and fork —
+live in the UI's tree, and the spawn road is an actor thread with no handle on
+it. So the count is unchanged and the claim is corrected: `unlandable`,
+`MAX_WORKTREES` and `too_many_worktrees` now say the question that was asked (not
+landable *against HEAD*), name the nested-child case, and give a remedy that
+works for both kinds — bring the branch's work to HEAD, or remove the checkout
+and delete the branch. Pinned by
+`the_worktree_cap_refuses_a_spawn_before_the_id_is_taken`, which now asserts the
+refusal names the nested-child case and never calls a branch the sweep can land
+“unmerged”. The audit's `a_nested_child_merged_into_its_parent_is_not_counted`
+stays owed to whoever gives the spawn road the tree's base/fork pairs.
+
+**The per-child books stop growing for the life of an actor (`d8ae94d`; A16).**
+Three per-actor books grew by one entry per event and were never pruned:
+`done_jobs` kept every job report the actor ever recorded (the audit's probe:
+1,000 jobs, 61,893 bytes of line text), `delivered_jobs` kept every mark beside
+them, and `forgotten` kept one id for every child the history window ever reaped.
+Measured here, the same 1,000-report road through `absorb`: before, `done_jobs`
+1,001 entries / 44,945 B and `delivered_jobs` 1,000 marks; after, `done_jobs` 16
+entries / 726 B and `delivered_jobs` 15 marks. The job books now stop at
+`REMEMBERED_JOBS` = `2 * jobs::MAX_JOBS`, which is the registry's own memory (that
+many running plus that many finished): a report older than that is one the
+registry cannot report again, and its line is in the transcript, where the fold
+put it. Oldest first, and an *undelivered* report is never dropped —
+`drain_signals` records one for the next boundary to fold in, and news is the one
+thing a book may not forget — and the delivery mark goes with the report it
+marks, so no `wait` can name a report that is not there. The `forgotten` set is
+not bounded — it is gone. `children` is the book that says whose reports are
+news, and `forget_child` empties it first, so `is_forgotten(id)` is
+`!children.contains_key(&id)`: the absence *is* the tombstone, and a report from
+an id no book names is swallowed exactly as before. **The tombstone design the
+fix refused:** the audit's alternative — drop a tombstone once no in-flight
+report can name it — cannot be done parent-side, because a parent cannot observe
+the child actor's death (the tree drops its sender, but the child holds its own
+`my_tx` and its thread may still send), so a parent-side drop would either swallow
+a real report or stay as unbounded as the set it replaced; the reason is in
+`ActorState::children`'s doc. Pinned by
+`a_thousand_jobs_leave_the_job_books_the_size_of_the_registry`, which folds 1,000
+reports through the real road, asserts both books stay at the registry's size,
+that the one unread report outlives every prune, and that the oldest read
+report's line is in the transcript rather than lost — then forgets a child and
+asserts its late report is still swallowed without a tombstone to hold it; the
+tombstone's own road stays pinned by
+`forgetting_a_child_drops_its_books_and_swallows_a_late_report`,
+`a_forgotten_child_handed_a_mailbox_keeps_no_book` and
+`a_row_handed_over_after_a_forget_reopens_the_child`.
+
+**The shared-workspace rule counts the directory (`d7f12a2`; F13's guard half).**
+The guard read `state.shared ∩ state.running` — this actor's own children — while
+its refusal and the delegation policy both claim a fact about the directory
+(“only one such child may run at a time”). A grandchild is never in the
+grandparent's books, so the root could spawn shared A, let A's run end while A's
+own shared child B still worked in the same checkout, and then spawn shared C
+into it: two writers, and a guard whose sentence was true of nothing but the book
+it read. A tree-wide book now counts the writers of a directory, keyed by its
+canonical workspace root: every run of a *shared* child books its id for as long
+as the run lives, given up by a `WriterGuard`'s `Drop` — the same RAII reason as
+`LiveGuard`, so a run that dies on its way to its ending does not leave a writer
+that refuses a sibling forever. The writers this parent's own books name are
+filtered out of that count: for a parent's own children the books are the finer
+answer, and the two checks together are the sentence; the spawner is never
+counted against itself, so a shared child may still delegate into the tree its
+own run is in. The book is a `static` rather than a handle carried through
+`TreeHandles`, because the writers are threads of one process and a revived actor
+is rebuilt with an `AgentCtx` of its own. The refusal now names the id the old
+count could not see, and its remedy says “wait for it to finish” rather than
+“wait for it first”: the writer it names may be a grandchild the reader cannot
+`wait` on. Pinned by
+`the_shared_workspace_rule_counts_every_live_writer_in_that_directory`, which
+drives the real road: a root spawns shared #1, #1 spawns shared #2 and ends its
+run while #2's reply is held in flight, and the refusal must name #2 while the
+root's own books hold only #1. **The sentence the audit's other half is owed:**
+`DELEGATION`'s “only one such child may run at a time” describes the per-parent
+rule and not the directory's, and `mush-core/src/prompt.rs` was not this commit's
+to edit.
+
+**A loose reply is still a reply (`fe83f8a`; B12's deserializer half).** A
+throwaway probe deserialized the four wire shapes the finding names, from the
+base tree, before any fix:
+
+```
+{"content":"hi"}                          -> missing field `role`
+{"role":"assistant", …, "tool_calls":[{"id":"x","type":"function"}]}
+                                            -> missing field `function`
+…"function":{"name":"read_file","arguments":{"path":"a"}}…
+                                            -> invalid type: map, expected a string
+…"tool_calls":[{"id":1,…}]…               -> invalid type: integer `1`, expected a string
+full reply {"choices":[{"message":{"content":"hi"},…}]}
+                                            -> missing field `role`
+```
+
+Every one of those `Err`s became `could not parse model response: …` and ended
+the run — the outcome the module's opening sentence (“intentionally loose … so
+that the many ‘OpenAI-compatible’ servers out there all round-trip cleanly”)
+exists to prevent. After the fix all five parses succeed: a missing `role`
+defaults to the empty string, a missing `function`/`name` to an empty call, an
+object `arguments` arrives as its JSON text `{"path":"a"}`, a numeric id as its
+text `"1"`, and the whole `ChatResponse` the run parses reads a role-less choice.
+`role` gets `#[serde(default)]`; `FunctionCall` derives `Default` and defaults
+`name`; `ToolCall` defaults `function`; `id_from_wire` and `arguments_from_wire`
+read the two fields the spec spells differently, each carrying its reason beside
+it. Pinned by `a_loose_reply_is_still_a_reply`. **Recorded, not changed:** the
+finding's other half — a malformed *reply* should be a refusal the model can
+answer rather than an ended run, the shape the `ModelError::Status` arm already
+gives a 400 — lives in `crates/mush/src/agent.rs` (the `ModelError::Malformed`
+arm), which this branch did not own.
+
+**A full lost pool forgets the oldest loss (`3483c4e`; A17).** `LOST_POOL`'s doc
+said “the oldest lost number is forgotten”, but `lose_agent` read `if id.0 >=
+agents.counter || agents.lost.len() >= LOST_POOL { return; }`, so a ninth loss
+was the one dropped: the newest loss became the gap while the oldest eight stayed
+pooled — the opposite of what `next_agent` pops first. Measured with the
+acceptance test staged first (draw #1..#9, lose all nine, read the pool back by
+drawing): before, the first draw was `AgentId(8)`, with #9 the gap and #1 coming
+back; after, the first draw is #9, then #8 #7 #6 #5 #4 #3 #2,
+then a fresh #10, with #1 the forgotten oldest that never comes out. `lose_agent`
+now drops `lost[0]` when the pool is full and then pushes the incoming id; the
+`id.0 >= agents.counter` guard stays. The newest is the entry to keep because it
+is the number a retry draws: the pool exists for the failure that just happened,
+and dropping the incoming id left exactly that retry unable to get its number
+back. The reason is written beside the code — `LOST_POOL` says which entry
+survives and why, `Agents::lost` says it holds at most `LOST_POOL`, and
+`lose_agent`'s doc carries the eviction rule. Pinned by
+`a_pool_full_names_which_lost_number_is_the_gap`.
+
+**A command that left its process group is outside cleanup's reach (`d4c596c`;
+A23).** The sentences that claimed more than the mechanism do now say what it
+does: mush's reach is the process group it gave the command, and only what is
+still in it. `setsid`/`setpgid`/a daemon's own session leaves that group, and
+neither `Job::kill` (a group signal) nor `Job::end_group` (which reads the
+group's members) can follow. Re-parenting alone is not the escape: a process
+whose parent died is still in the group and is still taken. Measured through the
+real `Shell` in a tempdir, with a throwaway probe whose command was `echo $$ >
+leader; setsid sh -c 'echo $$ > survivor; sleep 30' &`: leader pid 863632 (its
+process group), survivor pid 863633 with `ppid=1 pgrp=863633 sid=863633`, leader
+ended `Exited(0)`, `job.end_group() = Ok(0)`, the survivor's `/proc` entry still
+there, and the probe's own group kill the only thing that ended it. So
+`end_group`'s ordinary `Ok(0)` is not “nothing was left behind”; it is “nothing
+is left in the group mush can signal”, while a process that made its own session
+runs on. `machine.rs`'s four sentences are rewritten around that (the module
+doc, `Job::kill`, the build/cleanup comment, and `Job::end_group`'s boundary
+paragraph), and the committed test
+`a_command_that_left_its_process_group_is_outside_cleanup` pins the survivor's
+own `/proc/<pid>/stat` alive after `end_group()`, with `pgrp`/`sid` equal to its
+own pid, and a guard kills it however the assertions end. **Recorded, not
+changed:** `crates/mush/src/jobs.rs:483` carries the same old “Stop it and
+everything it started” sentence for the registry kill; that file was not this
+commit's.
+
+**A refusal calls the pid the lock file's last known holder (`926a12a`; E8).**
+`acquire` takes the flock first and writes its own pid after, and the lock file is
+deliberately never unlinked — so a refusal can read a dead process's number (an
+earlier life's, or a pid-reuse) while the sentence said “quit it first”, as if
+that number were the holder. The flock is the only thing that refuses; the
+refusal now says what it can know:
+
+```
+before: another mush is already running in this workspace (pid 865572) — quit it
+        first, or ask it things with `mush agents`
+after:  another mush is already running in this workspace — pid 929178 is the
+        lock file's last known holder; the flock is the lock, so that number may
+        be out of date — quit the running mush first, or ask it things with
+        `mush agents`
+```
+
+Staged before the fix, `a_refusal_does_not_name_a_dead_holder` held the lock
+in-process, wrote a really-dead pid into the lock file and asked again; the red
+run quoted exactly the before line, naming the dead child although the holder was
+the test process. The audit's suggested “write the pid *before* the flock” is
+refused in the doc beside `acquire`: the lock file is the one a refused acquirer
+opens too, so writing first would overwrite the holder's pid with the refused
+process's own, and the *next* refusal would name the process that was refused,
+not the holder. Pinned by `a_refusal_does_not_name_a_dead_holder` and
+`the_pid_the_refusal_names_is_the_holder`, with “already running in this
+workspace” and the pid text kept so `a_second_acquire_is_refused_and_drop_releases_the_workspace`
+and `scripts/smoke.py` still match. **The flake reading is the commit's half two,
+not a code fix:** H28's row and the “Recorded, not changed” paragraph supposed
+the one-off `lock::tests` failure was a stale `/tmp` lock left by a terminated
+run, and that reading does not hold — `flock` dies with the fd and the process
+(the audit's SIGKILLed holder was re-read here), the lock file is never
+unlinked, and every test's `root()` removes its directory before taking the
+lock, so no stale lock can survive a dead holder. The shape that does hold is a
+`fork` copying the process's open lock descriptions into a child (CLOEXEC closes
+them only at exec): a child forked beside a live `Guard` keeps that flock until
+it execs, and the sibling lock tests' drop-and-reacquire assertions then fail on
+a lock that is perfectly free. Measured: with the child forked inside the
+dead-holder test, 16–17 of 20 runs of `cargo test -p mush lock::tests` were red,
+with the failure message naming the test process's own pid as last known holder;
+with that test skipped, 12 of 12 green, and a probe child that execs and sleeps
+holds no copy. The dead pid is now taken once, at the first `root()` call —
+before any test can hold a lock — so the fork cannot copy one, and 25 of 25 runs
+of the filter are green;
+`the_lock_file_is_not_removed_when_the_holder_leaves` is left as it is (now
+safer). Left standing from the audit: `acquire` failing *before* the flock —
+`open` on a full `/tmp` (ENOSPC), or a loaded suite's fd pressure (EMFILE) — is
+the other shape the bool assertion would mis-blame on the lock.
+
+---
+
+## 8.84 A terminal, a home file, a dump and a schema (C8, C11, C12, F4, `11ad7dd`, `d338355`, `b1ee2f0`, `c96aae1`, merged `b836786`)
+
+Four commits, four surfaces that said less (or more) than the code behind them:
+the attach printers, the home config's key, the `--print-config` dump and
+`run_command`'s schema.
+
+**The attach printers defang what reaches the terminal (`11ad7dd`; C8).**
+`escape_line` made a transcript line *one* line but did not defang it, and
+`print_agents` did not even do that — so a stored session (a hand-editable file),
+a model reply, a tool result or a roster title/activity/branch could put a
+control sequence on the terminal of whoever ran `mush read`/`mush agents`. It was
+the one road in the tree that did not go through `mush_core::text::sanitize`.
+Measured at the pre-fix tree with a throwaway probe (the printers' own stdout): a
+body whose every string carried `ESC ]0;PWNED BEL` left 1 ESC + 1 BEL in the
+`read` row, and the `agents` row carried 4 ESC and 4 BEL, one in each of
+activity, title, branch and worktree. After, both printers emit 0 ESC and 0 BEL
+bytes, and the words the sequence wrapped stay (`look:` … `done`, `busy`, `/w`).
+The door is one function: `escape_line` now runs `sanitize` first (the escape
+sequence removed whole, the bidi and C0/C1 family dropped) and then the one-line
+escaping, and every roster column goes through it; the tab `sanitize`
+deliberately keeps is still escaped, because these rows are TSV, and the printing
+was split into `lines_text`/`agents_text` so the pin reads what reaches the
+terminal rather than that nothing panicked. Pinned by
+`the_read_and_agents_printers_emit_no_control_sequence` and the grown
+`a_read_line_is_escaped_onto_one_line`. **Recorded, not changed:** `print!` keeps
+the old road's failure shape — a broken pipe still panics rather than returning
+an error.
+
+**An unrelated command leaves an environment key in the environment (`d338355`;
+C11).** `persist_user_config` wrote the *resolved* key, so a key the human
+supplied for one run through `MUSH_API_KEY` — the README's own road for a key
+they did not want in a file — was written to the home config by any later `/url`,
+`/model` or `/provider`, a command whose ack says nothing about a file. Measured
+with one probe at the pre-fix tree and the same probe after, a cell whose key came
+from the environment and a `/url` on the same host: before, the file held
+`sk-env-0123456789` and the loaded key was `Some("sk-env-0123456789")`; after,
+the file does not hold it and the loaded key is `None`. The rule now lives in the
+save's own API: `UserConfig::save_to(path, KeyWrite)` takes the key by a *road* —
+`Stated` (the value's key, `None` included: the statement a host change makes,
+findings C6, D6) or `Keep` (the file's own key, present or absent; silence about
+the key). `App::persist_user_config` picks the road: `/key`'s arm sets
+`key_stated` — the one road where the human says “this key is for the file”, and
+whose ack already says `saved to <path>` — so every other save is `Keep`, unless
+the key in force is `None` (a host change's statement, which must reach the file
+or the old host's key would be re-homed). The write's destination is the app's
+own `home_config` field, the same value the `/key` and no-key acks read, so the
+line and the write cannot name two paths. Pinned by
+`an_unrelated_command_does_not_move_an_environment_key_into_the_home_config` and
+`a_keep_save_leaves_the_files_own_key_where_it_was`, while
+`a_save_states_the_key_even_when_it_has_none` still pins C6/D6. **Recorded, not
+changed:** `key_stated` is not unset while the key `/key` wrote stays the key in
+force — it is the human's for the file from then on — and a `Keep` save still
+writes the file's own key back, which is why the core test pins the bytes rather
+than “no key field”.
+
+**`--print-config` answers the image gate (`b1ee2f0`; C12).** The dump is
+advertised as “what a request will carry” and printed every request knob except
+the one *capability* a request is refused for: whether the model may be sent a
+picture. The fact lived only in the provider table (`provider::vision_capable`,
+whose one vision row is `deepseek-flash`), so a human pasting a screenshot at a
+custom endpoint learned it from a refusal. Measured with the real binary, a
+throwaway config and workspace: a `deepseek-flash` request printed 14 rows with
+none containing “vision” before and 15 rows with `vision  yes — image parts are
+sent` after, and both refusals read as the gate's own answer
+(`deepseek-v4-pro` → “no — the table does not document image parts for
+deepseek-v4-pro”, no model → “no — no model yet”). The row is read through the
+same function the three gate sites ask (`mush_core::provider::vision_capable`),
+so the dump cannot advertise a picture the run would drop; it sits under `model`,
+defanged like the model row above it, and `--help`'s list of what the dump prints
+names it (“model and whether it can see”). Pinned by
+`the_dump_answers_the_image_gate`.
+
+**`run_command` says the output limit kills the command (`c96aae1`; F4).** The
+schema described a *cut* where the code kills: it said “A result too big for the
+context window is cut, and the cut says how to read on”, and said nothing about
+`jobs::CMD_OUTPUT_LIMIT` — a command that writes past it is killed
+(`jobs::stopping` → `Stopped::TooMuchOutput`), and only then does the result say
+so. The machine block was worse: it stated the rule the kill violates, “A long
+command detaches into a job instead of dying”, with no exception. Measured with a
+throwaway probe over `tool_schemas()`: `run_command`'s description was 123 bytes,
+containing “killed” nowhere, and the whole schemas were 5,996 bytes against the
+6,000 the `schemas_fit_the_budget_reserve` bound allows; after, the description is
+213 bytes and says “A command that writes past 8 MiB of output is killed and its
+result says so; the road on is a narrower command”, the machine block names the
+kill beside the detach it is the exception to, and the whole schemas are 5,985
+bytes — the sentence is paid for by shedding facts another block already owns
+(the workspace root, `exclusive`'s examples, `wait`'s quoted refusal) and
+neutral compressions, not by growth. Pinned by
+`the_command_schema_names_the_output_kill`. **Recorded, not changed:** the 8 MiB
+figure is spelled in this crate because the number's one home (`jobs::CMD_OUTPUT_LIMIT`)
+is out of reach from the schema — `mush` depends on `mush-core`, not the other
+way round — so a change to the limit must touch prompt.rs too; and `docs/mush.md`'s
+tool table still says “output capped to fit the window”.
+
+---
+
+## 8.85 The unfocused tree's cursor is ink, not a band (`3809884`, merged `7338d81`)
+
+The human's ask, and the last landing of this stretch: the agents pane's selected
+row was a filled band even when the keyboard was in the conversation pane beside
+it, where a fill reads as a second cursor. The band *is* the cursor, so it stays
+while the tree has the keyboard — the pane's own border already says focus, and
+the band is the pair the bar's badge and the chat's selection wear. With the chat
+focused the row is marked with the hue as its own ink instead: no cell's
+background changes and no column is spent, which an outline, an underline or a
+`› ` highlight symbol could not promise, because the row's leading cells are the
+tree's `▶` and the agent's own `⊘`/`⏸`/`✓` glyph. No new theme role: both marks
+are the one accent, so the fixed palette and every hue (named, workspace, indexed)
+agree about what the cursor looks like by construction. The probe, the cells
+`draw_agents` paints into a real `TestBackend` at 30×8, cursor on `✓ #2 ⏸2`:
+
+```
+before, chat focused — the whole inner row filled:
+  y=3  fg=Black bg=Cyan   |     ✓ #2 ⏸2 row 2          |
+after, chat focused — the same glyphs, the hue as ink, background Reset:
+  y=3  fg=Cyan  bg=Reset  |     ✓ #2 ⏸2 row 2          |
+focused, before and after, unchanged:
+  y=3  fg=Black bg=Cyan   |     ✓ #2 ⏸2 row 2          |
+```
+
+Pinned by `the_agents_cursor_is_a_band_only_while_the_pane_has_the_keyboard`:
+with the chat focused no cell of the painted pane wears the accent as a
+background, and the cursor's row — and only that row — wears it as ink; with the
+agents pane focused the band is back on every cell of the cursor's row. Every form
+the accent resolves in is painted — the fixed cyan, a workspace hue's own bytes,
+and the 256-colour nearest entry — and the two frames' symbols are compared cell
+by cell, so nothing moved and the mark paints over no glyph.
+
+---
+
+## 8.86 The census after the minors' wave, and the drift the living docs still carry
+
+`python3 scripts/census.py` at `7338d81`:
+
+**TOTAL 86,623 · blank 4,972 · comment 24,395 · tests 38,164 · prod 19,092.**
+
+Against §8.71's landing at `38d0438` (79,208 · 4,605 · 21,708 · 34,663 ·
+18,232): this stretch is **7,415 lines — prod +860, tests +3,501, comments
++2,687, blank +367**. The census reads only `crates/**/*.rs`, so the six audit
+files, the four duplication reports and the `docs/refactor.md` ledger move no
+column; the delta is the fix waves — 45 findings closed, 3 half-closed, plus the
+human's window report, the output view, the deadline rule and the quieter cursor,
+none of which answers a finding. Comments are the largest growth after tests, and
+by the same rule §8.71 stated: the bound, the guard or the corrected sentence
+arrives with the reason beside it. No `cargo test` was run for this record pass:
+it changes no line under `crates/`.
+
+**The scoreboard.** 91 of the 104 findings are fixed, 4 partial (A19, B12, F7,
+F13) and 9 open (A13, A14, A15, A18, A21, A22, C7, F3, F17); every blocker and
+all three majors the earlier sheet left — A3, A6, F6 — are closed. The partials'
+other halves and the residuals the fixers named are H54–H63, below in the open
+queue.
+
+**The drift §8.71 recorded, re-read at this base.** One item was repaired by the
+landing it pointed at: `docs/refactor.md` §11's preamble no longer reads as the
+only ledger, because the four passes are its subsections now (`0fe6e22`, §8.76).
+The rest still stands, with the items this wave moved or added named where they
+fall:
+
+- `README.md:234–245` still describes the three-attempt transport retry and the
+  half-hour worst case that `190886c` and `b6a59c3` (§8.58) removed; `retrying`
+  repeats `Unsent` only, and one ask spends one 600 s deadline.
+- `README.md:189`, `docs/mush.md:465`, `docs/mush.md:874` and the `.mush/` tree
+  listing still describe `Ctrl-N` as one press that clears; it is two-step and
+  first keeps `.mush/session.json.previous` (`d505d9e`, §8.57).
+- `docs/refactor.md:480`'s B23 row still says “transport failures only”, which
+  the same narrowing made false (the row's `findings.md` twin in §2.75 carries
+  it).
+- `docs/mush.md:203`'s `run_command` row still says “output capped to fit the
+  window” where the schema now says the command is killed past 8 MiB (`c96aae1`,
+  §8.84) — the row F4 was about, still open in the manual.
+- `docs/mush.md:869/873` says the session is rewritten once a second where
+  `SESSION_DEBOUNCE` is 60 s.
+- `docs/mush.md:1291` says three `#[ignore]`d tests where there are four at this
+  base (three on the wire — the model list, the shipped reply cap and a TLS
+  handshake — and the 60 fps frame budget, `#[ignore = "the 16 ms budget needs an
+  idle box…"]`); the list is the manual's to regenerate.
+- `docs/refactor.md:474` says the reply cap is a quarter of the window where it
+  is an eighth; `docs/refactor.md:424` says the read and listing caps “went with
+  the file tools” where they came back (§8.36).
+- `README.md:154`/`docs/mush.md:895`'s “only one such child may run at a time” is
+  the sentence F13's guard half is still owed (H55), and
+  `mush-core/src/prompt.rs:58` is its one home.
+- The manual has no `/context` row and neither `README.md` nor `docs/mush.md`
+  names `Ctrl-O` at this base — the command is back and in `COMMANDS` (§8.82),
+  and the key is bound with its row printed by both help surfaces (§8.74);
+  `docs/mush.md:445` still names only `/context N`.
+
+**The drift in the code's own sentences, for the pass that owns those files.**
+`crates/mush/src/agent.rs:18071` still says the spawn schema “requires one”
+(`09c9446` made `title` optional, §8.78); `crates/mush/src/jobs.rs:483` still says
+“Stop it and everything it started” (`d4c596c` fixed `machine.rs`'s four
+sentences, §8.83); `crates/mush/src/app/commands.rs`'s `/url` arm still accepts a
+control character without a sentence (`4f7793c`, §8.79); and
+`docs/audits/agent-and-wire.md`'s blind-spot bullet still reads as open for A9's
+overflow, which `330fe61` closed (§8.79) — evidence files stay as found.
