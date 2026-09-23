@@ -11,6 +11,7 @@
 //! caller's cancellation flag is polled between them, so Ctrl-C interrupts a
 //! model that is still thinking instead of waiting for its reply.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -23,18 +24,28 @@ use mush_core::Config;
 
 use crate::clock::{self, Clock};
 
-/// Fail fast when the endpoint is unreachable, rather than inheriting the
-/// operating system's multi-minute connect timeout.
+/// The ceiling on one connect: fail fast when the endpoint is unreachable,
+/// rather than inheriting the operating system's multi-minute connect timeout.
+/// A *ceiling*, not a schedule — [`connect`] gives each address the smaller of
+/// this and what is left of the call's deadline, so no connect can outlive the
+/// call it serves.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Listing models must never freeze the caller: the UI thread does this when
 /// `/model`, `/url`, or `/key` runs, and a stalled endpoint should just fall
-/// back to the provider's known list.
+/// back to the provider's known list. The number is that ask's *whole* budget:
+/// every phase of it is bounded by the smaller of its own ceiling and what is
+/// left, so a stalled lookup, connect or write cannot extend it either.
 const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one socket read waits before the reader checks for a cancellation.
 /// Short enough that a Stop lands promptly, long enough that a silent endpoint
 /// costs a handful of wake-ups per second, not a spin.
 const READ_SLICE: Duration = Duration::from_millis(200);
-/// A request body is small; a write that blocks this long is a dead endpoint.
+/// The ceiling on one blocked write: a request body is small, and a write that
+/// blocks this long is a dead endpoint. A *ceiling*, not a schedule — the write
+/// phase sets the socket's own write timeout to the smaller of this and what is
+/// left of the call's deadline before every syscall ([`write_bounded`]), so a
+/// stalled endpoint cannot hold an actor's thread, or a human's Stop, past the
+/// call.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A response body larger than this is refused while it is being read. With
 /// [`MAX_HEAD_BYTES`] this is the whole of what one reply may make mush
@@ -66,8 +77,31 @@ pub struct Response {
 /// rustls TLS stream. `Box<dyn Read + Write>` is not a valid trait object, so
 /// one supertrait is needed. `Send` because a kept connection is parked in the
 /// pool a whole tree of actors shares.
-trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
+///
+/// Beside reading and writing it says one thing: how to bound a write. A
+/// socket's own timeout is the only bound that can end a write the kernel is
+/// holding, and it must be *this* call's remainder — a kept connection was
+/// opened under an earlier ask's budget — so the write phase sets it through
+/// this method on whatever connection the pool handed over. A stream with no
+/// syscall to bound (a test's in-memory connection) does nothing, which is
+/// exactly what it has to bound.
+trait ReadWrite: Read + Write + Send {
+    fn set_write_timeout(&self, _bound: Duration) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ReadWrite for TcpStream {
+    fn set_write_timeout(&self, bound: Duration) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, Some(bound))
+    }
+}
+
+impl ReadWrite for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_write_timeout(&self, bound: Duration) -> io::Result<()> {
+        self.sock.set_write_timeout(Some(bound))
+    }
+}
 
 pub fn get_json(url: &str, api_key: Option<&str>, timeout: Duration) -> io::Result<Response> {
     request(
@@ -267,8 +301,11 @@ static POOL: Pool = Pool::new();
 
 /// What opens a connection. The real client connects a socket; a test hands
 /// back an in-memory stream, so reuse — and a kept connection that died — are
-/// provable with no socket and no server.
-type Open<'a> = &'a mut dyn FnMut(&str, u16, bool, Duration) -> io::Result<Box<dyn ReadWrite>>;
+/// provable with no socket and no server. It is handed the call's [`Watch`],
+/// because the phases before a request exists — the name lookup, the connect,
+/// the TLS handshake — share the deadline the request itself is bounded by,
+/// and a failure those phases cause by spending it is the watch's own answer.
+type Open<'a> = &'a mut dyn FnMut(&str, u16, bool, &Watch<'_>) -> io::Result<Box<dyn ReadWrite>>;
 
 fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io::Result<Response> {
     let watch = Watch::new(ask.cancel, ask.timeout, clock);
@@ -290,10 +327,19 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     // everything it can fail with — a name that does not resolve, a connect
     // that is refused or times out, a TLS handshake — is `Unsent`: no byte of
     // the request was written, and asking again cannot duplicate or bill
-    // anything (finding A2).
+    // anything (finding A2). The one exception is a call already *over*: a
+    // Stop or a deadline a phase spent is the watch's own answer, already in
+    // the road's words, and marking it `Unsent` would ask a call with nothing
+    // left to ask with.
     let stream = match pool.take(&endpoint) {
         Some(stream) => stream,
-        None => BufReader::new(open(&host, port, tls, ask.timeout).map_err(unsent)?),
+        None => BufReader::new(open(&host, port, tls, &watch).map_err(|error| {
+            if watch.spent() {
+                error
+            } else {
+                unsent(error)
+            }
+        })?),
     };
 
     // One request, one reply, one connection: no second send hides in here.
@@ -317,7 +363,9 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
 /// received it, and mush never sends a request the endpoint may have seen
 /// twice (finding A2). The one failure that is not final is the write itself,
 /// which hands over no whole request and carries [`Unsent`] so `model.rs`
-/// knows a repeat cannot duplicate anything.
+/// knows a repeat cannot duplicate anything — and that is *only* the shape it
+/// takes while the call has time left: a write that spent the call's deadline
+/// is the deadline's own answer, never a request to ask again.
 ///
 /// A `Response` exists only for a reply whose body framed itself completely
 /// (to the `Content-Length`, through the zero chunk and its trailer, or to the
@@ -336,13 +384,16 @@ fn exchange(
         // The write did not hand the whole request over: no complete request
         // ever reached the endpoint, so this is the one failure a repeat cannot
         // duplicate — marked `Unsent`, the class `model.rs::retrying` asks
-        // again (finding A2). A cancellation is the human's own decision and is
-        // reported as itself.
-        return Err(if error.kind() == io::ErrorKind::Interrupted {
-            error
-        } else {
-            unsent(error)
-        });
+        // again (finding A2). A cancellation is the human's own decision, and a
+        // deadline the write spent is the call's: both are reported as
+        // themselves, never as a request to ask again with nothing left.
+        return Err(
+            if error.kind() == io::ErrorKind::Interrupted || watch.spent() {
+                error
+            } else {
+                unsent(error)
+            },
+        );
     }
 
     // A blank line is not an answer: a kept connection can carry one from the
@@ -472,13 +523,65 @@ fn write_request(
 
     // The head, the body and the flush are the same request: a signal landing
     // on any of them is a call to make again, not a request to report — and
-    // asking the watch first means a Stop still wins over the retry.
+    // asking the watch first means a Stop still wins over the retry. Every
+    // write is bounded by the smaller of [`WRITE_TIMEOUT`] and what is left of
+    // the call, per syscall ([`write_bounded`]).
     let out = stream.get_mut();
-    retrying_interrupted(Some(watch), || out.write_all(head.as_bytes()))?;
+    write_bounded(&mut **out, head.as_bytes(), watch)?;
     if let Some(body) = ask.body {
-        retrying_interrupted(Some(watch), || out.write_all(body.as_bytes()))?;
+        write_bounded(&mut **out, body.as_bytes(), watch)?;
     }
-    retrying_interrupted(Some(watch), || out.flush())
+    flush_bounded(&mut **out, watch)
+}
+
+/// Write `bytes` whole, and let nothing outlive the call: before every chunk
+/// the watch is consulted and the socket's own write timeout is set to the
+/// smaller of [`WRITE_TIMEOUT`] and what is left — so a syscall the kernel
+/// holds cannot block past the deadline, however many chunks were accepted
+/// before it. The bound is set per chunk and per ask, never once per
+/// connection: a kept connection carries the ask that opened it, and this write
+/// must be bounded by *this* ask's remainder.
+///
+/// A timeout whose bound was the call's own remainder is the call being over —
+/// said through [`Watch::spend`] in the road's words — never the write's own
+/// wire failure, which the caller would mark [`Unsent`] and `model.rs` would
+/// ask again with nothing left to ask with.
+fn write_bounded(out: &mut dyn ReadWrite, bytes: &[u8], watch: &Watch) -> io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        watch.check()?;
+        let left = watch.left();
+        let bound = WRITE_TIMEOUT.min(left);
+        out.set_write_timeout(bound)?;
+        match retrying_interrupted(Some(watch), || out.write(rest)) {
+            // A peer that took none of the bytes it was offered is the wire
+            // failing, not a signal: the error `write_all` would have raised.
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the endpoint accepted no more of the request",
+                ))
+            }
+            Ok(taken) => rest = &rest[taken..],
+            Err(error) if is_timeout(&error) && bound == left => return Err(watch.spend()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// One `flush`, bounded and answered like a write chunk: on a TLS stream a
+/// flush *is* a write, so it takes the same rule rather than whatever bound the
+/// last chunk happened to leave on the socket.
+fn flush_bounded(out: &mut dyn ReadWrite, watch: &Watch) -> io::Result<()> {
+    watch.check()?;
+    let left = watch.left();
+    let bound = WRITE_TIMEOUT.min(left);
+    out.set_write_timeout(bound)?;
+    match retrying_interrupted(Some(watch), || out.flush()) {
+        Err(error) if is_timeout(&error) && bound == left => Err(watch.spend()),
+        result => result,
+    }
 }
 
 /// A cancellation flag and a deadline, threaded through one request's reads.
@@ -486,6 +589,21 @@ fn write_request(
 /// The socket is given [`READ_SLICE`] as its read timeout, so every read wakes
 /// up quickly; `check` is what turns those wake-ups into a decision — keep
 /// waiting, or stop because the human asked us to.
+///
+/// The deadline is the *call's*, not a phase's, and this is where the rule that
+/// keeps it that way has its one home. `model.rs`'s `retrying` owns the logical
+/// call and hands each attempt only what is left of its one deadline;
+/// everything an attempt does — the name lookup, the connect, the write, every
+/// read — must fit inside what it was handed. So each phase takes the *smaller*
+/// of its own ceiling ([`CONNECT_TIMEOUT`], [`WRITE_TIMEOUT`],
+/// [`RESOLVE_TIMEOUT`]; [`READ_SLICE`] is polled between reads inside the
+/// deadline) and [`left`](Self::left), and a phase that runs out of the budget
+/// says so through [`spend`](Self::spend) — the sentence the deadline itself
+/// uses, so `model.rs` classifies it as the deadline it already is and never as
+/// a wire failure it may ask again. A phase that kept its own schedule instead
+/// would extend the call it serves: a stalled write alone could hold an actor's
+/// thread, and a human's Stop, thirty seconds past a deadline with a second
+/// left.
 struct Watch<'a> {
     cancel: Option<&'a AtomicBool>,
     deadline: Instant,
@@ -494,6 +612,25 @@ struct Watch<'a> {
     /// "the endpoint stopped responding" path does not cost the suite the
     /// timeout it is proving.
     clock: &'a dyn Clock,
+    /// Set the moment a phase spends the call — a Stop that landed or the
+    /// deadline reached — so the roads that wrap a phase's failure in
+    /// `Unsent` can tell "the call is over" from "the request never left",
+    /// without a second marker class beside [`Unsent`] for it.
+    spent: Cell<bool>,
+}
+
+/// The human's Stop, in the road's own words — what a phase that reads the flag
+/// answers with, wherever it reads it.
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "request cancelled")
+}
+
+/// The call's budget running out, in the road's own words: the sentence
+/// [`Watch`]'s read deadline already used, said by every phase that spends it,
+/// so the layer above classifies a spent phase as the deadline it is (finding
+/// A2) rather than as a new kind of failure.
+fn expired() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "the endpoint stopped responding")
 }
 
 impl<'a> Watch<'a> {
@@ -502,6 +639,7 @@ impl<'a> Watch<'a> {
             cancel,
             deadline: clock.now() + timeout,
             clock,
+            spent: Cell::new(false),
         }
     }
 
@@ -511,27 +649,56 @@ impl<'a> Watch<'a> {
             .unwrap_or(false)
     }
 
+    /// Whether the call's deadline has been reached: `check`'s clock half, for
+    /// a phase that must name its own ceiling when the ceiling — not the call —
+    /// is what ended it.
+    fn at_deadline(&self) -> bool {
+        self.clock.now() >= self.deadline
+    }
+
+    /// What is left of the call's deadline: the budget every phase gets, which
+    /// each bounds by the smaller of its own ceiling and this.
+    fn left(&self) -> Duration {
+        self.deadline.saturating_duration_since(self.clock.now())
+    }
+
+    /// What a phase that has spent the call is told: the human's Stop first,
+    /// then the deadline, in the road's own words — and the fact is marked, so
+    /// every road below passes this through instead of wrapping it in the
+    /// repeatable [`Unsent`].
+    fn spend(&self) -> io::Error {
+        self.spent.set(true);
+        if self.cancelled() {
+            stopped()
+        } else {
+            expired()
+        }
+    }
+
+    /// Whether a phase has already spent the call. Read by the two roads that
+    /// mark a pre-reply failure `Unsent` before they know whether the call is
+    /// over.
+    fn spent(&self) -> bool {
+        self.spent.get()
+    }
+
     /// Consulted after every successful read *and* on every read timeout: a
     /// cancellation or a deadline has to be able to stop a body that keeps
     /// arriving in slices, not only a silent one.
     fn check(&self) -> io::Result<()> {
         if self.cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "request cancelled",
-            ));
+            return Err(self.spend());
         }
-        if self.clock.now() >= self.deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the endpoint stopped responding",
-            ));
+        if self.at_deadline() {
+            return Err(self.spend());
         }
         Ok(())
     }
 }
 
-/// Only the short read slice is expected to time out; anything else is real.
+/// A call that ran out of its own time bound rather than failing: the read
+/// slice, a connect attempt, a blocked write. Those are the errors a phase
+/// answers with [`Watch::spend`] when the call's remainder was the bound.
 fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -556,8 +723,11 @@ fn is_timeout(error: &io::Error) -> bool {
 /// has passed — is returned as itself, so a cancelled request is still answered
 /// in a moment instead of being retried around the signal.
 ///
-/// `watch` is the request behind the call. It is `None` for a call that has no
-/// request yet — the connect, which carries its own timeout and no cancel flag.
+/// `watch` is the call behind the operation — the request's reads and writes,
+/// the connect, and the name-lookup wait all carry it, so a Stop or a spent
+/// deadline is returned as itself rather than retried after. Only a call with
+/// no request behind it at all passes `None`: the lookup that runs on the
+/// resolver's own thread, where there is no flag to read.
 fn retrying_interrupted<T>(
     watch: Option<&Watch>,
     mut operation: impl FnMut() -> io::Result<T>,
@@ -689,43 +859,67 @@ fn body_too_large() -> io::Error {
     )
 }
 
-/// Connect to the endpoint. Every step here is bounded: the name lookup by
-/// [`resolve_bounded`], the TCP connect by [`CONNECT_TIMEOUT`], the write by
-/// [`WRITE_TIMEOUT`], and every read by the read watch (finding A19).
-fn connect(
-    host: &str,
-    port: u16,
-    tls: bool,
-    read_timeout: Duration,
-) -> io::Result<Box<dyn ReadWrite>> {
+/// Connect to the endpoint. Every step here is bounded by the *call's* deadline
+/// before its own ceiling: the name lookup by [`RESOLVE_TIMEOUT`], the TCP
+/// connect by [`CONNECT_TIMEOUT`], the TLS handshake by what is left, and every
+/// read by [`READ_SLICE`] with the watch between the slices. [`Watch`] owns the
+/// deadline the phases share, and a phase that runs out of it answers in the
+/// watch's own voice — never as a wire failure (finding A19; finding A2's one
+/// deadline).
+fn connect(host: &str, port: u16, tls: bool, watch: &Watch<'_>) -> io::Result<Box<dyn ReadWrite>> {
     let mut last_error = None;
-    // Opening a connection happens before there is a request to cancel, so the
-    // calls below have no watch: they retry the signal and are bounded by
-    // their own timeouts.
+    // The lookup is the call's first phase: `resolve_bounded` ends its wait at
+    // the smaller of its own ceiling and what is left of the call.
     let name = host.to_string();
-    let addresses = resolve_bounded(host, port, clock::system(), move || {
+    let addresses = resolve_bounded(host, port, watch, move || {
         retrying_interrupted(None, || (name.as_str(), port).to_socket_addrs())
             .map(|addresses| addresses.collect())
     })?;
     for address in addresses {
-        let stream = match retrying_interrupted(None, || {
-            TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
-        }) {
-            Ok(stream) => stream,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
+        // What is left *now*, not when the call began: a second address must
+        // not get a fresh ceiling after the first spent the budget. A connect
+        // that ran out on the budget is the call being over, said the same way
+        // as every other spent phase; a connect that ran out on its own
+        // ceiling is the wire failing, still `Unsent` while the call has time.
+        let left = watch.left();
+        if left.is_zero() {
+            return Err(watch.spend());
+        }
+        let bound = CONNECT_TIMEOUT.min(left);
+        let stream =
+            match retrying_interrupted(Some(watch), || TcpStream::connect_timeout(&address, bound))
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if is_timeout(&error) && bound == left {
+                        return Err(watch.spend());
+                    }
+                    last_error = Some(error);
+                    continue;
+                }
+            };
         // Liveness guards, not UX timers: a stalled endpoint must not pin a
-        // thread (and, for the model list, the whole TUI) forever.
-        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        // thread (and, for the model list, the whole TUI) forever. Each is the
+        // smaller of its ceiling and the call's remainder; the write phase
+        // sets its own bound again, per request, because a kept connection
+        // carries the ask that opened it. A connect that used the last of the
+        // budget is the call being over like any other spent phase.
+        let left = watch.left();
+        if left.is_zero() {
+            return Err(watch.spend());
+        }
+        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(left)))?;
         if tls {
-            // A TLS handshake is a conversation, not a read, so during setup
-            // it gets the whole budget; only the reads after it get the short
-            // slice that lets a cancellation land while the model thinks.
-            stream.set_read_timeout(Some(read_timeout))?;
-            let stream = tls_connect(host, stream)?;
+            // A TLS handshake is a conversation, not a read, so during setup it
+            // gets the whole remainder; only the reads after it get the short
+            // slice that lets a cancellation land while the model thinks. A
+            // handshake that spends the remainder is the call being over.
+            stream.set_read_timeout(Some(left))?;
+            let stream = match tls_connect(host, stream) {
+                Ok(stream) => stream,
+                Err(error) if is_timeout(&error) => return Err(watch.spend()),
+                Err(error) => return Err(error),
+            };
             stream.sock.set_read_timeout(Some(READ_SLICE))?;
             return Ok(Box::new(stream));
         }
@@ -740,27 +934,32 @@ fn connect(
     }))
 }
 
-/// How long a name gets to resolve. std's `to_socket_addrs` cannot be given a
-/// timeout, and it is the last step of `connect` that could hang past every
+/// The ceiling on the wait for a name. std's `to_socket_addrs` cannot be given
+/// a timeout, and it is the step of `connect` that could hang past every
 /// deadline mush sets (a dead DNS server, a wedged VPN) — so the lookup runs on
-/// its own thread and this is the deadline the caller waits on (finding A19).
+/// its own thread and this is the ceiling the caller waits on (finding A19). A
+/// *ceiling*, not a schedule: the wait ends at the smaller of this and what is
+/// left of the call's deadline.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The resolver wait loop's slice: short enough that a deadline or a shutdown
 /// is noticed promptly, long enough not to spin.
 const RESOLVE_SLICE: Duration = Duration::from_millis(50);
 
-/// Resolve `host:port`, bounded by [`RESOLVE_TIMEOUT`] on `clock`.
+/// Resolve `host:port`, bounded by the smaller of [`RESOLVE_TIMEOUT`] and what
+/// is left of the call's deadline ([`Watch`]).
 ///
 /// The lookup itself still blocks on its own thread; what is bounded is the
-/// *wait* for it. A lookup that outlives the deadline is abandoned, not killed
-/// — the resolver thread belongs to the OS to collect — and the caller gets a
-/// `TimedOut` naming the host, which is a fact it can report instead of
-/// hanging. The clock is a parameter so a test reaches the deadline by
-/// advancing a fake instead of waiting ten seconds (finding A19).
+/// *wait* for it. A lookup that outlives its bound is abandoned, not killed —
+/// the resolver thread belongs to the OS to collect. Which bound ended the wait
+/// decides the answer: the call's own deadline answers in the watch's voice
+/// (the same sentence every spent phase uses), while [`RESOLVE_TIMEOUT`] alone
+/// gets a `TimedOut` naming the host and the seconds, a fact the caller can
+/// report instead of hanging. The clock is the watch's, so a test reaches a
+/// deadline by advancing a fake instead of waiting ten seconds (finding A19).
 fn resolve_bounded(
     host: &str,
     port: u16,
-    clock: &dyn Clock,
+    watch: &Watch<'_>,
     lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
 ) -> io::Result<Vec<SocketAddr>> {
     let (tx, rx) = mpsc::channel();
@@ -772,7 +971,7 @@ fn resolve_bounded(
             let _ = tx.send(lookup());
         })
         .map_err(io::Error::other)?;
-    let deadline = clock.now() + RESOLVE_TIMEOUT;
+    let deadline = watch.deadline.min(watch.clock.now() + RESOLVE_TIMEOUT);
     loop {
         match rx.try_recv() {
             Ok(result) => return result,
@@ -783,16 +982,27 @@ fn resolve_bounded(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        if clock.now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "{host}:{port} did not resolve within {}s",
-                    RESOLVE_TIMEOUT.as_secs()
-                ),
-            ));
+        // A Stop lands wherever the flag can be read, and this wait can read
+        // it between slices.
+        if watch.cancelled() {
+            return Err(watch.spend());
         }
-        clock.sleep(RESOLVE_SLICE);
+        if watch.clock.now() >= deadline {
+            return Err(if watch.at_deadline() {
+                // The call's budget, not this phase's ceiling, is what ran
+                // out: it is the deadline's answer, in the deadline's words.
+                watch.spend()
+            } else {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{host}:{port} did not resolve within {}s",
+                        RESOLVE_TIMEOUT.as_secs()
+                    ),
+                )
+            });
+        }
+        watch.clock.sleep(RESOLVE_SLICE);
     }
 }
 
@@ -1248,14 +1458,22 @@ mod tests {
     }
 
     /// A resolver that never answers must not hold the caller: the lookup runs
-    /// on its own thread and the wait is bounded by the clock, so advancing a
-    /// fake is the whole test. Before this, when the wait ended was the OS
-    /// resolver's to decide (finding A19).
+    /// on its own thread and the wait is bounded by the watch's clock, so
+    /// advancing a fake is the whole test. The budget is past the resolver's
+    /// *own* ceiling, so that ceiling is what ends this wait and the answer
+    /// names the host. Before this, when the wait ended was the OS resolver's to
+    /// decide (finding A19).
     #[test]
     fn a_resolver_that_never_answers_is_bounded_by_the_clock() {
         let clock = Advanceable::new();
+        let cancel = AtomicBool::new(false);
+        let watch = Watch::new(
+            Some(&cancel),
+            RESOLVE_TIMEOUT + Duration::from_secs(60),
+            &clock,
+        );
         let started = Instant::now();
-        let error = resolve_bounded("mush.invalid", 80, &clock, || {
+        let error = resolve_bounded("mush.invalid", 80, &watch, || {
             std::thread::sleep(Duration::from_secs(3600));
             Err(io::Error::other("too late"))
         })
@@ -1264,7 +1482,7 @@ mod tests {
         assert!(error.to_string().contains("mush.invalid"), "{error}");
         assert!(
             clock.elapsed() >= RESOLVE_TIMEOUT,
-            "the deadline is what ended it: {:?}",
+            "the ceiling is what ended it: {:?}",
             clock.elapsed()
         );
         assert!(
@@ -1281,8 +1499,9 @@ mod tests {
     #[test]
     fn a_resolver_answer_is_returned() {
         let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let addresses =
-            resolve_bounded("127.0.0.1", 1, clock::system(), move || Ok(vec![address])).unwrap();
+        let cancel = AtomicBool::new(false);
+        let watch = Watch::new(Some(&cancel), Duration::from_secs(1), clock::system());
+        let addresses = resolve_bounded("127.0.0.1", 1, &watch, move || Ok(vec![address])).unwrap();
         assert_eq!(addresses, vec![address]);
     }
 
@@ -1345,6 +1564,10 @@ mod tests {
         }
     }
 
+    /// An in-memory connection has no syscall to bound: the default
+    /// `set_write_timeout` is what the write phase's rule reduces to here.
+    impl ReadWrite for Wire {}
+
     /// A connection that serves these replies, and records what is written.
     fn wire(written: &Arc<Mutex<Vec<u8>>>, answers: &[&str]) -> Wire {
         Wire {
@@ -1392,7 +1615,7 @@ mod tests {
         let opens = opened.clone();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(wire(&written, &[&ok("{\"one\":1}"), &ok("{\"two\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1441,7 +1664,7 @@ mod tests {
         queue.push_back(wire(&written, &[&ok("{\"one\":1}")]));
         // The connection opened after that answers normally.
         queue.push_back(wire(&written, &[&ok("{\"two\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1496,7 +1719,7 @@ mod tests {
                        Transfer-Encoding: chunked\r\n\r\n\
                        9\r\n{\"one\":1}\r\n0\r\nX-Trace: abc\r\n\r\n";
         queue.push_back(wire(&written, &[chunked, &ok("{\"two\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1553,7 +1776,7 @@ mod tests {
         ));
         // The connection opened after it — the next call — answers normally.
         queue.push_back(wire(&written, &[&ok("{\"after\":1}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1618,7 +1841,7 @@ mod tests {
                        Transfer-Encoding: chunked\r\n\r\n\
                        5\r\nhello\r\n\r\n0\r\n\r\n";
         queue.push_back(wire(&written, &[chunked, &ok("{\"two\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1656,7 +1879,7 @@ mod tests {
             &written,
             &["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n"],
         ));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| match queue
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
             .pop_front()
         {
             Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1718,7 +1941,7 @@ mod tests {
             let mut queue = std::collections::VecDeque::new();
             queue.push_back(wire(&written, &[answer]));
             let mut opener =
-                move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| match queue
+                move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
                     .pop_front()
                 {
                     Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1770,7 +1993,7 @@ mod tests {
             flag_at: usize::MAX, // the Stop has already landed
             cancel: cancel.clone(),
         });
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1841,6 +2064,8 @@ mod tests {
         }
     }
 
+    impl ReadWrite for Drip {}
+
     /// A server can put a bare CRLF in front of a reply on an idle kept
     /// connection (a keep-alive probe, or a framing slip). It is not a status
     /// line: the reply behind it is read normally, on the same connection.
@@ -1852,7 +2077,7 @@ mod tests {
         let mut queue = std::collections::VecDeque::new();
         let second = format!("\r\n{}", ok("{\"two\":2}"));
         queue.push_back(wire(&written, &[&ok("{\"one\":1}"), &second]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1893,7 +2118,7 @@ mod tests {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(wire(&written, &[&ok("{\"one\":1}"), "\r\n"]));
         queue.push_back(wire(&written, &[&ok("{\"two\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -1962,6 +2187,8 @@ mod tests {
         }
     }
 
+    impl ReadWrite for Interrupted {}
+
     /// A signal landing on a read in flight is not the endpoint refusing the
     /// request: the read is made again and the reply arrives. Before the fix
     /// this failed with `Interrupted system call`, which the model layer
@@ -1972,7 +2199,7 @@ mod tests {
         let written = Arc::new(Mutex::new(Vec::new()));
         let reads = Arc::new(AtomicUsize::new(0));
         let counted = reads.clone();
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             Ok(Box::new(Interrupted {
                 inner: wire(&written, &[&ok("{\"answer\":1}")]),
                 interrupts: 3,
@@ -2005,7 +2232,7 @@ mod tests {
         let counted = reads.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             Ok(Box::new(Interrupted {
                 inner: wire(&written, &[&ok("{\"never\":1}")]),
                 interrupts: 1,
@@ -2122,7 +2349,7 @@ mod tests {
         let closing = ok_with("Connection: close\r\n", "{\"x\":1}");
         queue.push_back(wire(&written, &[&closing]));
         queue.push_back(wire(&written, &[&ok("{\"y\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -2164,7 +2391,7 @@ mod tests {
             &["HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"eof\":1}"],
         ));
         queue.push_back(wire(&written, &[&ok("{\"y\":2}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -2208,7 +2435,7 @@ mod tests {
             &["HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"a"],
         ));
         queue.push_back(wire(&written, &[&ok("{\"after\":1}")]));
-        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| {
             opens.fetch_add(1, Ordering::SeqCst);
             match queue.pop_front() {
                 Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
@@ -2449,6 +2676,216 @@ mod tests {
             bytes < 64 * MAX_HEAD_BYTES,
             "the endpoint wrote {bytes} bytes before the close: an unbounded head let it\
              write the whole line"
+        );
+    }
+
+    /// An endpoint that accepts the connection and then never reads it: the
+    /// request's write stalls on the kernel's buffers. Held open long enough
+    /// for the test that made it to outlive it.
+    fn never_read_endpoint() -> u16 {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((connection, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(connection);
+            }
+        });
+        port
+    }
+
+    /// An endpoint that reads the whole request and answers `body`: the healthy
+    /// shape no phase bound may cut. The client sends the request in one go and
+    /// then waits for its reply, so a read that pauses is the request being
+    /// complete rather than a stall.
+    fn answering_endpoint(body: &'static str) -> u16 {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut connection, _)) = listener.accept() {
+                connection
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+                let mut scratch = [0u8; 64 * 1024];
+                loop {
+                    match connection.read(&mut scratch) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) if is_timeout(&error) => break,
+                        Err(_) => return,
+                    }
+                }
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = connection.write_all(answer.as_bytes());
+                let _ = connection.flush();
+                // Long enough that the reply is read whole before the close.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        port
+    }
+
+    /// No phase may extend the call's deadline. Each phase of the wire — the
+    /// name lookup, the connect, the write — gets the smaller of its own
+    /// ceiling and what is left of the call, so a phase that stalls ends the
+    /// call at the call's deadline. Before this rule one ask could spend its
+    /// deadline *plus* those ceilings — a stalled write alone held the actor's
+    /// thread, and a human's Stop, for [`WRITE_TIMEOUT`].
+    #[test]
+    fn no_phase_outlives_the_calls_deadline() {
+        let deadline = Duration::from_millis(300);
+
+        // The name lookup. `connect` uses the OS resolver, with no seam for a
+        // lookup that never answers, so the phase runs through the opener's own
+        // [`Watch`] — exactly what `connect` hands `resolve_bounded` — on a fake
+        // clock, where waiting out RESOLVE_TIMEOUT costs nothing.
+        let clock = Advanceable::new();
+        let ask = Ask {
+            method: "POST",
+            url: "http://resolver.test:80/v1/chat/completions",
+            body: Some("{}"),
+            api_key: None,
+            timeout: deadline,
+            cancel: None,
+        };
+        let mut opener = |_host: &str, _port: u16, _tls: bool, watch: &Watch<'_>| {
+            resolve_bounded("resolver.test", 80, watch, || {
+                std::thread::sleep(Duration::from_secs(3600));
+                Err(io::Error::other("too late"))
+            })?;
+            unreachable!("the lookup never answers")
+        };
+        let error = request(&ask, &clock, &Pool::new(), &mut opener).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the endpoint stopped responding",
+            "the resolve phase ends in the deadline's own voice: {error}"
+        );
+        assert!(
+            !is_unsent(&error),
+            "a spent deadline is the call's answer, not a request to ask again: {error}"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            deadline,
+            "the lookup waited the call's budget, not RESOLVE_TIMEOUT"
+        );
+
+        // The connect: 10.255.255.1 is carried by the default route and nothing
+        // answers it, so the SYN is swallowed and the connect stalls.
+        let started = Instant::now();
+        let error = post_json(
+            "http://10.255.255.1:9/v1/chat/completions",
+            "{}",
+            None,
+            &AtomicBool::new(false),
+            deadline,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "the connect's bound is the call's remainder: {error}"
+        );
+        assert!(
+            !is_unsent(&error),
+            "a spent budget is the deadline, not an unsent connect: {error}"
+        );
+        assert!(
+            elapsed >= deadline && elapsed < Duration::from_secs(2),
+            "not CONNECT_TIMEOUT past the deadline: {elapsed:?}"
+        );
+
+        // The write: the listener accepts and then never reads, so a body past
+        // the loopback buffers stalls in the kernel. The write phase sets the
+        // socket's own timeout to what is left of the call and checks the watch
+        // between chunks, so the call ends at the deadline — never
+        // WRITE_TIMEOUT past it — and ends as the deadline rather than as a
+        // retryable request.
+        let port = never_read_endpoint();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let body = "x".repeat(16 * 1024 * 1024);
+        let started = Instant::now();
+        let error = post_json(&url, &body, None, &AtomicBool::new(false), deadline).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "the stalled write ends in the deadline's own voice: {error}"
+        );
+        assert!(
+            !is_unsent(&error),
+            "a spent budget is the deadline, not an unsent write: {error}"
+        );
+        assert!(
+            elapsed >= deadline && elapsed < Duration::from_secs(2),
+            "never WRITE_TIMEOUT past the deadline: {elapsed:?}"
+        );
+    }
+
+    /// A Stop that lands while a write stalls is read as soon as the write can
+    /// return, and the write returns at the call's deadline — not thirty seconds
+    /// later at [`WRITE_TIMEOUT`]. The deadline is what ends the stall and the
+    /// Stop is then the answer; this asserts the classification and the elapsed
+    /// time rather than driving a real Ctrl-C, which the seam does not reach.
+    #[test]
+    fn a_stop_lands_while_a_write_stalls() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let port = never_read_endpoint();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let body = "x".repeat(16 * 1024 * 1024);
+        let started = Instant::now();
+        let error = post_json(&url, &body, None, &cancel, Duration::from_millis(400)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.to_string(),
+            "request cancelled",
+            "the Stop is the answer, read as soon as the write returns: {error}"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the Stop did not wait out WRITE_TIMEOUT: {elapsed:?}"
+        );
+    }
+
+    /// The other side of the rule: the constants are ceilings, not schedules. A
+    /// healthy call — the listener reads the whole request and answers — is not
+    /// cut by any of them however small the call's own deadline is against them.
+    #[test]
+    fn a_healthy_call_is_not_cut_by_the_ceilings() {
+        let port = answering_endpoint("{\"ok\":true}");
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let started = Instant::now();
+        let response = post_json(
+            &url,
+            &"x".repeat(1024 * 1024),
+            None,
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "{\"ok\":true}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a real response is not held up by the phase bounds: {elapsed:?}"
         );
     }
 
