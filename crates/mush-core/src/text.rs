@@ -349,8 +349,19 @@ pub enum RunStyle {
     Fence,
     /// `#`/`##`/`###`, with the level.
     Heading(u8),
-    /// A list's own marker (`-`, `*`, `+`, `1.`), kept rather than hidden.
+    /// A list's own marker (`-`, `*`, `+`, `1.`) and the one space after it,
+    /// kept rather than hidden: the marker is where the item sits, and the
+    /// space is the column every wrapped continuation of the item hangs under.
     Bullet,
+    /// A horizontal rule's row: `─` across the pane, painted where the source
+    /// line's `---` was, and the same style for the `─┼─` separator a table
+    /// draws under its header. The runs the view writes rather than keeps:
+    /// both are lines across the *pane*, and the pane's own width is the only
+    /// width they can be drawn at.
+    Rule,
+    /// The `│ ` a block quote's `>` became. The quoted words keep their own
+    /// runs; this is the bar beside them.
+    Quote,
     /// The text of `[text](url)`.
     Link,
     /// The ` (url)` beside it. A URL is never dropped: this is a coding tool,
@@ -361,22 +372,26 @@ pub enum RunStyle {
 /// The model's prose read as a view: markdown parsed into styled runs, wrapped
 /// to a width. The pane paints the rows; nothing here writes anything back.
 ///
-/// A model writes markdown — headings, bullets, `**emphasis**`, code fences —
-/// and the pane painted the markers as if they were the sentence. This is the
-/// answer, and it is deliberately the small one. The parse is **line-local**:
-/// every source line is read on its own, so nothing here can reflow a
-/// paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
-/// the source did not have. That boundary is the point — the human called the
-/// full version a rabbit hole, and a chat reply needs a reading, not a document
-/// renderer. Tables, block quotes, setext headings, reference links, HTML,
-/// task-list checkboxes, nested lists and indented code blocks are all *not*
-/// rules; a line that uses one is simply the text it is.
+/// A model writes markdown — headings, bullets, `**emphasis**`, code fences,
+/// tables — and the pane painted the markers as if they were the sentence. This
+/// is the answer, and it is deliberately the small one. The parse is
+/// **line-local with one exception**: every source line is read on its own
+/// except a table, whose column widths are a fact about the whole block, so the
+/// walk buffers it and paints it as a block. Nothing else joins two lines: no
+/// paragraph is reflowed, no two lines are merged, a list is never re-indented
+/// and `- a\n- b` never becomes a layout the source did not have. That boundary
+/// is the point — the human called the full version a rabbit hole, and a chat
+/// reply needs a reading, not a document renderer. Setext headings, reference
+/// links, HTML, nested lists and indented code blocks are all *not* rules; a
+/// line that uses one is simply the text it is.
 ///
 /// It is **additive** too. The only text a rule removes is scaffolding a human
-/// does not read in a view — the `#`s of a heading and the two fence lines of a
-/// code block. Every word is kept; a list keeps its marker and only styles it,
-/// because the marker is information; and a link always shows its URL beside
-/// its text, because a dropped URL is data loss. Above all this is a *view*:
+/// does not read in a view — the `#`s of a heading, the `>` a quote's bar
+/// replaced, the two fence lines of a code block, and the delimiter row a
+/// table's separator replaced. Every word is kept: a table keeps every cell's
+/// text (a long cell wraps, it is never cut), a list keeps its marker and only
+/// styles it, because the marker is information; and a link always shows its URL
+/// beside its text, because a dropped URL is data loss. Above all this is a *view*:
 /// what the human copies out of the pane is still the model's own bytes,
 /// because nothing here rewrites the transcript — it only decides how a frame
 /// paints it.
@@ -402,6 +417,25 @@ pub enum RunStyle {
 ///   [`RunStyle::Url`]. The URL's own parentheses are counted, so a wiki link's
 ///   tail is not cut off.
 ///
+/// A span **nests**: its content is read by the same rules, so a strong run may
+/// hold an emphasis run and an emphasis run a strong one. `**a *b* c**` is
+/// strong `a `, emphasis `b`, strong ` c`; `~~old *new*~~` is strike `old `,
+/// emphasis `new`; a code span inside a strong one is still a code span; and a
+/// marker that does not close inside a span is the text it is, so `**a *b**` is
+/// one strong `a *b`. The runs stay a flat [`Vec<Run>`] and a run wears one
+/// style, so nesting on a terminal is *adjacent* runs with the inner style
+/// attached: the outer style is what the content left plain, and an inner
+/// span's own runs keep theirs. One character cannot wear two styles, and the
+/// inner one is the one the writer meant.
+///
+/// A run of three or more asterisks is still **one** strong span: the run is
+/// spent whole by the rule that opens it, so `***bold***` is the strong `bold`
+/// it always was. CommonMark reads that run as an emphasis *around* a strong,
+/// and this view does not read a span it cannot paint — such an emphasis would
+/// cover no character the strong does not, and a character wears one style, so
+/// the nested reading and this one are the same row. The nesting this view
+/// reads is the content's own.
+///
 /// A **run** of a marker is all-or-nothing: a rule spends every marker in the
 /// run it opens or closes with, and a run no rule can spend as a pair is text
 /// exactly as it was typed. So no row ever paints a marker left over from a run
@@ -409,13 +443,48 @@ pub enum RunStyle {
 ///
 /// Block, at the start of a line:
 ///
+/// - three or more `-`, `*` or `_` and nothing else on the line, spaces
+///   between them allowed → a row of `─` across the pane in
+///   [`RunStyle::Rule`]. The line's own characters are scaffolding, like a
+///   heading's `#`s: what the line says is "a break", and the characters it
+///   says it with are not words. `---` directly under a paragraph is the case
+///   worth writing down: CommonMark reads it as a *setext heading*, and this
+///   view deliberately reads it as a rule — a setext heading is still not a
+///   rule here — so `Title` above a `---` is a paragraph and the `---` is a
+///   rule across the pane. The row is exactly `width` columns, so a rule can
+///   never paint past the narrowest pane.
 /// - one, two or three `#`s and a space → [`RunStyle::Heading`]. The `#`s and
 ///   that one space are not painted: the heading's style says what they said.
 ///   Four or more `#`s, or a `#` with no space after it, are text.
+/// - a line whose first non-space text is `>` → the `>` and the one space that
+///   may follow it become `│ ` in [`RunStyle::Quote`], and the quoted words
+///   follow it as they were typed. The bar is not the `>`: in a coding tool a
+///   `>` at the head of a line reads as a shell redirect, and a quote is not a
+///   command — the same reason the words are kept, since the quote is
+///   something a human wrote and this is a view of it, not an edit. `>text`
+///   with no space is the same quote as `> text`: the space is the marker's
+///   separator, not a word. The source's own indentation is kept, because an
+///   indented `> ` is a quote inside a list item and moving it to column 0
+///   would move it out of the item it belongs to. A second `>` is text
+///   exactly as it is — `> > x` is `│ > x` — because this view reads one
+///   marker per line, and a bar for the inner one would be a nesting there is
+///   no layout for.
 /// - `- `, `* `, `+ `, or `1. `–`99. ` → the marker keeps its place and is
 ///   styled [`RunStyle::Bullet`]. A marker with no space after it is not one,
 ///   and an ordered marker is at most two digits, because `1998. It was a good
 ///   year` opens a sentence, not a list.
+/// - a `- `, `* ` or `+ ` item whose own text begins with `[ ]`, `[x]` or
+///   `[X]` and a space → the checkbox paints as `☐` or `☑` in
+///   [`RunStyle::Bullet`], the marker's own style. Two brackets and the space
+///   between them say what one box says, so the box says "checkbox" in one
+///   column where the source spelled it in three; a box is a fact about the
+///   item, and it is painted rather than dropped for the same reason the
+///   marker is. Everything that is not a checkbox is text exactly as typed:
+///   `[]` has no state, `[y]` is not a state this view knows, `[ ]` with no
+///   words after it would be a box nobody wrote, and a `[ ]` with no list
+///   marker is a line of text. `1. [ ] task` is not one either: this view's
+///   boxes belong to the unordered markers, because the ordered ones are
+///   where an item sits and the box is what it is.
 /// - a line whose first non-space text is three backticks opens a fenced block,
 ///   and the next such line closes it. The fence lines of a block with a body
 ///   are not painted and everything between them is [`RunStyle::Fence`], one
@@ -425,6 +494,49 @@ pub enum RunStyle {
 ///   is a turn the human can see (finding D14). A fence that never closes runs
 ///   to the end of the message: an unterminated block is still a block, and the
 ///   code in it is still code.
+///
+/// Block, over more than one line — the one rule whose block is read as a
+/// block:
+///
+/// - a **table** is a row whose next line is a *delimiter row* — every cell of
+///   that line is `:?-+:?`, with or without the outer pipes — and its body is
+///   every line after the delimiter that still looks like a row (it holds a
+///   `|` and is not a fence). A row with no delimiter under it is text, a
+///   delimiter row with no row above it is text, and the first line that is
+///   not a row ends the table. A delimiter row that is itself a rule is the
+///   **rule** the rule sentence promises: a bare `---` under `Title` is a
+///   break and `Title` stays a paragraph, exactly as the setext note says. A
+///   header that could also be read as another block — a line that begins `> `
+///   or `- ` and holds a `|` — is read as the table, because the delimiter row
+///   under it can be explained no other way.
+///
+///   The columns' widths are a fact about the whole block, so the walk buffers
+///   a table and paints it at the pane's own width: **the columns fill the
+///   pane exactly** — the cells' widths plus the ` │ ` between them sum to
+///   `width` — and a cell wraps inside its own column with the module's own
+///   wrap, so no row of a table is wider than the pane it is read on. No
+///   cell's text is dropped or truncated: a row with fewer cells than the
+///   header pads with empty ones, a row with more folds its extra cells into
+///   the last column, joined by the `|` the source separated them with —
+///   folding keeps the words where dropping them would not — and a pane too
+///   narrow for the table's columns folds them the same way, one level up. The
+///   alignment comes from the delimiter row — `:---` left, `:---:` center,
+///   `---:` right and `---` left, with a column the delimiter does not name
+///   left-aligned — and the padding spaces are the whole of it.
+///
+///   The delimiter row paints **no row of its own**: the `─┼─` separator is
+///   the header's underline, drawn in [`RunStyle::Rule`] and counted with the
+///   header's own source line, so [`markdown_row_counts`] stays one entry per
+///   source line and its total stays the number of painted rows (finding D14).
+///   The pane's stop map and the selection ride on that map exactly as they
+///   did before there were tables, and the selection still copies the *source*
+///   bytes: nothing about copy changes.
+///
+///   A `|` inside a `` `code span` `` and a `\|` are not cell boundaries; the
+///   backslash that escapes a pipe is scaffolding, and the cell paints the `|`
+///   it protected. A cell's text is read by the inline rules like any other
+///   words — `**bold**` inside a cell is a strong run — and the bar between two
+///   columns is layout, painted plain.
 ///
 /// An mark that never closes is **text**: `**bold` is `**bold`, a lone `*` is a
 /// lone `*`, and a `[link](` with no `)` is the characters it is. Nothing is
@@ -438,11 +550,42 @@ pub enum RunStyle {
 /// cannot fit a row by itself. A rendered row therefore does not outgrow
 /// `width` — one glyph (or one tab, four columns at once) wider than the whole
 /// width is the only thing a row cannot honour, and a pane's body is never that
-/// narrow. The wrap is the plain wrapper's wrap, exactly: the same break
-/// points, the same tab stop, and the same tail on every break — the spaces
-/// the break happened at, and no other character, a no-break space included
-/// (finding B14) — with the styles attached, so a row is the row the plain
-/// wrapper would have made of the text the rules above left.
+/// narrow.
+///
+/// The one thing a block marker changes is where a wrapped row *starts*: a line
+/// a rule opened with a marker — an item's `- ` or `1. `, a task item's `- ☐ `,
+/// a quote's `│ ` — wraps the line's own *text* in the columns the marker
+/// leaves, and every row after the first leads with the marker's own width of
+/// blank. So the continuation of
+///
+/// ```text
+/// - a bullet whose text is long enough to wrap
+/// over here
+/// ```
+///
+/// is
+///
+/// ```text
+/// - a bullet whose text is long enough to
+///   wrap over here
+/// ```
+///
+/// and not a row that begins in column 0 under nothing. The margin is the
+/// marker's own width, so `1. ` hangs three columns and `10. ` four, each
+/// under the text the marker introduced.
+///
+/// The wrap is still the plain wrapper's wrap, exactly — the same break
+/// points, the same tab stop, and the same tail on every break (finding B14) —
+/// with two amendments, both of which are the same rule read where the marker
+/// is: the text wrapped is the text the rules above left *after* the marker,
+/// at the columns the marker leaves, and the marker is a margin on every
+/// continuation row. The margin is a column the text was given, not a second
+/// wrapping rule: the break points, the tab stop and the tail are
+/// [`wrap_text`]'s, one margin over. A marker that leaves no column for the
+/// text — as wide as the pane, or wider — and a glyph wider than the columns a
+/// margin left are not margins: both fall back to the plain wrapper's wrap of
+/// the marker and the text together, so every character is still painted and
+/// no row outgrows the width.
 pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
     markdown_walk(text, width).0
 }
@@ -453,8 +596,10 @@ pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
 ///
 /// The map a caller that tags painted rows with their source line needs: the
 /// pane's stop map cannot count a fence line's rows off the source, because a
-/// fence line paints a row only when its block has no body, and only the walk
-/// that paints the rows knows that. Asking the same walk for both answers is
+/// fence line paints a row only when its block has no body, and it cannot count
+/// a table's either, because a table's delimiter line paints nothing by itself
+/// and the separator under the header is counted with the header. Only the walk
+/// that paints the rows knows both. Asking the same walk for both answers is
 /// what keeps the map from drifting off the screen — a second count with a
 /// restated rule is the drift this exists to prevent (finding D14).
 ///
@@ -473,8 +618,17 @@ fn markdown_walk(text: &str, width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let mut counts = Vec::with_capacity(lines.len());
     let mut at = 0;
     while at < lines.len() {
+        // A table is the one block whose columns are a fact about more than one
+        // line, so it is read and painted whole ([`table_end`]).
+        if let Some(end) = table_end(&lines, at) {
+            let (rows, block) = table(&lines[at..end], width);
+            out.extend(rows);
+            counts.extend(block);
+            at = end;
+            continue;
+        }
         if !fence_line(&lines[at]) {
-            let rows = wrap_runs(&block(&lines[at]), width);
+            let rows = wrap_block(&block(&lines[at], width), width);
             counts.push(rows.len());
             out.extend(rows);
             at += 1;
@@ -551,9 +705,43 @@ fn fence_line(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 
-/// One source line, parsed before it is wrapped: a heading, a list item, or
-/// whatever the inline rules make of it.
-fn block(line: &str) -> Vec<Run> {
+/// One source line, parsed before it is wrapped: a rule, a heading, a list
+/// item, or whatever the inline rules make of it.
+fn block(line: &str, width: usize) -> Block {
+    if rule_line(line) {
+        // The one run the view writes itself. A rule is a line across the
+        // pane, not the characters a model typed to ask for one: `-`, `*` and
+        // `_` are how markdown spells it, and painting them would show the
+        // spelling instead of the break. The pane's width is the only width
+        // the row can honour, so it is the width the row is built at — and it
+        // is then wrapped like any other run, which is one row of exactly
+        // `width` columns because `─` is one column.
+        return Block {
+            marker: Vec::new(),
+            content: vec![Run {
+                text: "─".repeat(width),
+                style: RunStyle::Rule,
+            }],
+        };
+    }
+    if let Some((indent, text)) = quote(line) {
+        let bar = if text.is_empty() { "│" } else { "│ " };
+        let mut marker = Vec::with_capacity(2);
+        if !indent.is_empty() {
+            marker.push(Run {
+                text: indent.to_string(),
+                style: RunStyle::Plain,
+            });
+        }
+        marker.push(Run {
+            text: bar.to_string(),
+            style: RunStyle::Quote,
+        });
+        return Block {
+            marker,
+            content: inline(text),
+        };
+    }
     if let Some((level, text)) = heading(line) {
         // The heading's style is the whole heading: a marker inside it is read
         // (so `## **Title**` does not paint its asterisks) but the runs all
@@ -562,17 +750,74 @@ fn block(line: &str) -> Vec<Run> {
         for run in &mut runs {
             run.style = RunStyle::Heading(level);
         }
-        return runs;
+        return Block {
+            marker: Vec::new(),
+            content: runs,
+        };
     }
     if let Some((marker, text)) = list_marker(line) {
-        let mut runs = vec![Run {
-            text: marker.to_string(),
+        // The marker and the one space after it lead the first row; the space
+        // is part of the marker because it is what a wrapped row hangs under.
+        let mut leading = vec![Run {
+            text: format!("{marker} "),
             style: RunStyle::Bullet,
         }];
-        runs.extend(inline(text));
-        return runs;
+        let rest = &text[1..];
+        if let Some((box_char, rest)) = checkbox(marker, text) {
+            // The brackets and the space between them are scaffolding: the box
+            // is the same fact in one column, and the box's own space is what
+            // the item's words hang under.
+            leading.push(Run {
+                text: format!("{box_char} "),
+                style: RunStyle::Bullet,
+            });
+            return Block {
+                marker: leading,
+                content: inline(rest),
+            };
+        }
+        return Block {
+            marker: leading,
+            content: inline(rest),
+        };
     }
-    inline(line)
+    Block {
+        marker: Vec::new(),
+        content: inline(line),
+    }
+}
+
+/// Whether a line is a horizontal rule: three or more `-`, `*` or `_` and
+/// nothing else, spaces between them allowed.
+///
+/// The same character all the way across, which is CommonMark's rule and the
+/// only reading that cannot be confused with text: `- * -` is prose about
+/// bullets, not a break. Two markers are not a rule — `--` is a longer
+/// hyphen, `**` an unclosed strong — and neither is a marker run with anything
+/// beside it. A rule line is checked before every other block rule because it
+/// is the one that would otherwise be read as something else: `* * *` is a
+/// bullet whose item is `* *` by the list rule, and CommonMark reads it as a
+/// break.
+fn rule_line(line: &str) -> bool {
+    let rest = line.trim();
+    let mut chars = rest.chars();
+    let Some(marker) = chars.next() else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+    chars.all(|ch| ch == marker || ch == ' ')
+        && rest.chars().filter(|ch| *ch == marker).count() >= 3
+}
+
+/// `> quoted`, `>quoted`: the source's own indentation and the text after the
+/// marker — the marker's one optional space is not part of the text, since a
+/// quote's words start at the first character that is not the marker.
+fn quote(line: &str) -> Option<(&str, &str)> {
+    let indent = line.len() - line.trim_start().len();
+    let body = line[indent..].strip_prefix('>')?;
+    Some((&line[..indent], body.strip_prefix(' ').unwrap_or(body)))
 }
 
 /// `# Title`, `## Title`, `### Title`: the level and the text after one space.
@@ -603,12 +848,47 @@ fn list_marker(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// The box a task-list item's `[ ]`/`[x]`/`[X]` names, and the item's own
+/// words after it — `None` for everything that is not a checkbox.
+///
+/// `marker` is the marker the item opened with: a box belongs to the unordered
+/// markers, because an ordered item already says where it sits and the box is
+/// what it is.
+///
+/// `text` is what [`list_marker`] left: the one space that separates the marker
+/// from the item's text, then the text. So the form read here is ` [ ] words`:
+/// `[`, one state character, `]`, one space, and at least one word after it. A
+/// box with nothing after it is not one — there is nothing for it to be about —
+/// and the state must be one a box can say, so `[]`, `[y]` and ` [ ]` are the
+/// characters they are.
+fn checkbox<'a>(marker: &str, text: &'a str) -> Option<(char, &'a str)> {
+    if !matches!(marker, "-" | "*" | "+") {
+        return None;
+    }
+    let rest = text.strip_prefix(" [")?;
+    let state = rest.chars().next()?;
+    let rest = &rest[state.len_utf8()..];
+    let box_char = match state {
+        ' ' => '☐',
+        'x' | 'X' => '☑',
+        _ => return None,
+    };
+    let rest = rest.strip_prefix("] ")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some((box_char, rest))
+}
+
 /// One source line's inline markers: plain text, spans, and links, in order.
 ///
-/// No nesting and no escapes: inside a span the text is the text, so
-/// `**a *b**` is strong text that happens to hold a star. That is the small
-/// version on purpose — a recursive parser is where a chat reply stops being a
-/// reading.
+/// A span's content is read by this same scanner — that is what nesting is —
+/// so `**a *b* c**` is three runs and `**a *b**` is one: the content's own
+/// markers are read where they stand, and a marker that does not close inside
+/// the span is the text it is. Two spans do not nest into their own content:
+/// a code span's text is code, so its backticks and asterisks are the
+/// characters they are, and a link's text is one link, because the URL beside
+/// it is the fact the pair exists to carry.
 fn inline(line: &str) -> Vec<Run> {
     let chars: Vec<char> = line.chars().collect();
     let mut runs: Vec<Run> = Vec::new();
@@ -637,6 +917,24 @@ fn inline(line: &str) -> Vec<Run> {
             text: plain,
             style: RunStyle::Plain,
         });
+    }
+    runs
+}
+
+/// The runs a span's content made, with the span's own style worn by every run
+/// the content left plain.
+///
+/// This is all "nesting" can mean on a terminal: a [`Run`] wears one style, so
+/// an outer span is the style of the content's plain runs and an inner span
+/// keeps its own — the two are *adjacent* runs, not two styles on one
+/// character. The inner style is the one the writer meant, so it is the one
+/// that survives where the two would overlap.
+fn nested(content: &str, style: RunStyle) -> Vec<Run> {
+    let mut runs = inline(content);
+    for run in &mut runs {
+        if run.style == RunStyle::Plain {
+            run.style = style;
+        }
     }
     runs
 }
@@ -682,13 +980,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 (RunStyle::Strong, Closer::Run)
             };
             close(chars, i + open, '*', closer).map(|(end, len)| {
-                (
-                    end + len,
-                    vec![Run {
-                        text: chars[i + open..end].iter().collect(),
-                        style,
-                    }],
-                )
+                let text: String = chars[i + open..end].iter().collect();
+                (end + len, nested(&text, style))
             })
         }
         '~' => {
@@ -697,13 +990,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 return None;
             }
             close(chars, i + open, '~', Closer::Run).map(|(end, len)| {
-                (
-                    end + len,
-                    vec![Run {
-                        text: chars[i + open..end].iter().collect(),
-                        style: RunStyle::Strike,
-                    }],
-                )
+                let text: String = chars[i + open..end].iter().collect();
+                (end + len, nested(&text, RunStyle::Strike))
             })
         }
         '_' if underscore_opens(chars, i) => {
@@ -713,13 +1001,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 if matches!(chars.get(end + len), Some(ch) if *ch == '_' || ch.is_alphanumeric()) {
                     return None;
                 }
-                Some((
-                    end + len,
-                    vec![Run {
-                        text: chars[i + 1..end].iter().collect(),
-                        style: RunStyle::Emphasis,
-                    }],
-                ))
+                let text: String = chars[i + 1..end].iter().collect();
+                Some((end + len, nested(&text, RunStyle::Emphasis)))
             })
         }
         '[' => link(chars, i).map(|(end, text, url)| {
@@ -845,6 +1128,315 @@ fn link(chars: &[char], open: usize) -> Option<(usize, String, String)> {
         i += 1;
     }
     None
+}
+
+/// One source line, parsed before it is wrapped: the runs that lead the line
+/// and the runs the line is about.
+///
+/// The split exists for one reason: a wrapped row must not start in column 0
+/// when the line above it started under a marker. `marker` is what the first
+/// row leads with — a list's `- `, a task item's `- ☐ `, a quote's `│ `, a
+/// chosen block's indentation — and its own width is the margin every row
+/// after the first hangs under ([`wrap_block`]). A line without a marker has
+/// an empty `marker` and wraps exactly as it always did.
+struct Block {
+    marker: Vec<Run>,
+    content: Vec<Run>,
+}
+
+/// [`wrap_runs`] over one parsed line: the content wraps in the columns the
+/// marker leaves, the marker leads the first row, and every row after it leads
+/// with the marker's own width of blank — so a wrapped item's continuation
+/// sits under the item's text and not under the marker.
+///
+/// A margin is only a margin when it leaves a column for the words. A marker
+/// as wide as the pane (or wider) would leave none, and a single glyph wider
+/// than the columns the margin left — a two-column glyph in a
+/// one-column budget — cannot be honoured by any break. Both cases fall back
+/// to the plain wrapper's wrap of the marker and the content together: nothing
+/// is dropped, the marker is still painted, and every row stays inside the
+/// width.
+fn wrap_block(block: &Block, width: usize) -> Vec<Vec<Run>> {
+    let width = width.max(1);
+    let margin = runs_width(&block.marker);
+    if margin > 0 && margin < width {
+        let budget = width - margin;
+        let rows = wrap_runs(&block.content, budget);
+        if rows.iter().all(|row| runs_width(row) <= budget) {
+            return rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut out = if index == 0 {
+                        block.marker.clone()
+                    } else {
+                        vec![Run {
+                            text: " ".repeat(margin),
+                            style: RunStyle::Plain,
+                        }]
+                    };
+                    out.extend(row);
+                    out
+                })
+                .collect();
+        }
+    }
+    let mut runs = block.marker.clone();
+    runs.extend(block.content.iter().cloned());
+    wrap_runs(&runs, width)
+}
+
+/// The columns a run sequence takes, by [`wrap_runs`]' own arithmetic: a tab
+/// is four columns, a glyph is its own width, and a character the width is
+/// unknown for is one column. One spelling of the arithmetic beside the
+/// wrapper's, because the marker's margin and a table's padding both measure
+/// the runs the wrapper will paint.
+fn runs_width(runs: &[Run]) -> usize {
+    runs.iter()
+        .flat_map(|run| run.text.chars())
+        .map(|ch| {
+            if ch == '\t' {
+                4
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+            }
+        })
+        .sum()
+}
+
+/// One column's alignment, as its delimiter row spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Align {
+    /// `---` and `:---`.
+    Left,
+    /// `:---:`.
+    Center,
+    /// `---:`.
+    Right,
+}
+
+/// Whether a line looks like a table row: it holds a `|` and it is not a fence.
+///
+/// The `|` is the only thing that makes a line a row, because it is the only
+/// thing that makes it a table: a line without one has no cells to speak of,
+/// and a fence line opens a block of code this view reads as code — a table is
+/// not allowed to swallow it.
+fn is_row(line: &str) -> bool {
+    line.contains('|') && !fence_line(line)
+}
+
+/// One row's cells, in order: the text between the `|`s that are cell
+/// boundaries, each trimmed of the spaces that pad the column.
+///
+/// Not every `|` is a boundary: one inside a `` `code span` `` is the code's own
+/// character, and one a `\` escapes is the cell's own too — the backslash is
+/// scaffolding and is dropped, because a view that reads the `|` as content
+/// must not paint the escape that said so (the `\` of any other escape is the
+/// text's). A `|` at either end of the line is the row's own outer pipe and not
+/// a cell, which is why a row may be written `| a | b |` or `a | b` and mean the
+/// same two cells.
+fn cells(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut code = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                code = !code;
+                cell.push(ch);
+            }
+            '\\' if !code && chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' if !code => out.push(std::mem::take(&mut cell)),
+            _ => cell.push(ch),
+        }
+    }
+    out.push(cell);
+    if out.len() > 1 && out.first().is_some_and(|cell| cell.trim().is_empty()) {
+        out.remove(0);
+    }
+    if out.len() > 1 && out.last().is_some_and(|cell| cell.trim().is_empty()) {
+        out.pop();
+    }
+    out.iter().map(|cell| cell.trim().to_string()).collect()
+}
+
+/// The alignment each of a delimiter row's cells names, or `None` when the line
+/// is not a delimiter row: every cell must be `:?-+:?`, which is CommonMark's
+/// spelling.
+fn delimiter_row(line: &str) -> Option<Vec<Align>> {
+    let cells = cells(line);
+    let mut align = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let core = cell.strip_prefix(':').unwrap_or(cell);
+        let core = core.strip_suffix(':').unwrap_or(core);
+        if core.is_empty() || !core.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        align.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    Some(align)
+}
+
+/// Where the table that starts at `lines[at]` ends, or `None` when no table
+/// starts there.
+///
+/// A table is recognised by its **delimiter row**: a row whose next line has
+/// `:?-+:?` in every cell. So a row with no delimiter under it is text, and a
+/// delimiter row with no row above it is text too — a table is a fact about
+/// two lines at least. A delimiter row that is itself a rule (a bare `---`
+/// under a paragraph) is the *rule* the rule sentence promises: that reading is
+/// unconditional, so a setext heading stays a paragraph here.
+///
+/// The body is every line after the delimiter that still looks like a row
+/// ([`is_row`]); the first line that does not ends the table.
+fn table_end(lines: &[String], at: usize) -> Option<usize> {
+    if !is_row(&lines[at]) {
+        return None;
+    }
+    let delimiter = lines.get(at + 1)?;
+    if rule_line(delimiter) || delimiter_row(delimiter).is_none() {
+        return None;
+    }
+    let mut end = at + 2;
+    while end < lines.len() && is_row(&lines[end]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// One row's cells brought to `columns` of them: a short row pads with empty
+/// cells, a long one folds its extra cells into the last column, joined by the
+/// `|` the source separated them with.
+///
+/// Folding beats dropping because the view is additive: a row a model wrote
+/// with more cells than its header is still the row the model wrote, and the
+/// only alternative that keeps its words is to keep the cell that holds them.
+/// The same fold serves a pane too narrow for the table's columns, one level
+/// up: what does not fit in a column of its own goes in the last column there
+/// is.
+fn fit_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
+    if cells.len() > columns {
+        let tail = cells.split_off(columns - 1);
+        cells.push(tail.join(" | "));
+    }
+    cells.resize(columns, String::new());
+    cells
+}
+
+/// One table's block: the painted rows and the row count of every source line
+/// in it.
+///
+/// `source` is the block [`table_end`] found: the header, the delimiter row and
+/// the body rows, in order. The header says how many columns the table has; the
+/// delimiter row says how they lean, and a delimiter that names fewer columns
+/// leaves the rest left-aligned, as a bare `---` does.
+///
+/// Every row of the table is one of these, painted to the pane: the cells share
+/// the width fairly, each cell wraps inside its own column with the module's
+/// own wrap ([`wrap_runs`]) and is padded to the column's width with the spaces
+/// its alignment asks for, and the `│` between two columns is layout, painted
+/// plain. A cell that wrapped gets one physical row per row of its own text —
+/// the row is as tall as its tallest cell — so nothing a cell holds is dropped
+/// and no row outgrows the width.
+fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
+    let header = cells(&source[0]);
+    let columns = header.len().max(1);
+    let mut align = delimiter_row(&source[1]).unwrap_or_default();
+    align.resize(columns, Align::Left);
+    // The pane may not be able to hold every column: the separator and one
+    // column each cost four pane columns a column, so a narrower pane folds the
+    // columns that do not fit into the last one — the same fold a row's extra
+    // cells take, for the same reason.
+    let painted = columns.min(width.div_ceil(4)).max(1);
+    align.truncate(painted);
+    let room = width - 3 * (painted - 1);
+    let (base, extra) = (room / painted, room % painted);
+    let widths: Vec<usize> = (0..painted)
+        .map(|column| base + usize::from(column < extra))
+        .collect();
+
+    let row = |cells: Vec<String>| -> Vec<Vec<Run>> {
+        let columns: Vec<Vec<Run>> = fit_cells(cells, painted)
+            .iter()
+            .map(|cell| inline(cell))
+            .collect();
+        let wrapped: Vec<Vec<Vec<Run>>> = columns
+            .iter()
+            .zip(&widths)
+            .map(|(runs, width)| wrap_runs(runs, *width))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        (0..height)
+            .map(|at| {
+                let mut row: Vec<Run> = Vec::new();
+                for (column, rows) in wrapped.iter().enumerate() {
+                    if column > 0 {
+                        row.push(Run {
+                            text: " │ ".to_string(),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                    let content = rows.get(at).cloned().unwrap_or_default();
+                    let pad = widths[column].saturating_sub(runs_width(&content));
+                    let (left, right) = match align[column] {
+                        Align::Left => (0, pad),
+                        Align::Right => (pad, 0),
+                        Align::Center => (pad / 2, pad - pad / 2),
+                    };
+                    if left > 0 {
+                        row.push(Run {
+                            text: " ".repeat(left),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                    row.extend(content);
+                    if right > 0 {
+                        row.push(Run {
+                            text: " ".repeat(right),
+                            style: RunStyle::Plain,
+                        });
+                    }
+                }
+                row
+            })
+            .collect()
+    };
+
+    let mut rows = Vec::new();
+    let mut counts = Vec::with_capacity(source.len());
+    let header_rows = row(header);
+    // The separator is the header's own underline: it is painted under the
+    // header's rows and counted with the header's source line, so the delimiter
+    // line paints no row of its own — the map is still one entry per source
+    // line and its total is still the number of painted rows (finding D14).
+    counts.push(header_rows.len() + 1);
+    rows.extend(header_rows);
+    let mut line = String::new();
+    for (column, width) in widths.iter().enumerate() {
+        if column > 0 {
+            line.push_str("─┼─");
+        }
+        line.push_str(&"─".repeat(*width));
+    }
+    rows.push(vec![Run {
+        text: line,
+        style: RunStyle::Rule,
+    }]);
+    counts.push(0);
+    for source in &source[2..] {
+        let painted = row(cells(source));
+        counts.push(painted.len());
+        rows.extend(painted);
+    }
+    (rows, counts)
 }
 
 /// [`wrap_text`] over styled runs: the same rows, each row split into runs of
@@ -1473,6 +2065,32 @@ mod tests {
             .collect()
     }
 
+    /// Assert a row never paints past `width`. The one exception the module
+    /// states is a glyph wider than the whole width — a two-column glyph at a
+    /// one-column pane — which no break can honour.
+    fn assert_row_fits(row: &[Run], width: usize, what: &str) {
+        let columns = runs_width(row);
+        if columns <= width {
+            return;
+        }
+        let widest = row
+            .iter()
+            .flat_map(|run| run.text.chars())
+            .map(|ch| {
+                if ch == '\t' {
+                    4
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+                }
+            })
+            .max()
+            .unwrap_or(1);
+        assert!(
+            widest > width,
+            "{what} @ {width}: {row:?} is {columns} columns"
+        );
+    }
+
     /// Every string of length 1..=`max_len` over `alphabet`, in order. The
     /// equality test's fuzz is generated rather than typed out, so its
     /// alphabet is readable and its reach is exact (finding B14).
@@ -1612,17 +2230,19 @@ mod tests {
 
     /// A list keeps its marker and only styles it: the marker is information —
     /// `1.` is where the item sits — so hiding it would lose what the line
-    /// said. A marker needs its space, an ordered one is at most two digits,
-    /// and an indented one is not a marker at all, because there is no nested
-    /// list layout here.
+    /// said. The marker's run carries the one space after it, because that
+    /// space is what a wrapped row hangs under ([`wrap_block`]). A marker
+    /// needs its space, an ordered one is at most two digits, and an indented
+    /// one is not a marker at all, because there is no nested list layout
+    /// here.
     #[test]
     fn a_list_marker_stays_as_its_text_and_only_a_marker_is_styled() {
         for (text, marker) in [("- item", "-"), ("+ item", "+"), ("* item", "*")] {
             assert_eq!(
                 runs(text),
                 vec![
-                    (marker.to_string(), RunStyle::Bullet),
-                    (" item".to_string(), RunStyle::Plain),
+                    (format!("{marker} "), RunStyle::Bullet),
+                    ("item".to_string(), RunStyle::Plain),
                 ],
                 "{text:?} is a bullet"
             );
@@ -1631,8 +2251,8 @@ mod tests {
             assert_eq!(
                 runs(text),
                 vec![
-                    (marker.to_string(), RunStyle::Bullet),
-                    (text[marker.len()..].to_string(), RunStyle::Plain),
+                    (format!("{marker} "), RunStyle::Bullet),
+                    (text[marker.len() + 1..].to_string(), RunStyle::Plain),
                 ],
                 "{text:?} is an item"
             );
@@ -1651,6 +2271,574 @@ mod tests {
                 vec![(text.to_string(), RunStyle::Plain)],
                 "{text:?} was read as a list"
             );
+        }
+    }
+
+    /// A line of three or more `-`, `*` or `_` — nothing else on it, spaces
+    /// between them allowed — is a horizontal rule: the pane draws `─` across
+    /// its own width, and the characters the line was written with are
+    /// scaffolding, like a heading's `#`s.
+    ///
+    /// `---` directly under a paragraph is the case the doc writes down:
+    /// CommonMark reads it as a *setext heading*, and this view deliberately
+    /// reads it as a rule, because a setext heading is not a rule here. The
+    /// row is the pane's width and never a column more, which is what the
+    /// narrowest-pane half of this test is for.
+    #[test]
+    fn a_rule_is_a_row_across_the_pane_and_its_characters_are_scaffolding() {
+        for text in ["---", "- - -", "***", "___", "  ----  ", "- -- -"] {
+            assert_eq!(rows(text, 12), vec!["─".repeat(12)], "{text:?} is a rule");
+            assert_eq!(
+                markdown_rows(text, 12),
+                vec![vec![Run {
+                    text: "─".repeat(12),
+                    style: RunStyle::Rule,
+                }]],
+                "{text:?} is a rule"
+            );
+        }
+        // Two markers are not a rule: `--` is a longer hyphen, `**` an
+        // unclosed strong, `- -` a bullet whose item is a dash — and `- * -`
+        // is prose about two markers, not a break.
+        for text in ["--", "**", "__", "- -", "- * -", "a ---", "--- x", "~~~"] {
+            assert!(
+                rows(text, 12).iter().all(|row| !row.contains('─')),
+                "{text:?} was read as a rule"
+            );
+        }
+        // A rule under a paragraph is still a rule, and a rule is a row the
+        // human can see — one entry in the map, not a source line that paints
+        // nothing.
+        assert_eq!(rows("Title\n---", 6), vec!["Title", "──────"]);
+        assert_eq!(markdown_row_counts("a\n---\nb", 40), vec![1, 1, 1]);
+        // The row is the pane's own width at every pane: a rule can never
+        // paint past the edge it was drawn on.
+        for width in 1..=8usize {
+            assert_eq!(markdown_row_counts("---", width), vec![1]);
+            assert_eq!(
+                markdown_rows("---", width),
+                vec![vec![Run {
+                    text: "─".repeat(width),
+                    style: RunStyle::Rule,
+                }]],
+                "a rule at {width} columns"
+            );
+        }
+    }
+
+    /// A quote's `>` becomes a bar: in a coding tool a `>` at the head of a
+    /// line reads as a shell redirect, and the quote is not a command. The
+    /// quoted words are kept as they were typed — additive, nothing of the
+    /// quote is dropped — `>text` is the same quote as `> text`, the source's
+    /// own indentation is kept (it is a `> ` inside a list), and a second `>`
+    /// stays the character it is.
+    #[test]
+    fn a_quote_is_a_bar_and_the_words_are_untouched() {
+        assert_eq!(
+            runs("> quoted words"),
+            vec![
+                ("│ ".to_string(), RunStyle::Quote),
+                ("quoted words".to_string(), RunStyle::Plain),
+            ]
+        );
+        // No space after the `>`: the same marker, so the same row.
+        assert_eq!(runs(">text"), runs("> text"));
+        // The words inside a quote are read like any other words.
+        assert_eq!(
+            runs("> **bold** words"),
+            vec![
+                ("│ ".to_string(), RunStyle::Quote),
+                ("bold".to_string(), RunStyle::Strong),
+                (" words".to_string(), RunStyle::Plain),
+            ]
+        );
+        // An indented quote is a quote, and it keeps the indent it was
+        // written with: re-indenting it would move it out of its list item.
+        assert_eq!(rows("  > indented", 40), vec!["  │ indented"]);
+        // One marker per line: the inner `>` is the quoter's own character.
+        assert_eq!(rows("> > nested", 40), vec!["│ > nested"]);
+        // A `>` with no words is a row with the bar and nothing after it.
+        assert_eq!(rows(">", 40), vec!["│"]);
+        assert_eq!(rows("> ", 40), vec!["│"]);
+        // The bar is a block rule: a `>` inside a line is the text it is, and
+        // a quote line is one row in the map like any other line.
+        for text in ["a > b", "=> arrow", "# > not a quote"] {
+            assert!(
+                !rows(text, 40)[0].contains('│'),
+                "{text:?} was read as a quote"
+            );
+        }
+        assert_eq!(markdown_row_counts("> a\n> b", 40), vec![1, 1]);
+    }
+
+    /// A task list's checkbox is a box: `[ ]` and `[x]`/`[X]` say one thing in
+    /// three columns, and `☐`/`☑` say it in one, in the bullet's own style.
+    /// The brackets and the space between them are scaffolding. Everything
+    /// that is not a checkbox is text exactly as typed, and a box is one
+    /// column wide because the pane's width arithmetic counts columns.
+    #[test]
+    fn a_task_list_is_a_box_in_the_bullets_style() {
+        for (text, box_char) in [
+            ("- [ ] todo", '☐'),
+            ("- [x] done", '☑'),
+            ("- [X] done", '☑'),
+            ("* [ ] star", '☐'),
+            ("+ [x] plus", '☑'),
+        ] {
+            let words = &text[6..];
+            assert_eq!(
+                runs(text),
+                vec![
+                    (format!("{} ", &text[..1]), RunStyle::Bullet),
+                    (format!("{box_char} "), RunStyle::Bullet),
+                    (words.to_string(), RunStyle::Plain),
+                ],
+                "{text:?} is a task item"
+            );
+        }
+        // The words after the box are read like any other item's.
+        assert_eq!(
+            runs("- [ ] **bold** word"),
+            vec![
+                ("- ".to_string(), RunStyle::Bullet),
+                ("☐ ".to_string(), RunStyle::Bullet),
+                ("bold".to_string(), RunStyle::Strong),
+                (" word".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(rows("- [ ] todo", 40), vec!["- ☐ todo"]);
+        // A box is one column: the row it is painted in counts it as one.
+        assert_eq!(UnicodeWidthStr::width("☐"), 1);
+        assert_eq!(UnicodeWidthStr::width("☑"), 1);
+        // And what is not a checkbox is the characters it is: the brackets
+        // are the item's own text, and the item keeps the marker it had.
+        for (text, marker) in [
+            ("- []", "-"),
+            ("- [y]", "-"),
+            ("- [ ]", "-"),
+            ("- [ ] ", "-"),
+            ("- [x]", "-"),
+            ("- [ ]x", "-"),
+            ("1. [ ] ordered", "1."),
+            ("99. [x] ordered", "99."),
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![
+                    (format!("{marker} "), RunStyle::Bullet),
+                    (text[marker.len() + 1..].to_string(), RunStyle::Plain),
+                ],
+                "{text:?} was read as a task item"
+            );
+        }
+        assert_eq!(
+            runs("[ ] no marker"),
+            vec![("[ ] no marker".to_string(), RunStyle::Plain)]
+        );
+    }
+
+    /// A wrapped item hangs under its own text: the marker is a margin on every
+    /// row after the first, so the continuation of an item starts where the
+    /// item's words start — two columns under `- `, three under `1. `, four
+    /// under `10. ` and under a task item's `- ☐ `, and two under a quote's
+    /// `│ `.
+    ///
+    /// This is the half of finding B14 that moved: the item's wrap is still the
+    /// plain wrapper's wrap — [`wrap_text`] of the item's *text* at the columns
+    /// the marker leaves, the same break points, tab stop and tail — with the
+    /// marker's own width as a left margin on every continuation row. The other
+    /// half is the pin that no row ever outgrows the width: a marker that
+    /// leaves no column for the words is not a margin, and then the line is the
+    /// plain wrapper's wrap of marker and text together.
+    #[test]
+    fn a_wrapped_item_hangs_under_its_own_text() {
+        let text = "a bullet whose text is long enough to wrap";
+        for width in 6..=40usize {
+            let mut want = Vec::new();
+            for (index, row) in wrap_text(text, width - 2).into_iter().enumerate() {
+                want.push(if index == 0 {
+                    format!("- {row}")
+                } else {
+                    format!("  {row}")
+                });
+            }
+            assert_eq!(rows(&format!("- {text}"), width), want, "at {width}");
+        }
+        // A marker's own width is the margin, so what hangs under a number is
+        // the text the number introduced.
+        assert_eq!(
+            rows("1. a first item that wraps", 12),
+            vec!["1. a first", "   item", "   that", "   wraps"]
+        );
+        assert_eq!(
+            rows("10. a tenth item that wraps", 12),
+            vec!["10. a tenth", "    item", "    that", "    wraps"]
+        );
+        assert_eq!(
+            rows("- [ ] a task that wraps", 12),
+            vec!["- ☐ a task", "    that", "    wraps"]
+        );
+        assert_eq!(
+            rows("> a quote that wraps", 12),
+            vec!["│ a quote", "  that wraps"]
+        );
+        // The indentation of a quote inside a list is still the source's, and
+        // it is part of the margin: `  ` then `│ ` is four columns.
+        assert_eq!(
+            rows("  > a quote that wraps", 12),
+            vec!["  │ a quote", "    that", "    wraps"]
+        );
+        // A marker wider than the pane, or a glyph the margin leaves no column
+        // for, is not a margin: the line is the plain wrapper's wrap of marker
+        // and text together — every character painted, no row past the edge.
+        for line in ["99. words", "- 日本語の項目"] {
+            for width in 1..=6usize {
+                for row in markdown_rows(line, width) {
+                    assert_row_fits(&row, width, line);
+                }
+            }
+        }
+        assert_eq!(rows("99. words", 4), wrap_text("99. words", 4));
+        // A marker whose room is real still hangs: at one column more than the
+        // marker, the item's words get that column and the rows line up.
+        assert_eq!(
+            rows("99. words", 5),
+            vec!["99. w", "    o", "    r", "    d", "    s"]
+        );
+        // Every kind of marker this view paints, at every pane: no row outgrows
+        // the width, `width` columns included.
+        for width in 1..=12usize {
+            for line in [
+                "- a long item here",
+                "99. a long item here",
+                "> a long quote here",
+                "  > a long quote here",
+                "- [ ] a long task here",
+                "- 日本語の長い項目です",
+            ] {
+                for row in markdown_rows(line, width) {
+                    assert_row_fits(&row, width, line);
+                }
+            }
+        }
+    }
+
+    /// A span's content is read by the same scanner, so emphasis nests: a
+    /// strong run may hold an emphasis run and the other way round. The runs
+    /// stay flat and a run wears one style, so nesting shows as *adjacent* runs
+    /// with the inner style attached — the outer style is what the content left
+    /// plain, and an inner span keeps its own.
+    #[test]
+    fn emphasis_nests_and_shows_as_adjacent_runs() {
+        assert_eq!(
+            runs("**a *b* c**"),
+            vec![
+                ("a ".to_string(), RunStyle::Strong),
+                ("b".to_string(), RunStyle::Emphasis),
+                (" c".to_string(), RunStyle::Strong),
+            ]
+        );
+        assert_eq!(
+            runs("*a **b** c*"),
+            vec![
+                ("a ".to_string(), RunStyle::Emphasis),
+                ("b".to_string(), RunStyle::Strong),
+                (" c".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        assert_eq!(
+            runs("_a **b** c_"),
+            vec![
+                ("a ".to_string(), RunStyle::Emphasis),
+                ("b".to_string(), RunStyle::Strong),
+                (" c".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        // Strike nests the same way: the words outside the inner span wear the
+        // strike, and the inner span wears its own style.
+        assert_eq!(
+            runs("~~old *new*~~"),
+            vec![
+                ("old ".to_string(), RunStyle::Strike),
+                ("new".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        // A code span inside a strong one is a code span: its backticks are
+        // read, not painted, and its own text is not parsed.
+        assert_eq!(
+            runs("**read `main.rs` now**"),
+            vec![
+                ("read ".to_string(), RunStyle::Strong),
+                ("main.rs".to_string(), RunStyle::Code),
+                (" now".to_string(), RunStyle::Strong),
+            ]
+        );
+        assert_eq!(
+            runs("**a `*b*` c**"),
+            vec![
+                ("a ".to_string(), RunStyle::Strong),
+                ("*b*".to_string(), RunStyle::Code),
+                (" c".to_string(), RunStyle::Strong),
+            ]
+        );
+        // A link inside a span stays a link and its URL.
+        assert_eq!(
+            runs("**see [docs](https://x.dev/a) now**"),
+            vec![
+                ("see ".to_string(), RunStyle::Strong),
+                ("docs".to_string(), RunStyle::Link),
+                (" (https://x.dev/a)".to_string(), RunStyle::Url),
+                (" now".to_string(), RunStyle::Strong),
+            ]
+        );
+        // What the view promised before nesting still holds: a run of three or
+        // more is one strong span spent whole, and a marker that does not close
+        // inside a span is the text it is.
+        assert_eq!(
+            runs("***bold***"),
+            vec![("bold".to_string(), RunStyle::Strong)]
+        );
+        assert_eq!(
+            runs("**a *b**"),
+            vec![("a *b".to_string(), RunStyle::Strong)]
+        );
+        assert_eq!(runs("*a**"), vec![("*a**".to_string(), RunStyle::Plain)]);
+    }
+
+    /// A table is the one block-level rule: the header, the delimiter row and
+    /// the body are read together, because the columns' widths are a fact about
+    /// the whole block. The delimiter row names the alignment, the header says
+    /// how many columns there are, and the `│` between two columns is layout.
+    ///
+    /// A table is painted at the pane's own width: the cells share it fairly and
+    /// a cell wraps inside its own column, so a table is exactly as wide as the
+    /// pane and never wider. The delimiter row paints no row of its own — the
+    /// `─┼─` line is the header's underline and counts with the header — and
+    /// the map is still one entry per source line whose total is the number of
+    /// painted rows (finding D14).
+    #[test]
+    fn a_table_is_painted_at_the_panes_own_width() {
+        let text = "| name | age |\n| :--- | ---: |\n| ana | 3 |\n| bob | 41 |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "name      │      age",
+                "──────────┼─────────",
+                "ana       │        3",
+                "bob       │       41",
+            ]
+        );
+        // The separator wears the rule's own style: it is a line across the
+        // pane, drawn rather than read.
+        assert_eq!(
+            markdown_rows(text, 20)[1],
+            vec![Run {
+                text: "──────────┼─────────".to_string(),
+                style: RunStyle::Rule,
+            }]
+        );
+        // The map: the header's line paints its row and the separator under
+        // it, the delimiter line paints nothing, and each body row paints one.
+        assert_eq!(markdown_row_counts(text, 20), vec![2, 0, 1, 1]);
+        // Nothing is dropped for fitting: the same table paints the same words
+        // at a width where the columns can only be two columns wide.
+        for width in 1..=20usize {
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table");
+            }
+        }
+        for width in 12..=20usize {
+            let flat: String = rows(text, width).join("");
+            for word in ["name", "age", "ana", "bob", "41"] {
+                assert!(flat.contains(word), "{word:?} is gone at {width}: {flat:?}");
+            }
+        }
+    }
+
+    /// The alignment comes from the delimiter row: `:---` left, `:---:` center,
+    /// `---:` right and `---` left. The padding spaces are the whole of the
+    /// mechanism.
+    #[test]
+    fn a_tables_alignment_is_the_delimiter_rows() {
+        let text = "| left | center | right |\n| :--- | :----: | ----: |\n| a | b | c |";
+        let painted = rows(text, 39);
+        assert_eq!(painted[0], "left        │   center    │       right");
+        assert_eq!(painted[1], "────────────┼─────────────┼────────────");
+        assert_eq!(painted[2], "a           │      b      │           c");
+        // A delimiter row without a colon is left-aligned, and a column the
+        // delimiter row does not name is left-aligned too.
+        let text = "| a | b |\n| --- | --- |\n| x | y |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "a         │ b       ",
+                "──────────┼─────────",
+                "x         │ y       "
+            ]
+        );
+    }
+
+    /// A cell wraps inside its own column, and the row is as tall as its
+    /// tallest cell: the cells beside a wrapped one are padded with blanks, and
+    /// a body row that wrapped into six paints six rows in the map.
+    #[test]
+    fn a_wrapped_cell_stays_inside_its_column() {
+        let text = "| a | a cell that must wrap |\n| --- | --- |\n| b | it does |";
+        assert_eq!(
+            rows(text, 20),
+            vec![
+                "a         │ a cell  ",
+                "          │ that    ",
+                "          │ must    ",
+                "          │ wrap    ",
+                "──────────┼─────────",
+                "b         │ it does ",
+            ]
+        );
+        assert_eq!(markdown_row_counts(text, 20), vec![5, 0, 1]);
+    }
+
+    /// A `|` is a cell boundary only where the text says so: inside a code span
+    /// and behind a `\` it is the cell's own character, and the backslash the
+    /// escape is written with is scaffolding — the cell paints the `|` it
+    /// protected, the way a heading paints no `#`.
+    #[test]
+    fn a_pipe_that_is_text_is_not_a_cell_boundary() {
+        let text = "| `a|b` | c |\n| --- | --- |\n| d \\| e | f |";
+        assert_eq!(
+            rows(text, 21),
+            vec![
+                "a|b       │ c        ",
+                "──────────┼──────────",
+                "d | e     │ f        ",
+            ]
+        );
+        assert_eq!(
+            markdown_rows(text, 21)[0],
+            vec![
+                Run {
+                    text: "a|b".to_string(),
+                    style: RunStyle::Code,
+                },
+                Run {
+                    text: "      ".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: " │ ".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: "c".to_string(),
+                    style: RunStyle::Plain,
+                },
+                Run {
+                    text: "        ".to_string(),
+                    style: RunStyle::Plain,
+                },
+            ]
+        );
+        // A cell's words are still words: a marker inside one is read.
+        let text = "| **b** | c |\n| --- | --- |\n";
+        assert_eq!(rows(text, 21)[0], "b         │ c        ");
+    }
+
+    /// A ragged row is still the row it is: a short row pads with empty cells
+    /// and a long one folds its extra cells into the last column, joined by the
+    /// `|` the source separated them with — nothing a row holds is dropped.
+    #[test]
+    fn a_ragged_table_row_keeps_every_cell() {
+        let text = "| a | b |\n| --- | --- |\n| only |\n| x | y | z |";
+        assert_eq!(
+            rows(text, 21),
+            vec![
+                "a         │ b        ",
+                "──────────┼──────────",
+                "only      │          ",
+                "x         │ y | z    ",
+            ]
+        );
+    }
+
+    /// A table needs its delimiter row: a row without one, and a delimiter row
+    /// with nothing above it, are text exactly as typed. `Title` above a bare
+    /// `---` is the rule the rule sentence promises, not a one-column table.
+    #[test]
+    fn a_row_without_a_delimiter_is_text() {
+        for text in [
+            "| a | b |\n| c | d |",
+            "| --- | --- |",
+            "a | b\nnot a delimiter",
+            "| a | b |\n| :-- | nope |",
+        ] {
+            let painted = rows(text, 40);
+            assert!(
+                !painted
+                    .iter()
+                    .any(|row| row.contains('─') || row.contains('┼')),
+                "{text:?} was read as a table: {painted:?}"
+            );
+        }
+        // A delimiter row that names fewer columns than the header is still a
+        // delimiter row: the header says how many columns there are, and the
+        // ones the delimiter does not name are left-aligned, as a bare `---`
+        // is.
+        assert_eq!(
+            markdown_row_counts("| a | b |\n| --- |\n| x | y |", 40),
+            vec![2, 0, 1]
+        );
+        // `| a | b |` above a bare `---`: the `---` is a rule, and the row
+        // above it stays a row of text.
+        assert_eq!(
+            rows("| a | b |\n---", 12),
+            vec!["| a | b |", "────────────"]
+        );
+        // The header itself says the columns: `x | y` without outer pipes is
+        // the same two columns as `| x | y |`.
+        assert_eq!(
+            rows("x | y\n--- | ---\n1 | 2", 21),
+            rows("| x | y |\n| --- | --- |\n| 1 | 2 |", 21)
+        );
+    }
+
+    /// A table at any pane: the columns share the width, cells wrap inside
+    /// them, and the columns a pane cannot hold fold into the last one it can —
+    /// so no row outgrows the width and no cell's words are dropped. A cell
+    /// whose one glyph is wider than its column is the module's one exception.
+    #[test]
+    fn a_table_never_outgrows_the_pane() {
+        let text = "| aa | bb | cc | dd |\n| :-- | :-: | --: | --- |\n| 1 | 2 | 3 | 4 |\n| a much longer cell than that | x | y | z |";
+        for width in 1..=40usize {
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table");
+            }
+        }
+        // Where the columns have room for the words, every word is painted.
+        let flat: String = rows(text, 40).join("");
+        for word in ["aa", "bb", "cc", "dd", "much", "longer"] {
+            assert!(flat.contains(word), "{word:?} is gone at 40: {flat:?}");
+        }
+        // Eight columns at a four-column pane: the fold keeps every cell, and
+        // the one-character cells make the check a check on cells and not on
+        // the words a word-wrap split.
+        let text = "| a | b | c | d | e | f | g | h |\n| - | - | - | - | - | - | - | - |\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |";
+        for row in markdown_rows(text, 4) {
+            assert_row_fits(&row, 4, "a wide table at a narrow pane");
+        }
+        let painted = rows(text, 4);
+        // The pane holds one column, so each source row's cells fold into one
+        // column that wraps: the header paints eight rows and the separator,
+        // the delimiter none, and the body eight.
+        assert_eq!(markdown_row_counts(text, 4), vec![9, 0, 8]);
+        let flat: String = painted
+            .iter()
+            .filter(|row| !row.contains('─'))
+            .cloned()
+            .collect();
+        for cell in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "1", "2", "3", "4", "5", "6", "7", "8",
+        ] {
+            assert!(flat.contains(cell), "{cell:?} is gone: {flat:?}");
         }
     }
 
@@ -1932,10 +3120,10 @@ mod tests {
             );
         }
         // A run beside a space is text, whichever side the space is on; so is a
-        // run of nothing but markers, at the start or the end of a row.
-        for text in [
-            "** a**", "**a **", "~~a ~~", "***a ***", "***", "****", "******",
-        ] {
+        // run of nothing but markers at the *end* of a row. At the start of a
+        // row three or more of one marker are a rule instead — the rule test
+        // pins that reading — so those lines are not in this list.
+        for text in ["** a**", "**a **", "~~a ~~", "***a ***"] {
             assert_eq!(
                 runs(text),
                 vec![(text.to_string(), RunStyle::Plain)],

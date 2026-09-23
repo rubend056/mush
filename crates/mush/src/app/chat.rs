@@ -3053,11 +3053,12 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
 /// new surface cannot invent its own reading of one.
 ///
 /// The palette is the pane's own. Bold, italic and strike are the modifiers a
-/// terminal already has; code, a fence and a link's URL are the dim grey the
-/// pane paints its secondary facts in; a heading is the reply's accent, in
-/// bold, because the heading is the reply's; a link is underlined, and a
-/// bullet's marker — the one part of a row that is layout rather than words —
-/// is the accent too.
+/// terminal already has; code, a fence, a link's URL, a rule and a quote's bar
+/// are the dim grey the pane paints its secondary facts in — a bar is layout
+/// and a rule is the pane's own line, drawn rather than read; a heading is the
+/// reply's accent, in bold, because the heading is the reply's; a link is
+/// underlined, and a bullet's marker — the one part of a row that is layout
+/// rather than words — is the accent too.
 fn reply_style(style: mush_core::text::RunStyle) -> Style {
     use mush_core::text::RunStyle;
     use ratatui::style::Modifier;
@@ -3068,6 +3069,8 @@ fn reply_style(style: mush_core::text::RunStyle) -> Style {
         RunStyle::Emphasis => Style::default().add_modifier(Modifier::ITALIC),
         RunStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
         RunStyle::Code | RunStyle::Fence | RunStyle::Url => Style::default().fg(Color::DarkGray),
+        RunStyle::Rule => dim(),
+        RunStyle::Quote => dim(),
         RunStyle::Heading(_) => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -6713,6 +6716,176 @@ mod tests {
         assert_eq!(code.style.fg, Some(Color::DarkGray));
     }
 
+    /// A rule is the pane's own line: a reply's `---` paints one `─` row,
+    /// exactly as wide as the columns the pane gave the words, in the dim
+    /// style the pane paints its layout in — and none of the source line's
+    /// characters are painted at all.
+    #[test]
+    fn a_rule_is_a_dim_pane_wide_line() {
+        let message = Message::assistant("before\n\n---\n\nafter");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        let painted = shown(&rows);
+        let rule = painted
+            .iter()
+            .position(|row| row.contains('─'))
+            .expect("the rule's row");
+        // `mush › ` leads the reply's first row, and every row after it is
+        // indented by the mark's own width: the rule is the source line's own
+        // row, so what is left of the pane is what it fills.
+        assert_eq!(painted[rule], format!("       {}", "─".repeat(33)));
+        let ink = rows[rule]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('─'))
+            .expect("the rule's run");
+        assert_eq!(ink.style.fg, Some(Color::DarkGray));
+        assert!(
+            !painted.iter().any(|row| row.contains("---")),
+            "the source's own characters are scaffolding: {painted:?}"
+        );
+    }
+
+    /// A quote's bar is dim and the words beside it are not: the `>` a model
+    /// wrote is layout, and in a coding tool it reads as a shell redirect.
+    #[test]
+    fn a_quote_is_a_dim_bar_beside_the_source_of_its_words() {
+        let message = Message::assistant("> quoted words\n\n> **bold** and plain");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        let painted = shown(&rows);
+        assert_eq!(painted[0], "mush › │ quoted words");
+        assert_eq!(painted[2], "       │ bold and plain");
+        let bar = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('│'))
+            .expect("the bar");
+        assert_eq!(bar.style.fg, Some(Color::DarkGray));
+        let bold = rows[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "bold")
+            .expect("the strong span");
+        assert!(bold
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
+    }
+
+    /// A task item's box paints through the pane in the bullet's accent, and
+    /// the box is one column wide where the source's brackets were three.
+    #[test]
+    fn a_task_item_paints_as_a_box_in_the_bullets_accent() {
+        let message = Message::assistant("- [ ] todo\n- [x] done");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "mush › - ☐ todo".to_string(),
+                "       - ☑ done".to_string(),
+                String::new(),
+            ]
+        );
+        let box_span = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "☐ ")
+            .expect("the box");
+        assert_eq!(box_span.style.fg, Some(Color::Green));
+        assert!(
+            !shown(&rows).iter().any(|row| row.contains('[')),
+            "the brackets are scaffolding"
+        );
+    }
+
+    /// Nested emphasis reaches the frame as adjacent spans: the outer style on
+    /// the words it holds, the inner style on the run it marks, and the outer
+    /// style again after it — one style per span, which is what nesting is on
+    /// a terminal.
+    #[test]
+    fn nested_emphasis_paints_as_adjacent_spans() {
+        let message = Message::assistant("**a *b* c**");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        assert_eq!(shown(&rows)[0], "mush › a b c");
+        let spans: Vec<(&str, bool, bool)> = rows[0]
+            .spans
+            .iter()
+            .map(|span| {
+                let modifier = span.style.add_modifier;
+                (
+                    span.content.as_ref(),
+                    modifier.contains(ratatui::style::Modifier::BOLD),
+                    modifier.contains(ratatui::style::Modifier::ITALIC),
+                )
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("mush › ", false, false),
+                ("a ", true, false),
+                ("b", false, true),
+                (" c", true, false),
+            ]
+        );
+    }
+
+    /// A table reaches the frame the human reads: the header, the separator and
+    /// the body are painted as rows of the pane — the separator in the rule's
+    /// dim, since it is a line the pane draws and not words — and the reply's
+    /// own bytes are left alone.
+    #[test]
+    fn a_table_is_painted_through_the_pane() {
+        let source = "| name | age |\n| :--- | ---: |\n| ana | 3 |";
+        let message = Message::assistant(source);
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 20, false, Fold::DEFAULT, &[]);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "mush › name  │   age".to_string(),
+                "       ──────┼──────".to_string(),
+                "       ana   │     3".to_string(),
+                String::new(),
+            ]
+        );
+        let separator = rows[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('─'))
+            .expect("the separator");
+        assert_eq!(separator.style.fg, Some(Color::DarkGray));
+        assert!(
+            !shown(&rows).iter().any(|row| row.contains('|')),
+            "the source's own pipes are scaffolding: {:?}",
+            shown(&rows)
+        );
+        assert_eq!(
+            message.text(),
+            source,
+            "the transcript keeps the source bytes"
+        );
+
+        // And through a real pane, stops and all: the select mode's map is built
+        // from the same walk that paints the rows, and a table the map counted
+        // wrong would take the frame down there (`mark_rows`'
+        // `debug_assert`), so painting one is the check.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant(source));
+        let painted = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 20, 8));
+        assert!(
+            painted.iter().any(|row| row.contains('┼')),
+            "the separator is painted: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|row| row.contains("ana")),
+            "the body is painted: {painted:?}"
+        );
+    }
+
     /// A tool result is data, not prose: its bytes are what the human copies
     /// out — a diff, a test log, a shell transcript — so the view does not
     /// touch it. A `#` in such a line is a comment, an `*` is a glob and
@@ -6802,17 +6975,14 @@ mod tests {
                     UnicodeWidthStr::width(row.as_str())
                 );
             }
-            // The view's margin on a wrapped row is the mark's own columns;
-            // strip it so the check reads the reply's words and not the
-            // layout the pane wraps every voice in.
-            let lead = if width >= "mush › ".width() + MIN_BODY {
-                "mush › ".width()
-            } else {
-                0
-            };
+            // The view's margins on a wrapped row are layout: the mark's own
+            // columns on a continuation of the voice, and a list item's
+            // marker width on a continuation of the item ([`wrap_block`]).
+            // Trim each row's leading layout so the check reads the reply's
+            // words rather than the columns the pane hangs them in.
             let flat: String = painted
                 .iter()
-                .map(|row| row.strip_prefix(&" ".repeat(lead)).unwrap_or(row))
+                .map(|row| row.trim_start())
                 .collect::<Vec<_>>()
                 .concat();
             assert!(
