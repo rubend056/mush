@@ -1203,10 +1203,23 @@ impl AgentTree {
     /// cannot keep: the thread is what vanished, and the copy of the
     /// conversation left on screen is where it would have to resume from
     /// (`docs/findings.md` H2, F6).
+    ///
+    /// A parent is owed a read exactly as it is for a stop, and for the same
+    /// reason: the dying thread filed `#N cut off: the run never ended —
+    /// nothing was committed` into its parent's books as its last act
+    /// (`agent::file_death`), and the parent's fold is what writes that line
+    /// into the model's transcript. So "unread" is the truth about the row
+    /// until the fold, and it is also what keeps the row and the transcript
+    /// alive for it: unmarked, the row is droppable, the next tick's reap
+    /// takes it, and the `ForgetChild` the reap sends lands behind the
+    /// `ChildDone` in the same mailbox — where the parent's one drain pass
+    /// erases the completion before the fold finds it (finding R7).
     pub fn cut_off(&mut self, id: AgentId) {
         if let Some(node) = self.node_mut(id) {
+            let unread = node.parent.is_some();
             node.phase = Phase::CutOff;
             node.since = Instant::now();
+            node.result_unread = unread;
         }
         self.agent_cancel.remove(&id);
     }
@@ -3152,6 +3165,44 @@ mod tests {
         assert!(
             !parkable.contains(&AgentId(2)),
             "and the re-armed one's may not: {parkable:?}"
+        );
+    }
+
+    /// The audit's R7: a child cut off mid-run is owed the read a stopped one
+    /// is, and the `✉` is what keeps its row until that read.
+    ///
+    /// The thread that died filed `ChildDone { CUT_OFF_RUN, CutOff }` for its
+    /// parent as its last act (`agent::file_death`), so the parent's fold has a
+    /// `#N cut off: …` line coming. The unread mark is the truth about the row
+    /// until that fold — and it is also one of the ways [`AgentTree::kept`]
+    /// refuses the history window: without it the next tick's reap drops the
+    /// node and the transcript, and the `ForgetChild` the reap sends lands
+    /// behind the `ChildDone` in the parent's mailbox and erases the line
+    /// before the fold finds it (finding R7).
+    #[test]
+    fn a_cut_off_child_keeps_its_row_until_its_parent_reads_it() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=52).map(|id| finished(&mut tree, id)).collect();
+        // #1 died mid-run: the row is `⚠` and its parent has a line coming it
+        // has not read.
+        tree.cut_off(AgentId(1));
+        assert!(
+            tree.node(AgentId(1)).unwrap().result_unread,
+            "the parent is owed the cut-off line, so the row is unread"
+        );
+
+        let gone = tree.past_history();
+        assert!(
+            !gone.contains(&AgentId(1)),
+            "the row a parent owes a read is not forgotten: {gone:?}"
+        );
+
+        // The read arrives — the parent's fold is what sends it — and only
+        // then does the oldest row become the window's to forget again.
+        tree.result_read(AgentId(1));
+        assert!(
+            tree.past_history().contains(&AgentId(1)),
+            "once read, the row is droppable again"
         );
     }
 

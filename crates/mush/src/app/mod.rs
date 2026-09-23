@@ -18712,6 +18712,128 @@ mod tests {
         );
     }
 
+    /// The cut-off line reaches the one reader the whole road exists for, and
+    /// the row lives until that reader has it (finding R7).
+    ///
+    /// The panic itself is pinned in `agent.rs`
+    /// (`an_actor_thread_that_dies_mid_run_is_reported_cut_off`): the dying
+    /// thread files `CutOff` to the UI and then
+    /// `ChildDone { CUT_OFF_RUN, CutOff }` to its parent. What this test drives
+    /// is the road those two filings take through a live parent — the UI's mark
+    /// has to keep the row (or the tick's reap forgets it and sends the
+    /// `ForgetChild` that lands behind the completion in the same mailbox), and
+    /// the parent's fold has to hand `#2 cut off …` to its model.
+    #[test]
+    fn a_cut_off_childs_line_reaches_its_parents_model_and_its_row_waits_for_the_read() {
+        let root = repo("cut-off-fold");
+        let held = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                // The root is mid-run while the child dies and the reap runs:
+                // the boundary that folds the news is then the turn's end, and
+                // the forget the reap may send sits in the same mailbox behind
+                // the completion.
+                .held(held.clone())
+                .says("on it")
+                // The run the news buys: this request has to carry the line.
+                .says("done"),
+        );
+        let (mut app, rx) = app_with_live_scripted_root(&root, scripted.clone());
+        app.deliver("start the task".into(), Vec::new())
+            .expect("the root takes the words");
+        assert!(
+            held.wait_until_asked(Duration::from_secs(5)),
+            "the root reaches the held turn"
+        );
+
+        // #2, a shared child of the root, mid-run when its thread dies: the
+        // shape every spawned child has.
+        let (tx, _child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let opened = app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: None,
+            fork: None,
+            cmd: tx,
+        });
+        app.chat.push_message(opened.id, opened.opening);
+        app.tree.begin(AgentId(2), None);
+        let parent = app.tree.agent_tx[&AgentId::ROOT].clone();
+        // The parent's books name the child: `seed_parent` writes the tree's
+        // row into them as `ChildBook`, the road a parent restored from a
+        // stored session takes — and the fact a real spawn leaves in the same
+        // place. Without the book, a completion is a report about a child the
+        // parent cannot name.
+        app.seed_parent(AgentId::ROOT, &parent);
+        // The dying thread's own two filings, in its own order: the UI first,
+        // then the parent (`agent::file_death`).
+        app.on_agent(
+            AgentId(2),
+            AgentEvent::CutOff {
+                reason: "the model call died mid-reply".to_string(),
+            },
+        );
+        parent
+            .send(AgentMsg::ChildDone {
+                id: 2,
+                run: agent::CUT_OFF_RUN,
+                outcome: agent::Outcome::CutOff,
+            })
+            .expect("the root's mailbox");
+
+        // Enough finished children that the history window wants #2's row.
+        let _mailboxes: Vec<Receiver<AgentMsg>> =
+            (3..=53).map(|id| finished_child(&mut app, id)).collect();
+
+        // The frame the reap runs on: the row and the transcript are kept for
+        // the read the parent owes, and no `ForgetChild` follows the
+        // completion into the mailbox.
+        app.tick();
+        assert!(app.tree.has(AgentId(2)), "the unread row is not reaped");
+        assert_eq!(
+            app.chat.transcript(AgentId(2)).len(),
+            1,
+            "and its transcript stays with it"
+        );
+
+        // The turn ends, the boundary folds the line, and the run it buys is
+        // the proof the model was handed it.
+        held.release();
+        assert!(
+            pump(&mut app, &rx, &scripted, |_, asked| asked.len() >= 2),
+            "the root folds the news into a run"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[1].saw("#2 cut off"),
+            "the parent's model reads the line the whole road exists for: {}",
+            asked[1]
+                .messages
+                .iter()
+                .map(|message| message.text())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+
+        // The fold is the read (`agent::fold_completions` emits `ResultRead` as
+        // it writes the line), and only then is the row the reap's again: the
+        // mark was the whole reason it survived the tick above.
+        assert!(
+            !app.tree
+                .node(AgentId(2))
+                .expect("the row is there")
+                .result_unread,
+            "the parent's fold took the ✉ off"
+        );
+        app.tick();
+        assert!(
+            !app.tree.has(AgentId(2)),
+            "once read, the oldest row is droppable again"
+        );
+    }
+
     /// A cut-off owner's job is killed rather than orphaned. The actor that
     /// started it is the one that vanished, so `Registry::stop` (owner-only) and
     /// the owner's own `Stop`/`Shutdown` handlers can never reach it, and the UI
