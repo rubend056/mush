@@ -540,9 +540,11 @@ one line, `Shift` holds the selection while it moves, `PgUp`/`PgDn` ten,
 leaves without copying. While it is open the mode has the keyboard — a letter is
 not typing — and `Tab` leaves it for the pane cycle. What lands on the system
 clipboard is `Message::text()`, exactly: the selected source lines joined with
-the newlines they have, so a soft wrap never becomes one, a tab is a tab, a tool
-result is copied whole even past the eight rows the pane paints of it, and a
-picture a saved transcript shed copies as its placeholder. A copy that cannot
+the newlines they have, so a soft wrap never becomes one, a tab is a tab, a
+folded block — a tool result, mush's own report about a child or a job, and the
+brief a child's pane opens with — is copied whole even past the eight rows the
+pane paints of it, and a picture a saved transcript shed copies as its
+placeholder. A copy that cannot
 reach the clipboard says so in the bar instead: no writer on `PATH` names what
 to install, and a writer that never takes the text is killed at the deadline and
 reported, not waited on. The bar says `copied 12 lines from #1's reply — 1,284
