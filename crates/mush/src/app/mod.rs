@@ -73,8 +73,13 @@ pub enum Msg {
         endpoint: String,
         models: Vec<http::Model>,
     },
-    /// A repository read that finished on its own thread.
+    /// A repository read that finished on its own thread. `conversation`
+    /// stamps the read the way [`Msg::Agent`]'s does: a read that outlives a
+    /// `Ctrl-N` belongs to the tree that asked for it, and a new tree must not
+    /// adopt a stat about agents it never had, a status read for a tree that
+    /// is gone, or a sweep decided from that tree's rows (finding D26).
     Git {
+        conversation: ConversationId,
         stats: HashMap<AgentId, git::Stat>,
         status: Option<git::RepoStatus>,
         /// What a sweep found at the worktree of every agent that is *at rest*
@@ -653,8 +658,10 @@ pub struct App {
     ui_tx: Sender<Msg>,
     /// When the git snapshot was last taken, so a long run refreshes it.
     git_at: Option<Instant>,
-    /// A `git` read is already running on its own thread; asking again would
-    /// only queue another one behind it.
+    /// A `git` read for *this* tree is already running on its own thread;
+    /// asking again would only queue another one behind it. A read from an
+    /// older tree is not one: it is dropped when it lands (finding D26), and
+    /// `Ctrl-N` clears this with the tree that started it.
     git_in_flight: bool,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
@@ -1084,12 +1091,16 @@ impl App {
     /// subprocesses on the UI thread are dropped frames. This used to fork up to
     /// three per isolated agent, synchronously, every two seconds of a run —
     /// which is felt while an agent works, exactly when the screen is busiest.
+    /// The tree's conversation is stamped on the read before the thread starts,
+    /// because it outlives the tree that asked for it: `Ctrl-N` while one is
+    /// out, and its answer is not news about the next tree (finding D26).
     pub fn refresh_git(&mut self) {
         if self.git_in_flight {
             return;
         }
         self.git_in_flight = true;
         let root = self.ws.root().to_path_buf();
+        let conversation = self.tree.conversation();
         // Resolved here: the tree is UI state, and the worker must not touch it.
         // A nested agent forked from its parent's branch, so that is what its
         // work is measured against; a top-level one forked from HEAD. The node's
@@ -1147,6 +1158,7 @@ impl App {
                 .collect();
             let status = git::status(&root);
             let _ = tx.send(Msg::Git {
+                conversation,
                 stats,
                 status,
                 sweep,
@@ -1154,7 +1166,10 @@ impl App {
         });
     }
 
-    /// Adopt a repository read that finished on its own thread.
+    /// Adopt a repository read that finished on its own thread. Only a read
+    /// stamped with this tree's conversation reaches this door — `update` drops
+    /// the others, so a `Ctrl-N` cannot have an old tree's read adopted here
+    /// (finding D26).
     fn adopt_git(
         &mut self,
         stats: HashMap<AgentId, git::Stat>,
@@ -1503,10 +1518,22 @@ impl App {
         match msg {
             Msg::Models { endpoint, models } => self.adopt_models(endpoint, models),
             Msg::Git {
+                conversation,
                 stats,
                 status,
                 sweep,
-            } => self.adopt_git(stats, status, sweep),
+            } => {
+                // A read that outlives the chat that asked for it is not news
+                // about this chat: dropped, the way a stale `Msg::Clipboard`
+                // is. The stats are keyed by agent id and the ids restart with
+                // the tree, so `adopt_git`'s `tree.has` — an id test — would
+                // wave an old agent's stat onto a new row with the same
+                // number; and the sweep is a decision about the old tree's
+                // worktrees (finding D26).
+                if conversation == self.tree.conversation() {
+                    self.adopt_git(stats, status, sweep);
+                }
+            }
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
@@ -2859,6 +2886,13 @@ impl App {
     /// Focus `agent` exactly as `Enter` on its row does: point the tree cursor
     /// at it and run the same path the key does, so the pane, the bar and the
     /// keyboard all move together.
+    ///
+    /// A focus that moves the pane under an open select mode drops the mode and
+    /// says so: the mode names an agent, and one left standing over another
+    /// agent's pane has no cursor on what the human now reads — its `Enter`
+    /// would copy nothing, silently (finding D18). The human's own `Tab` road
+    /// cancels the mode the same way and says nothing, because there the human
+    /// pressed the key that moved the pane and the badge names the new one.
     fn attach_focus(&mut self, agent: u64) -> attach::Reply {
         let id = AgentId(agent);
         // One question, one answer: `point_cursor_at` asks the same "is #N in
@@ -2869,7 +2903,20 @@ impl App {
         if !self.tree.point_cursor_at(id) {
             return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent {id}")));
         }
+        let was = self.tree.focused;
         self.focus_cursor_row();
+        // The mode is the old pane's, and the client that moved the pane did
+        // not press the key that does it: the bar has to say why the mode is
+        // gone. `focus_cursor_row` said the new brief a moment ago; the loss is
+        // the newer fact, so this line takes the bar.
+        if was != id {
+            if let Some(agent) = self.chat.selecting_agent() {
+                if agent != id {
+                    self.chat.cancel_select();
+                    self.say(format!("selection dropped — the pane moved to agent {id}"));
+                }
+            }
+        }
         attach::Reply::Ok(serde_json::json!({}))
     }
 
@@ -3448,6 +3495,12 @@ impl App {
         self.chat.clear();
         self.spin = 0;
         self.discover_worktrees();
+        // A read in flight belongs to the tree that just died: it is dropped
+        // when it lands (`Msg::Git`'s conversation), and the flag has to fall
+        // with it. Left up, this ask — and every later one — would be refused
+        // behind a read whose answer the new tree will never adopt, and the git
+        // facts would freeze at the first Ctrl-N (finding D26).
+        self.git_in_flight = false;
         self.refresh_git();
         // The old conversation is gone from this moment: if the write were left
         // to the debounce, a crash would bring it back with the next start.
@@ -3858,7 +3911,10 @@ impl App {
     /// The mode belongs to the conversation the chat pane shows, so the agent
     /// here is [`Tree::focused`] — the same agent every other chat key is about.
     /// A pane with nothing to stand on says so in the bar rather than opening a
-    /// cursor over nothing.
+    /// cursor over nothing, and so does an `Enter` whose copy did not happen:
+    /// [`Chat::select_apply`]'s `None` is a mode left with no line under it, and
+    /// a silent `Enter` was half of finding D18 (the focus-change half is
+    /// [`Self::attach_focus`]'s).
     fn select_key(&mut self, key: SelectKey) {
         let on = self.tree.focused;
         match key {
@@ -3872,11 +3928,13 @@ impl App {
                     }
                 }
             }
-            SelectKey::Copy => {
-                if let Some(copied) = self.chat.select_apply(on, SelectKey::Copy) {
-                    self.copy_text(copied);
-                }
-            }
+            SelectKey::Copy => match self.chat.select_apply(on, SelectKey::Copy) {
+                Some(copied) => self.copy_text(copied),
+                // The mode was left with nothing to copy — the pane under it has
+                // no line left to stand on — and that is the one thing the chat
+                // cannot say: the bar is the app's surface (finding D18).
+                None => self.say("nothing to copy — the selection is gone"),
+            },
             key => {
                 self.chat.select_apply(on, key);
             }
@@ -4586,9 +4644,12 @@ impl App {
             } else {
                 // Several agents are busy and the focused one is not among
                 // them: stopping the wrong one silently would be worse than
-                // asking, so name the scope instead.
+                // asking, so name the road that stops one instead. It used to
+                // name `Enter`, which sends the box's draft in the chat pane
+                // and only shows a row's transcript in the tree — it stops
+                // nothing (finding D25).
                 self.say(format!(
-                    "{} agents running · Enter picks one to stop · Ctrl-X stops them all",
+                    "{} agents running · agents pane: c stops the row · Ctrl-X stops all",
                     busy.len()
                 ));
             }
@@ -9708,6 +9769,72 @@ mod tests {
         assert!(line.contains("no clipboard writer"), "{line}");
     }
 
+    /// A `git` read carries the conversation that asked for it, so one that
+    /// lands after `Ctrl-N` is dropped: its stats name agents by number (an id
+    /// test, not an identity test — the numbers restart with the tree), its
+    /// status is a reading of a tree that is gone, and its sweep decides about
+    /// the old tree's worktrees. It must not clear the new tree's own read
+    /// either, and the new chat has to leave that read able to start at all:
+    /// the flag the old read left up would otherwise refuse every later ask
+    /// (finding D26 — suspected, mechanism read, so this pins the drop and not
+    /// a live failure).
+    #[test]
+    fn a_git_read_from_the_old_chat_does_not_touch_the_new_tree() {
+        let (mut app, rx) = test_app("stale-git");
+        let old = app.tree.conversation();
+        // The first tree's read is out (`App::new` asks for one), so a new
+        // chat that kept the flag up would never start its own.
+        assert!(app.git_in_flight, "the first tree's read is out");
+        new_chat(&mut app);
+        assert_ne!(old, app.tree.conversation(), "a fresh conversation");
+        assert!(app.git_in_flight, "and the new tree's own read is out");
+        // A row the old read's stats could land on: the numbers restart with
+        // the tree, which is exactly what makes an id test wrong.
+        spawn_agent(&mut app, 1, 0, 1, "the new tree's own", None);
+
+        app.update(Msg::Git {
+            conversation: old,
+            stats: HashMap::from([(
+                AgentId(1),
+                git::Stat {
+                    files: 4,
+                    added: 40,
+                    removed: 4,
+                },
+            )]),
+            status: Some(git::RepoStatus {
+                branch: "the-dead-tree".to_string(),
+                dirty: 9,
+                stat: git::Stat {
+                    files: 1,
+                    added: 1,
+                    removed: 1,
+                },
+            }),
+            sweep: vec![],
+        });
+
+        assert!(
+            app.tree.agent_stats.is_empty(),
+            "no stat from a tree that never held this id: {:?}",
+            app.tree.agent_stats
+        );
+        assert!(app.git.is_none(), "no status either");
+        assert!(app.git_at.is_none(), "and it is not this tree's own read");
+        assert!(
+            app.git_in_flight,
+            "the new tree's read is still its own to finish"
+        );
+
+        // The new tree's read lands and clears the flag: the dropped one did
+        // not leave mush unable to read git again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.git_in_flight && Instant::now() < deadline {
+            wait_git(&mut app, &rx);
+        }
+        assert!(!app.git_in_flight, "the new tree's read landed");
+    }
+
     /// Backspace takes the thing immediately before the cursor, and at the very
     /// start of the box that is the newest attachment — the pictures are painted
     /// above the words. Esc clears both halves of the box.
@@ -13923,6 +14050,57 @@ mod tests {
         );
     }
 
+    /// The line `Ctrl-C` answers with when several agents run and the focused
+    /// one does not: it must name a key that *stops*. It used to name `Enter`,
+    /// which sends the chat pane's draft (and only shows a tree row's
+    /// transcript) — following it with a draft in the box sent the message
+    /// instead of stopping anything (finding D25). The key named is the one the
+    /// key table routes to the tree's stop, so the sentence and the table
+    /// cannot drift.
+    #[test]
+    fn the_many_agents_line_names_a_key_that_stops() {
+        let (mut app, _rx) = test_app("many-agents-stop");
+        spawn_agent(&mut app, 1, 0, 1, "one", None);
+        spawn_agent(&mut app, 2, 0, 1, "two", None);
+        begin_run(&mut app, AgentId(1));
+        begin_run(&mut app, AgentId(2));
+        // The focused agent is neither of them, so Ctrl-C takes the several
+        // arm instead of stopping one.
+        ctrl(&mut app, 'c');
+
+        let line = text_of(&app).to_string();
+        assert!(!line.contains("Enter"), "Enter stops nothing: {line}");
+        // The key the line names is a row of the one key table, in the pane it
+        // is pressed in...
+        let cancel = keys::KEYS
+            .iter()
+            .find(|binding| binding.context == keys::Context::Agents && binding.keys == "c")
+            .expect("the agents pane's c row");
+        assert!(
+            line.contains(&format!("{} stops the row", cancel.keys)),
+            "the line names the table's key: {line}"
+        );
+        // ...and the table really routes it to the stop.
+        assert_eq!(
+            keys::key(
+                Focus::Agents,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            ),
+            keys::Intent::TreeCancel,
+            "the key the line names stops the row under the tree's cursor"
+        );
+        assert!(
+            line.contains("Ctrl-X stops all"),
+            "the all-agents brake is still named: {line}"
+        );
+        assert!(
+            line.chars().count() <= 73,
+            "one bar row once the badge takes its seven columns: {line}"
+        );
+    }
+
     /// The cancel mark lasts exactly as long as the cancel does: the actor
     /// acknowledges by ending the run, and a fresh run clears it too.
     #[test]
@@ -17158,6 +17336,42 @@ mod tests {
             &attach_request(4, attach::Op::Focus { agent: 9 }),
         ));
         assert_eq!(error.kind, "bad_request");
+    }
+
+    /// The select mode names an agent, so a focus that moves the pane under it
+    /// must not leave the mode standing over a pane the human no longer reads:
+    /// `Enter` would copy nothing, silently (finding D18 — the client's `Focus`
+    /// op changed the pane with no `cancel_select`). The mode either follows
+    /// the pane or leaves it and says so; never a mode with no cursor and no
+    /// line.
+    #[test]
+    fn a_focus_change_under_the_select_mode_either_follows_it_or_says_it_left() {
+        let (mut app, _rx) = test_app("select-focus");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        spawn_agent(&mut app, 1, 0, 1, "lexer", None);
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on the root's pane");
+
+        // Another client moves the pane to the child.
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Focus { agent: 1 }),
+        ));
+        assert_eq!(app.tree.focused, AgentId(1), "the pane moved");
+
+        match app.chat.selecting_agent() {
+            // The mode followed the pane: it stands over the agent the human
+            // now reads, and there is nothing to say.
+            Some(agent) => assert_eq!(agent, AgentId(1), "the mode follows the pane"),
+            // Or it left with the pane, and the bar carries the line that says
+            // so — the selection is not eaten in silence.
+            None => assert!(
+                text_of(&app).contains("selection dropped"),
+                "the loss is said in the bar: {:?}",
+                text_of(&app)
+            ),
+        }
     }
 
     /// A client's op is not the human's own key. The warning a `Ctrl-Q` armed
