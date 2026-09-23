@@ -34,8 +34,10 @@
 //! What a pane paints is built here too (`painted`), because which rows it shows
 //! is a fact about the conversation, its scrollback and its notes — not about the
 //! terminal: width and height are arguments, the blank separator that closes a
-//! message is trimmed before the window is cut, and the foot is capped and
-//! counted. `ui.rs` keeps the frame around it — the border, the prompt and the
+//! message is trimmed before the window is cut, every block that is not the
+//! human's own words or the model's reply is folded to its kind's number of rows
+//! ([`Fold`], with the `…` row that says what is hidden), and the foot is capped
+//! and counted. `ui.rs` keeps the frame around it — the border, the prompt and the
 //! cursor — and paints what this returns, title included, because a pane one row
 //! tall has no row to spend on saying what it is hiding, or that the human has
 //! scrolled away from the bottom.
@@ -387,7 +389,7 @@ struct Lost {
 }
 
 /// One stop of the select cursor: a source line of the message it stands in,
-/// or the tail a tool result's cap hid — the rows a pane paints as one `…`.
+/// or the tail a folded block's cap hid — the rows a pane paints as one `…`.
 ///
 /// The order is the transcript's: `Line(n)` before `Line(n+1)`, and a message's
 /// `Tail` after every one of its lines. The copy reads that order too: a
@@ -396,10 +398,10 @@ struct Lost {
 enum Stop {
     /// An index into `Message::text().split('\n')`.
     Line(usize),
-    /// Every source line the pane's cap painted no row for. It names no line
-    /// because *which* line that is is the pane's measure (`wrap_text_capped`
-    /// at its width), not the transcript's: this is the one spelling of "the
-    /// hidden tail", wherever a pane's cap falls.
+    /// Every source line the fold painted no row for. It names no line because
+    /// *which* line that is is the pane's measure and the block's kind
+    /// ([`Fold::shown`] rows), not the transcript's: this is the one spelling of
+    /// "the hidden tail", wherever the fold falls.
     Tail,
 }
 
@@ -413,10 +415,10 @@ enum Stop {
 /// handed. `Message::text()` is, and every source line is one line of it, so
 /// the copy is whole source lines joined with the newlines the transcript has —
 /// a soft wrap never becomes one. A *stop* is a painted row, though: a source
-/// line is one stop whether it wraps over one row or five, and the `…` a tool
-/// result's cap paints is one stop for every line that cap hid — so stepping
-/// through a long result steps through what the pane shows, and a selection
-/// that reaches the `…` takes the whole hidden tail.
+/// line is one stop whether it wraps over one row or five, and the `…` a
+/// folded block's cap paints is one stop for every line the fold hid — so
+/// stepping through a long result steps through what the pane shows, and a
+/// selection that reaches the `…` takes the whole hidden tail.
 ///
 /// The mode is *modal*: while it is on the keys belong to it (`keys::key`
 /// routes them before the panes, the way a picker does), so a letter is not
@@ -430,8 +432,8 @@ struct Selecting {
     /// stands on.
     ///
     /// The second component is a stop and not a bare line index because a stop
-    /// is a *painted row*: a tool result past the pane's cap paints one `…` row
-    /// for every source line the cap hid, and a cursor that named those lines
+    /// is a *painted row*: a block past its kind's number paints one `…` row
+    /// for every source line the fold hid, and a cursor that named those lines
     /// one at a time sat on that same row for a press each — the human's "the
     /// selector sits there a while instead of treating the `…` as one line"
     /// (measured: a 30-line result, `Ctrl-Y`, then 22 `↓` presses that all
@@ -439,7 +441,7 @@ struct Selecting {
     /// the last line the pane painted is the `…`, the next is the first line
     /// of the message after the result, and `↑` walks back the same way.
     ///
-    /// Which lines a cap hides is the *pane's* measure, so [`Self::measure`]
+    /// Which lines the fold hides is the *pane's* measure, so [`Self::measure`]
     /// is what turns a `Line` into a `Tail`: a hidden line is not a stop of its
     /// own, it is the tail's. Until a pane has painted the mode's rows, no line
     /// is known hidden and every source line is a stop.
@@ -449,7 +451,7 @@ struct Selecting {
     /// a line, or the whole tail when it is the `…`.
     anchor: Option<(usize, Stop)>,
     /// The width the pane last painted the mode's rows at, so the key road can
-    /// tell a line the pane painted from one its cap hid.
+    /// tell a line the pane painted from one the fold hid.
     ///
     /// A `Cell` because only the frame knows the pane's measure, exactly as
     /// `top` is: the frame publishes it as it paints, and the keys read it. It
@@ -530,10 +532,11 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
 /// The rows one message paints, and the stop each row is the reading of.
 ///
 /// The map is what lets a *stop* be found among painted rows at all: a wrapped
-/// row is not a line of the text, and a tool result's cap paints fewer rows than
-/// its text has lines. `rows` runs parallel to `lines` and is `None` for a row
-/// that is not the message's own words — the reasoning, a tool call, a picture
-/// label, the blank that closes a message.
+/// row is not a line of the text, and a block the fold paints
+/// ([`folded_marked`]) shows fewer rows than its text has lines. `rows` runs
+/// parallel to `lines` and is `None` for a row that is not the message's own
+/// words — the reasoning, a tool call, a picture label, the blank that closes a
+/// message.
 #[derive(Default)]
 struct Chunk {
     lines: Vec<Line<'static>>,
@@ -585,11 +588,12 @@ impl Body {
 ///
 /// The predicate is the `render_message` arms' own: a user line is always
 /// painted (the mark is, even for a message that is only a picture), a reply
-/// with no words paints nothing, and a tool result is painted from its first
-/// row — its cap decides *which* rows, never whether the line exists, so the
-/// lines a long result hides behind its `…` are still source lines the copy can
-/// take whole. They are one stop, though, not one each: [`Stops`] is where the
-/// cap's boundary turns them into [`Stop::Tail`].
+/// with no words paints nothing, and a folded block — a tool result, a report,
+/// a brief — is painted from its first row: the fold decides *which* rows,
+/// never whether the line exists, so the lines a long block hides behind its
+/// `…` are still source lines the copy can take whole. They are one stop,
+/// though, not one each: [`Stops`] is where the fold's boundary turns them into
+/// [`Stop::Tail`].
 fn lines_of(message: &Message) -> Option<Vec<&str>> {
     match message.role.as_str() {
         "user" | "tool" => Some(message.text().split('\n').collect()),
@@ -601,9 +605,9 @@ fn lines_of(message: &Message) -> Option<Vec<&str>> {
 }
 
 /// One message's cursor stops at a pane's measure: the source lines the pane
-/// painted a row for, and whether its cap hid a tail after them.
+/// painted a row for, and whether its fold hid a tail after them.
 ///
-/// Built from the painter's own wrap walk ([`capped_result`]), so the boundary
+/// Built from the painter's own wrap walk ([`folded_rows`]), so the boundary
 /// the cursor steps over is the boundary the pane painted — never a second wrap
 /// with arithmetic of its own that could disagree with the rows on screen.
 #[derive(Clone, Copy)]
@@ -616,7 +620,7 @@ struct Stops {
     /// every line up to the last painted row's line has a row, and every line
     /// after it has none.
     visible: usize,
-    /// Whether the cap hid rows after the last painted one.
+    /// Whether the fold hid rows after the last painted one.
     tail: bool,
 }
 
@@ -624,10 +628,22 @@ impl Stops {
     /// The stops of one message at the pane's last measure, or `None` for a
     /// message whose text has no row of its own ([`lines_of`]).
     ///
+    /// The message's voice decides which block the fold paints and how its rows
+    /// are indented ([`folded_block`]); the boundary is then [`folded_rows`]'s,
+    /// the painter's own walk, so the cursor steps over the rows the pane
+    /// painted. A message the fold never touches — the human's own line, the
+    /// reply, the reasoning — has every source line as a stop, which is what
+    /// `folded_block`'s `None` says.
+    ///
     /// `measure` is `None` for a mode no pane has painted yet: no line is then
     /// known hidden, and every source line is a stop — the reading that cannot
     /// lose a line the pane would have shown.
-    fn of(message: &Message, measure: Option<usize>) -> Option<Stops> {
+    fn of(
+        message: &Message,
+        voice: Option<Voice>,
+        measure: Option<usize>,
+        fold: Fold,
+    ) -> Option<Stops> {
         let lines = lines_of(message)?.len();
         let mut stops = Stops {
             lines,
@@ -637,10 +653,10 @@ impl Stops {
         let Some(width) = measure else {
             return Some(stops);
         };
-        if message.role.as_str() != "tool" {
+        let Some((kind, head)) = folded_block(message, voice) else {
             return Some(stops);
-        }
-        let rows = capped_result(message, width);
+        };
+        let (_, rows) = folded_rows(head, message.text(), width, kind, fold);
         if rows.last().is_some_and(|(_, stop)| *stop == Stop::Tail) {
             stops.visible = rows
                 .iter()
@@ -656,7 +672,7 @@ impl Stops {
     }
 
     /// The stop a cursor's line names at this measure: the line itself where
-    /// the pane painted a row for it, and the one tail where the cap hid it.
+    /// the pane painted a row for it, and the one tail where the fold hid it.
     fn clamp(self, stop: Stop) -> Stop {
         match (stop, self.tail) {
             (Stop::Tail, true) => Stop::Tail,
@@ -676,7 +692,7 @@ impl Stops {
     }
 
     /// The source lines `stop` covers: one line for [`Stop::Line`], and every
-    /// line the cap hid for [`Stop::Tail`]. Clamp first ([`Self::clamp`]): a
+    /// line the fold hid for [`Stop::Tail`]. Clamp first ([`Self::clamp`]): a
     /// `Tail` on a message the pane did not clip is not a stop at all.
     fn span(self, stop: Stop) -> (usize, usize) {
         match stop {
@@ -687,7 +703,7 @@ impl Stops {
 }
 
 /// The first row of a message that is the reading of `stop`, or — for a stop the
-/// pane's cap hid — the last row that is the reading of a stop at or before it:
+/// pane's fold hid — the last row that is the reading of a stop at or before it:
 /// the result's `…`, which stands for the tail that did not fit.
 fn first_row(rows: &[Option<(usize, Stop)>], message: usize, stop: Stop) -> Option<usize> {
     rows.iter()
@@ -720,13 +736,13 @@ fn last_text(chunk: &Chunk) -> usize {
 }
 
 /// Which row of a window the cursor is painted on: the cursor's own stop's
-/// first row, or — for a line the cap hid — the tail's `…`, the row the pane
+/// first row, or — for a line the fold hid — the tail's `…`, the row the pane
 /// paints for it. `None` is "this window does not show the cursor", which is
 /// what makes the frame place the window again.
 ///
 /// `cut` is the message whose rows the window's height cut short of its text: a
 /// cut message cannot answer for a hidden line, because the cursor's stop may be
-/// under the cut rather than behind the cap.
+/// under the cut rather than behind the fold.
 fn cursor_row(
     rows: &[Option<(usize, Stop)>],
     cursor: (usize, Stop),
@@ -895,6 +911,10 @@ pub struct Chat {
     /// rather than in `App`, because every pane paints through this one
     /// transcript and the choice is about the reading, not about the frame.
     reasoning: bool,
+    /// How much of each kind of block this conversation's panes paint: the one
+    /// [`Fold`] behind every pane, so two panes cannot fold the same kind to
+    /// two numbers — and so a view that sets one has one place to set it.
+    fold: Fold,
 }
 
 impl Chat {
@@ -914,6 +934,7 @@ impl Chat {
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
+            fold: Fold::DEFAULT,
         }
     }
 
@@ -1523,7 +1544,7 @@ impl Chat {
 
     /// `Ctrl-Y`: start selecting in the pane `on` shows, with the cursor on the
     /// newest source line — where the pane already is, because it follows the
-    /// bottom. For a tool result the cap clipped, that line is a hidden one and
+    /// bottom. For a block the fold clipped, that line is a hidden one and
     /// the frame paints it on the `…`: the tail is the newest stop there, and
     /// the first read of the cursor clamps it onto that stop.
     ///
@@ -1552,7 +1573,7 @@ impl Chat {
     }
 
     /// The newest source line of the newest message that has rows of its own,
-    /// if there is one. A cap may hide that line from the pane; the frame then
+    /// if there is one. The fold may hide that line from the pane; the frame then
     /// paints the cursor on the `…`, the tail's own stop.
     fn last_line(&self, on: AgentId) -> Option<(usize, Stop)> {
         let transcript = self.transcript(on);
@@ -1640,26 +1661,36 @@ impl Chat {
 
     /// The width the pane last painted the mode's rows at, if it has
     /// ([`Selecting::measure`]). The one read of the published measure, so the
-    /// clamp, the step and the copy all draw the cap's boundary the same way.
+    /// clamp, the step and the copy all draw the fold's boundary the same way.
     fn measure(&self) -> Option<usize> {
         self.select.as_ref().and_then(|select| select.measure.get())
+    }
+
+    /// One message's stops at a measure, with the voice the pane paints it
+    /// under: the fold a block wears is the message's own kind ([`folded_block`]),
+    /// and the block's boundary is the painter's walk ([`folded_rows`]), so the
+    /// key road measures the rows the paint road painted — one road, not two.
+    fn stops_at(&self, on: AgentId, index: usize, measure: Option<usize>) -> Option<Stops> {
+        let message = self.transcript(on).get(index)?;
+        let voice = self.voice_at(on, index, message);
+        Stops::of(message, voice, measure, self.fold)
     }
 
     /// The cursor as the transcript *and the pane's last paint* are now: a
     /// transcript can shrink under a state that still points into it — a reaped
     /// conversation, or a state a caller built — and neither a key nor a frame
-    /// may index past the end; and a line the pane's cap hid is not a stop of
-    /// its own, so it becomes the one [`Stop::Tail`] the `…` paints. The
-    /// nearest line that still exists is the honest clamp — and `None` when
-    /// there is no source line left at all, which drops the mode rather than
-    /// leaving a cursor over nothing.
+    /// may index past the end; and a line the fold hid is not a stop of its
+    /// own, so it becomes the one [`Stop::Tail`] the `…` paints. The nearest
+    /// line that still exists is the honest clamp — and `None` when there is no
+    /// source line left at all, which drops the mode rather than leaving a
+    /// cursor over nothing.
     fn clamped_cursor(&self, on: AgentId) -> Option<(usize, Stop)> {
         let select = self.select.as_ref().filter(|select| select.agent == on)?;
         let measure = select.measure.get();
         let transcript = self.transcript(on);
         let mut index = select.cursor.0.min(transcript.len().checked_sub(1)?);
         loop {
-            if let Some(stops) = Stops::of(&transcript[index], measure) {
+            if let Some(stops) = self.stops_at(on, index, measure) {
                 return Some((index, stops.clamp(select.cursor.1)));
             }
             index = index.checked_sub(1)?;
@@ -1669,11 +1700,11 @@ impl Chat {
     /// The stop one step older or newer than `cursor`, or `None` at an end of
     /// the transcript.
     ///
-    /// The transcript's own lines are not the stops: a line the pane's cap hid
-    /// is one of the lines the `…` stands for, and the whole hidden tail is the
-    /// `…`'s own stop ([`Stops`]). So forward from the last line the pane
-    /// painted is the tail, forward from the tail is the next message's first
-    /// line, and backward is the same road reversed.
+    /// The transcript's own lines are not the stops: a line the fold hid is one
+    /// of the lines the `…` stands for, and the whole hidden tail is the `…`'s
+    /// own stop ([`Stops`]). So forward from the last line the pane painted is
+    /// the tail, forward from the tail is the next message's first line, and
+    /// backward is the same road reversed.
     fn adjacent(
         &self,
         on: AgentId,
@@ -1682,7 +1713,7 @@ impl Chat {
         measure: Option<usize>,
     ) -> Option<(usize, Stop)> {
         let transcript = self.transcript(on);
-        let stops = Stops::of(transcript.get(cursor.0)?, measure)?;
+        let stops = self.stops_at(on, cursor.0, measure)?;
         if forward {
             if let Stop::Line(line) = cursor.1 {
                 if line + 1 < stops.visible {
@@ -1693,13 +1724,15 @@ impl Chat {
                 return Some((cursor.0, Stop::Tail));
             }
             ((cursor.0 + 1)..transcript.len()).find_map(|index| {
-                Stops::of(&transcript[index], measure).map(|_| (index, Stop::Line(0)))
+                self.stops_at(on, index, measure)
+                    .map(|_| (index, Stop::Line(0)))
             })
         } else {
             match cursor.1 {
                 Stop::Tail => Some((cursor.0, Stop::Line(stops.visible - 1))),
                 Stop::Line(0) => (0..cursor.0).rev().find_map(|index| {
-                    Stops::of(&transcript[index], measure).map(|stops| (index, stops.last()))
+                    self.stops_at(on, index, measure)
+                        .map(|stops| (index, stops.last()))
                 }),
                 Stop::Line(line) => Some((cursor.0, Stop::Line(line - 1))),
             }
@@ -1730,9 +1763,10 @@ impl Chat {
     /// transcript has between them — so a whole message is `Message::text()`
     /// byte for byte, a soft wrap at this pane's width is not a newline, and a
     /// tab is a tab. Every stop's own source is taken: a line is itself, and the
-    /// elided tail is every line the pane's cap hid, so a selection that reaches
-    /// the `…` gets the whole block however many presses the tail spans — the
-    /// cap bounds the frame, never the copy.
+    /// elided tail is every line the fold hid, so a selection that reaches the
+    /// `…` gets the whole block however many presses the tail spans — the fold
+    /// bounds the frame, never the copy. A folded block — a tool result, a
+    /// report, a brief — is copied whole however little of it the pane painted.
     fn copy(&self, on: AgentId, cursor: (usize, Stop)) -> Copied {
         let select = self.select.as_ref().expect("the mode is on");
         let measure = select.measure.get();
@@ -1748,10 +1782,10 @@ impl Chat {
             let Some(lines) = transcript.get(index).and_then(lines_of) else {
                 continue;
             };
-            let Some(stops) = Stops::of(&transcript[index], measure) else {
+            let Some(stops) = self.stops_at(on, index, measure) else {
                 continue;
             };
-            // A stop covers a span: one line, or every line the cap hid. The
+            // A stop covers a span: one line, or every line the fold hid. The
             // endpoints are clamped at this measure first, so a line a resize
             // has hidden since stands as the tail it now is, and the two ends'
             // spans meet without a gap (a stop's span always continues the one
@@ -1854,7 +1888,7 @@ impl Chat {
     /// A pane painting the select mode publishes the width its rows are made at
     /// ([`Selecting::measure`]) before it clamps the cursor: only the frame
     /// knows the pane's measure, and the key road reads it to tell a line the
-    /// pane painted from one its cap hid.
+    /// pane painted from one the fold hid.
     pub fn painted(&self, pane: &Pane<'_>, width: usize, height: usize) -> Painted {
         // The foot is a foot: at most `FOOT_ROWS`, and never the transcript's
         // last row, so a pane too short for both still has a conversation in
@@ -1979,8 +2013,8 @@ impl Chat {
         }
         // The window the state carries no longer shows the cursor: the terminal
         // was resized, the transcript moved under it, or the cursor's
-        // own stop is behind a tool result's cap. Put it where the pane can hold
-        // it — the cursor's stop at the top when it is above the window, at the
+        // own stop is behind a block's fold. Put it where the pane can hold it
+        // — the cursor's stop at the top when it is above the window, at the
         // bottom when it is below — and leave the placement where the next
         // frame finds it.
         let start = if cursor_above(&body, cursor) {
@@ -2035,7 +2069,7 @@ impl Chat {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
         let mut lines = Vec::new();
-        let rows = render_message(&mut lines, message, voice, width, self.reasoning);
+        let rows = render_message(&mut lines, message, voice, width, self.reasoning, self.fold);
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
             lines,
@@ -2047,8 +2081,8 @@ impl Chat {
     }
 
     /// The window's top with the cursor's own stop as its first row: where the
-    /// stop begins in its message. A tool result's elided tail begins at the
-    /// `…`, which is the row that stands for it.
+    /// stop begins in its message. A tail the fold hid begins at the `…`, which
+    /// is the row that stands for it.
     fn top_at_cursor(&self, on: AgentId, width: usize, cursor: (usize, Stop)) -> (usize, usize) {
         let chunk = self.chunk(on, cursor.0, width);
         (
@@ -2545,29 +2579,32 @@ fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
 /// *inside* the indent plus the mark's own columns so nothing is clipped from
 /// the right edge. Dim, because it is what the model thought and not what it
 /// told the human, and marked `⋯ ` — a thought trails off into the reply under
-/// it. Nothing is capped: see the arm that calls this.
-fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
-    const INDENT: usize = 2;
-    const MARK: &str = "⋯ ";
+/// it. It is [`Kind::Reasoning`] to the fold, whose number for it is
+/// `usize::MAX`: shown whole today, because this is the text the human pressed
+/// `Ctrl-T` to read — and folded like any other block the day a setting lowers
+/// the number, because the fold's number, not this function, is where that
+/// decision lives.
+///
+/// The map is dropped: a thought is not a source line the select mode walks to
+/// — the cursor moves over what the model *said* and what a tool returned — and
+/// `render_message`'s caller marks every row of this block `None` afterwards.
+fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize, fold: Fold) {
     let Some(reasoning) = message.reasoning_content.as_deref() else {
         return;
     };
     if reasoning.trim().is_empty() {
         return;
     }
-    let style = dim();
-    let lead = INDENT + MARK.width();
-    for (index, line) in wrap_text(reasoning, width.saturating_sub(lead))
-        .into_iter()
-        .enumerate()
-    {
-        let head = if index == 0 {
-            format!("{}{MARK}", " ".repeat(INDENT))
-        } else {
-            " ".repeat(lead)
-        };
-        out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
-    }
+    let mut map = Vec::new();
+    folded_marked(
+        out,
+        &mut map,
+        Head::solid("  ⋯ ", dim()),
+        reasoning,
+        width,
+        Kind::Reasoning,
+        fold,
+    );
 }
 
 /// The rows a message's pictures get, one dim row each: `▣ path (format ·
@@ -2710,8 +2747,9 @@ fn footnote_lines(notice: &Notice, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// How a pane says it is showing an excerpt. One wording, because the foot's own
-/// count row and the title are two places saying the same number.
+/// How a pane says it is showing an excerpt. One wording, because the foot's
+/// count row, the pane's title and a block's `…` row ([`elision`]) are places
+/// saying the same number.
 fn more_label(hidden: usize) -> String {
     format!("+{hidden} more lines")
 }
@@ -2775,85 +2813,366 @@ fn elsewhere(agent: AgentId, index: usize, message: &Message) -> Voice {
     }
 }
 
+/// What a line of mush's report grammar says after its `#N`/`#cN` head —
+/// `#1 done: wrote the parser` → `Some(" done: wrote the parser")` — or `None`
+/// for a line that is not one of mush's reports.
+fn report_tail(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('#')?;
+    let rest = rest.strip_prefix('c').unwrap_or(rest);
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let tail = &rest[digits..];
+    [" done:", " stopped:", " failed:", " cut off:"]
+        .iter()
+        .any(|head| tail.starts_with(head))
+        .then_some(tail)
+}
+
 /// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …`,
 /// `#3 cut off: …` — written by the run loop, the job registry and the UI's own
 /// last-resort report with exactly this vocabulary.
 fn report(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix('#') else {
-        return false;
-    };
-    let rest = rest.strip_prefix('c').unwrap_or(rest);
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    digits > 0
-        && [" done:", " stopped:", " failed:", " cut off:"]
-            .iter()
-            .any(|tail| rest[digits..].starts_with(tail))
+    report_tail(text).is_some()
 }
 
-/// The two columns every row of a tool result is indented by, before the mark.
-const TOOL_INDENT: usize = 2;
+/// Whether a report line is the one that says a run *failed* (`#3 failed: …`)
+/// — the report whose first row the fold may never give up.
+fn report_failed(text: &str) -> bool {
+    report_tail(text).is_some_and(|tail| tail.starts_with(" failed:"))
+}
 
-/// The `! ` a failed tool result wears, or nothing: mush's own spelling for a
-/// call that was refused or that failed. One spelling, because the painter and
-/// the select mode's cap both have to agree on how wide it is.
-fn tool_mark(message: &Message) -> &'static str {
-    if message.text().trim_start().starts_with(FAILED) {
-        "! "
-    } else {
-        ""
+/// The kinds of multi-line block a conversation paints, one number each in
+/// [`Fold`].
+///
+/// The list is closed on purpose. [`Kind::slot`] is a `match` with no wildcard,
+/// and [`Fold`]'s table is exactly [`Kind::COUNT`] long, so a block that
+/// arrives as a new variant cannot inherit a default number by accident: the
+/// compiler names every place the new kind has to be given one before the crate
+/// builds again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A tool call's result: a file dump — a diff, a test log, a shell
+    /// transcript — read from its head and copied whole behind its `…`.
+    Result,
+    /// Mush's own line written into a conversation ([`Voice::Mush`]): a child's
+    /// or a job's report (`#1 done: …`, `#c2 done: …`), a fold's carried
+    /// summary, the line that says the oldest turns were dropped.
+    Mush,
+    /// The words another agent addressed to this pane: the brief a child's
+    /// pane opens with ([`Voice::Brief`]) and a parent's steering after it
+    /// ([`Voice::Parent`]), which is the same words arriving later.
+    Brief,
+    /// The model's own reasoning — the `Ctrl-T` block [`reasoning_rows`]
+    /// paints.
+    Reasoning,
+}
+
+impl Kind {
+    /// How many kinds there are: the length of [`Fold`]'s table, so a new
+    /// variant that is given a slot but not a table entry is a compile error,
+    /// and one given a table entry but not a slot is too.
+    const COUNT: usize = 4;
+
+    /// This kind's own number in [`Fold`]'s table. No wildcard arm: a new kind
+    /// cannot compile until it is given a slot here, and the slot is where its
+    /// number is read from.
+    fn slot(self) -> usize {
+        match self {
+            Kind::Result => 0,
+            Kind::Mush => 1,
+            Kind::Brief => 2,
+            Kind::Reasoning => 3,
+        }
     }
 }
 
-/// The columns one tool result's rows carry before their text: the indent plus
-/// the mark, so a flagged result is not `mark` columns wider than a successful
-/// one. It is what the painter wraps inside of, and so what the select mode's
-/// cap boundary is measured from.
-fn tool_lead(message: &Message) -> usize {
-    TOOL_INDENT + tool_mark(message).width()
+/// The one place a conversation's "how much of this thing does the human see"
+/// decision lives: how many rows, per [`Kind`] of block, a pane paints before
+/// the `…` row that stands for the rest.
+///
+/// It is a *value* and not a `const` per arm. A view can hold one and set it
+/// ([`Fold::with`]) — the `Ctrl-O` child is the first setting, a `0`-rows
+/// number for one kind — and a setting will later read the numbers from
+/// configuration, which is why they are here and not spelled at a paint site.
+/// `Chat` holds the one a conversation paints through.
+///
+/// The numbers are **per kind** because the kinds are read differently. A tool
+/// result, a report and a brief are dumps: the human reads their head and
+/// copies the rest, and the pane exists to keep a long transcript scrollable —
+/// eight rows, the number the `"tool"` arm used to keep as a `const` of its
+/// own. Wrapping a block only as far as the fold is also why a long result
+/// stopped being most of a frame's cost on a long session (see
+/// [`wrap_text_capped`]). A reasoning block is the text the human pressed
+/// `Ctrl-T` to read, so its number is `usize::MAX`: shown whole today, with the
+/// slot in place because the setting the human already asked for is "one for
+/// child/tool calls and another for thinking rows shown".
+///
+/// A block that reports a **failure** is kept even where the fold would hide
+/// it: the failure is never what the fold gives up. The rule lives here, not in
+/// an arm and not in the handler of a key that changes a number, so a `0`-rows
+/// setting still paints a failed result's own `! error: …` row and a `#1
+/// failed: …` report's first row — the same rule the foot's cap already holds
+/// ("the failure is never the line the cap gives up").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    /// One number per kind, indexed by [`Kind::slot`].
+    rows: [usize; Kind::COUNT],
 }
 
-/// The rows a pane `width` columns wide paints of one tool result, and the stop
-/// each is the reading of: the result's own rows — only as many as its cap
-/// allows — and, where the cap hid the rest, the `…` whose stop is
-/// [`Stop::Tail`].
+impl Fold {
+    /// The numbers a conversation opens with: eight rows for a result, a
+    /// report or a brief, and no bound for the reasoning.
+    pub const DEFAULT: Fold = Fold {
+        rows: [8, 8, 8, usize::MAX],
+    };
+
+    /// How many of `text`'s rows this fold lets a pane paint for `kind` — the
+    /// kind's number, and the one exception at a `0`-rows setting: a block that
+    /// reports a failure keeps its failure row (see the type's doc).
+    pub fn shown(&self, kind: Kind, text: &str) -> usize {
+        let rows = self.rows[kind.slot()];
+        if rows == 0 && fails(kind, text) {
+            1
+        } else {
+            rows
+        }
+    }
+
+    /// The same fold with one kind's number changed — how a view sets it: a
+    /// setting that will read a number from configuration, and the key that
+    /// lowers one at runtime (the `Ctrl-O` child), both hand the result down
+    /// through here. The setter is test-only until that child lands, which is
+    /// why the attribute is here: the value is settable, and this is the door.
+    #[cfg(test)]
+    pub fn with(mut self, kind: Kind, rows: usize) -> Self {
+        self.rows[kind.slot()] = rows;
+        self
+    }
+}
+
+/// Whether a block of this kind reports a failure — the one thing the fold
+/// never gives up (see [`Fold`]'s own doc). The vocabulary is the kinds' own: a
+/// tool result fails when it opens with mush's `error:` prefix, and a mush line
+/// when it is a `#3 failed: …` report. A brief and a thought are nobody's
+/// failure to report.
+fn fails(kind: Kind, text: &str) -> bool {
+    match kind {
+        Kind::Result => text.trim_start().starts_with(FAILED),
+        Kind::Mush => report_failed(text),
+        Kind::Brief | Kind::Reasoning => false,
+    }
+}
+
+/// Which kind of block a voice's lines are, or `None` for the human's own
+/// words.
 ///
-/// Shared by the painter ([`render_message`]) and the select mode's stop walk
-/// ([`Stops::of`]), so the boundary the cursor steps over is the boundary the
-/// pane paints: a second wrap with arithmetic of its own could disagree with the
-/// rows on screen, and the cursor would then sit on the wrong one.
-fn capped_result(message: &Message, width: usize) -> Vec<(String, Stop)> {
-    // Only the first eight rows are ever shown, so only those are wrapped; the
-    // ninth is what tells us to print the `…`. Wrapping the whole result was
-    // most of a frame's cost on a long session.
-    const SHOWN: usize = 8;
-    let wrap = width.saturating_sub(tool_lead(message));
-    let wrapped = wrap_text_capped(message.text(), wrap, SHOWN + 1);
-    let clipped = wrapped.len() > SHOWN;
-    // Which source line each painted row is the reading of. The wrap is per
-    // source line, so walking the lines and counting their rows is where the
-    // boundaries are — and where the cap's ninth row falls, which is the row
-    // the `…` stands for. The walk stops at the cap: it is the same arithmetic
-    // `wrap_text_capped` just did, over the rows it was allowed to do it for,
-    // never a second wrap of the whole result.
-    let mut stops: Vec<Stop> = Vec::with_capacity(wrapped.len());
-    let mut left = SHOWN + 1;
-    for (line, raw) in message.text().split('\n').enumerate() {
+/// The two exemptions from the fold are named here: the human's lines are
+/// theirs, however long, and the model's reply is the conversation's own text.
+/// Everything else a pane writes into a transcript is a block with a number.
+/// No wildcard arm: a new voice has to be classified here before the crate
+/// builds again.
+fn voice_kind(voice: Voice) -> Option<Kind> {
+    match voice {
+        Voice::Human => None,
+        Voice::Brief | Voice::Parent => Some(Kind::Brief),
+        Voice::Mush => Some(Kind::Mush),
+    }
+}
+
+/// The folded block a message's own words are, if the fold paints them: the
+/// kind whose number bounds the block, and the head its rows are painted with.
+///
+/// The one classification the painter and the select mode's stop walk share
+/// ([`render_message`], [`Stops::of`]): the block the cursor measures is the
+/// block the pane painted. `None` for [`voice_kind`]'s two exemptions — the
+/// human's own lines, whose words are theirs however long, and the model's
+/// reply, which is the conversation's own text — and for every role with no
+/// block. The reasoning is outside this too: [`reasoning_rows`] paints it under
+/// its own kind, and its rows are no source line the cursor walks.
+fn folded_block(message: &Message, voice: Option<Voice>) -> Option<(Kind, Head<'static>)> {
+    match message.role.as_str() {
+        "tool" => {
+            // A result is a file dump, so it arrives folded ([`Kind::Result`]).
+            // A result that came back `error: …` — mush's own spelling for a
+            // call that was refused or that failed — is not a result, and it was
+            // painted exactly like one, with only the word at the front to tell
+            // them apart. The mark is the difference now, and it is red, because
+            // this is the one kind of line in the transcript that reports
+            // something did not happen; its row is the one the fold never gives
+            // up, at any number ([`Fold`]).
+            let (mark, style) = if message.text().trim_start().starts_with(FAILED) {
+                ("  ! ", Style::default().fg(Color::Red))
+            } else {
+                ("  ", dim())
+            };
+            Some((Kind::Result, Head::solid(mark, style)))
+        }
+        "user" => {
+            // Mush's own line about a child or a job, and the words another
+            // agent addressed to this pane — the brief a child's pane opens
+            // with, a parent's steering — are read the same way, each through
+            // its own kind of the fold.
+            let voice = voice.unwrap_or(Voice::Human);
+            let (mark, style) = voice.mark();
+            Some((voice_kind(voice)?, Head::spoken(mark, style)))
+        }
+        _ => None,
+    }
+}
+
+/// The one row a fold spends on saying what it hid: the `…` and the tree's own
+/// excerpt count ([`more_label`]) — the same words the foot's count row and the
+/// pane's title use, so no surface invents a second.
+fn elision(hidden: usize) -> String {
+    format!("… {}", more_label(hidden))
+}
+
+/// The head of a folded block: the mark that leads its first row, and the
+/// styles its mark and its words are painted in.
+///
+/// One value because the two styles can differ: a tool result and a working
+/// note paint the whole row in one colour, while a voice colours only its mark
+/// and leaves the words plain ([`marked`]). Bundled, they are one argument.
+#[derive(Clone, Copy)]
+struct Head<'a> {
+    mark: &'a str,
+    mark_style: Style,
+    body: Style,
+}
+
+impl<'a> Head<'a> {
+    /// A row painted in one style throughout: a tool result, a reasoning row.
+    fn solid(mark: &'a str, style: Style) -> Self {
+        Self {
+            mark,
+            mark_style: style,
+            body: style,
+        }
+    }
+
+    /// A mark in its speaker's own style, and the words in the pane's plain
+    /// one: the shape [`marked`] paints a voice's rows in.
+    fn spoken(mark: &'a str, style: Style) -> Self {
+        Self {
+            mark,
+            mark_style: style,
+            body: Style::default(),
+        }
+    }
+}
+
+/// One folded block's rows at the pane's width, and the stop each is the
+/// reading of: at most [`Fold::shown`] wrapped rows, and, where the text ran
+/// on, the one `…` row [`elision`] spells — whose stop is [`Stop::Tail`].
+///
+/// One walk, shared by the painter ([`folded_marked`]) and the select mode's
+/// stop boundary ([`Stops::of`]): the rows the cursor steps over are the rows
+/// the pane painted, never a second wrap with arithmetic of its own that could
+/// disagree with them. The returned head is the one the rows were wrapped
+/// under: a pane too narrow for the mark and a few words drops it, exactly as
+/// [`marked`] does for a voice's rows.
+///
+/// `hidden` is the number of source lines the `…` stands for (the first line no
+/// painted row is the reading of, and every line after it), counted without
+/// wrapping them: counting painted rows would wrap the very text the fold
+/// exists not to wrap, and a line is what a reader counts in a dump anyway.
+fn folded_rows<'a>(
+    head: Head<'a>,
+    text: &str,
+    width: usize,
+    kind: Kind,
+    fold: Fold,
+) -> (Head<'a>, Vec<(String, Stop)>) {
+    // A mark the pane clips is a row that says who spoke and nothing about what
+    // was said, so the words get the whole width instead.
+    let head = if width >= head.mark.width() + MIN_BODY {
+        head
+    } else {
+        Head { mark: "", ..head }
+    };
+    let lead = head.mark.width();
+    let wrap = width.saturating_sub(lead);
+    let shown = fold.shown(kind, text);
+    // Wrapped only as far as the fold: one row past the number is what tells
+    // the fold it has more to stand for.
+    let wrapped = wrap_text_capped(text, wrap, shown.saturating_add(1));
+    let clipped = wrapped.len() > shown;
+    // Which source line each painted row is the reading of, and how many lines
+    // the block has: the walk wraps only the lines the fold may paint and scans
+    // the rest, so the count cannot cost what the fold exists to avoid.
+    let mut tags: Vec<usize> = Vec::new();
+    let mut total = 0usize;
+    let mut left = shown.saturating_add(1);
+    for (line, raw) in text.split('\n').enumerate() {
+        total = line + 1;
         if left == 0 {
-            break;
+            continue;
         }
         let count = wrap_text_capped(raw, wrap, left).len();
-        stops.extend(std::iter::repeat(Stop::Line(line)).take(count));
+        tags.extend(std::iter::repeat(line).take(count));
         left -= count;
     }
-    debug_assert_eq!(stops.len(), wrapped.len(), "one source per wrapped row");
-    let mut rows: Vec<(String, Stop)> = wrapped.into_iter().zip(stops).take(SHOWN).collect();
+    debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
+    let mut rows: Vec<(String, Stop)> = wrapped
+        .into_iter()
+        .take(shown)
+        .zip(tags.iter().map(|line| Stop::Line(*line)))
+        .collect();
     if clipped {
-        // The `…` is the hidden tail's own row: one stop for every line the
-        // cap did not paint, rather than a row the cursor can only reach by
-        // walking them all.
-        rows.push(("…".to_string(), Stop::Tail));
+        // The `…` stands for the first wrapped row the fold did not paint, and
+        // it is one stop for every line from there on: one `↓` steps the whole
+        // hidden tail, and a selection that reaches the `…` copies it whole.
+        let hidden = total - tags[shown];
+        rows.push((elision(hidden), Stop::Tail));
     }
-    rows
+    (head, rows)
+}
+
+/// The rows of one folded block, painted: [`folded_rows`]'s walk, laid out with
+/// the mark on the first row and its own width of blank under it, exactly as
+/// [`marked`] paints a voice's rows.
+///
+/// The block is always a plain line: a folded block is a dump, a report or a
+/// working note, and never the reply the markdown view is for. The `…` row is
+/// part of the fold's own sentence rather than the block's words, so it wears
+/// the mark's style and carries [`Stop::Tail`] — one stop for every line the
+/// fold hid, so the cursor cannot sit on a row the pane never painted.
+fn folded_marked(
+    out: &mut Vec<Line<'static>>,
+    rows: &mut Vec<Option<Stop>>,
+    head: Head<'_>,
+    text: &str,
+    width: usize,
+    kind: Kind,
+    fold: Fold,
+) {
+    let start = out.len();
+    let base = rows.len();
+    let (head, folded) = folded_rows(head, text, width, kind, fold);
+    let lead = head.mark.width();
+    for (index, (line, stop)) in folded.into_iter().enumerate() {
+        let row = if stop == Stop::Tail {
+            Line::from(Span::styled(
+                format!("{}{}", " ".repeat(lead), line),
+                head.mark_style,
+            ))
+        } else if index == 0 {
+            Line::from(vec![
+                Span::styled(head.mark.to_string(), head.mark_style),
+                Span::styled(line, head.body),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" ".repeat(lead), head.body),
+                Span::styled(line, head.body),
+            ])
+        };
+        out.push(row);
+        rows.push(Some(stop));
+    }
+    debug_assert_eq!(out.len() - start, rows.len() - base, "one entry per row");
 }
 
 /// One message's rows: who said it, wrapped at the pane's width — and, beside
@@ -2862,40 +3181,53 @@ fn capped_result(message: &Message, width: usize) -> Vec<(String, Stop)> {
 /// The map is *returned* rather than kept by the painter because a stop is one
 /// or more painted rows, and only the pass that paints a row knows whether the
 /// row is a soft wrap of the line above it, a markdown view of it, or the `…`
-/// that stands for the tail a tool result's cap hid. A second pass that counted
-/// them could disagree with the rows on screen, and the cursor would then sit on
-/// the wrong one. The caller adds the message's index.
+/// that stands for the tail the fold hid. A second pass that counted them could
+/// disagree with the rows on screen, and the cursor would then sit on the wrong
+/// one. The caller adds the message's index.
 ///
-/// `reasoning` is the pane's `Ctrl-T` choice, threaded in rather than read off a
-/// `Chat` this free function has no handle on.
+/// `reasoning` is the pane's `Ctrl-T` choice and `fold` the pane's [`Fold`] —
+/// how much of each kind of block it paints. Both are threaded in rather than
+/// read off a `Chat` this free function has no handle on.
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
     voice: Option<Voice>,
     width: usize,
     reasoning: bool,
+    fold: Fold,
 ) -> Vec<Option<Stop>> {
     let start = out.len();
     let mut rows: Vec<Option<Stop>> = Vec::new();
     match message.role.as_str() {
         "user" => {
-            // Mush's own line in the conversation is marked like the other
-            // lines mush writes into a pane, and `mark()` is the one spelling
-            // of that mark as it is of every speaker's.
-            let (mark, style) = voice.unwrap_or(Voice::Human).mark();
             // The mark is painted even for a message that is only an
             // attachment: the `▣` rows below are *what* was said, whoever said
             // it, and the mark is *who* said it. Without it, a picture the
             // human sent would read exactly like a dim line of mush's own.
-            mark_rows(
-                out,
-                &mut rows,
-                mark,
-                style,
-                message.text(),
-                width,
-                View::Plain,
-            );
+            let voice = voice.unwrap_or(Voice::Human);
+            match folded_block(message, Some(voice)) {
+                // The human's own words: theirs, however long. The fold has no
+                // number for them ([`voice_kind`]).
+                None => {
+                    let (mark, style) = voice.mark();
+                    mark_rows(
+                        out,
+                        &mut rows,
+                        mark,
+                        style,
+                        message.text(),
+                        width,
+                        View::Plain,
+                    )
+                }
+                // The blocks the fold exists for, each through its own kind:
+                // mush's own line about a child or a job, and the words another
+                // agent addressed to this pane — the brief a child's pane opens
+                // with, a parent's steering — which are read the same way.
+                Some((kind, head)) => {
+                    folded_marked(out, &mut rows, head, message.text(), width, kind, fold)
+                }
+            }
             image_rows(out, message);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
@@ -2905,15 +3237,19 @@ fn render_message(
             // The reasoning comes first because that is the order it decided
             // the turn in: the human reading down the pane sees what the model
             // thought, then what it said. It is a block of its own rather than
-            // a third colour on the reply, and it carries no cap — the "tool"
-            // arm caps a result because a result is a file dump, while this is
-            // the text the human pressed `Ctrl-T` to read.
+            // a third colour on the reply, and it is[`Kind::Reasoning`] to the
+            // fold, whose number for it is `usize::MAX`: what the human pressed
+            // `Ctrl-T` to read is shown whole, and only a setting that lowers
+            // the number makes it fold like any other block.
             if reasoning {
-                reasoning_rows(out, message, width);
+                reasoning_rows(out, message, width, fold);
                 rows.resize(out.len() - start, None);
             }
             let text = message.text();
             if !text.trim().is_empty() {
+                // The reply is the conversation's own text: the one block the
+                // fold never touches ([`voice_kind`]'s other exemption), so it
+                // goes to the plain painter, not through the fold.
                 mark_rows(
                     out,
                     &mut rows,
@@ -2937,32 +3273,11 @@ fn render_message(
             rows.push(None);
         }
         "tool" => {
-            // A result that came back `error: …` — mush's own spelling for a
-            // call that was refused or that failed — is not a result, and it was
-            // painted exactly like one, with only the word at the front to tell
-            // them apart. The mark is the difference now, and it is red, because
-            // this is the one kind of line in the transcript that reports
-            // something did not happen.
-            let mark = tool_mark(message);
-            let style = if mark.is_empty() {
-                dim()
-            } else {
-                Style::default().fg(Color::Red)
-            };
-            // The rows, and the stop each is the reading of: `capped_result`
-            // wraps inside the same lead this heads them with, and its `…`
-            // entry is the tail's own stop — the row that stands for every
-            // line the cap hid. That is the whole reason the cursor steps the
-            // tail in one: the map says the `…` is one stop, not a row per
-            // hidden line.
-            for (index, (line, stop)) in capped_result(message, width).into_iter().enumerate() {
-                let head = if index == 0 {
-                    format!("{}{mark}", " ".repeat(TOOL_INDENT))
-                } else {
-                    " ".repeat(tool_lead(message))
-                };
-                out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
-                rows.push(Some(stop));
+            // A result is a file dump, so [`folded_block`] paints it through
+            // [`Kind::Result`]; the failure row it may never give up is the
+            // fold's own rule ([`Fold`]).
+            if let Some((kind, head)) = folded_block(message, None) {
+                folded_marked(out, &mut rows, head, message.text(), width, kind, fold);
             }
             image_rows(out, message);
             rows.resize(out.len() - start, None);
@@ -3150,8 +3465,21 @@ mod tests {
         width: usize,
         reasoning: bool,
     ) -> Vec<Line<'static>> {
+        message_rows_under(message, voice, width, reasoning, Fold::DEFAULT)
+    }
+
+    /// [`message_rows`] through a fold of the caller's choosing: the pane's
+    /// number under the test's control, where the conversation's own is a
+    /// `Chat` field.
+    fn message_rows_under(
+        message: &Message,
+        voice: Option<Voice>,
+        width: usize,
+        reasoning: bool,
+        fold: Fold,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        render_message(&mut lines, message, voice, width, reasoning);
+        render_message(&mut lines, message, voice, width, reasoning, fold);
         lines
     }
 
@@ -3355,7 +3683,7 @@ mod tests {
     }
 
     /// A tool result is copied whole, byte for byte, including the lines the
-    /// pane's cap hides: the cap bounds the frame, not the transcript — and a
+    /// fold hides: the fold bounds the frame, not the transcript — and a
     /// soft wrap would have eaten the tab or the indent.
     #[test]
     fn a_tool_result_is_copied_byte_exact() {
@@ -3575,10 +3903,10 @@ mod tests {
         );
     }
 
-    /// A line behind a tool result's cap still has a row to stand on — the `…`
+    /// A line behind a folded result's cap still has a row to stand on — the `…`
     /// that hides it, which the frame clamps the cursor onto — and that row is
     /// the whole hidden tail's one stop: the copy takes every line it stands
-    /// for, because the cap is the pane's, not the transcript's.
+    /// for, because the fold is the pane's, not the transcript's.
     #[test]
     fn a_line_behind_a_tool_results_cap_stands_on_the_ellipsis() {
         let result = (0..12)
@@ -3614,7 +3942,7 @@ mod tests {
         );
     }
 
-    /// The `…` a tool result's cap paints is one stop, not one stop per line it
+    /// The `…` a folded block's cap paints is one stop, not one stop per line it
     /// hides: from the result's last painted line, one `↓` reaches the elided
     /// stop (the cursor's own row is the `…`), the next `↓` is the following
     /// message's first line, and `↑` walks back the same way. Before this, a
@@ -5294,7 +5622,7 @@ mod tests {
         let source = "# Steps\n\n- **run** `cargo test`\n\nsee [the docs](https://example.com/a)";
         let message = Message::assistant(source);
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 60, false);
+        render_message(&mut rows, &message, None, 60, false, Fold::DEFAULT);
         assert_eq!(
             shown(&rows),
             vec![
@@ -5347,7 +5675,14 @@ mod tests {
         let text =
             "# not a heading\n\n- **not strong** `not code`\n\n[not a link](https://example.com/a)";
         let mut rows = Vec::new();
-        render_message(&mut rows, &Message::tool("call_1", text), None, 60, false);
+        render_message(
+            &mut rows,
+            &Message::tool("call_1", text),
+            None,
+            60,
+            false,
+            Fold::DEFAULT,
+        );
         assert_eq!(
             shown(&rows),
             vec![
@@ -5376,6 +5711,7 @@ mod tests {
             Some(Voice::Human),
             80,
             false,
+            Fold::DEFAULT,
         );
         assert_eq!(shown(&rows)[0], format!("you › {source}"));
 
@@ -5407,7 +5743,7 @@ mod tests {
         let message = Message::assistant(text);
         for width in [10usize, 12, 14, 20, 33, 40, 80] {
             let mut rows = Vec::new();
-            render_message(&mut rows, &message, None, width, false);
+            render_message(&mut rows, &message, None, width, false, Fold::DEFAULT);
             let painted = shown(&rows);
             for row in &painted {
                 assert!(
@@ -5448,5 +5784,210 @@ mod tests {
                 "no marker survives the view at {width}: {painted:?}"
             );
         }
+    }
+
+    /// The human's ask: a child's or a job's report arriving in the parent's
+    /// conversation folds like a command's result, through the one [`Fold`] —
+    /// at most its number of rows, the `…` row saying how much is hidden — and
+    /// the select mode still hands out the report's own bytes.
+    ///
+    /// Before this, a report was a `user`-role line painted by `mark_rows`,
+    /// which has no cap at all: the 25-line report below painted 26 rows,
+    /// where the same text as a tool result painted ten (eight rows, the `…`,
+    /// the blank).
+    #[test]
+    fn a_childs_report_folds_like_a_commands_result() {
+        let report = (0..25)
+            .map(|n| format!("#1 done: line {n} of the report"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user(&report));
+
+        // Eight wrapped rows, the `…` that stands for the rest; the pane trims
+        // the blank that closes the message when the transcript ends there.
+        let painted = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 20));
+        let mut want: Vec<String> = (0..8)
+            .map(|n| {
+                if n == 0 {
+                    format!("· #1 done: line {n} of the report")
+                } else {
+                    format!("  #1 done: line {n} of the report")
+                }
+            })
+            .collect();
+        want.push("  … +17 more lines".to_string());
+        assert_eq!(painted, want, "the report folds like a result");
+
+        // The cap is the pane's; the copy's is the text. `Ctrl-Y`'s `Enter`
+        // still hands out every byte of the report, the folded lines included.
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(-3 * keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, report, "the report's own bytes, folded or not");
+        assert_eq!(
+            copied.line,
+            format!("copied 25 lines from your message — {} bytes", report.len())
+        );
+    }
+
+    /// Every multi-line block a pane writes goes through the fold, each kind
+    /// with its own number: a tool result, mush's own line about a child or a
+    /// job, and the brief a child's pane opens with to eight rows; the
+    /// reasoning to its own slot, which is `usize::MAX` — shown whole, because
+    /// that is the text the human pressed `Ctrl-T` to read, and folded the day
+    /// a setting lowers the number.
+    ///
+    /// A new kind is a compile-time question, not a silent omission: [`Kind`]'s
+    /// table is exactly [`Kind::COUNT`] long and [`Kind::slot`] is a `match`
+    /// with no wildcard, so a variant added without a number stops the crate
+    /// from building.
+    #[test]
+    fn every_multi_line_block_the_pane_writes_goes_through_the_fold() {
+        let many = (0..25)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fold = Fold::DEFAULT;
+        for kind in [Kind::Result, Kind::Mush, Kind::Brief] {
+            assert_eq!(fold.shown(kind, &many), 8, "{kind:?}");
+        }
+        assert_eq!(
+            fold.shown(Kind::Reasoning, &many),
+            usize::MAX,
+            "a thought is shown whole until a setting says otherwise"
+        );
+
+        // The result, the report and the brief each paint eight rows and the
+        // `…` — the same ten rows with the blank, whatever their mark.
+        let result = message_rows(&Message::tool("call_1", &many), None, 60, true);
+        let report = message_rows(&Message::user(&many), Some(Voice::Mush), 60, true);
+        let brief = message_rows(&Message::user(&many), Some(Voice::Brief), 60, true);
+        for painted in [&result, &report, &brief] {
+            let rows = shown(painted);
+            assert_eq!(rows.len(), 10, "eight rows and the `…`: {rows:?}");
+            assert!(
+                rows[8].ends_with("… +17 more lines"),
+                "the ninth row names what is hidden: {rows:?}"
+            );
+            assert_eq!(rows[9], "", "and the blank closes the message");
+        }
+        assert_eq!(shown(&result)[0], "  line 0", "the result's own indent");
+        assert_eq!(shown(&report)[0], "· line 0", "mush's own mark");
+        assert_eq!(shown(&brief)[0], "brief › line 0", "the brief's mark");
+
+        // The reasoning is whole today — every row, no `…`...
+        let thought = thinking("", &many);
+        let whole = message_rows(&thought, None, 60, true);
+        assert_eq!(shown(&whole).len(), 26, "25 rows and the blank");
+        assert!(
+            !shown(&whole).iter().any(|row| row.contains('…')),
+            "nothing is elided: {:?}",
+            shown(&whole)
+        );
+        // ...and the slot is real: a lower number folds it like any other block.
+        let folded = message_rows_under(&thought, None, 60, true, fold.with(Kind::Reasoning, 3));
+        assert_eq!(
+            shown(&folded),
+            vec![
+                "  ⋯ line 0".to_string(),
+                "    line 1".to_string(),
+                "    line 2".to_string(),
+                "    … +22 more lines".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    /// A block that reports a failure is kept even where the fold would hide
+    /// it: the foot's cap already refuses to drop the failure row ("the failure
+    /// is never the line the cap gives up"), and the fold holds the same rule —
+    /// it lives on [`Fold`], not in an arm, so a `0`-rows setting still paints
+    /// the `! error: …` result and the `#1 failed: …` report's own row.
+    #[test]
+    fn a_failure_is_never_what_the_fold_gives_up() {
+        let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Mush, 0);
+
+        // A failed result: the failure row stays, and the log it came with is
+        // what the fold gives up.
+        let failed = "error: the call was refused\nthe log line one\nthe log line two";
+        let rows = shown(&message_rows_under(
+            &Message::tool("call_1", failed),
+            None,
+            60,
+            true,
+            zero,
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                "  ! error: the call was refused".to_string(),
+                "    … +2 more lines".to_string(),
+                String::new(),
+            ]
+        );
+
+        // The same text as a *success* vanishes into its `…` at 0: the
+        // exemption is the block's, not the setting's.
+        let ok = "wrote three lines\nthe log line one\nthe log line two";
+        let rows = shown(&message_rows_under(
+            &Message::tool("call_1", ok),
+            None,
+            60,
+            true,
+            zero,
+        ));
+        assert_eq!(rows, vec!["  … +3 more lines".to_string(), String::new()]);
+
+        // And a child's failed report, painted through the pane the human
+        // reads: the fold rides on `Chat`, so this is the whole road.
+        let mut chat = Chat::bare();
+        chat.fold = zero;
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user("#1 failed: no route to the endpoint\nthe run's own log"),
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)),
+            vec![
+                "· #1 failed: no route to the endpoint".to_string(),
+                "  … +1 more lines".to_string(),
+            ]
+        );
+    }
+
+    /// The two blocks the fold never touches, whatever it says: the human's own
+    /// lines, because their words are theirs however long, and the model's
+    /// reply, because it is the conversation's own text. A `0`-rows setting for
+    /// every other kind leaves both whole.
+    #[test]
+    fn the_humans_lines_and_the_reply_are_never_folded() {
+        let many = (0..25)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let zero = Fold::DEFAULT
+            .with(Kind::Result, 0)
+            .with(Kind::Mush, 0)
+            .with(Kind::Brief, 0)
+            .with(Kind::Reasoning, 0);
+
+        let human = message_rows_under(&Message::user(&many), Some(Voice::Human), 60, true, zero);
+        assert_eq!(
+            shown(&human).len(),
+            26,
+            "the human's 25 lines and the blank, in full"
+        );
+        assert_eq!(shown(&human)[0], "you › line 0");
+
+        let reply = message_rows_under(&Message::assistant(&many), None, 60, true, zero);
+        assert_eq!(
+            shown(&reply).len(),
+            26,
+            "the reply's 25 lines and the blank, in full"
+        );
+        assert_eq!(shown(&reply)[0], "mush › line 0");
     }
 }
