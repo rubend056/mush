@@ -465,7 +465,7 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -935,5 +935,284 @@ mod tests {
                 "{accent:?}: and the row above it keeps its own"
             );
         }
+    }
+
+    /// The repository root, from this crate's manifest directory: a test's cwd
+    /// is the crate, and a doc path in a block below is the workspace's.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// Compare a generated block in `file` against `rendered`, or — with
+    /// `MUSH_BLESS_DOCS` set — write `rendered` in its place.
+    ///
+    /// This is the whole zero-drift mechanism: a block whose words the code
+    /// prints is rewritten by the one command its own head names, and any other
+    /// `cargo test` fails while the two disagree. The comparison is the whole
+    /// region — the head comment, `rendered` and the tail — so a hand edit
+    /// anywhere in it is drift, whitespace included. `rendered` is the block's
+    /// whole text, fences and all when the block is a code block, because a
+    /// manual is read as markdown and the check must not care what markdown
+    /// does with it.
+    ///
+    /// One mutex, because three checks write `docs/mush.md`: a blessing run
+    /// rewrites whole files, and two tests interleaving a read with a write
+    /// would lose one block.
+    pub(crate) fn doc_block(file: &str, id: &str, check: &str, rendered: &str) {
+        static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = WRITER.lock().unwrap_or_else(|poison| poison.into_inner());
+
+        let path = repo_root().join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let head = format!(
+            "<!-- generated: {id} (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush {check}) -->"
+        );
+        let tail = format!("<!-- /generated: {id} -->");
+        let block = format!("{head}\n{rendered}\n{tail}");
+
+        // The head is a whole line in the file, never a substring of one.
+        let start = text
+            .match_indices(&head)
+            .find(|(at, _)| *at == 0 || text.as_bytes()[at - 1] == b'\n')
+            .unwrap_or_else(|| panic!("{file} has no `{id}` block"))
+            .0;
+        let after = start + head.len();
+        let end = after
+            + text[after..]
+                .find(&tail)
+                .unwrap_or_else(|| panic!("{file}'s `{id}` block has no tail"))
+            + tail.len();
+
+        if std::env::var_os("MUSH_BLESS_DOCS").is_some() {
+            let next = format!("{}{block}{}", &text[..start], &text[end..]);
+            std::fs::write(&path, next)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            return;
+        }
+        assert_eq!(
+            &text[start..end],
+            block,
+            "{file}'s `{id}` block is stale — regenerate it with:\n  MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush {check}"
+        );
+    }
+
+    /// One painted frame as text: the cells the real painters put in a
+    /// `TestBackend` of the frame's own size, one line per row. Colour is
+    /// dropped — a manual cannot carry it — and a row's trailing spaces are
+    /// cut, because they are the pane's padding and not a word it says.
+    fn frame_text(width: u16, height: u16, screen: &Screen) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, screen, &Theme::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One row of the mark sweep: `agent_line`'s own fields, with every mark
+    /// the row can wear set by the flag that produces it.
+    #[allow(clippy::too_many_arguments)]
+    fn mark_row(
+        glyph: &'static str,
+        title: &str,
+        place: &str,
+        activity: &str,
+        focused: bool,
+        result_unread: bool,
+        unread_children: usize,
+        parent_gone: bool,
+    ) -> AgentRow {
+        AgentRow {
+            id: AgentId(0),
+            depth: 0,
+            parent_gone,
+            glyph,
+            focused,
+            result_unread,
+            unread_children,
+            title: title.to_string(),
+            place: place.to_string(),
+            activity: activity.to_string(),
+        }
+    }
+
+    /// Every phase glyph and every mark `agent_line` adds, as rows. The glyphs
+    /// are inputs here — `phase_glyph` is private to `app::screen`, and that
+    /// module's own sweep pins each phase to its glyph — while every mark this
+    /// file paints is read back through the function that paints it, so a mark
+    /// added, moved or removed changes this block and fails its check.
+    fn marks_rows() -> Vec<AgentRow> {
+        vec![
+            mark_row("·", "idle", "", "", false, false, 0, false),
+            mark_row("◐", "thinking", "", "thinking 3s", false, false, 0, false),
+            mark_row(
+                "◐",
+                "working",
+                "",
+                "edit_file src/lib.rs 12s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "≡",
+                "compacting",
+                "",
+                "compacting 2s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⧗",
+                "waiting",
+                "",
+                "waiting on results 3s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⊘",
+                "cancelling",
+                "",
+                "cancelling 0s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⊘",
+                "stopped",
+                "",
+                "stopped · re-send to resume",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⚠",
+                "cut off",
+                "",
+                "cut off · nothing committed",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row("✓", "done", "", "wrote README.md", false, false, 0, false),
+            mark_row(
+                "✗",
+                "failed",
+                "",
+                "no route to host",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "◐",
+                "the focused row",
+                "",
+                "thinking 3s",
+                true,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "◐",
+                "lexer",
+                "mush/1 +12−3 ⚙1",
+                "edit_file src/lex.rs 3s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "✓",
+                "result unread",
+                "",
+                "wrote README.md",
+                false,
+                true,
+                0,
+                false,
+            ),
+            mark_row("·", "two reads owed", "", "", false, false, 2, false),
+            mark_row(
+                "✓",
+                "parent gone",
+                "",
+                "wrote src/lex.rs",
+                false,
+                false,
+                0,
+                true,
+            ),
+        ]
+    }
+
+    /// The rows a tree draws, painted by the row painter itself: `ui`'s side of
+    /// the mark set (`agent_line`'s `▶`, `⚮` and `✉`/`✉N`) and the phase
+    /// glyph column, in the manual's `marks` block — and on the front page,
+    /// which carries the same block.
+    #[test]
+    fn the_marks_block_matches_the_code() {
+        let rows = marks_rows();
+        let painted: Vec<String> = rows.iter().map(|row| agent_line(row, 56)).collect();
+        let rendered = format!("```\n{}\n```", painted.join("\n"));
+        for file in ["docs/mush.md", "README.md"] {
+            doc_block(
+                file,
+                "marks",
+                "ui::tests::the_marks_block_matches_the_code",
+                &rendered,
+            );
+        }
+    }
+
+    /// The sample frame on the manual's front page, painted by the real
+    /// painters at 100×28 — a wide enough terminal for the whole facts line and
+    /// the pane title's Σ. Its `Screen` is built by `app::commands`'s test
+    /// fixture, because a message box's `InputPane` cannot be named from this
+    /// module (`app::screen` is private to `app`), and a sample that showed an
+    /// empty box would be a picture no `App` ever paints.
+    #[test]
+    fn the_readme_frame_matches_the_code() {
+        let screen = crate::app::commands::tests::readme_sample_screen();
+        doc_block(
+            "README.md",
+            "frame",
+            "ui::tests::the_readme_frame_matches_the_code",
+            &format!("```\n{}\n```", frame_text(100, 28, &screen)),
+        );
+    }
+
+    /// The frame §4.5 photographs: one row per phase and per mark, painted the
+    /// way a real terminal paints them.
+    #[test]
+    fn the_manual_frame_matches_the_code() {
+        let screen = crate::app::commands::tests::manual_sample_screen();
+        doc_block(
+            "docs/mush.md",
+            "frame",
+            "ui::tests::the_manual_frame_matches_the_code",
+            &format!("```\n{}\n```", frame_text(100, 28, &screen)),
+        );
     }
 }

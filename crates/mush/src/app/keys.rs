@@ -627,7 +627,7 @@ fn chat(key: KeyEvent) -> Intent {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn none(code: KeyCode) -> KeyEvent {
@@ -1086,6 +1086,23 @@ mod tests {
             .expect("the Backspace row")
             .help;
         assert!(help.contains("the start of the box"), "{help}");
+    }
+
+    /// The key table, exactly as `mush --help` and the in-app `/help` print it,
+    /// in the manual's `keys` block — and on the front page, which carries the
+    /// same block for a reader who never opens the manual. Both surfaces read
+    /// [`KEYS`], and this check is what keeps the two blocks honest.
+    #[test]
+    fn the_keys_block_matches_the_code() {
+        let rendered = format!("```\n{}\n```", help_table());
+        for file in ["docs/mush.md", "README.md"] {
+            crate::ui::tests::doc_block(
+                file,
+                "keys",
+                "app::keys::tests::the_keys_block_matches_the_code",
+                &rendered,
+            );
+        }
     }
 
     /// The two stop keys name their scope, so the help cannot repeat the doc's

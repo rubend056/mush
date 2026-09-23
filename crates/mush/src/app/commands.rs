@@ -327,8 +327,15 @@ fn optional(argument: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders};
+
+    use crate::app::screen::{AgentsPane, BarPane, ChatPane, InputPane, Panes, Screen};
+    use crate::app::{AgentId, AgentRow, Focus, Painted, Rank};
     use crate::ui::HINT;
 
     /// One typed line for a command: with an argument when the table says one
@@ -620,5 +627,236 @@ mod tests {
                 "the bar advertises `{word}`, which is not a command"
             );
         }
+    }
+
+    /// The `/help` table, exactly as `mush --help` prints it, in the manual's
+    /// `commands` block — and on the front page, which carries the same block.
+    /// One table behind both surfaces, and a failing test while a block
+    /// disagrees with it.
+    #[test]
+    fn the_commands_block_matches_the_code() {
+        let rendered = format!("```\n{}\n```", table(&mush_core::provider::names_piped()));
+        for file in ["docs/mush.md", "README.md"] {
+            crate::ui::tests::doc_block(
+                file,
+                "commands",
+                "app::commands::tests::the_commands_block_matches_the_code",
+                &rendered,
+            );
+        }
+    }
+
+    /// One tree row, with its fields already chosen the way `App::rows`
+    /// derives them. A sample frame's words are a fixture's, so no clock and no
+    /// endpoint can move them.
+    fn row(
+        id: u64,
+        depth: usize,
+        glyph: &'static str,
+        title: &str,
+        place: &str,
+        activity: &str,
+    ) -> AgentRow {
+        AgentRow {
+            id: AgentId(id),
+            depth,
+            parent_gone: false,
+            glyph,
+            focused: false,
+            result_unread: false,
+            unread_children: 0,
+            title: title.to_string(),
+            place: place.to_string(),
+            activity: activity.to_string(),
+        }
+    }
+
+    /// A sample frame's `Screen` at 100×28: the layout `App::screen` works out
+    /// at that size — a 34-column tree, the chat beside it, a two-row bar —
+    /// with a fixture's words. The trees' title is elided by `screen::elide`,
+    /// the function the pane's own title goes through, and the footer's detail
+    /// line through `mush_core::text::truncate`, so the fixture cannot show a
+    /// title or a line the pane would have cut.
+    ///
+    /// It lives in this module because a message box's `InputPane` can only be
+    /// named inside `app` (`app::screen` is private), and a sample showing a box
+    /// no `App` ever paints would be a picture of something else; the checks
+    /// that paint and compare the frames live in `ui::tests` with the painter.
+    fn sample_screen(
+        title_cells: &[&str],
+        rows: Vec<AgentRow>,
+        cursor: usize,
+        footer: Vec<Line<'static>>,
+        transcript: Vec<Line<'static>>,
+        word: Option<(Rank, String)>,
+        facts: &str,
+    ) -> Screen {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 28;
+        // The arithmetic of `App::screen` at 100×28: `bar_rows(28) == 2`,
+        // `agents_columns(100) == 34` (the share clamped to its floor), a
+        // three-row message box, and the transcript taking the rest.
+        let agents_area = Rect::new(0, 0, 34, HEIGHT - 2);
+        let chat_area = Rect::new(34, 0, WIDTH - 34, HEIGHT - 2);
+        let inner = Block::default().borders(Borders::ALL).inner(agents_area);
+        let cells: Vec<String> = title_cells.iter().map(|cell| cell.to_string()).collect();
+        let title = crate::app::screen::elide(
+            &cells,
+            " · ",
+            " agents · ",
+            " agents ",
+            inner.width as usize,
+        );
+        let footer_rows = if footer.is_empty() {
+            0
+        } else {
+            footer.len() as u16 + 1
+        };
+        let input_area = Rect {
+            y: chat_area.y + chat_area.height - 3,
+            height: 3,
+            ..chat_area
+        };
+        Screen::Panes(Box::new(Panes {
+            agents: AgentsPane {
+                area: agents_area,
+                list_area: Rect {
+                    height: inner.height - footer_rows,
+                    ..inner
+                },
+                title,
+                rows,
+                cursor,
+                footer,
+            },
+            chat: ChatPane {
+                transcript_area: Rect {
+                    height: chat_area.height - input_area.height,
+                    ..chat_area
+                },
+                input_area,
+                transcript: Some(Painted {
+                    lines: transcript,
+                    title: " mush ".to_string(),
+                    select: None,
+                }),
+                input: Some(InputPane {
+                    prompt: "› ".to_string(),
+                    attachments: Vec::new(),
+                    attachment_count: 0,
+                    lines: vec![String::new()],
+                    cursor_row: 0,
+                    column: 0,
+                }),
+            },
+            bar: BarPane {
+                area: Rect::new(0, HEIGHT - 2, WIDTH, 2),
+                word,
+                facts: Some(facts.to_string()),
+            },
+            picker: None,
+            focus: Focus::Chat,
+        }))
+    }
+
+    /// The front page's sample: the root and one child working, one child done,
+    /// a conversation in the chat, the hint under it and the facts.
+    pub(crate) fn readme_sample_screen() -> Screen {
+        let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
+        root.focused = true;
+        sample_screen(
+            &["2 working", "Σ +12 −3"],
+            vec![
+                root,
+                row(
+                    1,
+                    1,
+                    "◐",
+                    "lexer",
+                    "mush/1 +12−3",
+                    "edit_file src/lex.rs 3s",
+                ),
+                row(2, 1, "✓", "docs", "", "wrote README.md"),
+            ],
+            0,
+            vec![
+                Line::from(vec![
+                    Span::styled(" #0 ", Style::default().fg(Color::Cyan)),
+                    Span::raw("rename the lexer module"),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        " {}",
+                        mush_core::text::truncate(
+                            "thinking 4s · .mush/wt/1 · git diff HEAD...mush/1",
+                            30
+                        )
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+            vec![
+                Line::from("you › rename the lexer module"),
+                Line::from("mush › Starting with the rename."),
+                Line::from("      ⚙ edit_file src/lex.rs"),
+                Line::from("      · spawned #1 lexer"),
+                Line::from("      ✓ #1 done: renamed the module"),
+                Line::from("mush › The tests are next."),
+                Line::from("· waiting on #1"),
+            ],
+            None,
+            " ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k",
+        )
+    }
+
+    /// §4.5's sample: one row per phase and one per row mark, so the picture
+    /// says the same thing about the marks the `marks` block names.
+    pub(crate) fn manual_sample_screen() -> Screen {
+        let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
+        root.focused = true;
+        root.unread_children = 2;
+        let mut orphan = row(8, 1, "✓", "orphan", "", "wrote src/lex.rs");
+        orphan.parent_gone = true;
+        let mut unread = row(7, 1, "✓", "docs", "", "wrote README.md");
+        unread.result_unread = true;
+        sample_screen(
+            &["3 working", "1 waiting", "Σ +324 −40"],
+            vec![
+                root,
+                row(1, 1, "⧗", "lexer", "", "waiting on results 3s"),
+                row(
+                    2,
+                    2,
+                    "◐",
+                    "tests",
+                    "mush/2 +324−40 ⚙1",
+                    "edit_file tests/lex.rs 3s",
+                ),
+                row(3, 1, "✗", "probe", "", "no route to host"),
+                row(4, 1, "⊘", "run", "", "stopped · re-send to resume"),
+                row(5, 1, "⚠", "build", "", "cut off · nothing committed"),
+                row(6, 1, "≡", "fold", "", "compacting 2s"),
+                unread,
+                orphan,
+            ],
+            0,
+            Vec::new(),
+            vec![
+                Line::from("you › make the tree show every state"),
+                Line::from("mush › Spawning the children."),
+                Line::from("      ⚙ spawn_agent tests probe"),
+                Line::from("      · spawned #2 (tests)"),
+                Line::from("      ⚙ wait"),
+                Line::from("      · #2 done: 3 tests pass"),
+                Line::from("      ✗ #3 failed: no route to host"),
+                Line::from("      ⚠ #5 cut off · nothing committed"),
+                Line::from("mush › Every mark is on a row above."),
+            ],
+            Some((
+                Rank::Said,
+                "spawned #8 (orphan) — its parent was reaped".to_string(),
+            )),
+            " ⌂ ~/p/demo │ master ±3 +324−40 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k",
+        )
     }
 }
