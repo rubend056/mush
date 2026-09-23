@@ -1102,9 +1102,11 @@ impl Workspace {
     /// Literal on purpose: a regex engine is a dependency and a search that
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
-    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped, and a
-    /// matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut said, so
-    /// one minified file cannot spend the result.
+    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped — the read
+    /// is bounded to the cap + 1 like [`Self::whole_read`]'s, so a file that
+    /// grew behind the stat is caught by its length rather than loaded whole —
+    /// and a matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut
+    /// said, so one minified file cannot spend the result.
     ///
     /// The match line is the *file's* line: no paint-time sanitizing, no
     /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
@@ -1173,10 +1175,17 @@ impl Workspace {
                 skipped += 1;
                 return true;
             }
-            let Ok(bytes) = fs::read(path) else {
+            // Bounded like the other two readers: the stat above saw a file
+            // within the cap, and one that grew past it since is a skip rather
+            // than a whole load.
+            let Ok(bytes) = read_bounded(path, SEARCH_FILE_CAP) else {
                 skipped += 1;
                 return true;
             };
+            if bytes.len() as u64 > SEARCH_FILE_CAP {
+                skipped += 1;
+                return true;
+            }
             if bytes.contains(&0) {
                 skipped += 1;
                 return true;
@@ -1761,6 +1770,21 @@ fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs
             Err(e) => return Err(format!("cannot write {}: {e}", paste_rel(&name))),
         }
     }
+}
+
+/// The bytes of `path` read under `cap`, bounded to `cap + 1` so a file that
+/// grew behind the caller's own stat is caught by its length instead of loaded
+/// whole — the bound [`Workspace::whole_read`] and [`Workspace::image_at`]
+/// keep, and the one [`Workspace::search`]'s read used to keep only from the
+/// stat. A bound checked from `metadata` alone is no bound on a file that is
+/// still growing; `cap + 1` is what lets the caller answer "past the cap"
+/// without coming back for the file's real size.
+fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// One matched line, as `search` hands it to a model: the file's own bytes,
@@ -3898,6 +3922,28 @@ mod tests {
         );
         assert!(reported.contains("line cut at"), "{reported}");
         assert!(reported.len() < long.len(), "the cut is real");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A reader that stats a file before it reads it still bounds the read:
+    /// [`read_bounded`] hands back at most `cap + 1` bytes, so a file that grew
+    /// behind the stat is caught by the length rather than loaded whole. This
+    /// is the bound `whole_read` and `image_at` keep, and the one `search`'s
+    /// read kept only from the stat (finding: the drift the dedup report named
+    /// at workspace.rs:1068 vs :509, :878).
+    #[test]
+    fn a_bounded_read_stops_at_the_cap() {
+        let ws = temp_workspace("read-bounded");
+        let path = ws.root().join("grew.txt");
+        fs::write(&path, vec![b'x'; 4096]).unwrap();
+
+        let bytes = read_bounded(&path, 1024).unwrap();
+        assert_eq!(bytes.len(), 1025, "cap + 1 is what says `past the cap`");
+        assert_eq!(
+            read_bounded(&path, 4096).unwrap().len(),
+            4096,
+            "a file inside the cap is read whole"
+        );
         let _ = fs::remove_dir_all(ws.root());
     }
 
