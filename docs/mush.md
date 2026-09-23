@@ -298,7 +298,13 @@ How an image is **weighed** (pixels, not bytes), where its dimensions come from,
 and how a stored transcript sheds the bytes in place:
 `crates/mush-core/src/message.rs` (`Message::content_parts`, `Message::weight`,
 `Message::drop_images`) and `crates/mush-core/src/workspace.rs`
-(`image_dimensions`).
+(`image_dimensions`). Pictures keep their payloads newest-first while they total
+at most `IMAGE_BYTES_KEPT` (8 MiB, `crates/mush-core/src/message.rs`); an older
+picture whose bytes no longer fit gives them up and keeps everything else — its
+row, path, mime and size, so `▣ name (png · 2.0 MB)` still reads the same — and
+the model sees the placeholder sentence ("bytes dropped to save room; read the
+file again if you need them") where the bytes were. The newest message's own
+pictures are never given up, and pricing is still by pixels.
 
 ### History budget
 
