@@ -997,6 +997,25 @@ pub(crate) mod tests {
         );
     }
 
+    /// One painted frame as text: the cells the real painters put in a
+    /// `TestBackend` of the frame's own size, one line per row. Colour is
+    /// dropped — a manual cannot carry it — and a row's trailing spaces are
+    /// cut, because they are the pane's padding and not a word it says.
+    fn frame_text(width: u16, height: u16, screen: &Screen) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, screen, &Theme::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// One row of the mark sweep: `agent_line`'s own fields, with every mark
     /// the row can wear set by the flag that produces it.
     #[allow(clippy::too_many_arguments)]
@@ -1160,6 +1179,23 @@ pub(crate) mod tests {
             "marks",
             "ui::tests::the_marks_block_matches_the_code",
             &format!("```\n{}\n```", painted.join("\n")),
+        );
+    }
+
+    /// The sample frame on the manual's front page, painted by the real
+    /// painters at 100×28 — a wide enough terminal for the whole facts line and
+    /// the pane title's Σ. Its `Screen` is built by `app::commands`'s test
+    /// fixture, because a message box's `InputPane` cannot be named from this
+    /// module (`app::screen` is private to `app`), and a sample that showed an
+    /// empty box would be a picture no `App` ever paints.
+    #[test]
+    fn the_readme_frame_matches_the_code() {
+        let screen = crate::app::commands::tests::readme_sample_screen();
+        doc_block(
+            "README.md",
+            "frame",
+            "ui::tests::the_readme_frame_matches_the_code",
+            &format!("```\n{}\n```", frame_text(100, 28, &screen)),
         );
     }
 }

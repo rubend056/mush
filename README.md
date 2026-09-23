@@ -8,6 +8,36 @@ mush does not edit files itself. The agents do, and mush is how you steer them
 and see what changed.
 
 <!-- generated: frame (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush ui::tests::the_readme_frame_matches_the_code) -->
+```
+┌ agents · 2 working · Σ +12 −3──┐┌ mush ──────────────────────────────────────────────────────────┐
+│▶◐ #0 root  thinking 4s         ││you › rename the lexer module                                   │
+│   ◐ #1 lexer  mush/1 +12−3     ││mush › Starting with the rename.                                │
+│   ✓ #2 docs  wrote README.md   ││      ⚙ edit_file src/lex.rs                                    │
+│                                ││      · spawned #1 lexer                                        │
+│                                ││      ✓ #1 done: renamed the module                             │
+│                                ││mush › The tests are next.                                      │
+│                                ││· waiting on #1                                                 │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│────────────────────────────────│└────────────────────────────────────────────────────────────────┘
+│ #0 rename the lexer module     │┌ message ───────────────────────────────────────────────────────┐
+│ thinking 4s · .mush/wt/1 · gi… ││›                                                               │
+└────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+ chat  Tab cycles panes · /help lists commands · Ctrl-P picks a model
+ ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k
+```
 <!-- /generated: frame -->
 
 ## Quick start
