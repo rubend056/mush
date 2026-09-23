@@ -616,9 +616,12 @@ pub enum Landing {
 /// would make, read-only.
 ///
 /// The read and the removal are two functions because only the caller knows
-/// *when* a directory may be taken: the UI reads the repository on its git
-/// worker and removes on the thread that owns the tree, so a node whose agent
-/// started running in between keeps the worktree it is working in.
+/// *when* a directory may be taken: the UI's read worker decides, and the
+/// removal runs on a second worker — off the UI thread, because the process
+/// chain per worktree was a keystroke asleep (finding R10) — which asks the
+/// tree, which owns "is this node still at rest", once more through
+/// `Msg::SweepAsk` before calling [`reclaim`], so a node whose agent started
+/// running in between keeps the worktree it is working in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reclaimable {
     /// Neither the checkout nor the branch is there: nothing to reclaim, and
@@ -811,7 +814,8 @@ fn ahead_of(root: &Path, branch: &str, base_sha: &str) -> Option<u64> {
 /// guarantee: `git worktree remove --force` (the `--force` is for git's own
 /// lock-file bookkeeping, not for a dirty checkout — that case never gets here)
 /// and `git branch -d`, never `-D`, so a branch git will not certify as deleted
-/// is a branch mush leaves alone (finding H10).
+/// is a branch mush leaves alone (finding H10). It runs on the UI's sweep
+/// worker and never on the UI thread itself ([`Reclaimable`], finding R10).
 pub fn reclaim(root: &Path, id: u64, base: &str, fork: Option<&str>) -> Reclaimed {
     match reclaimable(root, id, base, fork) {
         Reclaimable::Nothing => Reclaimed::Nothing,
