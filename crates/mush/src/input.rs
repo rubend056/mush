@@ -94,6 +94,60 @@ impl Input {
         self.cursor = (self.cursor + 1).min(self.graphemes());
     }
 
+    /// Move the cursor one painted row up, keeping its display column.
+    ///
+    /// A painted row is one of the box's lines: a line wider than the box is
+    /// windowed sideways with `…` ([`window_line`]) instead of wrapped, so the
+    /// rows the human moves between are the hard lines. The column kept is the
+    /// *display* column the cursor had — the same measurement
+    /// [`Self::cursor_line`] and the painter use — so the landing spot is the
+    /// row above at that column, clamped to the row's end when the row is
+    /// shorter, exactly as a wrapped editor clamps. A column that falls inside
+    /// a wide glyph lands *before* it, never in the glyph's second cell, and a
+    /// column inside a grapheme cluster is that cluster's boundary. A press on
+    /// the first row is a no-op: the box does not wrap, and there is no row
+    /// above to move to.
+    pub fn move_up(&mut self) {
+        self.move_row(-1);
+    }
+
+    /// [`Self::move_up`], one row down; a press on the last row is a no-op.
+    pub fn move_down(&mut self) {
+        self.move_row(1);
+    }
+
+    /// The arithmetic both directions share: the row `step` away, at the
+    /// cursor's own display column (clamped where it lands), or nowhere when
+    /// there is no such row.
+    fn move_row(&mut self, step: i64) {
+        let (row, column) = self.cursor_line();
+        let target = row as i64 + step;
+        if !(0..self.line_count() as i64).contains(&target) {
+            return;
+        }
+        let target = target as usize;
+        self.cursor = self.line_start(target) + self.grapheme_at_column(target, column);
+    }
+
+    /// The grapheme in `line` a display `column` can start on: the walk adds
+    /// each grapheme's painted width and stops before the one that would cross
+    /// the column, so the answer is a grapheme boundary and a wide glyph's
+    /// second cell is never a landing spot. A column past the line's end is the
+    /// line's end.
+    fn grapheme_at_column(&self, line: usize, column: usize) -> usize {
+        let mut width = 0;
+        let mut index = 0;
+        for grapheme in self.line(line).graphemes(true) {
+            let painted = UnicodeWidthStr::width(sanitize(grapheme).as_str());
+            if width + painted > column {
+                break;
+            }
+            width += painted;
+            index += 1;
+        }
+        index
+    }
+
     /// Home is the start of the cursor's own line, not of the box: with more
     /// than one line, jumping to the very beginning is not what the key means.
     pub fn move_home(&mut self) {
@@ -392,6 +446,103 @@ mod tests {
         assert_eq!(row, 1);
         assert_eq!(lines[1], "…hij");
         assert!(column < 5, "the cursor must fit inside the field");
+    }
+
+    /// Vertical movement goes between the rows the box paints — the lines, a
+    /// wide one windowed sideways rather than wrapped — and keeps the cursor's
+    /// display column. A shorter row clamps it to its end; coming back, the
+    /// walk starts from the column the cursor really has, which is what a
+    /// wrapped editor does.
+    #[test]
+    fn vertical_movement_keeps_the_display_column_across_the_boxes_rows() {
+        // A first row wider than the box, cursor at its end (23 columns).
+        let mut typed = input("a long row that windows\nshort\nanother row", 23);
+        assert_eq!(typed.cursor_line(), (0, 23));
+        typed.move_down();
+        assert_eq!(
+            typed.cursor_line(),
+            (1, 5),
+            "a shorter row clamps the column to its end"
+        );
+        typed.move_down();
+        assert_eq!(typed.cursor_line(), (2, 5), "the next row keeps it");
+        typed.move_up();
+        typed.move_up();
+        assert_eq!(
+            typed.cursor_line(),
+            (0, 5),
+            "the row above is the one landed on, at the column it had"
+        );
+
+        // The wide row's window follows the cursor's column there: the cursor
+        // is on screen, at the column it kept.
+        let (lines, row, column) = typed.view(1, 10);
+        assert_eq!(row, 0);
+        assert_eq!(lines, vec!["a long ro…".to_string()]);
+        assert!(column < 10, "the cursor must fit inside the field");
+    }
+
+    /// The first and the last row are walls, not wraps: a press there leaves
+    /// the cursor — and the text — exactly where it was. An empty box has one
+    /// row and is both walls at once.
+    #[test]
+    fn vertical_movement_at_the_first_and_last_row_is_a_no_op() {
+        let mut typed = input("one\ntwo", 0);
+        typed.move_up();
+        assert_eq!(
+            typed.cursor_line(),
+            (0, 0),
+            "there is no row above the first"
+        );
+        typed.move_end();
+        typed.move_up();
+        assert_eq!(
+            typed.cursor_line(),
+            (0, 3),
+            "End is the first row's end, and Up is still a wall"
+        );
+        typed.move_down();
+        assert_eq!(typed.cursor_line(), (1, 3));
+        typed.move_down();
+        assert_eq!(
+            typed.cursor_line(),
+            (1, 3),
+            "there is no row below the last"
+        );
+        assert_eq!(typed.text(), "one\ntwo", "no move edited the text");
+
+        let mut empty = Input::default();
+        empty.move_up();
+        empty.move_down();
+        assert_eq!(empty.cursor_line(), (0, 0));
+        assert!(empty.is_empty(), "and the box is still empty");
+    }
+
+    /// A wide glyph's second cell is not a place a cursor can be: a display
+    /// column inside one lands before the glyph, and a column inside a grapheme
+    /// cluster is that cluster's boundary.
+    #[test]
+    fn vertical_movement_never_lands_inside_a_wide_glyph() {
+        // Cursor after the first wide glyph (grapheme 1, column 2).
+        let mut typed = input("日本語\nx", 1);
+        assert_eq!(typed.cursor_line(), (0, 2));
+        typed.move_down();
+        assert_eq!(typed.cursor_line(), (1, 1));
+        typed.move_up();
+        assert_eq!(
+            typed.cursor_line(),
+            (0, 0),
+            "column 1 is 日's second cell: the cursor stops before the glyph"
+        );
+
+        // A combining acute is one cluster: the cursor is before or after it,
+        // never between the mark and the `e` it belongs to.
+        let mut marked = input("ae\u{301}\nx", 1);
+        marked.move_down();
+        marked.move_up();
+        assert_eq!(marked.cursor_line(), (0, 1));
+        marked.move_right();
+        assert_eq!(marked.cursor_line(), (0, 2), "past the whole cluster");
     }
 
     /// A paste whose last cluster merges with the one before it leaves the

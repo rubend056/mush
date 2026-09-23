@@ -360,6 +360,18 @@ or a ZWJ emoji is one keystroke, and the view is measured in display columns
 pane width the box scrolls horizontally instead of clipping its tail: `…` marks
 whichever edge is elided, and the cursor is always on screen.
 
+`Shift-Enter` and `Alt-Enter` put a newline in the message instead of sending
+it, and `Shift`/`Alt` with `↑`/`↓` move the box's cursor a row — the display
+column it had is kept, clamped to the row it lands on, the way a wrapped editor
+clamps — where the bare `↑`/`↓` keep scrolling the transcript. A terminal that
+encodes keys the legacy way reports neither shift, so at startup mush asks once
+whether the terminal speaks the keyboard protocol and pushes its disambiguating
+flags only when it answers yes; on a terminal that cannot, or does not answer,
+`Shift-Enter` arrives as a plain `Enter` and sends, and `Alt-Enter` is the
+spelling that is always there. Under tmux the query and the flags travel only
+with tmux ≥ 3.2 and `set -g extended-keys on` — old tmux, or a session that has
+not turned it on, is the same quiet `Shift-Enter`-sends case.
+
 **Keys and commands.** `mush --help` prints exactly these two tables, and so do
 the blocks below (a test fails while either is stale):
 
@@ -408,6 +420,8 @@ the blocks below (a test fails while either is stale):
     Shift / Alt-Enter    new line in the message
     letters and symbols  type into the message box
     ← / →, Home / End    move the box cursor
+    Shift-↑ / Shift-↓    move the box cursor a row
+    Alt-↑ / Alt-↓        the same move, where the terminal reports Alt
     Backspace / Delete   delete in the box; at the start of the box, Backspace pops the newest attachment
     Ctrl-U               clear the words in the box, keeping the images
     Ctrl-Z               put back the words and images the box last lost

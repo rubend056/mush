@@ -23,7 +23,7 @@ mod theme;
 mod ui;
 
 use std::error::Error;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,10 +33,12 @@ use crossbeam_channel::{unbounded, Receiver};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
+use ratatui::crossterm::queue;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::Terminal;
 
@@ -1261,23 +1263,92 @@ fn drain_actors(app: &mut App, rx: &Receiver<Msg>) {
     }
 }
 
+/// Whether the keyboard enhancement flags are on the terminal's stack.
+///
+/// The terminal is one process-wide device and there is at most one
+/// [`TerminalGuard`] alive for it, so "did we push the flags?" is one
+/// process-wide fact rather than a value threaded through the panic hook: the
+/// hook is installed *before* the guard exists (a panic inside the entry has to
+/// be able to hand the modes back), and both roads out — the hook and
+/// `Drop` — read this same flag. [`restore_terminal_modes`] takes it with
+/// `swap`, so a panic's restore followed by the guard's `Drop` pops exactly one
+/// frame.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
 /// Undo every mode [`TerminalGuard::enter`] turned on.
 fn restore_terminal_modes() {
     let _ = disable_raw_mode();
-    let _ = restore_mode_sequences(&mut io::stdout());
+    let _ = restore_mode_sequences(
+        &mut io::stdout(),
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    );
 }
 
 /// The escape sequences that leave the modes [`TerminalGuard::enter`] entered,
 /// written through a `Write` rather than straight to `stdout`: the panic hook's
 /// one effect on the terminal, so a test can read exactly what a panic puts on
 /// the wire without a terminal (finding E10).
-fn restore_mode_sequences(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(
+///
+/// `enhanced` is whether [`TerminalGuard::enter`] pushed the keyboard
+/// enhancement flags. When it did, the pop is queued beside the leave escapes
+/// and the whole hand-back goes out in one `flush` — the single-write shape the
+/// comment on [`TerminalGuard::enter_with`] leans on; a separate write would
+/// leave a process that died between the two with the human's shell still
+/// reading mush's keys as `CSI u`. When it did not, the terminal is never sent
+/// a pop it never opened.
+fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Result<()> {
+    queue!(
         writer,
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableMouseCapture
-    )
+    )?;
+    if enhanced {
+        queue!(writer, PopKeyboardEnhancementFlags)?;
+    }
+    writer.flush()
+}
+
+/// The screen step of [`TerminalGuard::enter`]: the alternate screen and
+/// bracketed paste — and, when the terminal says it can, the keyboard
+/// enhancement flags.
+///
+/// Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
+/// keystrokes — one event, one repaint, and a redraw per character — into a
+/// single `Event::Paste` carrying the whole paste. Mouse capture is
+/// deliberately NOT taken: it would let mush scroll by wheel notch instead of
+/// by arrow key, but it also takes away the terminal's own drag-to-select, and
+/// reading text out of the transcript is worth more than a wheel notch. The
+/// lag that made the wheel feel broken was the per-keystroke repaint, which
+/// the event loop no longer does.
+///
+/// The flags are what make `Shift-Enter`, `Shift-↑` and `Shift-↓` arrive at
+/// all: a terminal that encodes keys the legacy way sends them byte-identical
+/// to their unmodified forms, which is why `Alt-Enter` exists. So mush asks
+/// once, now that raw mode is on, and pushes only when the terminal answers the
+/// protocol's flags query. `supports_keyboard_enhancement` is a query and a
+/// *bounded* wait, and a terminal that stays silent is a terminal that cannot:
+/// no push, and exactly the old behaviour (`Shift-Enter` sends). The query
+/// reaching an outer terminal through tmux needs tmux ≥ 3.2 with
+/// `extended-keys on`; that is the manual's sentence, not code.
+///
+/// Entry and undo are the two halves of one shape — queue what the terminal
+/// gets, then a single `flush` — so a half-written set of screen modes is not a
+/// state that exists.
+fn screen_modes() -> io::Result<()> {
+    // An `Err` here is a terminal that did not answer the query in time, which
+    // is no support — never a reason to refuse to start.
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    KEYBOARD_ENHANCED.store(enhanced, Ordering::SeqCst);
+    let mut stdout = io::stdout();
+    queue!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    if enhanced {
+        queue!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    stdout.flush()
 }
 
 /// Restores the terminal on both clean exit (Drop) and panic.
@@ -1306,18 +1377,7 @@ impl TerminalGuard {
             // what makes the human's typing stop echoing and `Ctrl-C` stop
             // signalling.
             enable_raw_mode,
-            // Bracketed paste is what turns Ctrl-Shift-V from a stream of
-            // individual keystrokes — one event, one repaint, and a redraw per
-            // character — into a single `Event::Paste` carrying the whole
-            // paste.
-            //
-            // Mouse capture is deliberately NOT taken. It would let mush
-            // scroll by wheel notch instead of by arrow key, but it also takes
-            // away the terminal's own drag-to-select, and reading text out of
-            // the transcript is worth more than a wheel notch. The lag that
-            // made the wheel feel broken was the per-keystroke repaint, which
-            // the event loop no longer does.
-            || execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste),
+            screen_modes,
             || Terminal::new(CrosstermBackend::new(io::stdout())),
             restore_terminal_modes,
         )
@@ -1335,8 +1395,8 @@ impl TerminalGuard {
     /// The order is the fact: `raw` first, `screen` second, `build` last, and
     /// any failure after `raw` succeeded runs `restore` before returning the
     /// error. `restore` undoes *every* promise, not only the failed step's,
-    /// because the escapes are written in one `execute!` and a half-written
-    /// one cannot be told from a whole one.
+    /// because the escapes are written in one `flush` and a half-written one
+    /// cannot be told from a whole one.
     fn enter_with(
         raw: impl FnOnce() -> io::Result<()>,
         screen: impl FnOnce() -> io::Result<()>,
@@ -2875,7 +2935,7 @@ mod tests {
         let owner = std::thread::current().id();
         install_panic_hook_for(owner, route.clone(), move || {
             let mut sink = sink.clone();
-            let _ = restore_mode_sequences(&mut sink);
+            let _ = restore_mode_sequences(&mut sink, false);
         });
         route.raise();
 
@@ -2935,6 +2995,41 @@ mod tests {
         // The hook is the process's: put the default back, so whatever panic
         // comes next is not shaped by this test.
         let _ = std::panic::take_hook();
+    }
+
+    /// The keyboard enhancement flags are popped only when they were pushed: a
+    /// terminal that never answered the support query is not sent a pop it
+    /// never opened, and a terminal that did answer must not keep mush's flags
+    /// across the hand-back — a shell that inherits them reads every key as a
+    /// `CSI u` sequence. The pop rides in the same `flush` as the leave
+    /// escapes, so the hand-back cannot be half-written.
+    #[test]
+    fn the_keyboard_flags_are_popped_only_when_they_were_pushed() {
+        let modes = Modes::default();
+        let mut sink = modes.clone();
+        restore_mode_sequences(&mut sink, false).expect("the sink answers");
+        let plain = String::from_utf8_lossy(&modes.0.lock().unwrap()).into_owned();
+        assert!(
+            plain.contains("\u{1b}[?1049l"),
+            "leaves the alternate screen: {plain:?}"
+        );
+        assert!(
+            !plain.contains("\u{1b}[<1u"),
+            "a terminal that never pushed the flags was sent a pop: {plain:?}"
+        );
+
+        let modes = Modes::default();
+        let mut sink = modes.clone();
+        restore_mode_sequences(&mut sink, true).expect("the sink answers");
+        let enhanced = String::from_utf8_lossy(&modes.0.lock().unwrap()).into_owned();
+        assert!(
+            enhanced.contains("\u{1b}[<1u"),
+            "pops the flags the terminal answered for: {enhanced:?}"
+        );
+        assert!(
+            enhanced.contains("\u{1b}[?1049l"),
+            "and the pop is part of the one hand-back: {enhanced:?}"
+        );
     }
 
     /// The hold is bounded, and the bound is said rather than silent: a process

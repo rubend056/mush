@@ -3003,6 +3003,18 @@ impl Chat {
                 self.input.move_end();
                 None
             }
+            // The box's vertical cursor: one painted row, the display column
+            // kept, clamped to the row it lands on (`Input::move_up`'s own
+            // arithmetic). The transcript's scrollback is the *bare* arrow's
+            // job, and the keymap is where that split is made.
+            ChatKey::Up => {
+                self.input.move_up();
+                None
+            }
+            ChatKey::Down => {
+                self.input.move_down();
+                None
+            }
             ChatKey::Insert(c) => {
                 self.input.insert(&c.to_string());
                 None
@@ -6947,6 +6959,29 @@ mod tests {
         assert!(press(&mut chat, key(KeyCode::Left)));
         assert!(press(&mut chat, key(KeyCode::Char('A'))));
         assert_eq!(chat.input().text(), "Ax");
+    }
+
+    /// The modified Up/Down keys the keymap hands the chat move the box's
+    /// cursor through a multi-line draft — bare Up/Down stay the transcript's
+    /// scrollback, which the keymap's own table pins — and the movement is the
+    /// box's own arithmetic, not a second copy here.
+    #[test]
+    fn a_modified_up_and_down_move_the_box_cursor() {
+        let mut chat = Chat::bare();
+        chat.insert("one\ntwo");
+        assert_eq!(chat.input().cursor_line(), (1, 3), "typed at the end");
+
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert!(press(&mut chat, KeyEvent::new(KeyCode::Up, modifiers)));
+            assert_eq!(chat.input().cursor_line(), (0, 3), "{modifiers:?}");
+            assert!(press(&mut chat, KeyEvent::new(KeyCode::Down, modifiers)));
+            assert_eq!(chat.input().cursor_line(), (1, 3), "{modifiers:?}");
+        }
+        assert_eq!(
+            chat.input().text(),
+            "one\ntwo",
+            "moving the cursor never edited the draft"
+        );
     }
 
     /// Backspace takes the thing immediately before the cursor, and at the very

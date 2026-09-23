@@ -7,10 +7,10 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel|--sigterm|--lock]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--shift-enter|--cancel|--sigterm|--lock]
 
-The resize, cancel, sigterm and lock scenarios need no model endpoint; the
-others do.
+The resize, shift-enter, cancel, sigterm and lock scenarios need no model
+endpoint; the others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
 Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).
@@ -214,6 +214,134 @@ def scenario_resize(binary: str, root: pathlib.Path) -> bool:
     ]
     if not all(results):
         print(tui.tail())
+    return all(results)
+
+
+def scenario_shift_enter(binary: str, root: pathlib.Path) -> bool:
+    """Shift-Enter is a newline when the terminal can say so.
+
+    A terminal that encodes keys the legacy way sends Shift-Enter byte for byte
+    as a plain Enter, which is why `Alt-Enter` exists; mush asks once at startup
+    whether the terminal speaks the keyboard protocol (the kitty flags query)
+    and pushes `DISAMBIGUATE_ESCAPE_CODES` when it answers yes, after which a
+    supporting terminal reports the shift as `CSI 13;2u`. This drives the real
+    binary through a pty that answers the query the way such a terminal does,
+    injects that sequence, and asserts the two facts that must follow: it sent
+    nothing, and the message the plain Enter then sends holds both lines. The
+    push and the pop are read off the wire, so the protocol path is covered end
+    to end and not only crossterm's decoding.
+    """
+    print(f"\n== shift-enter == {root}")
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    bodies = []
+
+    env = {
+        "MUSH_URL": f"http://127.0.0.1:{port}",
+        "MUSH_PROVIDER": "custom",
+        "MUSH_MODEL": "probe",
+    }
+    # Fork the TUI before any thread exists, as the cancel scenario explains.
+    tui = Tui(binary, root, rows=30, cols=110, env_extra=env)
+
+    def reply(connection, payload: bytes):
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+        )
+        connection.close()
+
+    def handle(connection):
+        request = connection.recv(65536)
+        if b"/models" in request:
+            reply(connection, b'{"object":"list","data":[{"id":"probe"}]}')
+            return
+        bodies.append(request)
+        reply(
+            connection,
+            b'{"choices":[{"message":{"role":"assistant","content":"ok"},'
+            b'"finish_reason":"stop"}]}',
+        )
+
+    def endpoint():
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+
+    threading.Thread(target=endpoint, daemon=True).start()
+
+    # Answer the keyboard-protocol query the way a supporting terminal does.
+    # Both replies are needed: crossterm waits for the flags response and then
+    # flushes the primary-device-attributes response out of its queue, so a
+    # terminal that answers only one of the two hangs the other. Flags bit 1 is
+    # `DISAMBIGUATE_ESCAPE_CODES`.
+    asked = False
+    deadline = time.time() + 15
+    while time.time() < deadline and not asked:
+        tui.pump(0.2)
+        if b"\x1b[?u" in bytes(tui.captured):
+            os.write(tui.master, b"\x1b[?1u\x1b[?1;2c")
+            asked = True
+    tui.pump(1.0)
+
+    tui.send("hello")
+    # What a supporting terminal sends for Shift-Enter: CSI 13;2 u.
+    tui.send("\x1b[13;2u")
+    tui.send("world", settle=0.5)
+    # Shift-↑ (`CSI 1;2 A`) moves the box's cursor to the row above, at the
+    # column it had. The next character must therefore land at the end of
+    # `hello`: if the arrow had scrolled the transcript instead, it would land
+    # after `world`.
+    tui.send("\x1b[1;2A")
+    tui.send("X", settle=0.5)
+    before_enter = len(bodies)
+
+    tui.send("\r")
+    deadline = time.time() + 10
+    while time.time() < deadline and not bodies:
+        tui.pump(0.2)
+    tui.pump(0.5)
+
+    exit_code = tui.close()
+    captured = bytes(tui.captured)
+    first = bodies[0] if bodies else b""
+    message_ok = b"helloX\\nworld" in first
+
+    results = [
+        check("the terminal was asked about the keyboard protocol", asked),
+        check(
+            "the flags were pushed when the terminal answered yes",
+            b"\x1b[>1u" in captured,
+            "DISAMBIGUATE_ESCAPE_CODES",
+        ),
+        check(
+            "Shift-Enter did not send the message",
+            before_enter == 0,
+            f"{before_enter} request(s) before Enter",
+        ),
+        check("the plain Enter sent one message", len(bodies) == 1, f"{len(bodies)} request(s)"),
+        check(
+            "the message holds both lines, in order",
+            message_ok,
+            "Shift-Enter inserted the line and Shift-↑ moved the cursor back over it"
+            if message_ok
+            else repr(first[:400]),
+        ),
+        check("the flags were popped on the way out", b"\x1b[<1u" in captured),
+        check("clean exit", exit_code == 0, f"exit {exit_code}"),
+    ]
+    if not all(results):
+        print(tui.tail())
+    try:
+        listener.close()
+    except OSError:
+        pass
     return all(results)
 
 
@@ -571,6 +699,9 @@ def main() -> int:
     parser.add_argument("workdir", nargs="?", default="/tmp/mush-smoke")
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
+    parser.add_argument(
+        "--shift-enter", action="store_true", help="run only the Shift-Enter scenario"
+    )
     parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
     parser.add_argument("--sigterm", action="store_true", help="run only the sigterm scenario")
     parser.add_argument("--lock", action="store_true", help="run only the lock scenario")
@@ -581,7 +712,7 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    chosen = [args.agent, args.resize, args.cancel, args.sigterm, args.lock]
+    chosen = [args.agent, args.resize, args.shift_enter, args.cancel, args.sigterm, args.lock]
     both = not any(chosen)
     base = pathlib.Path(args.workdir)
     passed = True
@@ -589,6 +720,8 @@ def main() -> int:
         passed &= scenario_agent(binary, base / "agent")
     if both or args.resize:
         passed &= scenario_resize(binary, base / "resize")
+    if both or args.shift_enter:
+        passed &= scenario_shift_enter(binary, base / "shift-enter")
     if both or args.cancel:
         passed &= scenario_cancel(binary, base / "cancel")
     if both or args.sigterm:

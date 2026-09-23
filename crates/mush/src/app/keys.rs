@@ -270,6 +270,20 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Chat,
+        keys: "Shift-↑ / Shift-↓",
+        help: "move the box cursor a row",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Alt-↑ / Alt-↓",
+        // The same caveat `Shift-Enter` carries: the move happens when the
+        // terminal reports the modifier, and `Alt` is the spelling that is
+        // there in most of them. The two rows are split so the keys column
+        // cannot read as "Shift or Alt, and ↓" — a bare `↓` scrolls.
+        help: "the same move, where the terminal reports Alt",
+    },
+    Binding {
+        context: Context::Chat,
         keys: "Backspace / Delete",
         help: "delete in the box; at the start of the box, Backspace pops the newest attachment",
     },
@@ -349,6 +363,14 @@ pub enum ChatKey {
     Right,
     Home,
     End,
+    /// The box's cursor one painted row up (`Shift-↑` or `Alt-↑`). The column
+    /// it had is kept — a *display* column, clamped to the row it lands on the
+    /// way a wrapped editor clamps — and a press on the first row is a no-op
+    /// rather than a wrap or a jump to the box's start.
+    Up,
+    /// The box's cursor one painted row down (`Shift-↓` or `Alt-↓`), by
+    /// [`ChatKey::Up`]'s rule.
+    Down,
     /// A printable character, inserted at the cursor.
     Insert(char),
     /// The transcript's scrollback, in rows: positive is older.
@@ -585,13 +607,18 @@ fn tree(key: KeyEvent) -> Intent {
     }
 }
 
-/// The chat pane: sending, the message box, and the scrollback. `<Enter>` is
-/// the split — a plain one sends, a modified one is a newline — and it is the
-/// only key here whose meaning depends on a modifier the terminal may not
-/// report.
+/// The chat pane: sending, the message box, and the scrollback. `<Enter>` and
+/// the two vertical arrows are the splits that depend on a modifier: a plain
+/// `Enter` sends where a modified one is a newline, and a bare arrow scrolls
+/// the transcript where a modified one moves the box's cursor between the rows
+/// of a draft. Whether the terminal reports the modifier at all is the
+/// terminal's business — `Shift-Enter` and `Shift-↑`/`Shift-↓` need the
+/// keyboard protocol, which [`crate::TerminalGuard`] asks the terminal for at
+/// startup, and `Alt` is the spelling that is there without it.
 fn chat(key: KeyEvent) -> Intent {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         // `Ctrl-V`: the box takes the clipboard's image. It is here rather
         // than with the app-wide `Ctrl-` keys because it is about the message
@@ -605,9 +632,7 @@ fn chat(key: KeyEvent) -> Intent {
         // has no box on screen — is not a way to reach the draft behind it.
         KeyCode::Char('u') if ctrl => Intent::Chat(ChatKey::ClearWords),
         KeyCode::Char('z') if ctrl => Intent::Chat(ChatKey::Undo),
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
-            Intent::Chat(ChatKey::Newline)
-        }
+        KeyCode::Enter if shift || alt => Intent::Chat(ChatKey::Newline),
         KeyCode::Enter => Intent::Send,
         KeyCode::Backspace => Intent::Chat(ChatKey::Backspace),
         KeyCode::Delete => Intent::Chat(ChatKey::Delete),
@@ -615,6 +640,13 @@ fn chat(key: KeyEvent) -> Intent {
         KeyCode::Right => Intent::Chat(ChatKey::Right),
         KeyCode::Home => Intent::Chat(ChatKey::Home),
         KeyCode::End => Intent::Chat(ChatKey::End),
+        // A modified arrow is the box's: with a draft that has rows, moving
+        // the cursor between them is what the key is for, and the transcript's
+        // scrollback is the bare arrow's job below. `Alt` is here for the same
+        // reason `Alt-Enter` is: a terminal that never reports `Shift` still
+        // reports the one modifier it has spelled that way for decades.
+        KeyCode::Up if shift || alt => Intent::Chat(ChatKey::Up),
+        KeyCode::Down if shift || alt => Intent::Chat(ChatKey::Down),
         // A `Ctrl-` or `Alt-` char that got past the app-wide keys above is a
         // shortcut mush does not have; typing it would be worse than dropping
         // it, and `Shift-` is how a capital letter arrives.
@@ -729,6 +761,22 @@ pub(crate) mod tests {
             (none(KeyCode::End), Intent::Chat(ChatKey::End)),
             (none(KeyCode::Up), Intent::Chat(ChatKey::Scroll(1))),
             (none(KeyCode::Down), Intent::Chat(ChatKey::Scroll(-1))),
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+                Intent::Chat(ChatKey::Up),
+            ),
+            (
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                Intent::Chat(ChatKey::Down),
+            ),
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+                Intent::Chat(ChatKey::Up),
+            ),
+            (
+                KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+                Intent::Chat(ChatKey::Down),
+            ),
             (none(KeyCode::PageUp), Intent::Chat(ChatKey::Scroll(10))),
             (none(KeyCode::PageDown), Intent::Chat(ChatKey::Scroll(-10))),
             (none(KeyCode::Esc), Intent::Chat(ChatKey::Clear)),
@@ -887,6 +935,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// The message box's cursor has a vertical spelling too, and it is the
+    /// modified arrow in both spellings — while the bare arrow stays exactly
+    /// what it always was, the transcript's scrollback. The split is the whole
+    /// point of the row: `↑` never moves the box, `Shift-↑` never scrolls.
+    #[test]
+    fn a_modified_arrow_moves_the_box_cursor_and_a_bare_one_scrolls() {
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            assert_eq!(
+                at(Focus::Chat, false, KeyEvent::new(KeyCode::Up, modifiers)),
+                Intent::Chat(ChatKey::Up),
+                "{modifiers:?}"
+            );
+            assert_eq!(
+                at(Focus::Chat, false, KeyEvent::new(KeyCode::Down, modifiers)),
+                Intent::Chat(ChatKey::Down),
+                "{modifiers:?}"
+            );
+        }
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Up)),
+            Intent::Chat(ChatKey::Scroll(1)),
+            "a bare Up still scrolls the transcript"
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Down)),
+            Intent::Chat(ChatKey::Scroll(-1)),
+            "a bare Down still scrolls the transcript"
+        );
+    }
+
     /// A picker takes the keyboard: the rows it owns are its own, and a key it
     /// has no opinion about is dropped rather than reaching the pane underneath
     /// — which is what stops a picker's `j` from also moving the tree, and its
@@ -998,6 +1076,17 @@ pub(crate) mod tests {
             (
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
                 Intent::TreeFocus,
+            ),
+            // The chat's split of the vertical arrows does not reach the tree:
+            // a modified arrow still moves the tree's cursor a row, the way the
+            // pane has always read its arrows.
+            (
+                KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+                Intent::TreeMove(-1),
+            ),
+            (
+                KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+                Intent::TreeMove(1),
             ),
         ];
         for (key, want) in cases {

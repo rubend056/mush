@@ -283,6 +283,8 @@ stale:
     Shift / Alt-Enter    new line in the message
     letters and symbols  type into the message box
     ← / →, Home / End    move the box cursor
+    Shift-↑ / Shift-↓    move the box cursor a row
+    Alt-↑ / Alt-↓        the same move, where the terminal reports Alt
     Backspace / Delete   delete in the box; at the start of the box, Backspace pops the newest attachment
     Ctrl-U               clear the words in the box, keeping the images
     Ctrl-Z               put back the words and images the box last lost
