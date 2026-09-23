@@ -7599,3 +7599,73 @@ sentences, §8.83); `crates/mush/src/app/commands.rs`'s `/url` arm still accepts
 control character without a sentence (`4f7793c`, §8.79); and
 `docs/audits/agent-and-wire.md`'s blind-spot bullet still reads as open for A9's
 overflow, which `330fe61` closed (§8.79) — evidence files stay as found.
+
+---
+
+## 8.87 A row whose parent the history window reaped wears ⚮ (#119, `4592da5`, merged `a65cdb5`)
+
+The human's live report — “an old #58 row appearing” — was the history window's
+own road. `CHILD_HISTORY = 50` drops the oldest children (`AgentTree::past_history`,
+applied by `App::reap_history`), and a node does not inherit its parent's age, so
+#49 was reaped while the probe it had spawned stayed; the frame read
+`✓ #58 Adversarial write-road …` among the root's current children, claiming a
+parent it does not have. The row had always been *ordered* at the top level —
+`rows()` cannot place a node whose parent is not in the tree anywhere else — and
+since D9 it is *indented* there too (`painted_depth` is zero for a node whose
+parent is not in the tree): the exact shape a child of the root wears. Same
+order, same indent, same glyph — the structure itself cannot tell the two apart,
+which is why the fact has to be said in the row.
+
+The row now says it. `⚮` (U+26AE, `DIVORCE SYMBOL`) is the one symbol Unicode
+has for a severed pair, and here the severed pair is the parent link. It rides
+the head, right
+after the id it qualifies — the head is the one field `fit_row` never gives up
+(R1: the title yields first), which is where a mark that must survive the 80×24
+floor has to sit — and it costs one column, the arithmetic
+`every_row_mark_is_one_column` pins for every mark a row can wear, `⚮` counted
+beside `▶`, `⏸`, `✉`, `⚙` and `⚠`.
+
+`AgentRow::parent_gone` reads `AgentTree::parent_gone` —
+`node.parent.is_some_and(|parent| !self.has(parent))` — so it is true only when
+`parent` names an id the *tree* does not hold. The four no's are the design, not
+fallout: the root has no parent to lose, a leftover worktree found on disk never
+had one in this tree, a root child's parent is the root, and any node whose parent
+is in the tree is a child. The indent rule stays D9's: `AgentNode::depth` is still
+where the agent was spawned (the actor's prompt and the spawn limit read it), and
+the mark is about the missing parent alone.
+
+Measured on the painted pane at the 80×24 floor, cursor on the probe, its parent
+reaped by the window's own road (50 newer root children, then the probe, so
+`past_history` drops the oldest two and `reap_history` lands what a tick does with
+it):
+
+```
+before   "     ✓ #2 probe  done"    (#1's probe, two levels in, no mark)
+after    " ✓ #2 ⚮ probe  done"      (#1 reaped, D9's top level, the mark)
+```
+
+Pinned by:
+- `a_row_whose_parent_the_window_reaped_says_its_parent_is_gone` (`screen.rs`):
+  the live window road read as painted cells, with the root and a root child
+  asserting no mark, the pane unfocused, and the hidden-rows `▲` title;
+- `a_parent_gone_row_says_so_in_every_state_it_can_wear` (`screen.rs`): focused
+  and unfocused, 80×24 and 120×40, the four themes, the mark beside a landed row,
+  a `⊘` stop and a `⏸1` count, and the rows that must stay unmarked;
+- `a_reaped_parent_is_a_parent_gone` (`tree.rs`): the predicate's four no's, and
+  the stored-depth/painted-depth pair it must not disturb;
+- `a_row_without_a_painted_parent_is_painted_at_the_top_level` (`app/mod.rs`),
+  the one line outside those modules, and only its expected cells moved: the
+  orphan it reads is now `" ✓ #2 ⚮ 2  done"`.
+
+**The merge's own one-line fix.** `fc22789` is the root's answer to a semantic
+merge: #118's `agents_pane` fixture (`ui.rs`) builds `AgentRow` literals and #119
+added `parent_gone` to the struct, in different regions of one file — git merged
+both and the combination did not build. The fixture's four rows are not about the
+severed-parent mark, so it passes `false`; the gate on the merge is what caught
+it.
+
+This is D9's leftover: that rule made the painted order and the painted indent
+one spelling of the nesting, and a parent the window reaped is the one case where
+the order says *top level* while the link says otherwise. The rule is kept and
+the leftover is said — the row is still ordered and indented as a top-level row,
+and the mark is what keeps its orphan from reading as the root's own child.
