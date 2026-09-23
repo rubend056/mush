@@ -5678,6 +5678,15 @@ mod tests {
         }
     }
 
+    /// Renew a status line for the next shot: the draw sweep paints one fixed
+    /// moment, and the bar's own clock must not age a transient line out from
+    /// under the words a state asserts (see that test's doc).
+    fn renew_status(app: &mut App) {
+        if let Some(status) = app.status.as_mut() {
+            status.set_at = Instant::now();
+        }
+    }
+
     /// A `Ctrl-` key as the terminal delivers it: one press, through the key
     /// table and the arms, exactly as `main` routes it.
     fn ctrl(app: &mut App, key: char) {
@@ -17735,6 +17744,16 @@ mod tests {
     /// control byte, and that the frame is exactly the terminal's size. The
     /// words are the evidence; a layout that silently drops a fact is the bug
     /// class the audit's ten defects all belonged to (refactor B17).
+    ///
+    /// The bar's transient line has a life of its own ([`INFO_TTL`], the fact
+    /// `info_fades_and_errors_stay` pins), and this sweep runs for seconds. A
+    /// state whose words ride on a line written when the states were built —
+    /// the job's `#c1`, which at 79×24 has only the bar to come from, the
+    /// compact strip being three rows with no foot row under the selected one —
+    /// would lose it to the sweep's own runtime: which shots still saw the word
+    /// would answer how fast the machine ran, not what the layout paints. Every
+    /// shot is taken with the line renewed ([`renew_status`]), so `INFO_TTL`
+    /// cannot age a state out from under its own assertions.
     #[test]
     fn the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic() {
         let paint = shot;
@@ -17748,6 +17767,9 @@ mod tests {
                 absent,
             } = state;
             for &(width, height) in SWEEP_SIZES {
+                // The sweep's own runtime must not age a transient line out of
+                // the words its state asserts (see this test's doc).
+                renew_status(app);
                 let shot = shot(app, width, height);
                 let at = format!("{name} at {width}×{height}");
                 // The frame is the terminal: every row, every column, and not
