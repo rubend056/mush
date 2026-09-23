@@ -334,15 +334,15 @@ default suite, and `--ignored` is now exactly the three live-endpoint tests in
 (`a_frame_fits_in_a_60fps_budget_on_a_long_transcript`).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
-(`chat(&ChatRequest, &AtomicBool, Duration) -> Result<ChatResponse, ModelError>`), the
-real `HttpModel` over `http::post_json` (body encoding, and the classification
-of a cancellation, a refusal, a transport failure, a status the endpoint chose
-and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` — a reply queue
-that also scripts a refusal and a cancellation, and records the requests it was
-given. `AgentCtx::model` carries it, children inherit it, so one client serves a
-whole tree (and one scripted client can too). `run_loop` and `compact_history`
-go through it with every branch and every error string unchanged; `http.rs` is
-untouched. Three in-process tests: a scripted run that runs its tool call and
+(`chat(&ChatRequest, &AtomicBool, Duration) -> Result<ChatResponse, ModelError>`),
+the real `HttpModel` over `http::post_json` (body encoding, and the
+classification of a cancellation, a refusal, a transport failure, a status the
+endpoint chose and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` —
+a reply queue that also scripts a refusal and a cancellation, and records the
+requests it was given. `AgentCtx::model` carries it, children inherit it, so one
+client serves a whole tree (and one scripted client can too). `run_loop` and
+`compact_history` go through it with every branch and every error string
+unchanged; `http.rs` is untouched. Three in-process tests: a scripted run that runs its tool call and
 ends with the answer, the learned-context retry, and a cancellation mid-reply.
 
 **Stage 2.2 — the `#[ignore]`d actor tests.** ✅ All five now run in process on
@@ -362,9 +362,9 @@ model's own stop (H45). Gone with
 them: `start_mock*`, `stop_mock`, the four port constants (18731–18735), the
 `python3` readiness probe, and every sleep over 20 ms in these tests.
 `scripts/mock_llm.py` stays in the tree for hand-driven runs; no test, and
-nothing else in the repo, refers to it. The only surface the production code grew is `#[cfg(test)]`:
-`agent::spawn_scripted`, which starts the same root actor over a caller-supplied
-client.
+nothing else in the repo, refers to it. The only surface the production code
+grew is `#[cfg(test)]`: `agent::spawn_scripted`, which starts the same root
+actor over a caller-supplied client.
 
 **Stage 2.3 — `Machine` + `Job`, `Clock`, `Events`.** ✅ The last three seams of
 §4, plus B6. `machine.rs` holds `Machine::spawn(&ShellCommand) -> Box<dyn Job>`
@@ -587,14 +587,14 @@ The rule the waves have settled into, so it is not re-derived each time:
 
 The review that follows every integration onto `master` (§10.3) reports the same
 fact, rule or shape written more than once, ranked by (net lines × confidence) ÷
-risk. This is the one ledger of the duplication queue's decisions: a row per item,
-what it costs, and — while it is open — the risk the fix removes and the test
-that would protect it. The queue's evidence is the record's, not this ledger's:
-`findings.md` §8.51 carries the six blind audits and their findings, §8.70 the
-four duplication passes that read the tree blind, each pointing back at the rows
-here. The reviews' own subsections below are kept for their evidence: what each
-measured, which bugs it injected, and which semantic changes it proved
-byte-identical.
+risk. This is the one ledger of the duplication queue's decisions: a row per
+item, what it costs, and — while it is open — the risk the fix removes and the
+test that would protect it. The queue's evidence is the record's, not this
+ledger's: `findings.md` §8.51 carries the six blind audits and their findings,
+§8.70 the four duplication passes that read the tree blind, each pointing back
+at the rows here. The reviews' own subsections below are kept for their
+evidence: what each measured, which bugs it injected, and which semantic changes
+it proved byte-identical.
 
 How to read a row. `Net` is the fix's size — the measured delta for a landed row,
 the review's estimate for an open one. `Status` names the commit that landed a
@@ -622,10 +622,10 @@ prod 18 232, tests 34 663, comments 21 708, blank 4 605 (`scripts/census.py`).
 That sentence is kept as it stood: it is the census the four passes' rows were
 checked against at entry, not a number to be overwritten. This ledger's anchor is
 now `7338d81`: 86 623 lines — prod 19 092, tests 38 164, comments 24 395, blank
-4 972 (`scripts/census.py`) — prod +860 / tests +3 501 / comments +2 687 / blank
-+367 over `38d0438`. The `b8d8baa` sentence above is left as it stands: it is
-the census the reviews before these read, not a number to be overwritten, and the
-rows below say where a later wave re-priced one of them (`1e07c2e`).
+4 972 (`scripts/census.py`); over `38d0438` that is prod +860, tests +3 501,
+comments +2 687, blank +367. The `b8d8baa` sentence above is left as it stands:
+it is the census the reviews before these read, not a number to be overwritten,
+and the rows below say where a later wave re-priced one of them (`1e07c2e`).
 
 | # | What is duplicated | Net | Risk | Protecting test | Status |
 |---|---|---|---|---|---|
