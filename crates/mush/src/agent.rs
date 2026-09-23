@@ -970,11 +970,9 @@ impl AgentCtx {
     /// the UI never hears about. `Ok(false)` is the cell refusing a number —
     /// the human stated a window, or it was not plausible.
     fn learn_context(&self, id: u64, tokens: usize, source: WindowSource) -> Result<bool, String> {
-        if !self.cfg.learn_context(tokens, source)? {
-            return Ok(false);
-        }
-        self.emit(id, AgentEvent::Context { tokens, source });
-        Ok(true)
+        self.cfg.learn_context(tokens, source, || {
+            self.emit(id, AgentEvent::Context { tokens, source })
+        })
     }
 }
 
