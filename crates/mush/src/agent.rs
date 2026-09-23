@@ -805,8 +805,9 @@ pub enum AgentEvent {
     /// exactly where they were — and it is also what a child the history window
     /// has since forgotten leaves, which the parent's books outlive as well
     /// (finding H19), and what a thread that *died* leaves
-    /// ([`AgentEvent::CutOff`], finding F6). The parent cannot tell the three
-    /// apart, and cannot wake any of them: only the UI holds the transcript an
+    /// ([`AgentEvent::CutOff`], finding F6). The mailbox cannot tell the three
+    /// apart — that is the whole of the empty send — and the parent cannot wake
+    /// any of them: only the UI holds the transcript an
     /// actor is rebuilt from. So the command travels here and the UI hands it
     /// over through the door a human's own message uses
     /// (`App::deliver_to_actor`), which revives a parked child and drops a
@@ -815,7 +816,10 @@ pub enum AgentEvent {
     /// The parent has already answered its model by then — an empty mailbox is
     /// not proof that the child is gone, which is the whole of finding H18 — so
     /// nothing on the UI side writes a result for this: the child's own
-    /// `ChildRunning` and `ChildDone` are what settle the parent's books.
+    /// `ChildRunning` and `ChildDone` are what settle the parent's books. Which
+    /// of the three left the mailbox behind is said by the *answer* the parent's
+    /// model reads — a park and a death are two different sentences
+    /// (`actor_gone`) — never by this command.
     ChildAsleep {
         child: u64,
         command: AgentMsg,
@@ -4890,15 +4894,38 @@ fn parse_target(raw: &str) -> Result<Target, String> {
 /// The child a human's own message was aimed at is not there to take it: the
 /// UI reached for it and found no node at all, so there is nothing to revive
 /// (`App::deliver_to_actor`). A *parent's* `control` no longer lands here: the
-/// mailbox it holds being empty is a parked child, which the UI can wake
-/// ([`AgentEvent::ChildAsleep`]). Takes the typed id, so the sentence's `#`
-/// comes from [`AgentId`]'s `Display` alone.
+/// mailbox it holds being empty is a child whose actor is not there — parked, or
+/// dead with its run cut off, which the reply tells apart (`actor_gone`) — and
+/// both are the UI's to wake ([`AgentEvent::ChildAsleep`]). Takes the typed id,
+/// so the sentence's `#` comes from [`AgentId`]'s `Display` alone.
 pub(crate) fn gone(id: AgentId) -> String {
     format!("agent {id} is gone")
 }
 
+/// Whether this child's actor is *gone* rather than parked.
+///
+/// The books' own answer, and the only one this actor can have: a parked child
+/// is one whose thread `App::park_history` reclaimed **at rest** — the window
+/// parks nothing that is running — so the last ending this parent recorded is one
+/// of the other three. A cut-off is the one ending only a vanished actor files
+/// (`file_death`), and it is the last word the books hold about a child whose
+/// thread died with its run in flight (finding F6).
+///
+/// Deliberately not a thread's liveness: this actor does not own the child's
+/// thread and holds no handle on it, and the mailbox that failed is exactly the
+/// mailbox a *parked* child leaves — indistinguishable by construction. What
+/// tells the two apart is what the child itself reported before it went: a park
+/// is at rest by definition, and a corpse reports its own cut-off.
+fn actor_gone(state: &ActorState, id: u64) -> bool {
+    matches!(state.outcome(id), Some(Outcome::CutOff))
+}
+
 /// Stop a child this agent owns. Stopping is not finishing: the child keeps its
 /// context and work, and a later `control message` resumes it.
+///
+/// A mailbox with no actor behind it is two facts, and the answer says which:
+/// a *parked* child's thread is the window's to wake, while one whose thread
+/// died with its run in flight has nothing left to stop at all.
 fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
         return Err(unknown_child(id));
@@ -4915,6 +4942,17 @@ fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, 
     // what it did rather than what happened to it.
     match cmd.send(AgentMsg::Stop(Stop::Parent)) {
         Ok(()) => Ok(format!("stopping agent #{id}")),
+        Err(_) if actor_gone(state, id) => {
+            // A corpse is not parked, and a Stop is aimed at work: there is none
+            // left. Waking an actor to take a stop would spend the promise this
+            // road's other arm makes — "mush is waking one to take the stop" —
+            // on a child that has nothing to stop, so the answer is the fact
+            // itself (finding F6).
+            Ok(format!(
+                "stopping agent #{id} — its actor is gone: the run it died in was cut off, \
+                 so there is nothing left of it to stop"
+            ))
+        }
         Err(_) => {
             hand_to_ui(actor, id, AgentMsg::Stop(Stop::Parent));
             Ok(format!(
@@ -4930,10 +4968,14 @@ fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, 
 /// A mailbox with no actor behind it used to be read as "the child is gone",
 /// which is the one thing it does not say: parking ends a finished child's
 /// *thread* and leaves its node, its id and its transcript exactly where they
-/// were (`App::park_history`). The parent holds no transcript and so cannot
-/// revive — the UI can, and delivers through the same door a human's own
-/// message uses (`App::deliver_to_actor`, finding H18). What the reply says is
-/// the caller's: this only makes sure the command is not lost on the way there.
+/// were (`App::park_history`). A thread that *died* leaves the same mailbox, and
+/// the two are told apart by what the child reported, never by the send: a park
+/// happens at rest, a corpse files its own cut-off (`file_death`, finding F6).
+/// The parent holds no transcript and so cannot revive — the UI can, and delivers
+/// through the same door a human's own message uses (`App::deliver_to_actor`,
+/// finding H18). What the reply says is the caller's, and that is where the
+/// difference between the two has to be said: this only makes sure the command is
+/// not lost on the way there.
 fn hand_to_ui(actor: &Actor, child: u64, command: AgentMsg) {
     actor
         .ctx
@@ -4953,7 +4995,10 @@ fn hand_to_ui(actor: &Actor, child: u64, command: AgentMsg) {
 ///
 /// A *parked* child is the other shape a missing actor takes, and there the
 /// answer is the opposite one: the words are handed to the UI, which wakes the
-/// child to take them ([`hand_to_ui`], finding H18).
+/// child to take them ([`hand_to_ui`], finding H18). A child whose thread *died*
+/// is the third: the same mailbox, a different ending, and the third answer —
+/// nothing here may call a corpse parked, and nothing the dead run held is on
+/// the screen it resumes from (`actor_gone`, finding F6).
 fn message_agent(
     actor: &Actor,
     state: &mut ActorState,
@@ -4995,6 +5040,24 @@ fn message_agent(
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
+        Err(_) if actor_gone(state, id) => {
+            // Not a park: the thread died with a run in flight and filed the
+            // cut-off itself (`file_death`). The words still go to the UI — it
+            // is the only hand holding the transcript an actor is rebuilt from
+            // — but nothing here may call that "parked": the run that died
+            // produced nothing, and what resumes is a fresh actor on the copy of
+            // the conversation the screen has, not the one the dead run held
+            // (finding F6). The books follow the words exactly as the parked
+            // arm's do: a `wait` must not answer the result of a run that ended
+            // before them.
+            hand_to_ui(actor, id, AgentMsg::Steer(text));
+            state.running.insert(id);
+            Ok(format!(
+                "messaged agent #{id} — its actor is gone, not parked: the run it died in was \
+                 cut off and nothing was committed, so mush is waking a fresh actor from the \
+                 transcript on screen — this resumes the child from there"
+            ))
+        }
         Err(_) => {
             // No actor behind the mailbox: a parked child, whose thread the UI
             // reclaimed and whose transcript is the one on screen (finding H18).
@@ -10214,6 +10277,30 @@ mod tests {
             clock.elapsed() < Duration::from_secs(600),
             "and it costs no part of the cap: {:?}",
             clock.elapsed()
+        );
+
+        // A `control message` aimed at that child finds no actor behind its
+        // mailbox — the same mailbox a parked child leaves — and the parent's
+        // answer must not hand a corpse back as a parked child (finding F6). The
+        // words still go to the UI, which holds the only transcript an actor can
+        // be rebuilt from.
+        state.shared.insert(child);
+        let answer = message_agent(
+            &parent,
+            &mut state,
+            &json!({ "id": "7", "text": "are you there?" }),
+            child,
+        )
+        .unwrap();
+        assert!(
+            !answer.contains("its actor was parked"),
+            "not a parked child: {answer}"
+        );
+        assert!(answer.contains("is gone"), "it says what it is: {answer}");
+        let stopping = stop_agent(&parent, &mut state, child).unwrap();
+        assert!(
+            !stopping.contains("its actor was parked"),
+            "nor is a stop promised to a child with nothing left to stop: {stopping}"
         );
         let _ = fs::remove_dir_all(parent.ws.root());
     }

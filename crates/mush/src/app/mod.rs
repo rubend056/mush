@@ -2566,6 +2566,14 @@ impl App {
     /// seeded with the transcript the pane is showing; the command comes back
     /// with the failed send, so nothing is lost to the probe.
     ///
+    /// The failed send is also what a thread that *died* leaves (finding F6), and
+    /// this door is the same for both on purpose: it is the one hand holding the
+    /// transcript an actor is rebuilt from, so a corpse resumes from the copy of
+    /// the conversation on screen exactly as a parked child does — the difference
+    /// is that the corpse's run produced nothing, and the row and the pane say so
+    /// (the death filed its own ending, and the phase, the `⚠` notice and the
+    /// parent's line are where a human reads which of the two this is).
+    ///
     /// The root is never parked — it is nobody's child, and the window keeps it —
     /// so a dead root mailbox stays the answer it was: `Ctrl-N` restarts it
     /// (`App::deliver`'s root half, `App::new_chat`).
@@ -3547,11 +3555,15 @@ impl App {
     /// actor from the transcript on screen ([`Self::deliver_to_actor`]), so what
     /// the human sees does not change by one row.
     ///
-    /// The send is the whole probe. A parked child's mailbox still exists —
-    /// it is what the tree and its parent hold — and it has no receiver, so a
-    /// `Shutdown` into it fails and says so; a live actor takes it and ends.
-    /// Nothing here reads a stored "parked" flag, because there is none to get
-    /// out of step with the thread it describes.
+    /// The send is the whole probe, and it answers one question: is there a
+    /// thread here? A live actor takes the `Shutdown` and ends; a mailbox with no
+    /// receiver has no thread left, whichever way the thread went — parked by an
+    /// earlier tick, or dead with its run cut off, which the dying thread filed
+    /// itself (`agent::file_death`, finding F6). The two are told apart by what
+    /// that thread *reported*, never by the send, and this window is not the road
+    /// that needs the answer: it only reclaims what is still here. Nothing here
+    /// reads a stored "parked" flag, because there is none to get out of step with
+    /// the thread it describes.
     fn park_history(&mut self) {
         for id in self.tree.parkable() {
             let Some(tx) = self.tree.agent_tx.get(&id) else {
@@ -3560,8 +3572,10 @@ impl App {
                 continue;
             };
             if tx.send(AgentMsg::Shutdown).is_err() {
-                // Already parked. The parent was told when it happened, and the
-                // window recomputes the same set every frame.
+                // No receiver: the thread is gone already — parked by an earlier
+                // tick, or dead and reported by its own last act. Either way
+                // there is nothing here to reclaim, and the window recomputes
+                // the same set every frame.
                 continue;
             }
             // The parent's books outlive the child's actor, and its run
