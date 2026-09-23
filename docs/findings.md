@@ -4624,6 +4624,13 @@ open set is nine minors: A13, A14, A15, A18, A21 and A22 (agent-and-wire), C7
 open at `38d0438` — A3, A6 and F6 — closed in §8.73–§8.83, with D19, A9, A10,
 D7–D18, D20–D26, B13, B14, B16, C8, C10–C12, E6, E8–E10 and F2, F4, F5, F14–F16.
 
+**Addendum, 22 September 2026 — this sheet now speaks for `df115bc`.** Since
+`7338d81` the tree has grown to **87 068** (· 4 999 blank · 24 513 comment ·
+38 456 tests · 19 100 prod — +445, and prod +8 of it), and D9's leftover is
+closed: the row whose parent the history window reaped now wears `⚮` and no
+longer passes for a root child (§8.87). The counts above remain the snapshot at
+`7338d81`; no finding's status moved.
+
 ### agent-and-wire (`docs/audits/agent-and-wire.md`)
 
 | # | severity | the defect | status at `7338d81` |
