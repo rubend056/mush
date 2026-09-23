@@ -25,7 +25,7 @@
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
-//! | `/context` | ignored | say the window's size and the road it came by |
+//! | `/context [N]` | optional, a positive count | say the window and its road, or state one |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read every note about the focused agent |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
@@ -78,6 +78,10 @@ pub enum Command {
 pub enum ContextArg {
     /// No argument: say the window in force and the road it came by.
     Report,
+    /// A token count, read by [`mush_core::config::parse_context`]: the one
+    /// number reader `--context`, `MUSH_CONTEXT` and this command share, so
+    /// one typo cannot be answered two ways by three doors.
+    State(usize),
 }
 
 /// Why a typed line is not a command to run.
@@ -164,8 +168,8 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "/context",
         aliases: &[],
-        args: "",
-        help: "say the window's size and the road it came by",
+        args: "[N]",
+        help: "say the window's size and road, or state one for this workspace",
     },
     Spec {
         name: "/compact",
@@ -262,14 +266,14 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/model" => Command::Model,
         "/models" => Command::Models,
         "/context" if argument.is_empty() => Command::Context(ContextArg::Report),
-        // The number and `auto` roads are read where they are answered; a line
-        // that carries an argument now is refused as the shape this command
-        // does not take yet.
-        "/context" => {
-            return Err(CommandError::Usage(
-                "usage: /context — say the window and the road it came by".to_string(),
-            ))
-        }
+        // The number is read by the one reader `--context` and `MUSH_CONTEXT`
+        // use: a value that does not read is refused with the sentence naming
+        // the road that carried it, and the arm carries out a typed value
+        // rather than parsing text a second time.
+        "/context" => match mush_core::config::parse_context(argument, "/context") {
+            Ok(tokens) => Command::Context(ContextArg::State(tokens)),
+            Err(error) => return Err(CommandError::Usage(error)),
+        },
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
@@ -450,6 +454,39 @@ mod tests {
         assert_eq!(
             parse_command("/context"),
             Ok(Command::Context(ContextArg::Report))
+        );
+        assert_eq!(
+            parse_command("/context 32768"),
+            Ok(Command::Context(ContextArg::State(32_768)))
+        );
+    }
+
+    /// `/context`'s number is read by [`mush_core::config::parse_context`] — the
+    /// one reader `--context` and `MUSH_CONTEXT` use — so the three doors refuse
+    /// one typo with one sentence, naming the road that carried the value.
+    /// `main.rs`'s `the_context_flag_and_the_variable_read_one_number_one_way`
+    /// pins the other two doors.
+    #[test]
+    fn a_context_argument_that_is_not_a_number_is_refused_by_name() {
+        assert_eq!(
+            parse_command("/context 8k"),
+            Err(CommandError::Usage(
+                "/context needs a token count, got `8k`".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_command("/context 0"),
+            Err(CommandError::Usage(
+                "/context needs a token count, got `0`".to_string()
+            )),
+            "a window of no tokens is not a window"
+        );
+        // The same number the flag reads, read the same way: the line's own
+        // trim is the box's, and the reader's trim is the same one the flag
+        // and the variable go through.
+        assert_eq!(
+            parse_command("/context  8192"),
+            Ok(Command::Context(ContextArg::State(8_192)))
         );
     }
 

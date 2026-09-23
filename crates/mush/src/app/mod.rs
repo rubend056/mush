@@ -3171,6 +3171,21 @@ impl App {
                     self.cfg().context_source.words()
                 ));
             }
+            Command::Context(ContextArg::State(tokens)) => {
+                // `set_context` clamps a typo into a window an endpoint will
+                // accept and marks the road Stated; the cell's one edit door
+                // makes the UI's copy and every actor's copy one write.
+                self.cell.edit(|cfg| cfg.set_context(tokens));
+                // The workspace is what remembers it, so the file is written
+                // before the line promises it — the same "must not be lost"
+                // road a human's message takes.
+                self.flush_session();
+                self.say(format!(
+                    "{} · {} — this workspace will remember it",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
+            }
         }
         // A command is a transition the human drove: whatever they asked for
         // may have changed the workspace, and the bar they read next should
@@ -13344,6 +13359,65 @@ mod tests {
                 "{source:?}: the window and its road in one line"
             );
         }
+    }
+
+    /// What a restart makes of a stored session: the layer chain `main.rs`
+    /// builds at startup (`config::resolve`), minus the process environment
+    /// this test does not want to read — a base config, no flags, no variables,
+    /// no home file, and the session file as the middle layer.
+    fn resolved_from_session(stored: &Session) -> Config {
+        mush_core::config::resolve_with(
+            Config::new("http://127.0.0.1:1", "test-model", None),
+            &mush_core::Overrides::default(),
+            &mush_core::Overrides::default(),
+            &UserConfig::default(),
+            Some(stored),
+        )
+        .expect("the stored layer resolves")
+        .config
+    }
+
+    /// `/context N` is a statement about *this workspace*: the cell clamps it
+    /// and marks the road Stated, so the meter's copy and every actor's copy
+    /// move together, and the session file — the layer a restart reads back —
+    /// carries it. The acknowledgement names the new window, the road, and who
+    /// will remember it.
+    #[test]
+    fn the_context_command_states_a_window_and_the_workspace_remembers_it() {
+        let root = dir("context-state");
+        let (mut app, _writer) = app_writing(&root);
+        // Taken before the command, the way every actor of a running tree holds
+        // its handle: an edit that reached only the UI would leave the
+        // requests measuring against the old window.
+        let handle = app.cell.handle();
+
+        run(&mut app, "/context 32000");
+
+        assert_eq!(app.cfg().context_tokens, 32_000);
+        assert_eq!(app.cfg().context_source, WindowSource::Stated);
+        assert_eq!(
+            handle.config().unwrap().context_tokens,
+            32_000,
+            "the actors' copy moved with the UI's"
+        );
+        assert_eq!(
+            text_of(&app),
+            "ctx 32k (set) · stated by the human — this workspace will remember it"
+        );
+
+        // The file is what remembers it past this process, and the next start
+        // reads it back through the one resolution: stated, and beating the
+        // model table.
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert_eq!(stored.context, Some(32_000), "the statement is on disk");
+        let resolved = resolved_from_session(&stored);
+        assert_eq!(resolved.context_tokens, 32_000);
+        assert!(
+            resolved.context_explicit(),
+            "a stored statement is a statement, not a guess"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A window an actor learned reaches the UI's cell, through the event that
