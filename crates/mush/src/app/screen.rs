@@ -74,8 +74,18 @@ const MAX_ATTACHMENT_ROWS: usize = 3;
 const PICKER_MIN_WIDTH: u16 = 40;
 const PICKER_MAX_WIDTH: u16 = 80;
 
+/// A share of `whole`, clamped between `min` and `max`.
+///
+/// One integer type, wide enough to hold the multiply: `whole * percent`
+/// overflows a `u16` above a few hundred columns — at the picker's 60% it
+/// panics in a debug build above 1092 columns, while a release build wraps and
+/// the clamp quietly turns the wrap into the floor (finding R72).
+fn share(whole: u16, percent: u32, min: u16, max: u16) -> u16 {
+    ((whole as u32 * percent / 100) as u16).clamp(min, max)
+}
+
 fn picker_width(terminal_width: u16) -> u16 {
-    (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+    share(terminal_width, 60, PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
 }
 
 /// The columns the picker's list gives one item's text. The term carries the
@@ -92,9 +102,7 @@ pub(crate) fn picker_text_width(terminal_width: u16) -> usize {
 /// this is a length: a row's four ranked fields need about forty of them, the
 /// chat keeps its own floor, and past the cap the extra columns are empty.
 fn agents_columns(terminal_width: u16) -> u16 {
-    let share = (terminal_width as u32 * 34 / 100) as u16;
-    share
-        .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+    share(terminal_width, 34, AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
         .min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))
 }
 
@@ -1387,6 +1395,32 @@ mod tests {
             assert!(
                 picker_text_width(terminal) <= picker_width(terminal) as usize,
                 "a report wider than its popup at {terminal}"
+            );
+        }
+    }
+
+    /// A share of the terminal is arithmetic about a `u16`, so it is computed
+    /// in one integer type wide enough to hold the product: `terminal_width *
+    /// 60` in `u16` overflows above 1092 columns — a debug build panics on the
+    /// multiply and a release build wraps, which the clamp then quietly turns
+    /// into the popup's floor (finding R72). The sweep crosses that width, and
+    /// both shares are asserted to be the natural one, clamped, at every size a
+    /// terminal can name.
+    #[test]
+    fn no_share_of_a_terminal_overflows_its_integer() {
+        let natural = |whole: u16, percent: u32| (whole as u32 * percent / 100) as u16;
+        for terminal in 40..=2000u16 {
+            assert_eq!(
+                picker_width(terminal),
+                natural(terminal, 60).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH),
+                "the picker's share at {terminal}"
+            );
+            assert_eq!(
+                agents_columns(terminal),
+                natural(terminal, 34)
+                    .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+                    .min(terminal.saturating_sub(CHAT_MIN_COLUMNS)),
+                "the agents pane's share at {terminal}"
             );
         }
     }
