@@ -392,6 +392,11 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// Returns the path and the branch, both from the formatters above, so no caller
 /// ever spells `.mush/wt/<id>` or `mush/<id>` itself.
 ///
+/// `dir` is the caller's workspace, and may be any directory *inside* a
+/// repository: git's own questions are answered from there and the checkout is
+/// made under it, so `mush crates/mush` gets `.mush/wt/<id>` below its own
+/// workspace like any root does (finding F11).
+///
 /// Every way this can refuse carries a reason a human has to read: not a
 /// repository, no commit to start from, a path git cannot be handed, and git's
 /// own message when the add itself fails (an id whose branch or directory is
@@ -399,8 +404,17 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// base is a promise about history, and a child running on the wrong one is
 /// worse than no child.
 pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
-    if !dir.join(".git").exists() {
-        return Err("not a git repository".to_string());
+    // The `.git` test that used to stand here asked a question git does not: a
+    // linked worktree's `.git` is a file, and a workspace that is a
+    // subdirectory of a repository has none at all while `rev-parse` answers
+    // every question inside it — so the whole isolated road was refused, with
+    // "not a git repository" about a directory the human had opened mush in
+    // (finding F11). The refusal is kept for a directory git really cannot
+    // answer for; the question is git's own.
+    match run(dir, &["rev-parse", "--git-dir"]) {
+        Ok(_) => {}
+        Err(error) if error == GIT_UNAVAILABLE => return Err(error),
+        Err(_) => return Err("not a git repository".to_string()),
     }
     match (base, has_commits(dir)) {
         (None, Some(false)) => {
@@ -1760,5 +1774,45 @@ mod tests {
             "no commit carries mush's subject on the human's branch"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An isolated spawn below the repository root: the workspace is `repo/sub`,
+    /// and the same call `spawn_tool` makes creates `repo/sub/.mush/wt/<id>` on
+    /// `mush/<id>`, forked from the base. The `.git` test this replaces refused
+    /// it with "not a git repository" about a directory git answers every
+    /// question inside (finding F11).
+    #[test]
+    fn an_isolated_spawn_works_below_the_repository_root() {
+        let repo = init_repo("spawn-below-root");
+        let sub = repo.join("crates").join("mush");
+        fs::create_dir_all(&sub).unwrap();
+        let base = resolve(&sub, "HEAD").unwrap();
+
+        let (path, name) = worktree_add(&sub, 1, Some("HEAD")).unwrap();
+        assert_eq!(
+            path,
+            sub.join(".mush/wt/1"),
+            "the checkout is under the workspace, not the repository root"
+        );
+        assert_eq!(name, "mush/1");
+        assert!(path.join(".git").exists(), "it is a real checkout");
+        assert_eq!(
+            resolve(&path, "HEAD").unwrap(),
+            base,
+            "forked from the base git resolved in the workspace"
+        );
+        assert_eq!(branch(&path).as_deref(), Some("mush/1"));
+
+        // A directory that is not in any repository keeps its own sentence.
+        let plain =
+            std::env::temp_dir().join(format!("mush-git-below-plain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&plain);
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            worktree_add(&plain, 2, None).unwrap_err(),
+            "not a git repository"
+        );
+        let _ = fs::remove_dir_all(&plain);
+        let _ = fs::remove_dir_all(&repo);
     }
 }
