@@ -405,6 +405,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
+    use mush_core::scratch::Scratch;
+
     /// One `EnvText` built by hand, the way the edge would have read it.
     fn text(theme: Option<&str>, colorterm: Option<&str>, term: Option<&str>) -> EnvText {
         EnvText {
@@ -455,9 +457,7 @@ mod tests {
     /// canonical path, so `mkdir work && cd work/` cannot change the colour.
     #[test]
     fn two_spellings_of_one_directory_are_one_hue() {
-        let dir = std::env::temp_dir().join(format!("mush-theme-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("theme");
         let hue = hue_of(&dir);
         assert!(std::ptr::eq(hue, hue_of(&dir)));
         assert!(std::ptr::eq(hue, hue_of(&dir.join("."))));

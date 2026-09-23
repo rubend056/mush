@@ -10,6 +10,13 @@ pub mod git;
 pub mod message;
 pub mod prompt;
 pub mod provider;
+/// A test's own scratch root, removed when it drops.
+///
+/// Not part of the product: the module is compiled only for this crate's tests
+/// (`cfg(test)`) or for `mush`'s, which reach it through the `test-support`
+/// feature its `dev-dependencies` entry turns on.
+#[cfg(any(test, feature = "test-support"))]
+pub mod scratch;
 pub mod secrets;
 pub mod session;
 pub mod text;

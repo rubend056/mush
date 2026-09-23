@@ -444,6 +444,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::message::Image;
+    use crate::scratch::Scratch;
 
     /// An `absent` session and one mush *cannot read* are two different facts,
     /// and telling them apart is what stops the second from being silently
@@ -451,9 +452,7 @@ mod tests {
     /// the finding — has to survive the first save of the fresh one.
     #[test]
     fn an_unreadable_session_is_told_apart_from_an_absent_one() {
-        let root = std::env::temp_dir().join(format!("mush-session4-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session4");
         ensure_mush_dir(&root).unwrap();
 
         // Nothing stored: silence, and no backup of nothing.
@@ -515,9 +514,7 @@ mod tests {
     /// searched, not reused.
     #[test]
     fn keeping_a_second_unreadable_session_does_not_overwrite_the_first() {
-        let root = std::env::temp_dir().join(format!("mush-session5-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session5");
         ensure_mush_dir(&root).unwrap();
 
         fs::write(session_path(&root), "first").unwrap();
@@ -538,9 +535,7 @@ mod tests {
     /// rename (refactor R18).
     #[test]
     fn a_session_that_cannot_be_kept_still_names_the_file() {
-        let root = std::env::temp_dir().join(format!("mush-session6-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session6");
         ensure_mush_dir(&root).unwrap();
 
         // Nothing to move: the rename fails, and the sentence still names the
@@ -593,9 +588,7 @@ mod tests {
 
     #[test]
     fn ensure_creates_self_ignoring_dir() {
-        let root = std::env::temp_dir().join(format!("mush-session-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session");
         ensure_mush_dir(&root).unwrap();
         let ignore = mushroom_dir(&root).join(".gitignore");
         assert_eq!(fs::read_to_string(ignore).unwrap(), "*\n");
@@ -629,8 +622,7 @@ mod tests {
     /// and `git status --porcelain` empty.
     #[test]
     fn mushs_own_ignore_line_is_enforced_and_git_stays_clean() {
-        let root = std::env::temp_dir().join(format!("mush-session-ignore-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = Scratch::new("session-ignore");
         let ignore = mushroom_dir(&root).join(".gitignore");
         fs::create_dir_all(mushroom_dir(&root)).unwrap();
 
@@ -658,9 +650,7 @@ mod tests {
 
     #[test]
     fn session_roundtrips() {
-        let root = std::env::temp_dir().join(format!("mush-session2-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session2");
         ensure_mush_dir(&root).unwrap();
 
         let session = Session {
@@ -754,9 +744,7 @@ mod tests {
     /// grow a new copy each save).
     #[test]
     fn a_session_keeps_the_path_and_not_the_bytes() {
-        let root = std::env::temp_dir().join(format!("mush-session-image-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session-image");
         ensure_mush_dir(&root).unwrap();
 
         let mut session = saying("look at this");
@@ -935,9 +923,7 @@ mod tests {
     /// dropped still carries — an unknown key is not a broken session.
     #[test]
     fn a_session_without_a_context_loads() {
-        let root = std::env::temp_dir().join(format!("mush-session3-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("session3");
         ensure_mush_dir(&root).unwrap();
         fs::write(
             session_path(&root),

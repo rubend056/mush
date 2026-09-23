@@ -1320,6 +1320,7 @@ mod tests {
     use crate::app::Compacting;
     use crate::Msg;
     use crossbeam_channel::Receiver;
+    use mush_core::scratch::{Held, Scratch};
 
     /// A real `App` on a scratch directory with a real (idle) root actor, for
     /// the tests that read a painted frame. The model-picker test builds this
@@ -1328,16 +1329,16 @@ mod tests {
     ///
     /// The receiver keeps the UI channel's sender alive (a dropped receiver is
     /// a message that never lands) and the path comes back so the test can
-    /// remove what it made.
-    fn frame_app(label: &str) -> (App, Receiver<Msg>, std::path::PathBuf) {
+    /// name it; the root's guard rides in the [`Held`] app, so the directory is
+    /// removed when the test ends however it ends.
+    fn frame_app(label: &str) -> (Held<App>, Receiver<Msg>, std::path::PathBuf) {
         use crate::agent::spawn;
         use crate::app::ConfigCell;
         use crate::session_save;
         use crossbeam_channel::unbounded;
 
-        let root = std::env::temp_dir().join(format!("mush-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let scratch = Scratch::new(label);
+        let root = scratch.path().to_path_buf();
         let ws = mush_core::Workspace::new(&root).unwrap();
         let cell = ConfigCell::own(mush_core::Config::new(
             "http://127.0.0.1:1",
@@ -1354,7 +1355,7 @@ mod tests {
             tx,
             session_save::fake::Recorder::new(),
         );
-        (app, rx, root)
+        (scratch.hold(app), rx, root)
     }
 
     /// One agent through the tree's own door, with a mailbox nobody reads:
@@ -2116,9 +2117,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let root = std::env::temp_dir().join(format!("mush-bullet-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("bullet");
         let ws = mush_core::Workspace::new(&root).unwrap();
         let cell = ConfigCell::own(mush_core::Config::new(
             "http://127.0.0.1:1",
@@ -2126,7 +2125,7 @@ mod tests {
             None,
         ));
         let (tx, _rx) = unbounded::<Msg>();
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let handle = spawn(cell.handle(), tx.clone(), root.path().to_path_buf());
         let mut app = App::new(
             ws,
             cell,

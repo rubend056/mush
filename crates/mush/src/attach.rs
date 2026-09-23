@@ -765,6 +765,7 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mush_core::scratch::Scratch;
     use std::io::Write;
 
     fn round_trip(request: Request) -> Request {
@@ -902,8 +903,7 @@ mod tests {
     /// the UI, reading `Msg::Attach` off the channel and replying.
     #[test]
     fn a_socket_answers_a_request_a_bad_line_and_then_more() {
-        let root = std::env::temp_dir().join(format!("mush-attach-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::new("attach");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
@@ -967,8 +967,7 @@ mod tests {
     /// agents` hang for as long as the holder felt like it (finding A2).
     #[test]
     fn an_idle_client_does_not_wedge_the_socket() {
-        let root = std::env::temp_dir().join(format!("mush-attach-idle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::new("attach-idle-wedge");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
@@ -1026,9 +1025,7 @@ mod tests {
 
         // A file a live listener holds is another mush: the bind refuses it
         // rather than stealing its socket, and leaves the file where it was.
-        let live_root =
-            std::env::temp_dir().join(format!("mush-attach-live-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&live_root);
+        let live_root = Scratch::new("attach-live");
         std::fs::create_dir_all(live_root.join(mush_core::session::MUSH_DIR)).unwrap();
         let live_path = socket_path(&live_root);
         let live = UnixListener::bind(&live_path).unwrap();
@@ -1044,8 +1041,7 @@ mod tests {
         // — is cleared and replaced. A root of its own, so the live phase's
         // probe (which leaves an unaccepted connection in that listener's
         // backlog) cannot outlive the listener it belongs to (finding A9).
-        let root = std::env::temp_dir().join(format!("mush-attach-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::new("attach-stale");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let path = socket_path(&root);
         let stale = UnixListener::bind(&path).unwrap();
@@ -1079,8 +1075,7 @@ mod tests {
     #[test]
     fn a_request_line_is_capped_and_a_client_is_reaped() {
         // (1) The line cap, under the production limits.
-        let root = std::env::temp_dir().join(format!("mush-attach-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::new("attach-cap");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         let guard = serve_with(&root, tx, LIMITS, spawn_accept_loop).unwrap();
@@ -1139,8 +1134,7 @@ mod tests {
         // answered `unavailable` without a thread of its own. The two idle
         // clients hold their slots because this server's idle window is the
         // production one.
-        let crowd = std::env::temp_dir().join(format!("mush-attach-crowd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&crowd);
+        let crowd = Scratch::new("attach-crowd");
         std::fs::create_dir_all(crowd.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
         let guard = serve_with(
@@ -1178,8 +1172,7 @@ mod tests {
         // (3) The idle window: a client that connects and says nothing is
         // reaped. The wait is the socket's own timeout — short here — and the
         // client reads the close instead of sleeping on it.
-        let idle = std::env::temp_dir().join(format!("mush-attach-idle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&idle);
+        let idle = Scratch::new("attach-idle-reap");
         std::fs::create_dir_all(idle.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
         let guard = serve_with(
@@ -1245,8 +1238,7 @@ mod tests {
     /// `Drop` and the file goes with it (finding A7).
     #[test]
     fn a_thread_that_will_not_start_takes_the_socket_with_it() {
-        let root = std::env::temp_dir().join(format!("mush-attach-spawn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::new("attach-spawn");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
 

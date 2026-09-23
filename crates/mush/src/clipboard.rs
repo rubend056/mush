@@ -533,14 +533,16 @@ fn deliver(program: &str, args: &[String], text: &Arc<str>, deadline: Instant) -
 mod tests {
     use std::fs;
 
+    use mush_core::scratch::{Held, Scratch};
+
     use super::*;
 
-    fn temp_workspace(name: &str) -> Workspace {
-        let dir =
-            std::env::temp_dir().join(format!("mush-clipboard-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Workspace::new(&dir).unwrap()
+    /// A workspace on a scratch root of its own: the guard travels back with
+    /// the workspace, so the files the test saves into it go when it ends.
+    fn temp_workspace(name: &str) -> Held<Workspace> {
+        let dir = Scratch::new(&format!("clipboard-{name}"));
+        let ws = Workspace::new(&dir).unwrap();
+        dir.hold(ws)
     }
 
     /// Both clipboard roads spawn their child through
@@ -552,9 +554,7 @@ mod tests {
     /// removal untouched; the two children are chosen for what they prove.
     #[test]
     fn a_clipboard_child_never_sees_mushs_key() {
-        let dir = std::env::temp_dir().join(format!("mush-clipboard-key-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("clipboard-child-key");
         let previous = std::env::var_os("MUSH_API_KEY");
         std::env::set_var("MUSH_API_KEY", "sk-probe-inheritance-0123456789");
         let read = dir.join("read");
@@ -796,15 +796,15 @@ mod tests {
         );
     }
 
-    /// A path in the machine's temp directory that one test owns: it names the
-    /// test and the process, so a leftover from an earlier run cannot be read as
-    /// this run's answer. The file is removed first for the same reason — a test
-    /// that asserts "this was never written" has to know it was not there.
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("mush-clipboard-{name}-{}", std::process::id()));
-        let _ = fs::remove_file(&path);
-        path
+    /// A path in a scratch root one test owns: it names the test and the
+    /// process, so a leftover from an earlier run cannot be read as this run's
+    /// answer, and the guard — which comes back with the path — removes it.
+    /// The file itself is never written by the fixture: a test that asserts
+    /// "this was never written" has to know it was not there.
+    fn temp_path(name: &str) -> Held<std::path::PathBuf> {
+        let dir = Scratch::new(&format!("clipboard-file-{name}"));
+        let path = dir.path().join(name);
+        dir.hold(path)
     }
 
     /// A writer that takes its stdin the way a real one does and puts it in a

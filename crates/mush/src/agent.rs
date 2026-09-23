@@ -6708,6 +6708,7 @@ mod tests {
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use crate::model::RETRY_ATTEMPTS;
     use mush_core::config::{ReasoningEffort, ThinkingMode};
+    use mush_core::scratch::{Held, Scratch};
     // The fold's trigger is core's formula, not this file's: the test below
     // crosses it instead of restating it.
     use mush_core::transcript::compaction_trigger;
@@ -9126,9 +9127,10 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let timeout = Duration::from_secs(5);
         let started = Instant::now();
+        let scratch = Scratch::new("command-timeout");
         let report = run_shell(
             "sleep 30",
-            &std::env::temp_dir(),
+            scratch.path(),
             timeout,
             Detach::No,
             &cancel,
@@ -9174,9 +9176,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
 
+        let scratch = Scratch::new("command-exits");
         let report = run_shell(
             "false",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(5),
             Detach::No,
             &cancel,
@@ -9209,9 +9212,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(true));
         let started = Instant::now();
+        let scratch = Scratch::new("command-cancel");
         let report = run_shell(
             "sleep 30",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(30),
             Detach::No,
             &cancel,
@@ -9242,9 +9246,10 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
 
+        let scratch = Scratch::new("command-stop");
         let report = run_shell(
             "echo starting; sleep 30",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(30),
             Detach::No,
             &cancel,
@@ -9278,9 +9283,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
+        let scratch = Scratch::new("command-runaway");
         let report = run_shell(
             "yes mush",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(30),
             Detach::No,
             &cancel,
@@ -9313,9 +9319,10 @@ mod tests {
         let (actor, _mailbox) = test_actor("long-output");
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        let scratch = Scratch::new("command-long-output");
         let report = run_shell(
             "yes mush | head -c 40000",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(10),
             Detach::No,
             &cancel,
@@ -9947,7 +9954,7 @@ mod tests {
         let cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         let budget = cfg.history_budget();
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
         // A picture in the opening turn, and a history filled to the fold's
         // trigger behind it.
         let mut messages = vec![
@@ -10907,7 +10914,7 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
+    fn test_actor(label: &str) -> (Held<Actor>, Sender<AgentMsg>) {
         let cfg = test_cfg();
         let (actor, _events, mailbox) =
             build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
@@ -10941,7 +10948,7 @@ mod tests {
     /// The same actor, keeping the sink it emits into: how a delivery test sees
     /// both halves of one fact — the line the model reads and the line the UI
     /// was told.
-    fn recording_actor(label: &str) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+    fn recording_actor(label: &str) -> (Held<Actor>, Arc<Recorder>, Sender<AgentMsg>) {
         let cfg = test_cfg();
         build_actor_about(
             label,
@@ -10973,7 +10980,7 @@ mod tests {
     fn scripted_actor(
         label: &str,
         model: &Arc<Scripted>,
-    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+    ) -> (Held<Actor>, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor(label, model.clone(), test_cfg())
     }
 
@@ -10984,7 +10991,7 @@ mod tests {
         label: &str,
         model: &Arc<Scripted>,
         clock: Arc<dyn clock::Clock>,
-    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+    ) -> (Held<Actor>, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor_about(
             label,
             model.clone(),
@@ -11007,7 +11014,7 @@ mod tests {
         label: &str,
         model: Arc<dyn ModelClient>,
         cfg: ConfigHandle,
-    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+    ) -> (Held<Actor>, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor_about(label, model, cfg, Arc::new(Shell), Arc::new(clock::System))
     }
 
@@ -11019,7 +11026,7 @@ mod tests {
         label: &str,
         machine: Arc<dyn Machine>,
         clock: Arc<dyn clock::Clock>,
-    ) -> (Actor, Sender<AgentMsg>) {
+    ) -> (Held<Actor>, Sender<AgentMsg>) {
         let cfg = test_cfg();
         let (actor, _events, mailbox) = build_actor_about(
             label,
@@ -11040,7 +11047,7 @@ mod tests {
         cfg: ConfigHandle,
         machine: Arc<dyn Machine>,
         clock: Arc<dyn clock::Clock>,
-    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+    ) -> (Held<Actor>, Arc<Recorder>, Sender<AgentMsg>) {
         let recorder = Recorder::new();
         let actor = build_actor_with_events(label, model, cfg, machine, clock, recorder.clone());
         let mailbox = actor.my_tx.clone();
@@ -11057,10 +11064,9 @@ mod tests {
         machine: Arc<dyn Machine>,
         clock: Arc<dyn clock::Clock>,
         events: Arc<dyn Events>,
-    ) -> Actor {
-        let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+    ) -> Held<Actor> {
+        let scratch = Scratch::new(&format!("actor-{label}"));
+        let root = scratch.path().to_path_buf();
         let ids = Ids::default();
         // The tree's one registry, over the same scripted machine and clock:
         // a job a test starts is watched in process, and its events land in the
@@ -11078,7 +11084,7 @@ mod tests {
             live: Arc::new(AtomicU64::new(0)),
         });
         let (my_tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        Actor {
+        scratch.hold(Actor {
             ctx,
             id: 7,
             depth: 0,
@@ -11094,7 +11100,7 @@ mod tests {
             // own (`Some(dead_mailbox())`, §8.39).
             parent_tx: None,
             rx,
-        }
+        })
     }
 
     /// A5, the ordering probe: this is the state machine the `✉` re-arm used to
@@ -11156,14 +11162,15 @@ mod tests {
             report: report_rx,
             verdict: verdict_tx,
         });
-        let mut actor = build_actor_with_events(
+        let (mut actor, _scratch) = build_actor_with_events(
             "end-before-report",
             scripted,
             test_cfg(),
             Arc::new(ScriptedMachine::new()),
             Arc::new(clock::System),
             sink,
-        );
+        )
+        .into_parts();
         actor.parent_tx = Some(report_tx);
         let mailbox = actor.my_tx.clone();
         let run = std::thread::spawn(move || {
@@ -11249,7 +11256,8 @@ mod tests {
     /// tests below are built from.
     fn a_run_that_dies(label: &str, with_parent: bool) -> Died {
         let client = Panics::new();
-        let (mut actor, events, mailbox) = build_actor(label, client.clone(), test_cfg());
+        let (actor, events, mailbox) = build_actor(label, client.clone(), test_cfg());
+        let (mut actor, _scratch) = actor.into_parts();
         let live = actor.ctx.live.clone();
         client.watch(live.clone());
         let parent = with_parent.then(|| {
@@ -11999,9 +12007,7 @@ mod tests {
             }
         }
 
-        let root = std::env::temp_dir().join(format!("mush-wake-e2e-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("wake-e2e");
         let gate = root.join("open-the-gate");
         let _gate = Gate(gate.clone());
         let block = format!(
@@ -12040,7 +12046,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -12979,9 +12985,7 @@ mod tests {
     /// than wait for the human's next message.
     #[test]
     fn a_compact_parked_by_a_cancelled_reply_still_folds() {
-        let root = std::env::temp_dir().join(format!("mush-compact-parked-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("compact-parked");
         let summary = "folded after the cancel";
         // The first reply is held inside the model call, so the test can act
         // while it is genuinely in flight.
@@ -12998,7 +13002,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -13169,9 +13173,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
 
+        let scratch = Scratch::new("command-detach");
         let report = run_shell(
             "cargo build",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(CMD_TIMEOUT_SECS),
             Detach::Job {
                 registry: &actor.ctx.registry,
@@ -13383,6 +13388,10 @@ mod tests {
             Arc::new(HttpModel::new(test_cfg())),
             test_cfg(),
         );
+        // The root's guard stays in this test's scope, not in the thread's: the
+        // panic below unwinds inside the thread, and this test reads what the
+        // command wrote into the root after that.
+        let (actor, _scratch) = actor.into_parts();
         let agent_id = actor.id;
         let registry = actor.ctx.registry.clone();
         let root = actor.ws.root().to_path_buf();
@@ -13607,6 +13616,7 @@ mod tests {
         let (actor, _mailbox) = scripted_tools_actor("root-beside", machine, clock);
         // The helper builds agent 7; only the root wears id 0, and the
         // exemption is about that id.
+        let (actor, _scratch) = actor.into_parts();
         let actor = Actor {
             id: AgentId::ROOT.0,
             ..actor
@@ -13863,6 +13873,7 @@ mod tests {
         );
         // The helper builds agent 7; only the root wears id 0, and the
         // exemption is about that id.
+        let (actor, _scratch) = actor.into_parts();
         let actor = Actor {
             id: AgentId::ROOT.0,
             ..actor
@@ -14018,6 +14029,7 @@ mod tests {
             Arc::new(ScriptedMachine::new()),
             clock.clone(),
         );
+        let (actor, _scratch) = actor.into_parts();
         let actor = Actor {
             id: AgentId::ROOT.0,
             ..actor
@@ -14069,6 +14081,7 @@ mod tests {
         let machine = Arc::new(ScriptedMachine::new());
         let (actor, _mailbox) =
             scripted_tools_actor("exclusive-wrong-type", machine.clone(), clock);
+        let (actor, _scratch) = actor.into_parts();
         let actor = Actor {
             id: AgentId::ROOT.0,
             ..actor
@@ -14845,9 +14858,7 @@ mod tests {
     /// result indefinitely — the one thing §5.5 promises cannot happen.
     #[test]
     fn a_parent_in_a_tool_chain_still_hears_its_child() {
-        let root = std::env::temp_dir().join(format!("mush-chain-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("chain");
         // Three replies: a tool call, a tool call held open so the completion
         // can land while the model is thinking, and an answer.
         let gate = Arc::new(Gate::new());
@@ -14870,7 +14881,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15061,7 +15072,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15416,7 +15427,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             model,
         )
         .tx;
@@ -15466,7 +15477,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15533,7 +15544,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15648,7 +15659,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15729,7 +15740,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -15812,7 +15823,7 @@ mod tests {
         let handle = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         );
         handle
@@ -15943,7 +15954,7 @@ mod tests {
         let handle = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         );
         handle
@@ -16006,7 +16017,7 @@ mod tests {
     /// child's script answers the nudge with a `run_command` that writes
     /// `extra.txt`, so a test that forgot to land the worktree would see the
     /// file really written.
-    fn finished_isolated_child(label: &str) -> (PathBuf, Arc<Recorder>, Sender<AgentMsg>) {
+    fn finished_isolated_child(label: &str) -> (Scratch, Arc<Recorder>, Sender<AgentMsg>) {
         let root = init_git_repo(label);
         let scripted = Arc::new(
             Scripted::new()
@@ -16043,7 +16054,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -16331,7 +16342,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -16437,7 +16448,7 @@ mod tests {
         cfg.context_tokens = 6_000;
         let budget = cfg.history_budget();
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
 
         // History above 3/4 of the budget but still fitting: compaction must
         // trigger instead of trimming. Built until it crosses the line, so the
@@ -16529,7 +16540,8 @@ mod tests {
             cfg.context_tokens = context;
             let budget = cfg.history_budget();
             let events = Recorder::new();
-            let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+            let root_tx =
+                spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
             // A transcript at the fold's own trigger, built from the formula so
             // the test does not encode it.
             let mut messages = vec![
@@ -16608,7 +16620,7 @@ mod tests {
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("say something".to_string()),
@@ -16833,7 +16845,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -16981,7 +16993,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17057,7 +17069,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17140,7 +17152,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17203,7 +17215,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17263,7 +17275,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17313,7 +17325,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17360,7 +17372,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17413,7 +17425,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17519,7 +17531,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17576,7 +17588,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17623,7 +17635,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17674,7 +17686,7 @@ mod tests {
         cfg.max_completion_tokens = true;
         let context = cfg.context_tokens;
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system("you are mush"),
@@ -17735,7 +17747,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17785,7 +17797,7 @@ mod tests {
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             scripted.clone(),
         )
         .tx;
@@ -17852,7 +17864,7 @@ mod tests {
         // but the model's own stop may end this run.
         cfg.context_tokens = 128_000;
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
@@ -18033,7 +18045,7 @@ mod tests {
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         cfg.context_tokens = 128_000;
         let events = Recorder::new();
-        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
         let opening = || {
             vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
@@ -18091,6 +18103,7 @@ mod tests {
         let model = Arc::new(Scripted::new().says("done"));
         let (actor, _events, _mailbox) = scripted_actor("child-running", &model);
         let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let (actor, _scratch) = actor.into_parts();
         let child = Actor {
             parent_tx: Some(parent_tx),
             ..actor
@@ -18169,6 +18182,7 @@ mod tests {
             Arc::new(Scripted::new().says("done")),
             test_cfg(),
         );
+        let (actor, _scratch) = actor.into_parts();
         let child = Actor {
             parent_tx: Some(dead_mailbox()),
             ..actor
@@ -18206,6 +18220,7 @@ mod tests {
             Arc::new(Scripted::new().says("done")),
             test_cfg(),
         );
+        let (root, _scratch) = root.into_parts();
         start(root, vec![Message::user("do the thing")], true);
         let mut seen = Watched::default();
         assert!(
@@ -18305,11 +18320,10 @@ mod tests {
     }
 
     /// A scratch workspace, empty: for a scenario whose work is not files.
-    fn scratch_dir(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("mush-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
+    /// The guard is the caller's: it can use the root through `Deref` and keep
+    /// it alive for as long as the test runs.
+    fn scratch_dir(label: &str) -> Scratch {
+        Scratch::new(label)
     }
 
     /// The two `expect("workspace root must exist")` that used to sit on the UI
@@ -18327,7 +18341,7 @@ mod tests {
         let handle = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
             events.clone(),
-            root.clone(),
+            root.to_path_buf(),
             Arc::new(Scripted::new()),
         );
 
@@ -18380,7 +18394,7 @@ mod tests {
             test_cfg(),
             tx,
             1,
-            root.clone(),
+            root.to_path_buf(),
             ReviveSpec {
                 id: 5,
                 depth: 1,
@@ -18435,7 +18449,7 @@ mod tests {
             test_cfg(),
             tx,
             1,
-            root.clone(),
+            root.to_path_buf(),
             ReviveSpec {
                 id: 5,
                 depth: 1,
@@ -18578,6 +18592,7 @@ mod tests {
 
         // The spawning agent is the nested parent: its workspace is its own
         // worktree, which is what `HEAD` must be read in.
+        let (actor, _scratch) = actor.into_parts();
         let parent = Actor {
             id: 1,
             ws: Workspace::new(&parent_ws).unwrap(),
@@ -19357,9 +19372,10 @@ mod tests {
                 .unwrap();
         }
 
+        let scratch = Scratch::new("launch-refused");
         let report = run_shell(
             "cargo build --release",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(CMD_TIMEOUT_SECS),
             Detach::Job {
                 registry: &actor.ctx.registry,
@@ -19393,9 +19409,10 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
 
+        let scratch = Scratch::new("budget-timeout");
         let report = run_shell(
             "cargo build --release",
-            &std::env::temp_dir(),
+            scratch.path(),
             Duration::from_secs(CMD_TIMEOUT_SECS),
             Detach::No,
             &cancel,
@@ -19411,7 +19428,7 @@ mod tests {
 
     /// A scratch git repo with one initial commit, ready for worktrees. The
     /// label keeps parallel tests from sharing a directory.
-    fn init_git_repo(label: &str) -> PathBuf {
+    fn init_git_repo(label: &str) -> Scratch {
         let root = scratch_dir(&format!("git-{label}"));
         git_in(&root, &["init", "-q", "-b", "main"]);
         git_in(&root, &["config", "user.email", "t@t"]);

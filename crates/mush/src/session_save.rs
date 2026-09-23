@@ -461,16 +461,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mush_core::message::Message;
+    use mush_core::scratch::{Held, Scratch};
     use mush_core::session::{session_path, Session};
 
     use super::{SessionSave, Writer, FLUSH_DEADLINE};
 
-    /// A directory to write a session into, and to leave behind nothing.
-    fn root(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mush-writer-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory to write a session into, and to leave behind nothing: the
+    /// guard comes back with the path, so the root goes when the test ends —
+    /// panicking or not.
+    fn root(label: &str) -> Held<std::path::PathBuf> {
+        let dir = Scratch::new(&format!("writer-{label}"));
+        let path = dir.path().to_path_buf();
+        dir.hold(path)
     }
 
     /// A session with one user message, so which snapshot landed is readable.
@@ -526,7 +528,7 @@ mod tests {
     #[test]
     fn a_handed_over_snapshot_is_on_disk_when_flush_returns() {
         let root = root("roundtrip");
-        let writer = Writer::new(root.clone(), None).expect("the worker starts");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
         writer.save(saying("hello"));
         writer.flush();
         assert_eq!(last_message(&root), "hello");
@@ -540,7 +542,7 @@ mod tests {
     #[test]
     fn a_burst_of_handovers_costs_one_write_and_lands_the_newest() {
         let root = root("newest");
-        let mut writer = Writer::parked(root.clone(), None);
+        let mut writer = Writer::parked(root.to_path_buf(), None);
         writer.save(saying("one"));
         writer.save(saying("two"));
         writer.save(saying("three"));
@@ -556,7 +558,7 @@ mod tests {
     #[test]
     fn a_flush_with_nothing_pending_still_returns() {
         let root = root("empty");
-        let writer = Writer::new(root.clone(), None).expect("the worker starts");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
         writer.flush();
         assert!(!session_path(&root).exists(), "nothing was handed over");
         writer.save(saying("after"));
@@ -576,7 +578,7 @@ mod tests {
     fn a_flush_with_a_dead_writer_returns_with_an_error() {
         let root = root("dead-flush");
 
-        let never = Arc::new(Writer::parked(root.clone(), None));
+        let never = Arc::new(Writer::parked(root.to_path_buf(), None));
         never.save(saying("lost"));
         assert!(
             flushed_within(&never, FLUSH_DEADLINE),
@@ -589,7 +591,7 @@ mod tests {
             "and says what was lost: {error}"
         );
 
-        let died = Arc::new(Writer::new(root.clone(), None).expect("the worker starts"));
+        let died = Arc::new(Writer::new(root.to_path_buf(), None).expect("the worker starts"));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = died.inner.pending.lock().unwrap();
             panic!("poison the queue on purpose");
@@ -614,7 +616,7 @@ mod tests {
     #[test]
     fn the_writer_thread_is_named() {
         let root = root("named");
-        let writer = Writer::new(root.clone(), None).expect("the worker starts");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
         // The worker's own death: the queue it must take is poisoned under it.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = writer.inner.pending.lock().unwrap();
@@ -659,7 +661,7 @@ mod tests {
     #[test]
     fn a_timed_out_flush_leaves_the_next_one_able_to_try() {
         let root = root("flush-timeout");
-        let writer = Writer::parked(root.clone(), None);
+        let writer = Writer::parked(root.to_path_buf(), None);
         // The shape of a worker stuck inside `Session::save`: the thread is
         // there (the flag says so), the answer is not. Nothing is parked on the
         // queue, so the wait can only end at the deadline — which the test
@@ -702,7 +704,7 @@ mod tests {
         // `.mush` as a *file* is a workspace the session cannot be written to,
         // exactly as a full disk or a read-only checkout would be.
         fs::write(root.join(".mush"), "not a directory").unwrap();
-        let writer = Writer::new(root.clone(), None).expect("the worker starts");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
         writer.save(saying("lost"));
         writer.flush();
         let error = writer.take_error().expect("the failure is reported");
@@ -721,7 +723,8 @@ mod tests {
         let root = root("lock-replaced");
         mush_core::session::ensure_mush_dir(&root).unwrap();
         let guard = crate::lock::acquire(&root).unwrap();
-        let writer = Writer::new(root.clone(), Some(guard.identity())).expect("the worker starts");
+        let writer =
+            Writer::new(root.to_path_buf(), Some(guard.identity())).expect("the worker starts");
 
         // While the name still leads to the locked inode, the writer writes:
         // the check is the lock's identity, not a refusal.
