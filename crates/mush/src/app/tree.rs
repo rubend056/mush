@@ -545,6 +545,23 @@ pub struct Roster {
     pub waiting: usize,
 }
 
+/// The row a nudge displaced: the phase it was wearing and the clock that
+/// phase was running on, kept together because putting the row back "exactly as
+/// it was" is both.
+///
+/// A nudge rewrites the phase to `thinking…` and restarts the clock, so a
+/// delivery that fails has to restore the pair: writing the phase back alone
+/// left the row wearing `waiting on results` with `0s` beside it, and a failed
+/// nudge is no news about how long the agent had been waiting (finding B10,
+/// refactor R66).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replaced {
+    /// The phase the row wore before the nudge.
+    pub phase: Phase,
+    /// The instant that phase began: the age the row painted.
+    pub since: Instant,
+}
+
 /// A child actor that now exists, as its parent reported it: everything the
 /// tree needs to give it a row, a mailbox, and an opening line.
 pub struct Spawn {
@@ -1284,18 +1301,22 @@ impl AgentTree {
     }
 
     /// A nudge is on its way: the row shows the agent thinking. Returns the
-    /// phase it replaced, so a delivery that fails can put it back (B10).
+    /// phase it replaced and the clock that phase was running on — the row as it
+    /// was — so a delivery that fails can put both back (B10, R66).
     ///
     /// A fold is not replaced by it: the words land after the summarize call,
     /// not instead of it, and a row that started saying `thinking…` while the
     /// fold is still on the wire is the same lie the fold phase exists to stop.
     /// The run the nudge starts announces itself with `Running` when it does
     /// start.
-    pub fn nudge(&mut self, id: AgentId) -> Option<Phase> {
-        let previous = self.node(id).map(|node| node.phase.clone());
+    pub fn nudge(&mut self, id: AgentId) -> Option<Replaced> {
+        let previous = self.node(id).map(|node| Replaced {
+            phase: node.phase.clone(),
+            since: node.since,
+        });
         if previous
             .as_ref()
-            .is_some_and(|phase| phase.compacting().is_some())
+            .is_some_and(|was| was.phase.compacting().is_some())
         {
             return previous;
         }
@@ -1310,9 +1331,15 @@ impl AgentTree {
     /// leaving a `thinking…` on an agent nothing is running is a lie, and
     /// rewriting it to some other phase loses what the agent had achieved
     /// (finding B10).
-    pub fn nudge_failed(&mut self, id: AgentId, was: Option<Phase>) {
+    ///
+    /// The clock is part of "exactly as it was": [`Self::nudge`] started a new
+    /// one for the phase it showed, and the phase alone is not the row — a
+    /// `waiting on results 4m` written back without its `since` reads `0s`, as
+    /// if the agent had just begun to wait (refactor R66).
+    pub fn nudge_failed(&mut self, id: AgentId, was: Option<Replaced>) {
         if let (Some(node), Some(was)) = (self.node_mut(id), was) {
-            node.phase = was;
+            node.phase = was.phase;
+            node.since = was.since;
         }
     }
 
@@ -2553,15 +2580,19 @@ mod tests {
         assert_eq!(tree.node(AgentId::ROOT).unwrap().summary, None);
     }
 
-    /// A nudge that cannot be delivered puts the row back exactly as it was,
-    /// instead of leaving a `thinking…` on an agent nothing is running
-    /// (finding B10).
+    /// A nudge that cannot be delivered puts the row back exactly as it was —
+    /// phase *and* clock: a phase written back without its `since` is the same
+    /// row freshly restarted, so a row that said `waiting on results 4m` came
+    /// back saying `0s` (finding B10, refactor R66).
     #[test]
-    fn a_nudge_that_cannot_be_delivered_restores_the_previous_phase() {
+    fn a_nudge_that_cannot_be_delivered_restores_the_previous_phase_and_its_clock() {
         let mut tree = AgentTree::bare();
         let (opened, _rx) = child(&mut tree, 1);
         let id = opened.id;
         tree.finish(id, Some("did the work".to_string()));
+        // The row has been at rest for four minutes: the clock is part of what
+        // the row says, and a failed nudge must not restart it.
+        tree.age(id, Duration::from_secs(240));
         // The actor is gone: its mailbox went with it, so the nudge cannot land.
         tree.agent_tx.remove(&id);
 
@@ -2571,10 +2602,19 @@ mod tests {
             Phase::Thinking,
             "a nudge on its way shows immediately"
         );
+        assert!(
+            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(1),
+            "and the clock it shows is the nudge's"
+        );
 
         tree.nudge_failed(id, was);
         let node = tree.node(id).unwrap();
         assert_eq!(node.phase, Phase::Done, "the ✓ is not rewritten");
+        assert!(
+            node.since.elapsed() >= Duration::from_secs(240),
+            "nor is its clock reset: the row came back as `0s` where it said `4m`: {:?}",
+            node.since.elapsed()
+        );
         assert_eq!(
             node.summary.as_deref(),
             Some("did the work"),
