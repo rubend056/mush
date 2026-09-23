@@ -289,9 +289,9 @@ pub enum Work {
 }
 
 impl Work {
-    /// The line the UI prints when this happened. One home for the sentence,
-    /// so the transcript's status line and the listing agree about the same
-    /// commit.
+    /// The line the UI prints when this happened. One home for the sentence, so
+    /// the row's status line, the transcript line a failed commit leaves
+    /// ([`report_work`]) and the listing agree about the same commit.
     fn status_line(&self) -> Option<String> {
         match self {
             Work::Committed { branch, revision } => {
@@ -2186,8 +2186,8 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome),
             )
         });
-        if let Some(line) = work.as_ref().and_then(Work::status_line) {
-            actor.ctx.emit(actor.id, AgentEvent::Status(line));
+        if let Some(work) = &work {
+            report_work(&actor, &mut transcript, work);
         }
         // …and the run's own worktree, swept now that the run is finished with
         // it: a branch that adds nothing to the base this run was forked from —
@@ -5705,6 +5705,29 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
     }
 }
 
+/// File what the run did to its worktree: the row's tail, and — for a commit
+/// that failed — the transcript line that outlives the run.
+///
+/// The status line is a *tail*: `AgentTree::activity` refuses it for an agent
+/// that is not running, and the next run's `begin` clears it, so by the time a
+/// human looks, the one line that says the work is unlanded may be gone — while
+/// the model sees the fact only if it thinks to ask (`Work::digest`). A commit
+/// that failed (a lock, a conflict, a full disk) leaves real work behind in a
+/// worktree, so that line becomes a message as well: the pane keeps it, the
+/// session stores it, and the model reads it at its next request — the sentence
+/// is about *its* work, and it is the hand that can repair a commit (finding
+/// F17). The other two shapes are progress reports the row and the listing
+/// already carry; only unlanded work must not be missable.
+fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
+    let Some(line) = work.status_line() else {
+        return;
+    };
+    actor.ctx.emit(actor.id, AgentEvent::Status(line.clone()));
+    if matches!(work, Work::Uncommitted { .. }) {
+        push_line(actor, transcript, line);
+    }
+}
+
 /// `read_file`: a window of a text file, or an image.
 ///
 /// It takes no lock and runs no process, which is what makes it the read that
@@ -6927,6 +6950,91 @@ mod tests {
             .digest(),
             " · mush/1 uncommitted (/repo/.mush/wt/1 is no longer a worktree)"
         );
+    }
+
+    /// A commit that failed is not a row tail the next run clears: the line is
+    /// filed as a transcript line too, so the human keeps it and the model —
+    /// the hand that can repair a commit — reads it at its next request
+    /// (finding F17). Staged with a real commit that really fails: the repo
+    /// holds a `.git/index.lock`, the "a lock" shape the finding names, so
+    /// `git add` refuses before anything is written.
+    #[test]
+    fn a_failed_commit_is_a_transcript_line_that_outlives_the_next_run() {
+        let scripted = Arc::new(Scripted::new().says("carried on"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "failed-commit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let root = actor.ctx.root.clone();
+        let git = |args: &[&str]| git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("work.txt"), "the work\n").unwrap();
+        // The lock that makes the commit fail, and leaves the change behind.
+        fs::write(root.join(".git/index.lock"), "").unwrap();
+
+        let work = work_from_commit(
+            "mush/1".into(),
+            commit_worktree(&root, 1, "the brief", &Outcome::Finished("done".into())),
+        );
+        assert!(
+            matches!(work, Work::Uncommitted { .. }),
+            "the commit must really fail: {work:?}"
+        );
+        let line = work
+            .status_line()
+            .expect("an uncommitted worktree has a line");
+
+        let mut state = ActorState::default();
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("do the work"),
+        ];
+        report_work(&actor, &mut transcript, &work);
+
+        // The row is still told (the same sentence, from the one home), and
+        // the transcript keeps it as well.
+        let status: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Status(what) => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(status, vec![line.clone()], "the row's tail is unchanged");
+        assert!(
+            transcript.iter().any(|message| message.text() == line),
+            "and the line is a transcript line: {transcript:?}"
+        );
+
+        // The next run neither clears it nor keeps it from the model: the
+        // request that run makes carries the sentence.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_loop(&actor, &mut state, &mut transcript, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("carried on"));
+        assert!(
+            transcript.iter().any(|message| message.text() == line),
+            "the next run does not clear it: {transcript:?}"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .any(|message| message.text() == line),
+            "and the model reads it: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The work fact is a listing, not a signal: it starts no run and changes
