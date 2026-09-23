@@ -4982,6 +4982,14 @@ fn shown_path(rel: &str) -> String {
 /// is a refusal the model can correct. The shape is `edits` only — a list, of
 /// which a lone edit is the list of one — see [`tools::edits_arg`] for why the
 /// second, top-level spelling is gone.
+///
+/// The read is the strict whole read ([`Workspace::read_file`]): a file that is
+/// not valid UTF-8 is refused before any edit is attempted, naming the offset,
+/// the encoding problem and the road (`iconv` through `run_command`), and every
+/// byte is left as it was. The model's `read_file` tool still *shows* such a
+/// file lossily — a window is not an edit, and a refusal to show it would hide
+/// the file from the one tool that can diagnose it — but the road that writes
+/// back must not decode what it cannot re-encode (finding B6).
 fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let rel = tools::arg_string(args, "path")?;
     let edits = tools::edits_arg(args)?;
@@ -9189,6 +9197,64 @@ mod tests {
              count was not read)"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "small\n");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A file that is not valid UTF-8 is not edited through a lossy read. The
+    /// old road decoded with `from_utf8_lossy`, so a Latin-1 `caf\xe9` was read
+    /// as U+FFFD, edited as text and written back — the two lines the model
+    /// never touched came back with the replacement character and the original
+    /// bytes were gone (finding B6; measured: after a one-line edit the file
+    /// held `239, 191, 189` where `233` had been). The edit now refuses before
+    /// reading out the loss, names the file, the offset and the road (`iconv`
+    /// through `run_command`), and leaves every byte as it was. The positive
+    /// twin: a valid UTF-8 file with multi-byte characters still edits.
+    #[test]
+    fn a_non_utf8_file_is_not_edited_through_a_lossy_read() {
+        let (actor, _mailbox) = test_actor("edit-non-utf8");
+        let path = actor.ws.root().join("latin.txt");
+        let latin1 = b"caf\xe9 = 1\nna\xefve = 2\n";
+        fs::write(&path, latin1).unwrap();
+
+        let refused = edit_tool(
+            &actor.ws,
+            &json!({
+                "path": "latin.txt",
+                "edits": { "old_string": "= 1", "new_string": "= 9" }
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("latin.txt"),
+            "the file is named: {refused}"
+        );
+        assert!(refused.contains("not valid UTF-8"), "{refused}");
+        assert!(
+            refused.contains("offset 3"),
+            "where the decode stopped: {refused}"
+        );
+        assert!(
+            refused.contains("iconv") && refused.contains("run_command"),
+            "the roads that still work: {refused}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            latin1,
+            "every byte of the file is exactly as it was"
+        );
+
+        let utf8 = "café = 1\nnaïve = 2\n";
+        fs::write(&path, utf8).unwrap();
+        let edited = edit_tool(
+            &actor.ws,
+            &json!({
+                "path": "latin.txt",
+                "edits": { "old_string": "= 1", "new_string": "= 9" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(edited, "edited latin.txt");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "café = 9\nnaïve = 2\n");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
