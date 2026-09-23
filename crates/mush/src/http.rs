@@ -511,8 +511,9 @@ fn write_request(
     watch: &Watch,
 ) -> io::Result<()> {
     let mut head = format!(
-        "{} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
-        ask.method
+        "{} {path} HTTP/1.1\r\nHost: {}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
+        ask.method,
+        host_header(host)
     );
     if let Some(key) = ask.api_key {
         // The key as the doors handed it over: a value that may not carry a
@@ -540,6 +541,23 @@ fn write_request(
         write_bounded(&mut **out, body.as_bytes(), watch)?;
     }
     flush_bounded(&mut **out, watch)
+}
+
+/// The authority a `Host` header spells: the host, with an IPv6 literal
+/// bracketed again.
+///
+/// [`parse_url`] strips the brackets so the literal can be resolved and its
+/// colons are not read as a port separator — but RFC 7230 §5.4 wants the
+/// authority bracketed on the wire, and a server that validates `Host` answers
+/// 400 to `::1:8443`, a refusal the human then reads as the endpoint's fault
+/// (audit IN13). A colon is the whole test: a DNS name has none, and every
+/// colon that survives [`parse_url`] belongs to an IPv6 literal.
+fn host_header(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 /// Write `bytes` whole, and let nothing outlive the call: before every chunk
@@ -1741,6 +1759,41 @@ mod tests {
         assert_eq!(
             up_to_next_header, "\r\n",
             "exactly one CRLF after the bearer token: {sent}"
+        );
+    }
+
+    /// An IPv6 endpoint is addressed with the brackets its URL carried.
+    /// [`parse_url`] strips them so a literal can be resolved — its colons are
+    /// not a port separator — and RFC 7230 §5.4 wants the `Host` header's
+    /// authority bracketed again. A server that validates `Host` answers 400
+    /// to `::1:8443`, and the human reads that as the endpoint's fault (audit
+    /// IN13).
+    #[test]
+    fn an_ipv6_endpoint_is_addressed_with_a_bracketed_host_header() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(&written, &[&ok("{}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        send(
+            &Pool::new(),
+            &mut opener,
+            "http://[::1]:8443/v1/chat/completions",
+            "{}",
+        )
+        .unwrap();
+
+        let sent = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(
+            sent.starts_with("POST /v1/chat/completions HTTP/1.1\r\nHost: [::1]:8443\r\n"),
+            "the Host header brackets the IPv6 literal: {sent}"
         );
     }
 
