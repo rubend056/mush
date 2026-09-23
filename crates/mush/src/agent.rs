@@ -3346,10 +3346,15 @@ fn compact_history(
             if asked {
                 // The endpoint's own words, the way a run reports them: a
                 // refusal and an unreadable body are different things, and the
-                // human is the one who can act on either.
+                // human is the one who can act on either. Bounded the way the
+                // run's own refusal arm bounds its body (`truncate(&body,
+                // 600)`), so the two refusals read alike and a notice stays a
+                // line: the endpoint's body is bounded only by `http.rs`'s
+                // `MAX_BODY_BYTES`, and a notice is wrapped and painted — 80 MiB
+                // of it through the notes list is not a sentence (finding C10).
                 let why = match &error {
                     ModelError::Status { status, body } => {
-                        format!("the endpoint answered {status}: {body}")
+                        format!("the endpoint answered {status}: {}", truncate(body, 600))
                     }
                     ModelError::Malformed(what) => {
                         format!("the endpoint's reply could not be read: {what}")
@@ -15728,6 +15733,57 @@ mod tests {
             ],
             "the fold's call is reported, and the noun is the fold's"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The fold's refusal is the run's refusal, in one sentence and one bound:
+    /// a notice is wrapped and painted (and `/notes` re-wraps it), while the
+    /// endpoint's body is bounded only by `http.rs`'s `MAX_BODY_BYTES = 80 MiB`
+    /// — a hostile or verbose endpoint plus one `/compact` used to put the whole
+    /// body through the notes list (finding C10).
+    #[test]
+    fn a_folds_refusal_is_bounded_like_the_runs() {
+        let body = "x".repeat(1 << 20);
+        let scripted = Arc::new(Scripted::new().fails_with(500, &body));
+        let (actor, events, _mailbox) = build_actor_about(
+            "fold-refusal",
+            scripted,
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        let refusals: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("could not compact") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusals.len(), 1, "one line: {refusals:?}");
+        let line = &refusals[0];
+        assert!(
+            line.contains("the endpoint answered 500: xxx"),
+            "the refusal still says what the endpoint said: {line}"
+        );
+        assert!(
+            line.len() < 1_000,
+            "the notice is bounded, not the endpoint's whole body: {} bytes",
+            line.len()
+        );
+        assert!(line.ends_with('…'), "and it says it was cut: {line:?}");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
