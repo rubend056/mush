@@ -32,10 +32,21 @@
 //! child's stdin on a thread of its own, since a program that stops reading
 //! fills the pipe and a caller that wrote the text itself would block in
 //! `write` on exactly the program that never came back for the read.
+//!
+//! Both helper threads a road needs — the drain that reads a reader's stdout and
+//! the writer that fills a writer's stdin — are started through this module's
+//! own [`WorkerSpawn`] road, the same contract the app's four worker roads keep
+//! (finding R11's residual): a box at its thread limit gets a sentence, never a
+//! panic on the worker the app started — whose answer would then never come, so
+//! the key did nothing in silence. What a refusal means is decided beside each
+//! use: the reader is killed, because nothing can read what it would write
+//! ([`Answer::NoThread`]), and the writer is killed *before* its pipe is let go,
+//! so a writer waiting for EOF cannot read a closed, empty pipe as the copy
+//! ([`Delivered::NoThread`]).
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mush_core::message::Image;
@@ -73,6 +84,36 @@ const READ_CAP: usize = IMAGE_FILE_CAP as usize + 1;
 /// for a format mush cannot name would be a round trip for a refusal.
 const MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/// How this module starts the one helper thread a clipboard road needs: a named
+/// `std::thread::Builder` thread, whose refusal is returned and not raised.
+///
+/// `std::thread::spawn` panics when the OS refuses a thread — a container's
+/// `pids.max`, a `ulimit -u`, a fork storm — and that panic lands *inside* the
+/// clipboard worker the app started: the send that would carry the answer never
+/// runs, so `Ctrl-V` and `Ctrl-Y Enter` do nothing and say nothing. The app's
+/// four worker roads answer that refusal through its own `WorkerSpawn` (finding
+/// R11); this is the same road spelled a second time, because the clipboard is a
+/// machine facility *below* the UI — the app calls it, never the other way — and
+/// a subprocess module reaching up into the TUI module for its thread would
+/// point the dependency the wrong way. One rule, two spellings:
+/// `Builder::new().name(...).spawn(job).map(|_| ())`, and the `Err` is what the
+/// caller turns into the sentence the human reads.
+///
+/// The road is a parameter of the two bodies below rather than a bare call
+/// because a test has to drive a refusal without exhausting the machine's own
+/// threads — the same reason the app keeps its road in a field. The production
+/// road is [`spawn_worker`].
+type WorkerSpawn = fn(&str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+/// The production [`WorkerSpawn`]: a named `Builder` thread, whose refusal is
+/// the `Err` that `std::thread::spawn` would have panicked on.
+fn spawn_worker(name: &str, job: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(job)
+        .map(|_| ())
+}
+
 /// The image on the system clipboard, saved into the workspace. `Ok(None)` is
 /// "the clipboard holds no image"; `Err(line)` is "it cannot be attached, and
 /// this is the sentence to say".
@@ -82,6 +123,13 @@ const MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// even be spawned, the clipboard is unreadable on this machine, and the
 /// refusal names what to install rather than pretending the clipboard was
 /// empty — the two facts need different actions from the human.
+///
+/// A drain thread the machine refused is a third refusal: the drain that reads
+/// a reader's stdout is this road's own worker, and a refused spawn
+/// ([`Answer::NoThread`]) ends the read with a sentence — the reader is killed,
+/// because nothing can read what it would write, and the file road still works
+/// — never with a panic on the app's worker, whose message would then never
+/// come.
 ///
 /// The same is true of a reader killed at the deadline: it is its own refusal
 /// ([`Answer::TimedOut`]) because the picture may well be on the clipboard and
@@ -93,15 +141,17 @@ const MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// a reader that never answers; installing one on the machine's PATH would be
 /// the test's own lie about the machine.
 pub fn read_image(ws: &Workspace) -> Result<Option<Image>, String> {
-    run_readers(ws, readers(), Instant::now() + DEADLINE)
+    run_readers(ws, readers(), Instant::now() + DEADLINE, spawn_worker)
 }
 
-/// [`read_image`] with the readers and the deadline handed in: the loop, the
-/// three answers that are not a picture, and the sentences each one earns.
+/// [`read_image`] with the readers, the deadline and the spawn road handed in:
+/// the loop, the four answers that are not a picture, and the sentences each one
+/// earns.
 fn run_readers(
     ws: &Workspace,
     readers: Vec<(&'static str, Vec<String>)>,
     deadline: Instant,
+    spawn: WorkerSpawn,
 ) -> Result<Option<Image>, String> {
     let mut ran = false;
     let mut stalled = None;
@@ -109,9 +159,21 @@ fn run_readers(
         if Instant::now() >= deadline {
             break;
         }
-        match run(program, &args, deadline) {
+        match run(program, &args, deadline, spawn) {
             Answer::Missing => {}
             Answer::Nothing => ran = true,
+            Answer::NoThread(error) => {
+                // The drain could not start, and the refusal is the machine's,
+                // not this program's: every reader after this one would need a
+                // drain thread of its own, so the road stops here instead of
+                // spending what is left of the deadline on children it cannot
+                // read. The key still has a road — the path of an image file —
+                // and the sentence names it rather than leaving the human with
+                // a keystroke that did nothing.
+                return Err(format!(
+                    "could not start the clipboard read: {error} — paste the image's path instead"
+                ));
+            }
             Answer::TimedOut => {
                 ran = true;
                 stalled = Some(program);
@@ -196,6 +258,14 @@ enum Answer {
     /// the human's move — copy the picture again, or paste its path — is the one
     /// an empty clipboard asks for.
     Nothing,
+    /// The machine refused the thread that reads this reader's stdout
+    /// ([`WorkerSpawn`]): the reader is up and nothing can collect what it
+    /// writes, so it was killed and this reader hands nothing over. Not
+    /// [`Answer::Missing`] — the program is on the machine — and not
+    /// [`Answer::TimedOut`] — no deadline was reached; the box is at its thread
+    /// limit, and the caller says *that* rather than naming a reader that never
+    /// had a chance to answer.
+    NoThread(String),
     /// It was still running when the shared deadline arrived and was killed.
     /// That is not the same fact as [`Answer::Nothing`]: the clipboard may hold
     /// the picture and the reader may be stuck, so the caller says a reader did
@@ -215,7 +285,14 @@ enum Answer {
 /// what it keeps is bounded by [`READ_CAP`] — a runaway that pours out gigabytes
 /// has the rest drained and dropped, so the memory a stuck tool can cost is a
 /// constant rather than the machine's.
-fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
+///
+/// The drain thread goes through [`WorkerSpawn`], and a refused thread is its
+/// own answer ([`Answer::NoThread`]): the reader is killed and reaped at once,
+/// because its stdout can never be read — the bytes it writes are what the drain
+/// exists for, and a child left running would only fill a pipe nobody drains —
+/// so the caller says the machine refused a thread rather than naming a reader
+/// that never had a chance to answer.
+fn run(program: &str, args: &[String], deadline: Instant, spawn: WorkerSpawn) -> Answer {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -237,9 +314,21 @@ fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
     // as long as the grandchild lives. The wait below is bounded like every
     // other one here; a thread left behind ends when the pipe finally closes.
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(drain(stdout));
-    });
+    let started = spawn(
+        "mush-clipboard-drain",
+        Box::new(move || {
+            let _ = tx.send(drain(stdout));
+        }),
+    );
+    if let Err(error) = started {
+        // Nothing can read this reader's stdout, so it is killed and reaped
+        // there and then, before the poll below could spend the deadline on a
+        // pipe nobody drains. The refusal is the machine's fact, and the answer
+        // says so rather than reporting a reader that did not answer.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Answer::NoThread(error.to_string());
+    }
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -332,6 +421,10 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
 /// rather than a failure the human cannot act on — the same two facts the read
 /// road keeps apart.
 ///
+/// A stdin thread the machine refused is its own fact ([`Delivered::NoThread`]):
+/// the text never entered the pipe, and the sentence says the write did not
+/// start rather than reading the refusal as a failed write.
+///
 /// Nothing is added and nothing is taken away: a multi-line text keeps its
 /// newlines and tabs, and a text that ends in `\n` keeps that newline, because
 /// what the human copied is what they mean to paste elsewhere. `wl-copy`'s `-n`
@@ -353,15 +446,17 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
 // clipboard, or depending on which of the four writers the machine has on
 // `PATH`.
 pub fn write_text(text: &str) -> Result<(), String> {
-    run_writers(writers(), text, Instant::now() + DEADLINE)
+    run_writers(writers(), text, Instant::now() + DEADLINE, spawn_worker)
 }
 
-/// [`write_text`] with the writers and the deadline handed in: the loop, the
-/// fall-through, and the sentences the failures earn.
+/// [`write_text`] with the writers, the deadline and the spawn road handed in:
+/// the loop, the fall-through, the refusal that stops it, and the sentences the
+/// failures earn.
 fn run_writers(
     writers: Vec<(&'static str, Vec<String>)>,
     text: &str,
     deadline: Instant,
+    spawn: WorkerSpawn,
 ) -> Result<(), String> {
     // Shared with the thread that writes it, so a text handed to four writers
     // is copied once, and never once per poll.
@@ -372,10 +467,22 @@ fn run_writers(
         if Instant::now() >= deadline {
             break;
         }
-        match deliver(program, &args, &text, deadline) {
+        match deliver(program, &args, &text, deadline, spawn) {
             Delivered::Missing => {}
             Delivered::Taken => return Ok(()),
             Delivered::Refused => ran = true,
+            Delivered::NoThread(error) => {
+                // The write thread could not start, and the refusal is the
+                // machine's, not this program's: every writer after this one
+                // would need a write thread of its own, so the road stops here
+                // instead of starting writers it cannot feed. The text never
+                // entered the pipe, and the sentence says the write did not
+                // start rather than calling it a failed write.
+                return Err(format!(
+                    "could not start the clipboard write: {error} — the text was not copied; try \
+                     again"
+                ));
+            }
             Delivered::TimedOut => {
                 ran = true;
                 stalled = Some(program);
@@ -445,6 +552,12 @@ enum Delivered {
     /// the program ever reads it, and no exit status can be asked about bytes
     /// already buffered.
     Refused,
+    /// The machine refused the thread that would fill this writer's stdin
+    /// ([`WorkerSpawn`]), so the text never entered the pipe: the writer was
+    /// killed before the caller let the pipe go, and this is its own fact — not
+    /// [`Delivered::Refused`], where the program ran and the text did not land,
+    /// and not [`Delivered::TimedOut`], where the deadline was reached.
+    NoThread(String),
     /// It was still running when the shared deadline arrived and was killed.
     /// That is not the same fact as [`Delivered::Refused`]: the text may be on
     /// its way to the clipboard and the writer merely stuck on an owner that
@@ -471,7 +584,19 @@ enum Delivered {
 /// not a copy. It is evidence about the stdin and nothing more: bytes buffered
 /// in a pipe are the program's to read or to leave, and that gap is the price of
 /// not blocking on a writer that may never read them.
-fn deliver(program: &str, args: &[String], text: &Arc<str>, deadline: Instant) -> Delivered {
+///
+/// The stdin thread goes through [`WorkerSpawn`], and a refused thread is its
+/// own answer ([`Delivered::NoThread`]): the writer is killed and reaped while
+/// the pipe is still held open, so a writer that waits for EOF cannot read a
+/// closed, empty pipe as the copy, and a text that never entered the pipe is
+/// not reported as a write that failed.
+fn deliver(
+    program: &str,
+    args: &[String],
+    text: &Arc<str>,
+    deadline: Instant,
+    spawn: WorkerSpawn,
+) -> Delivered {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -482,20 +607,55 @@ fn deliver(program: &str, args: &[String], text: &Arc<str>, deadline: Instant) -
         Ok(child) => child,
         Err(_) => return Delivered::Missing,
     };
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return Delivered::Refused;
     };
+    // The pipe's write end lives in a slot both sides hold: the thread takes it
+    // if it starts, and the refusal below takes it back — *after* killing the
+    // writer — because a spawn the OS refuses drops the job it was handed, and a
+    // pipe that closed with nothing in it is an EOF a writer waiting for the
+    // text (every one of them does) could read as the copy. The text itself is
+    // not in the pipe on that road: the thread that would have written it never
+    // ran.
+    let stdin = Arc::new(Mutex::new(Some(stdin)));
+    let feeding = Arc::clone(&stdin);
     let (tx, rx) = std::sync::mpsc::channel();
     let text = Arc::clone(text);
-    std::thread::spawn(move || {
-        // The drop of `stdin` when this closure ends is the end of the text: a
-        // writer that waits for EOF — every one of the three does — is waiting
-        // for exactly that. The send is what the caller reads as "the write
-        // succeeded"; a write that failed sends its error instead.
-        let _ = tx.send(stdin.write_all(text.as_bytes()));
-    });
+    let started = spawn(
+        "mush-clipboard-stdin",
+        Box::new(move || {
+            let taken = feeding
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(mut stdin) = taken else {
+                // The refusal took the pipe: the writer it belonged to is dead,
+                // and there is nothing left to write to.
+                return;
+            };
+            // The drop of `stdin` when this closure ends is the end of the text:
+            // a writer that waits for EOF — every one of the four does — is
+            // waiting for exactly that. The send is what the caller reads as
+            // "the write succeeded"; a write that failed sends its error
+            // instead.
+            let _ = tx.send(stdin.write_all(text.as_bytes()));
+        }),
+    );
+    if let Err(error) = started {
+        // The write thread never ran, so the text never entered the pipe. The
+        // writer is killed and reaped first and the pipe is let go after, so the
+        // EOF it sees is its own death and not an empty copy; what the caller
+        // says is the refusal ([`Delivered::NoThread`]).
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        return Delivered::NoThread(error.to_string());
+    }
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -569,6 +729,7 @@ mod tests {
                 format!("printenv MUSH_API_KEY > {}; true", read.display()),
             ],
             Instant::now() + DEADLINE,
+            spawn_worker,
         );
         let write = dir.join("write");
         let delivered = deliver(
@@ -582,6 +743,7 @@ mod tests {
             ],
             &Arc::from("some text"),
             Instant::now() + DEADLINE,
+            spawn_worker,
         );
         match previous {
             Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
@@ -711,8 +873,13 @@ mod tests {
     fn a_reader_killed_at_the_deadline_is_a_timeout_and_says_so() {
         let ws = temp_workspace("timeout");
         let readers = vec![("sh", vec!["-c".to_string(), "sleep 30".to_string()])];
-        let refused =
-            run_readers(&ws, readers, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        let refused = run_readers(
+            &ws,
+            readers,
+            Instant::now() + Duration::from_millis(50),
+            spawn_worker,
+        )
+        .unwrap_err();
         assert!(
             refused.contains("`sh` did not answer within 2s"),
             "{refused}"
@@ -738,6 +905,7 @@ mod tests {
                 "sh",
                 &["-c".into(), exit.into()],
                 Instant::now() + Duration::from_secs(5),
+                spawn_worker,
             );
             assert!(
                 matches!(answer, Answer::Nothing),
@@ -746,9 +914,14 @@ mod tests {
         }
         let readers = vec![("sh", vec!["-c".to_string(), "exit 3".to_string()])];
         assert!(
-            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5))
-                .unwrap()
-                .is_none(),
+            run_readers(
+                &ws,
+                readers,
+                Instant::now() + Duration::from_secs(5),
+                spawn_worker,
+            )
+            .unwrap()
+            .is_none(),
             "a failed reader answers as an empty clipboard does"
         );
     }
@@ -760,8 +933,13 @@ mod tests {
     fn no_reader_at_all_names_what_to_install() {
         let ws = temp_workspace("no-reader");
         let readers = vec![("mush-no-such-reader", Vec::new())];
-        let refused =
-            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        let refused = run_readers(
+            &ws,
+            readers,
+            Instant::now() + Duration::from_secs(5),
+            spawn_worker,
+        )
+        .unwrap_err();
         assert!(refused.contains("no clipboard reader on PATH"), "{refused}");
         assert!(refused.contains("wl-clipboard"), "{refused}");
     }
@@ -838,6 +1016,7 @@ mod tests {
                 vec![("sh", capturing(&path))],
                 text,
                 Instant::now() + Duration::from_secs(5),
+                spawn_worker,
             )
             .unwrap_or_else(|refused| panic!("a `cat` takes any text, {text:?}: {refused}"));
             assert_eq!(
@@ -867,6 +1046,7 @@ mod tests {
             writers,
             "the winner",
             Instant::now() + Duration::from_secs(5),
+            spawn_worker,
         )
         .expect("the third writer takes what the first two could not");
         assert_eq!(fs::read(&path).unwrap(), b"the winner");
@@ -889,8 +1069,13 @@ mod tests {
             ("sh", vec!["-c".to_string(), "exit 0".to_string()]),
             ("sh", capturing(&path)),
         ];
-        run_writers(writers, &text, Instant::now() + Duration::from_secs(5))
-            .expect("the second writer takes what the first dropped");
+        run_writers(
+            writers,
+            &text,
+            Instant::now() + Duration::from_secs(5),
+            spawn_worker,
+        )
+        .expect("the second writer takes what the first dropped");
         assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
     }
 
@@ -906,6 +1091,7 @@ mod tests {
             writers,
             "undelivered",
             Instant::now() + Duration::from_secs(5),
+            spawn_worker,
         )
         .unwrap_err();
         assert!(refused.contains("did not reach the clipboard"), "{refused}");
@@ -921,8 +1107,13 @@ mod tests {
     #[test]
     fn no_writer_at_all_names_what_to_install() {
         let writers = vec![("mush-no-such-writer", Vec::new())];
-        let refused =
-            run_writers(writers, "nowhere", Instant::now() + Duration::from_secs(5)).unwrap_err();
+        let refused = run_writers(
+            writers,
+            "nowhere",
+            Instant::now() + Duration::from_secs(5),
+            spawn_worker,
+        )
+        .unwrap_err();
         assert!(refused.contains("no clipboard writer on PATH"), "{refused}");
         assert!(refused.contains("wl-clipboard"), "{refused}");
         assert!(refused.contains("wl-copy"), "{refused}");
@@ -966,8 +1157,13 @@ mod tests {
         // Room for the writer's first line: the pid it echoes is the reaping
         // check's instrument, and 50 ms is less than a loaded machine takes to
         // start a shell (see the doc).
-        let refused =
-            run_writers(writers, &text, Instant::now() + Duration::from_millis(250)).unwrap_err();
+        let refused = run_writers(
+            writers,
+            &text,
+            Instant::now() + Duration::from_millis(250),
+            spawn_worker,
+        )
+        .unwrap_err();
         let waited = started.elapsed();
         assert!(
             refused.contains("`sh` did not take the text within 2s"),
@@ -1009,6 +1205,166 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A [`WorkerSpawn`] that refuses every thread, like a box at its limit
+    /// (`ulimit -u`, a container's `pids.max`, a fork storm) — the seam the
+    /// app's own `WorkerSpawn` tests drive their four roads with. The breath
+    /// before the refusal is what lets the reader or writer the road has
+    /// already started name itself: the tests below read the kill and the reap
+    /// off the pid it wrote, and a process killed before `sh` could run would
+    /// leave the instrument unread rather than the fact unproven.
+    fn refuse_after_a_breath(
+        _name: &str,
+        _job: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<()> {
+        std::thread::sleep(Duration::from_millis(300));
+        Err(std::io::Error::other("the box is at its thread limit"))
+    }
+
+    /// A drain thread that cannot start is a returned sentence, not a panic on
+    /// the worker the app started — whose answer would then never come, so
+    /// `Ctrl-V` would do nothing in silence (finding R11's residual). The
+    /// reader the road had already started is killed and reaped, because
+    /// nothing can read its stdout: a picture past the pipe buffer would sit in
+    /// a full pipe until the deadline, and the bytes already in it could never
+    /// be collected. The sentence says the read did not start and names the road
+    /// that still works; the reader after it never runs, because the refusal is
+    /// the machine's and not the program's, and it would need a drain thread of
+    /// its own.
+    #[test]
+    fn a_drain_reader_that_cannot_start_kills_the_reader_and_says_the_read_did_not_start() {
+        let ws = temp_workspace("no-drain");
+        let pid_file = temp_path("no-drain-pid");
+        let later = temp_path("no-drain-later");
+        let readers = vec![
+            (
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!("echo $$ > '{}'; sleep 5", pid_file.display()),
+                ],
+            ),
+            (
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!("echo ran > '{}'", later.display()),
+                ],
+            ),
+        ];
+        let refused = run_readers(
+            &ws,
+            readers,
+            Instant::now() + Duration::from_secs(5),
+            refuse_after_a_breath,
+        )
+        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        {
+            // The reader named itself while the refusal was being made, and
+            // the road killed and reaped it before the sentence came back: a
+            // `/proc` entry would be a reader still running.
+            let named = fs::read_to_string(&pid_file)
+                .expect("the reader names itself while the refusal is being made");
+            let pid: i32 = named.trim().parse().expect("sh's `$$` is a pid");
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the reader whose drain could not start is killed and reaped: /proc/{pid} is still \
+                 there"
+            );
+        }
+        assert!(!later.exists(), "the readers after the refusal never run");
+        assert!(
+            refused.contains("could not start the clipboard read"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("the box is at its thread limit"),
+            "the machine's refusal is carried into the sentence: {refused}"
+        );
+        assert!(
+            refused.contains("paste the image's path instead"),
+            "the road that still works: {refused}"
+        );
+        assert!(
+            !refused.contains("no clipboard reader on PATH") && !refused.contains("no image"),
+            "a refused thread is neither a missing reader nor an empty clipboard: {refused}"
+        );
+    }
+
+    /// A stdin thread that cannot start is a returned sentence, not a panic on
+    /// the worker the app started — whose answer would then never come, so
+    /// `Ctrl-Y Enter` would do nothing in silence (finding R11's residual). The
+    /// writer the road had already started is killed and reaped *before* the
+    /// pipe is let go, because a writer that waits for EOF — every one of them
+    /// does — must not read a closed, empty pipe as the copy: the text never
+    /// entered the pipe, no program took it, and the sentence says the write did
+    /// not start. The writer after it never runs, because the refusal is the
+    /// machine's and not the program's, and it would need a write thread of its
+    /// own.
+    #[test]
+    fn a_stdin_writer_that_cannot_start_kills_the_writer_and_says_the_text_was_not_copied() {
+        let path = temp_path("no-write");
+        let pid_file = temp_path("no-write-pid");
+        let later = temp_path("no-write-later");
+        let writers = vec![
+            (
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "echo $$ > '{}'; cat > '{}'",
+                        pid_file.display(),
+                        path.display()
+                    ),
+                ],
+            ),
+            (
+                "sh",
+                vec!["-c".to_string(), format!("cat > '{}'", later.display())],
+            ),
+        ];
+        let refused = run_writers(
+            writers,
+            "the text that must not land",
+            Instant::now() + Duration::from_secs(5),
+            refuse_after_a_breath,
+        )
+        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        {
+            // The writer named itself while the refusal was being made, and the
+            // road killed and reaped it before the sentence came back: a
+            // `/proc` entry would be a writer still holding a pipe nobody fills.
+            let named = fs::read_to_string(&pid_file)
+                .expect("the writer names itself while the refusal is being made");
+            let pid: i32 = named.trim().parse().expect("sh's `$$` is a pid");
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the writer whose stdin thread could not start is killed and reaped: /proc/{pid} \
+                 is still there"
+            );
+        }
+        assert!(
+            !matches!(fs::read(&path), Ok(bytes) if !bytes.is_empty()),
+            "the text never reached the writer: {:?}",
+            fs::read(&path)
+        );
+        assert!(!later.exists(), "the writers after the refusal never run");
+        assert!(
+            refused.contains("could not start the clipboard write"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("the box is at its thread limit"),
+            "the machine's refusal is carried into the sentence: {refused}"
+        );
+        assert!(
+            !refused.contains("no clipboard writer on PATH")
+                && !refused.contains("did not reach the clipboard"),
+            "a refused thread is neither a missing writer nor a failed write: {refused}"
+        );
     }
 
     /// The writer list is the four platforms' tools in the order the module
