@@ -986,8 +986,9 @@ a live lie, and the row the report would fix first); `picker_width` multiplies a
 `u16` and overflows above 1092 columns where `agents_columns` computes the same
 share in `u32` (`R72`); and the parker and the reaper count different populations
 under a comment that says "one arithmetic" (`R73`). Four findings cost lines rather
-than save them (`R68`, `R70`, `R71`, `R73`) and are entered `⬜ judged`, each with
-the contract or invariant it buys stated in the row. Nothing of the seven files
+than save them (`R68`, `R70`, `R71`, `R73`) and were entered `⬜ judged`, each with
+the contract or invariant it buys stated in the row; `R71` has since landed
+(`bc581ba`). Nothing of the seven files
 changed between `f47bfdb` and `38d0438`, so every span the report quotes still
 stands as written; its count of `AgentNode`'s fields is fourteen, not fifteen
 (`R58`), `nudge` carries only the fold guard and no busy check (`R61`), the three
