@@ -1908,6 +1908,44 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
     Ok(())
 }
 
+/// How many backup names mush will try beside a file it cannot use before it
+/// gives up looking. A store that has been hand-broken a hundred times has a
+/// problem that no file name solves.
+pub(crate) const BACKUP_TRIES: u32 = 100;
+
+/// The first free backup name beside `path` — `<path>.bak`, then `<path>.bak.2`,
+/// `<path>.bak.3`, … up to [`BACKUP_TRIES`] — for the two files mush sets aside
+/// rather than let the next write replace them: the unreadable session
+/// ([`crate::session::keep_unreadable`]) and the unparsable home config
+/// ([`crate::userconfig`]'s save).
+///
+/// The numbering is one rule so the two roads cannot disagree about it, and a
+/// copy already beside the file is never overwritten: it is one the human
+/// already needed, so the next free name is taken instead. The bound on how
+/// hard mush looks is this one constant. `Err` is the sentence both callers
+/// carry on: every name beside the file is taken.
+///
+/// The rename itself is each caller's, because *why* the copy is kept differs —
+/// a conversation that must not be lost and a key that must not be replaced are
+/// different accidents, kept for different reasons in the callers' own docs.
+pub fn backup_name(path: &Path) -> Result<PathBuf, String> {
+    let base = PathBuf::from(format!("{}.bak", path.display()));
+    for step in 1..=BACKUP_TRIES {
+        let to = if step == 1 {
+            base.clone()
+        } else {
+            PathBuf::from(format!("{}.{step}", base.display()))
+        };
+        if !to.exists() {
+            return Ok(to);
+        }
+    }
+    Err(format!(
+        "every backup name beside {} is taken",
+        path.display()
+    ))
+}
+
 /// What a write to `path` must land on, or why it cannot: the file the name
 /// really is.
 ///
@@ -3163,6 +3201,40 @@ mod tests {
         assert_eq!(mode_of(&path), 0o640);
         assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
         let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// One numbering rule for the copy kept beside a file mush cannot use: the
+    /// first free `.bak` name, then `.bak.2`, …, and the shared bound is what
+    /// stops it. The session store and the home config both take this road
+    /// ([`crate::session::keep_unreadable`], [`crate::userconfig`]), so the two
+    /// cannot disagree about which copy is the second accident; each keeps its
+    /// own reason for the copy in its own doc.
+    #[test]
+    fn a_backup_name_is_the_first_free_one_beside_the_file() {
+        let root = std::env::temp_dir().join(format!("mush-backup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("thing.json");
+        fs::write(&file, "x").unwrap();
+
+        assert_eq!(backup_name(&file).unwrap(), root.join("thing.json.bak"));
+        fs::write(root.join("thing.json.bak"), "kept").unwrap();
+        assert_eq!(backup_name(&file).unwrap(), root.join("thing.json.bak.2"));
+
+        // Every name the bound allows, taken: the answer is the refusal, not a
+        // hundred-and-first name.
+        for step in 1..=BACKUP_TRIES {
+            let name = if step == 1 {
+                "thing.json.bak".to_string()
+            } else {
+                format!("thing.json.bak.{step}")
+            };
+            fs::write(root.join(name), "kept").unwrap();
+        }
+        let refused = backup_name(&file).unwrap_err();
+        assert!(refused.contains("every backup name beside"), "{refused}");
+        assert!(refused.contains("thing.json"), "{refused}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The one fact a rename cannot keep, pinned as the fact it is: a hard link
