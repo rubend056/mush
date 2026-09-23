@@ -418,12 +418,14 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a m
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --sigterm # needs none
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --lock    # needs none
 ```
 
 The endpoint-free scenarios drive the real binary over a pty: `--resize` checks
 that it repaints on its own, `--cancel` points it at a socket that accepts the
 request and never answers and checks that a single `Ctrl-C` frees the agent to
-work again, and `--sigterm` checks the clean-quit road a signal takes. The
+work again, `--sigterm` checks the clean-quit road a signal takes, and `--lock`
+checks that a second mush on one workspace is refused while the first works. The
 manual's §10 lists what the suite covers.
 
 ## Development

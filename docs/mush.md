@@ -1105,7 +1105,9 @@ them should ask rather than build.
   SIGWINCH behave as they do in a terminal. Scenarios: agent (needs a model),
   resize (needs nothing), cancel (needs nothing — a socket that accepts the chat
   request and never answers must be abandoned by a single Ctrl-C, which is only
-  observable from outside the process), and sigterm (needs nothing).
+  observable from outside the process), sigterm (needs nothing), and lock (needs
+  nothing — one mush holds the workspace lock and a second start on the same
+  workspace is refused; it runs last, because it needs the workspace to itself).
 - **Deterministic orchestration.** More than twenty `cargo test` scenarios drive
   the real actor loop in process, on a scripted `ModelClient` rather than a
   server; six of them spawn a real subagent actor. Between them: a root → child →
@@ -1124,7 +1126,7 @@ them should ask rather than build.
   makes a TLS handshake against `https://api.deepseek.com` (no key, so a 401 is
   the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
-  -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
+  -D warnings`, the unit tests, and the endpoint-free pty scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
   `scripts/census.py` prints the production/test/comment split.
 - **Screen review.** `scripts/screen.py` drives the real binary over a pty and
