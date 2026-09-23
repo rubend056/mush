@@ -170,6 +170,30 @@ fn refusal_error(reason: &str) -> String {
 /// on. It is bounded because a model that cannot write small enough is not
 /// going to start now.
 const TRUNCATION_ROUNDS: usize = 3;
+/// How many consecutive replies mush may fail to *read* before the run ends
+/// with the parse failure.
+///
+/// One, not [`TRUNCATION_ROUNDS`]: a truncated body is the model writing more
+/// than it was allowed (asking for a smaller answer is the road back), while a
+/// malformed body is the endpoint not answering in the protocol at all — the
+/// retry exists for the transient shape, and a second one would just bill the
+/// human for a server that is systematically broken (finding B12).
+const MALFORMED_ROUNDS: usize = 1;
+/// What the model is told when the endpoint's reply could not be read as a
+/// reply: nothing of it was recorded, so the ask stands and the answer has to
+/// be written again.
+///
+/// The words name the *wire's* failure, never the model's — the model's last
+/// turn was never seen — and the road back is the one every other refusal
+/// names: write the answer again, or the tool call with its arguments as JSON.
+/// It travels as a line in the transcript the next request is built from, the
+/// same way [`TRUNCATION_INSTRUCTION`] does, so the model and the human read
+/// the same fact.
+const MALFORMED_INSTRUCTION: &str = "\
+mush could not read the endpoint's last reply, so nothing of it was recorded. \
+Answer the message before this one again: a tool call with its arguments \
+written as JSON, or the answer as plain text.";
+
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
@@ -3083,6 +3107,11 @@ fn run_turns(
     state.waited = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
+    // Consecutive replies the endpoint sent and mush could not read as a reply
+    // at all (a body that does not parse into `ChatResponse`). Bounded, like the
+    // cut-offs: an endpoint that answers garbage every time must not be asked
+    // forever (finding B12).
+    let mut malformed_rounds = 0usize;
 
     loop {
         drain_mailbox(actor, cancel, messages, state);
@@ -3215,7 +3244,40 @@ fn run_turns(
                 return Err(format!("could not encode request: {error}"));
             }
             Err(ModelError::Malformed(error)) => {
-                return Err(format!("could not parse model response: {error}"));
+                // The endpoint *answered*, and the answer cannot be read as a
+                // reply. `message.rs`'s opening promise is that the loose wire
+                // shapes are deliberately tolerated so a reply is not lost to a
+                // parse; a body that still does not parse is the one road where
+                // a bad reply ended the run, losing the transcript, the tokens
+                // spent and the work in flight (finding B12). It is a refusal
+                // the model can answer instead: the ask stands, the model is
+                // told the reply was not recorded and answers again, and the
+                // run carries on. Bounded — a malformed body is the endpoint
+                // not speaking the protocol, not a model slip, so one retry
+                // covers the transient shape (a proxy's hiccup, a half-written
+                // body) without billing a user for a systematically broken one.
+                //
+                // The reset below the truncation check counts this "in a row"
+                // like the cut-offs: a good reply between two bad ones is not a
+                // server answering garbage every time.
+                malformed_rounds += 1;
+                if malformed_rounds > MALFORMED_ROUNDS {
+                    return Err(format!(
+                        "could not parse model response {malformed_rounds} times in a row: \
+                         {error}"
+                    ));
+                }
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!(
+                        "the endpoint's reply could not be read ({error}) — asking again"
+                    )),
+                );
+                // One door, so the model and the human see the same fact: the
+                // instruction travels in the transcript the next request is
+                // built from.
+                push_line(actor, messages, MALFORMED_INSTRUCTION.to_string());
+                continue;
             }
             Err(ModelError::Status { status, body }) => {
                 let parsed = serde_json::from_str::<ChatResponse>(&body).ok();
@@ -3334,8 +3396,11 @@ fn run_turns(
         }
         // A reply that was not cut off ends the run of them: the guard counts
         // *consecutive* truncations, and four scattered over a long run are not
-        // "in a row" (audit row 16).
+        // "in a row" (audit row 16). The same for a reply that was not
+        // malformed: an endpoint that read one request fine is not one that
+        // answers garbage every time (finding B12).
         cut_offs = 0;
+        malformed_rounds = 0;
 
         if let Some(reason) = refused {
             // A refused reply may still carry tool calls (a filtering endpoint
@@ -12703,6 +12768,76 @@ mod tests {
             result.is_ok(),
             "scattered cut-offs are not a row: {result:?}"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A reply the endpoint sent but mush cannot read is a refusal the model
+    /// can answer, not the end of the run: `message.rs`'s own promise is that
+    /// the loose wire shapes must not cost a run, and a 200 whose body does not
+    /// parse into a reply was the one road left where they did (finding B12).
+    /// The ask stands, the model is told the reply was not recorded and answers
+    /// again, and the run carries on.
+    #[test]
+    fn a_malformed_reply_is_a_refusal_the_model_can_answer() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .fails(ModelError::Malformed(
+                    "expected value at line 1 column 1".to_string(),
+                ))
+                .says("carried on"),
+        );
+        let (actor, events, _mailbox) = scripted_actor("malformed-refusal", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("say hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel)
+            .expect("a bad reply is not the run's ending");
+
+        assert_eq!(result.as_deref(), Some("carried on"));
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the bad reply was asked again, once");
+        assert!(
+            asked[1].messages.iter().any(|message| message
+                .text()
+                .contains("could not read the endpoint's last reply")),
+            "the model is told why it is answering again: {:?}",
+            asked[1]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        let notices: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(what) if what.contains("could not be read") => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "and the human is told once: {notices:?}");
+        assert!(notices[0].contains("expected value"), "{}", notices[0]);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The retry is bounded: an endpoint that answers something unreadable
+    /// every time ends the run with the parse failure it always did — after
+    /// one retry, not a loop of paid asks (finding B12).
+    #[test]
+    fn a_malformed_reply_that_repeats_ends_the_run() {
+        let malformed = || ModelError::Malformed("expected value at line 1 column 1".to_string());
+        let scripted = Arc::new(Scripted::new().fails(malformed()).fails(malformed()));
+        let (actor, _events, _mailbox) = scripted_actor("malformed-bound", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("say hi")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(error.contains("could not parse model response"), "{error}");
+        assert!(error.contains("in a row"), "{error}");
+        assert_eq!(scripted.asked().len(), MALFORMED_ROUNDS + 1);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
