@@ -287,7 +287,7 @@ no generics threading through the actor.
 
 | Seam | Signature (sketch) | Fake | Unlocks |
 |---|---|---|---|
-| `ModelClient` | `fn chat(&self, req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, a run kept past the old 200-turn ceiling (H45) — all in-process |
+| `ModelClient` | `fn chat(&self, request: &ChatRequest<'_>, cancel: &AtomicBool, timeout: Duration) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, a run kept past the old 200-turn ceiling (H45) — all in-process |
 | `Machine` + `Job` | `fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>`; `Job::{poll, written, output, kill}` | scripted end states, output sizes, kills | timeout, cancel, output cap, and M2.8's detach/exclusive lock without `sh`, `yes` or sleeps — landed in 2.3, with the timeout still decided by the watcher in `agent.rs` |
 | `Clock` | `fn now(&self) -> Instant; fn sleep(&self, d: Duration)` | advanceable by hand, `sleep` returns at once | `wait_tool`'s 50 ms poll, `wait_bounded`'s 10 ms poll, `Watch`'s deadline — landed in 2.3; `INFO_TTL` ageing still reads the wall clock in `app/mod.rs` |
 | `Events` | `fn emit(&self, id: AgentId, event: AgentEvent)` | recording sink | exactly-once completion delivery, fan-out refusal, dispatch, cancel mid-batch — asserted, instead of `mem::forget(ui_rx)` |
@@ -334,7 +334,7 @@ default suite, and `--ignored` is now exactly the three live-endpoint tests in
 (`a_frame_fits_in_a_60fps_budget_on_a_long_transcript`).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
-(`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
+(`chat(&ChatRequest, &AtomicBool, Duration) -> Result<ChatResponse, ModelError>`), the
 real `HttpModel` over `http::post_json` (body encoding, and the classification
 of a cancellation, a refusal, a transport failure, a status the endpoint chose
 and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` — a reply queue
