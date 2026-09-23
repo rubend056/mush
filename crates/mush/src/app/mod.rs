@@ -4118,6 +4118,11 @@ impl App {
     /// cancelled actor goes back to waiting for work (which is what Ctrl-C
     /// should do), while Ctrl-N needs the threads to be gone — and an actor
     /// holds its own mailbox open, so it never notices that the UI let go.
+    ///
+    /// The exit road sends this too ([`App`]'s `Drop`), before the job walk:
+    /// an actor mid-run is the one thing that can start a command after the
+    /// walk has read the registry, and its own ending is what closes that
+    /// window (finding R5).
     fn stop_all(&self) {
         for tx in self.tree.agent_tx.values() {
             let _ = tx.send(AgentMsg::Shutdown);
@@ -5422,10 +5427,20 @@ impl Drop for App {
     /// to `SESSION_DEBOUNCE` of streamed chat rather than to everything since
     /// the last boundary. A failure here is reported the usual way and then lost
     /// with the status line: there is no screen left to read it on.
+    ///
+    /// The actors are told to end *before* the jobs are walked (finding R5):
+    /// `Shutdown` is what ends an actor's own run, and a tool call in flight is
+    /// the one place a process group can still be born — it either drains the
+    /// `Shutdown` at its next poll and kills the command it is holding, or its
+    /// `detach` is refused by the fence `kill_all` raises. Stopping the actors
+    /// after the walk would leave that window open with nothing watching it.
     fn drop(&mut self) {
         if self.session_dirty_at.is_some() {
             self.flush_session();
         }
+        // `Shutdown`, not `Stop`: a cancelled actor goes back to waiting for
+        // work, while the exit needs the threads to be gone.
+        self.stop_all();
         // Jobs die with mush itself. Each one is a process group, and a build an
         // agent started used to outlive a clean quit — the human's next `cargo
         // build` then fought a ghost for the target directory. Killing here,
@@ -12196,6 +12211,37 @@ mod tests {
             "the restart kept the failure and dropped the diff line"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The exit road tells the actors to end, not only their jobs (finding R5).
+    /// The root's own `Shutdown` is what stops its thread — a signal that
+    /// reaches the actor and ends its run, where killing its jobs alone would
+    /// leave the actor free to start another command after the walk. A mailbox
+    /// whose actor has ended refuses a send, which is how that is observable
+    /// from outside the tree.
+    #[test]
+    fn the_exit_road_ends_the_actors_not_only_their_jobs() {
+        let (app, _rx) = test_app("exit-ends-actors");
+        let mailbox = app
+            .tree
+            .agent_tx
+            .get(&AgentId::ROOT)
+            .cloned()
+            .expect("the root has a mailbox");
+        drop(app);
+        // A send into a mailbox whose actor is gone fails: the receiver went
+        // with the thread. `Stop` is the neutral word for this — an idle actor
+        // absorbs it and keeps waiting (`absorb`'s `Stop` arm) — so a refusal
+        // to send is the actor's own ending and not something the message did.
+        // Bounded, because a defect must not hang the suite.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mailbox
+            .send(AgentMsg::Stop(crate::agent::Stop::Human))
+            .is_ok()
+        {
+            assert!(Instant::now() < deadline, "the root actor never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A typo'd command answers the moment the human typed it, so it is nothing

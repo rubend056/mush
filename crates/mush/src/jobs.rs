@@ -717,6 +717,9 @@ pub enum Refused {
     Budget,
     /// The job's own thread could not start.
     Thread(String),
+    /// The quit road has begun: the fence `kill_all` raises before its walk
+    /// refuses every command that would start after it (finding R5).
+    Quitting,
 }
 
 impl Refused {
@@ -772,6 +775,13 @@ impl Refused {
                  wait; a sibling's job is neither — work without it until a slot frees"
             ),
             Refused::Thread(error) => format!("could not start the job: {error}"),
+            // The quit road is running: the command was not started, and the
+            // group the launch was handing over has been killed. There is no
+            // road back for the model to take — mush is ending — so the
+            // sentence says what happened and nothing more.
+            Refused::Quitting => {
+                "mush is quitting — the command was not started".to_string()
+            }
         }
     }
 
@@ -950,6 +960,12 @@ struct Inner {
     /// beyond the job list. In agent order, one per agent that is running a
     /// command, so a handful at most.
     foregrounds: BTreeMap<u64, Live>,
+    /// Whether the quit road has begun: set by [`Registry::kill_all`] *before*
+    /// its walk, and read by [`Registry::launch`] under this same lock. From
+    /// the moment it is set, no command is admitted — a process group cannot be
+    /// registered into a map the walk has already read, and a launch that is
+    /// refused kills the group it was handing over (finding R5).
+    quitting: bool,
 }
 
 impl Registry {
@@ -1195,7 +1211,17 @@ impl Registry {
         };
         let admitted = {
             let mut inner = self.inner();
-            let refusal = if exclusive {
+            // The quit fence first, before the lock and the budget (finding
+            // R5): once `kill_all` has set it, the walk that follows is the
+            // last word on what is on the machine, and a launch admitted after
+            // it would hand this registry a process group no walk will read.
+            // Read under the same lock `kill_all` writes it under, so the two
+            // cannot interleave: a launch that takes the lock first is in the
+            // map the walk reads, and one that takes it second is refused —
+            // and the refusal below kills the group it was handed.
+            let refusal = if inner.quitting {
+                Some(Refused::Quitting)
+            } else if exclusive {
                 match &inner.holder {
                     // Somebody else's claim, or a *job* of the owner's already
                     // holding the machine: two exclusive claims may not overlap.
@@ -1328,13 +1354,44 @@ impl Registry {
         self.kill(Some(owner));
     }
 
-    /// Stop everything. This is what quitting mush runs, where a build an agent
-    /// started used to outlive a clean quit — and, until finding S4, an ordinary
-    /// foreground command with it: the process group was spawned for the length
-    /// of a tool call and registered nowhere, so nothing on the way out could
-    /// see it.
+    /// Stop everything, and raise the quit fence before the walk.
+    ///
+    /// A build an agent started used to outlive a clean quit — and, until
+    /// finding S4, an ordinary foreground command with it: the process group was
+    /// spawned for the length of a tool call and registered nowhere, so nothing
+    /// on the way out could see it.
+    ///
+    /// The fence is the second half of the same fact (finding R5): a launch
+    /// that races the walk — an actor mid-run that has not yet drained its
+    /// `Shutdown` — would register a process group after the walk had read the
+    /// maps, and nothing would ever kill it. [`Registry::begin_quit`] is set
+    /// first, and [`Registry::launch`] reads it under the registry's own lock,
+    /// so the walk and admission cannot interleave. This is what quitting mush
+    /// runs; Ctrl-N goes through [`Registry::kill_owned`], which must not
+    /// fence, because the workspace is not being left.
     pub fn kill_all(&self) {
+        self.begin_quit();
         self.kill(None);
+    }
+
+    /// Raise the quit fence: from here on every launch is refused under the same
+    /// lock, with the group it was handed killed like any other refusal.
+    ///
+    /// Private on purpose: [`Registry::kill_all`] is the one caller, because
+    /// the fence and the walk it precedes are one decision — a fence raised
+    /// without a walk would refuse work while every group already running
+    /// survived, and a walk without the fence is the window this exists to
+    /// close (finding R5).
+    fn begin_quit(&self) {
+        self.inner().quitting = true;
+    }
+
+    /// Whether the quit fence is up. The tests' question about
+    /// [`Registry::kill_all`]; nothing on a production road reads it beside
+    /// [`Registry::launch`].
+    #[cfg(test)]
+    pub fn quitting(&self) -> bool {
+        self.inner().quitting
     }
 
     /// Stop what `owner` started — both its jobs and the commands it is running
@@ -2387,6 +2444,129 @@ mod tests {
             2,
             "and a finished call leaves nothing to kill"
         );
+    }
+
+    /// The quit walk is the last word (finding R5): a launch that arrives after
+    /// the fence is refused, and the group it was handing over is killed like
+    /// every other refusal's. Without that, an actor mid-run could register a
+    /// process group after the walk had read the maps, and it would outlive a
+    /// clean quit with nothing ever looking for it.
+    #[test]
+    fn a_launch_after_the_quit_is_refused_and_its_group_is_killed() {
+        let (registry, _events, _clock) = registry();
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let (first, _rx) = launch(&registry, &machine, 7);
+        registry.kill_all();
+
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx2) = crossbeam_channel::unbounded();
+        let refused = registry
+            .launch(Launch::started(
+                8,
+                "cargo build".to_string(),
+                false,
+                tx,
+                job,
+            ))
+            .expect_err("a launch after the quit walk must not be admitted");
+        assert_eq!(refused, Refused::Quitting, "first job {first}");
+        assert_eq!(
+            machine.kills(),
+            2,
+            "the walk's kill and the refusal's: the group the launch was handing over is ended"
+        );
+        assert!(registry.quitting(), "and the fence stays up");
+    }
+
+    /// The fence is up *before* the walk (finding R5). The order is only
+    /// visible from inside a kill, so the job the walk reaches answers the
+    /// question itself: a walk that set the fence as it went would leave the
+    /// jobs before this one killable and everything after it admitted.
+    #[test]
+    fn the_quit_fence_is_up_before_the_walk() {
+        let (registry, _events, _clock) = registry();
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        let probe = ProbeJob {
+            inner: job,
+            registry: Arc::downgrade(&registry),
+            seen: seen.clone(),
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        registry
+            .launch(Launch::started(
+                7,
+                "cargo build".to_string(),
+                false,
+                tx,
+                Box::new(probe),
+            ))
+            .unwrap();
+
+        registry.kill_all();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "the launch fence must be up when the walk reaches the job"
+        );
+    }
+
+    /// A job that answers "was the fence up?" from inside its own kill: the one
+    /// moment the order of `kill_all` is observable from a test. Everything else
+    /// is the wrapped job's.
+    struct ProbeJob {
+        inner: Box<dyn Job>,
+        registry: std::sync::Weak<Registry>,
+        seen: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Job for ProbeJob {
+        fn poll(&mut self) -> Result<Option<End>, String> {
+            self.inner.poll()
+        }
+
+        fn written(&self) -> u64 {
+            self.inner.written()
+        }
+
+        fn output(&self, cap: usize) -> (String, String) {
+            self.inner.output(cap)
+        }
+
+        fn tail(&self, cap: usize) -> (String, String) {
+            self.inner.tail(cap)
+        }
+
+        fn kill(&mut self) {
+            if let Some(registry) = self.registry.upgrade() {
+                *self.seen.lock().unwrap() = Some(registry.quitting());
+            }
+            self.inner.kill();
+        }
+
+        fn kill_failure(&self) -> Option<String> {
+            self.inner.kill_failure()
+        }
+
+        fn end_group(&mut self) -> Result<usize, String> {
+            self.inner.end_group()
+        }
     }
 
     /// A hold dropped while its command still runs must end it: that is the
