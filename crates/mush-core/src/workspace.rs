@@ -776,7 +776,7 @@ impl Workspace {
         let Image { bytes, mime, .. } = image;
         self.write_pasted_image(bytes, &mime)
             .map(Some)
-            .map_err(|e| format!("cannot copy {label} into .mush/paste: {e}"))
+            .map_err(|e| format!("cannot copy {label} into {PASTE_REL}: {e}"))
     }
 
     /// Write bytes that came from outside the workspace — the clipboard, or a

@@ -4262,8 +4262,9 @@ impl App {
                 // `false` side of `cut_at_the_cap` (see this method's doc).
                 ws.save_pasted_image(image.bytes, false).map_err(|e| {
                     format!(
-                        "cannot copy {from} into {}/.mush/paste: {e}",
-                        root.display()
+                        "cannot copy {from} into {}/{}: {e}",
+                        root.display(),
+                        mush_core::workspace::PASTE_REL
                     )
                 })
             })
@@ -9021,6 +9022,35 @@ mod tests {
         assert!(
             path.starts_with(".mush/paste/"),
             "the FIFO was not the picture; the copy is: {path}"
+        );
+    }
+
+    /// A carry that cannot be written names the paste directory by its one
+    /// spelling ([`mush_core::workspace::PASTE_REL`]): the sentence a human
+    /// acts on says the path the writer itself uses, so the two cannot drift
+    /// apart. (The literal it replaced was the same string — which is exactly
+    /// how a second spelling starts.)
+    #[test]
+    fn a_refused_carry_names_the_paste_directory_by_its_one_spelling() {
+        let (app, _rx) = test_app("carry-refused");
+        // `.mush` is a file, so nothing can be created under it: the copy fails
+        // the way a read-only checkout or a full disk makes it fail.
+        let mush = app.ws.root().join(".mush");
+        let _ = std::fs::remove_dir_all(&mush);
+        std::fs::write(&mush, "not a directory").unwrap();
+
+        let refused = app
+            .carry_images(AgentId(1), vec![image("shot.png")])
+            .unwrap_err();
+        assert!(
+            refused.starts_with(&format!(
+                "cannot copy shot.png into {}:",
+                app.ws
+                    .root()
+                    .join(mush_core::workspace::PASTE_REL)
+                    .display()
+            )),
+            "the sentence names the paste directory the one way: {refused}"
         );
     }
 
