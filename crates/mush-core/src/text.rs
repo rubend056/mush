@@ -192,6 +192,57 @@ pub fn wrap_text_capped(text: &str, width: usize, max_lines: usize) -> Vec<Strin
     wrap_capped(text, width, Some(max_lines))
 }
 
+/// The least a description column may be and still be read: below this the
+/// two-column shape stops paying for itself, and a description hangs under the
+/// cell it describes instead of into a column of fragments.
+///
+/// At the `/help` popup's 40-column floor the command table's descriptions
+/// wrapped to one character per row — and to nine columns at 80 — because the
+/// usage column was never allowed to give a column back (finding D23). Sixteen
+/// is about a word and a half of prose: a readability judgement, not an
+/// arithmetic one, and one number because both help tables read it.
+pub const MIN_DESCRIPTION_COLUMNS: usize = 16;
+
+/// One row of a two-column help table, rendered for a surface `width` columns
+/// wide: `left` (its column sized by the caller's `left_width`, the longest
+/// left cell's) starts at the table's four-space indent and `description`
+/// starts in the column `4 + left_width + 2` reserves it, with every wrapped
+/// continuation hanging under the description rather than under the left cell.
+///
+/// When that description column would be narrower than
+/// [`MIN_DESCRIPTION_COLUMNS`], the two-column shape is abandoned: the left
+/// cell gets its own row and the description hangs *under* it, wrapped to the
+/// same four-space indent and the rest of `width`. A column of one- and
+/// two-word fragments costs more rows than it saves and reads as broken text,
+/// and the row it describes is what the human came for (finding D23).
+///
+/// Both help surfaces render through this one function — `mush --help`'s keys
+/// and commands blocks and the `/help` popup's — so the popup and the CLI
+/// cannot disagree about the shape, and the continuation indent is spelled
+/// once (the column arithmetic refactor R60 names).
+pub fn columns(left: &str, left_width: usize, description: &str, width: usize) -> String {
+    let description_column = 4 + left_width + 2;
+    let mut out = String::new();
+    if width.saturating_sub(description_column) < MIN_DESCRIPTION_COLUMNS {
+        out.push_str(&format!("    {left}\n"));
+        for line in wrap_text(description, width.saturating_sub(4).max(1)) {
+            out.push_str(&format!("    {line}\n"));
+        }
+        return out;
+    }
+    let lead = format!("    {left:<left_width$}  ");
+    let mut wrapped = wrap_text(description, width - description_column).into_iter();
+    if let Some(first) = wrapped.next() {
+        out.push_str(&lead);
+        out.push_str(&first);
+        out.push('\n');
+    }
+    for continuation in wrapped {
+        out.push_str(&format!("{:description_column$}{continuation}\n", ""));
+    }
+    out
+}
+
 fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();

@@ -11708,6 +11708,61 @@ mod tests {
         assert!(rows[0].contains("1 working"), "{}", rows[0]);
     }
 
+    /// The `/help` popup at the 40-column floor: the command table's
+    /// descriptions wrapped to one character per row — the usage column never
+    /// gave a column back, and `4 + 27 + 2` leaves one column of a 34-column
+    /// surface. When the description column would fall under
+    /// `mush_core::text::MIN_DESCRIPTION_COLUMNS`, the description hangs under
+    /// its own left cell instead, wrapped at the popup's whole width — for the
+    /// commands *and* the keys, since the popup shows both and the keys table
+    /// had the same arithmetic and the same collapse (finding D23; the audit's
+    /// "as the key table already does" is not true of the code it read).
+    ///
+    /// Measured at this width: 563 lines before the rule, 136 after; the
+    /// audit's own probe read the command table as `s` / `w` one row at a
+    /// time.
+    #[test]
+    fn the_help_picker_keeps_a_readable_description_column() {
+        use unicode_width::UnicodeWidthStr;
+
+        let width = screen::picker_text_width(40);
+        assert_eq!(width, 34, "the popup's text width at the floor");
+
+        let commands = commands::table_at("deepseek|custom", width);
+        assert!(
+            commands.contains(
+                "    /provider [deepseek|custom]\n    switch provider, or pick one\n    from a list\n"
+            ),
+            "the description hangs under its usage, wrapped at the popup's width:\n{commands}"
+        );
+        assert!(
+            !commands
+                .lines()
+                .any(|line| line.trim().chars().count() == 1),
+            "no description is shredded to one character per row:\n{commands}"
+        );
+
+        // The keys table, which the popup paints under the commands. Its *keys*
+        // column can be one character (`c` cancels the selected row), so the
+        // shape is pinned by a description that could not fit a nine-column
+        // column: the one the audit's probe read shredded.
+        let keys = keys::help_table_at(width);
+        assert!(
+            keys.contains("    Ctrl-Q\n    quit (a second press confirms\n"),
+            "a key's description hangs under the key:\n{keys}"
+        );
+
+        // The whole popup, at the floor: every row fits the surface it is
+        // painted in.
+        let notice = help_notice(width);
+        for line in notice.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width,
+                "a {width}-column popup row: {line:?}"
+            );
+        }
+    }
+
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
     /// in full, oldest first, with the cursor on the newest.
     #[test]
