@@ -213,11 +213,35 @@ pub fn branch_name(id: u64) -> String {
 /// never spends a slot on its way out.
 pub const MAX_WORKTREES: usize = 70;
 
-/// The agent id in a `mush/<id>` branch name, `None` for any other name. A
-/// branch the human made by hand must not be adopted as mush's leftover, so
-/// everything that is not exactly this shape stays unnamed.
+/// The agent id in a `mush/<id>` branch name, `None` for any other name.
+///
+/// A branch the human made by hand must not be adopted as mush's leftover, so
+/// everything that is not exactly this shape stays unnamed. Neither does a name
+/// the id space can keep no floor above: the floor mush keeps is one past the
+/// largest id the repository has named, so `mush/18446744073709551615` would
+/// pin that counter at the end of its space and the next draw would overflow
+/// it (`attempt to add with overflow` in a debug build). Refusing the name here
+/// — where every road from a branch to an id passes — keeps the floor usable;
+/// `saturating_add` at the reservation sites is the belt for the roads a
+/// hand-edited file reaches.
+///
+/// Callers that need to tell a refusable name from a branch that was never
+/// mush's ask [`is_child_branch`].
 pub fn worktree_id(branch: &str) -> Option<u64> {
-    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
+    branch
+        .strip_prefix(BRANCH_PREFIX)?
+        .parse()
+        .ok()
+        .filter(|id| *id < u64::MAX)
+}
+
+/// Whether `branch` sits in mush's own branch namespace — `mush/<…>`, the shape
+/// a child's branch is given. A name here that [`worktree_id`] refuses is not a
+/// child's, and it is not another program's either: a caller names it for the
+/// human, rather than passing it over in silence as a branch that was never
+/// mush's.
+pub fn is_child_branch(branch: &str) -> bool {
+    branch.starts_with(BRANCH_PREFIX)
 }
 
 /// One entry of `git worktree list --porcelain`: where the checkout is, the
@@ -919,6 +943,18 @@ mod tests {
         assert_eq!(worktree_id("mush/x"), None);
         assert_eq!(worktree_id("main"), None);
         assert_eq!(worktree_id("refs/heads/mush/1"), None);
+        // The top of the id space has no floor above it, so it names no child
+        // mush could hold; one past the space reads as no name at all.
+        assert_eq!(worktree_id("mush/18446744073709551615"), None);
+        assert_eq!(worktree_id("mush/18446744073709551616"), None);
+        assert_eq!(worktree_id("mush/18446744073709551614"), Some(u64::MAX - 1));
+
+        // The namespace and the id are two questions: a refusable name is still
+        // in mush's namespace, and a branch outside it never was mush's.
+        assert!(is_child_branch("mush/9"));
+        assert!(is_child_branch("mush/18446744073709551615"));
+        assert!(is_child_branch("mush/x"));
+        assert!(!is_child_branch("main"));
     }
 
     /// "No commits yet" and "no git at all" are different answers for a human:

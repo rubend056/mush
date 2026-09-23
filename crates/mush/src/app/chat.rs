@@ -417,8 +417,8 @@ struct Selecting {
     /// A `Cell` because only the frame knows the pane's measure. The cursor is
     /// the state the keys own; where the pane can show it depends on a width and
     /// a height the keys never see, so the frame places the window as it paints
-    /// and leaves the cursor alone. The placement is idempotent, and one a fold
-    /// or a resize left behind is put right by the next frame or key.
+    /// and leaves the cursor alone. The placement is idempotent, and one a
+    /// resize left behind is put right by the next frame or key.
     top: Cell<(usize, usize)>,
 }
 
@@ -619,27 +619,31 @@ fn cursor_above(body: &Body, cursor: (usize, usize)) -> bool {
 
 /// The rows a window paints the mode on: the cursor's own line, and every
 /// source line the selection covers.
+///
+/// `cursor` is the caller's clamp of the mode's own, not `select.cursor`: the
+/// row the pane paints is the row the window was placed for.
 fn select_rows(
     rows: &[Option<(usize, usize)>],
     select: &Selecting,
+    cursor: (usize, usize),
     cut: Option<usize>,
 ) -> Option<SelectRows> {
-    let at = cursor_row(rows, select.cursor, cut)?;
+    let at = cursor_row(rows, cursor, cut)?;
     // Every row of the cursor's own line, not just the one the lookup landed
     // on: a wrapped line is one line, and every row of it is the cursor.
     let tag = rows[at];
-    let cursor: Vec<usize> = rows
+    let painted: Vec<usize> = rows
         .iter()
         .enumerate()
         .filter(|(_, row)| **row == tag)
         .map(|(at, _)| at)
         .collect();
     let selected = match select.anchor {
-        Some(anchor) if anchor != select.cursor => {
-            let (from, to) = if anchor < select.cursor {
-                (anchor, select.cursor)
+        Some(anchor) if anchor != cursor => {
+            let (from, to) = if anchor < cursor {
+                (anchor, cursor)
             } else {
-                (select.cursor, anchor)
+                (cursor, anchor)
             };
             rows.iter()
                 .enumerate()
@@ -651,7 +655,10 @@ fn select_rows(
         // both styles and say nothing the cursor does not.
         _ => Vec::new(),
     };
-    Some(SelectRows { cursor, selected })
+    Some(SelectRows {
+        cursor: painted,
+        selected,
+    })
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -708,6 +715,13 @@ pub struct Chat {
     /// `None` when the keys are the box's again. One mode at a time, over one
     /// conversation — a pane showing another agent paints no cursor and its
     /// keys are the box's.
+    ///
+    /// A cursor into a transcript that no longer exists is not a cursor, so
+    /// `replace_transcript` drops the mode when it is over the conversation it
+    /// replaces, as `clear` does for a new chat. The paint road clamps the
+    /// cursor the way the key road does, so a mode left pointing past the rows
+    /// by any other road paints the pane rather than taking the frame down
+    /// with it.
     select: Option<Selecting>,
     /// The user lines that are *not* the human's, keyed by the index they sit at
     /// in their conversation. Absent is the norm — most of a transcript is the
@@ -891,10 +905,24 @@ impl Chat {
     /// by describe the transcript that is gone, and a stale one would paint
     /// somebody else's line in the wrong voice. What a restored transcript still
     /// says for itself is read back at paint time.
+    ///
+    /// The select mode goes with it when it is over this conversation: a cursor
+    /// into a transcript that no longer exists is not a cursor, and a frame
+    /// asked to paint one would index a row the replacement took away. This is
+    /// the one road that replaces a transcript, so this is where the mode is
+    /// dropped — clamped at paint time as well, for every road that cannot know
+    /// it took rows away ([`Chat::painted`]).
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
         let prior = self.revision(agent);
         self.spoken.remove(&agent);
         self.pending = None;
+        if self
+            .select
+            .as_ref()
+            .is_some_and(|select| select.agent == agent)
+        {
+            self.select = None;
+        }
         if agent == AgentId::ROOT {
             self.root = messages;
         } else {
@@ -1374,8 +1402,11 @@ impl Chat {
     /// the mode left behind with it.
     pub fn select_apply(&mut self, on: AgentId, key: SelectKey) -> Option<Copied> {
         let Some(cursor) = self.clamped_cursor(on) else {
-            // A fold took the lines the cursor was over: the mode has nothing
-            // left to stand on, and leaving is the only honest answer.
+            // The transcript under the mode has no line left to stand on.
+            // `replace_transcript` drops the mode with the rows it replaces, so
+            // this is the guard for every other road — an agent reaped out from
+            // under the pane, or a state a test built — and leaving is the only
+            // honest answer.
             self.select = None;
             return None;
         };
@@ -1434,11 +1465,12 @@ impl Chat {
         }
     }
 
-    /// The cursor as the transcript is *now*: a fold can leave the state
-    /// pointing at a message or a line that is gone, and a key must not index
-    /// past the end. The nearest line that still exists is the honest clamp —
-    /// and `None` when there is no source line left at all, which drops the
-    /// mode rather than leaving a cursor over nothing.
+    /// The cursor as the transcript is *now*: a transcript can shrink under a
+    /// state that still points into it — a reaped conversation, or a state a
+    /// caller built — and neither a key nor a frame may index past the end. The
+    /// nearest line that still exists is the honest clamp — and `None` when
+    /// there is no source line left at all, which drops the mode rather than
+    /// leaving a cursor over nothing.
     fn clamped_cursor(&self, on: AgentId) -> Option<(usize, usize)> {
         let select = self.select.as_ref().filter(|select| select.agent == on)?;
         let transcript = self.transcript(on);
@@ -1621,15 +1653,25 @@ impl Chat {
         let protected = usize::from(!transcript.is_empty());
         let room = FOOT_ROWS.min(height.saturating_sub(protected));
         let foot = self.foot(pane, width, room);
-        // The window: the select mode's own while its cursor is on this pane,
-        // the human's reading otherwise.
+        // The window: the select mode's own while it is on this pane, the
+        // human's reading otherwise. The mode counts as on only while the
+        // transcript still has a line under its cursor: `clamped_cursor` is the
+        // key road's clamp, and the frame takes the same one because no frame
+        // may index a row that is not there. `None` here — another pane's mode,
+        // no mode, or a cursor whose rows a replacement took away — paints the
+        // ordinary body, with no cursor and no `Enter copies` clause promising
+        // one, which is what keeps a stale state from taking the process down
+        // with it (D1).
         let select = self
             .select
             .as_ref()
             .filter(|select| select.agent == pane.agent);
-        let (mut body, cut) = match select {
-            Some(select) => self.select_body(
+        let cursor = self.clamped_cursor(pane.agent);
+        let mode = select.zip(cursor);
+        let (mut body, cut) = match mode {
+            Some((select, cursor)) => self.select_body(
                 select,
+                cursor,
                 pane.agent,
                 width,
                 height.saturating_sub(foot.lines.len()),
@@ -1641,7 +1683,8 @@ impl Chat {
         };
         // Read before the foot is appended: the mode's rows are transcript
         // rows, and the foot never carries the cursor.
-        let select_rows = select.and_then(|select| select_rows(&body.rows, select, cut));
+        let select_rows =
+            mode.and_then(|(select, cursor)| select_rows(&body.rows, select, cursor, cut));
         body.lines.extend(foot.lines);
         let lines = body.lines;
 
@@ -1655,7 +1698,7 @@ impl Chat {
         // are not the ones the hint under the pane advertises. The pair named
         // is the one that leaves the mode — nothing else on this screen says
         // which of the two copies.
-        if select.is_some() {
+        if mode.is_some() {
             title.push_str("· Enter copies · Esc leaves ");
         }
         // A pane with no row to spare for the foot's own count line is the case
@@ -1674,7 +1717,7 @@ impl Chat {
         // back down to the newest line. While the mode is on, this is not the
         // reading the pane shows — the mode has its own window — so the clause
         // would be a lie about the rows on screen.
-        if select.is_none() {
+        if mode.is_none() {
             if let Some((offset, _)) = self.reading(pane.agent).held(transcript.len()) {
                 title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
             }
@@ -1692,9 +1735,14 @@ impl Chat {
     /// The pane's own reading ([`Reading`]) is not touched: the mode is a
     /// reading of its own, and leaving it puts the pane back where the human
     /// was, not where the cursor ended.
+    ///
+    /// `cursor` is the caller's clamp of the mode's own ([`Chat::clamped_cursor`]),
+    /// never `select.cursor`: the window is placed for the line the transcript
+    /// still has, so every index the walk makes names a row that is there.
     fn select_body(
         &self,
         select: &Selecting,
+        cursor: (usize, usize),
         on: AgentId,
         width: usize,
         height: usize,
@@ -1703,7 +1751,6 @@ impl Chat {
         if transcript.is_empty() || height == 0 {
             return (Body::default(), None);
         }
-        let cursor = select.cursor;
         let start = select.top.get();
         let start = (start.0.min(transcript.len() - 1), start.1);
         let (body, cut) = self.window_from(on, width, height, start);
@@ -1711,7 +1758,7 @@ impl Chat {
             return (body, cut);
         }
         // The window the state carries no longer shows the cursor: the terminal
-        // was resized, the transcript moved under it (a fold), or the cursor's
+        // was resized, the transcript moved under it, or the cursor's
         // own line is behind a tool result's cap. Put it where the pane can hold
         // it — the cursor's line at the top when it is above the window, at the
         // bottom when it is below — and leave the placement where the next
@@ -3313,6 +3360,70 @@ mod tests {
         chat.start_select(AgentId::ROOT);
         chat.clear();
         assert!(!chat.selecting());
+    }
+
+    /// A fold is the other road that takes the transcript the mode stands on:
+    /// `replace_transcript` drops a mode over the conversation it replaces,
+    /// exactly as `clear` drops it for a new chat — a cursor into a transcript
+    /// that no longer exists is not a cursor.
+    #[test]
+    fn a_fold_leaves_the_select_mode_behind() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        chat.start_select(AgentId::ROOT);
+        chat.replace_transcript(AgentId::ROOT, vec![Message::user("a summary")]);
+        assert!(!chat.selecting());
+
+        // Another pane's mode is not that fold's to drop: the child's
+        // transcript moved, the root's rows did not.
+        chat.push_message(AgentId::ROOT, Message::assistant("third"));
+        chat.start_select(AgentId::ROOT);
+        chat.replace_transcript(AgentId(1), vec![Message::user("the child's line")]);
+        assert!(chat.selecting(), "the mode is over the root, not the child");
+    }
+
+    /// The frame clamps the mode's cursor exactly as the key road does: a state
+    /// left pointing past the transcript — a road that took rows away without
+    /// dropping the mode — paints the cursor on a line that exists, and a
+    /// transcript with no line left to stand on paints no cursor and no `Enter
+    /// copies` clause. No frame may index a row that is not there (D1,
+    /// `chat.rs:1768`).
+    #[test]
+    fn the_frame_clamps_a_cursor_left_past_the_transcript() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "first\nsecond");
+        assert!(chat.start_select(AgentId::ROOT).is_none());
+        // The state the paint road must survive, reached without a key: the
+        // cursor names a message and a line the transcript does not have.
+        chat.select.as_mut().expect("the mode is on").cursor = (9, 4);
+
+        let pane = pane(AgentId::ROOT);
+        let painted = chat.painted(&pane, 40, 8);
+        let select = painted
+            .select
+            .as_ref()
+            .expect("the cursor lands on the newest line that still exists");
+        assert!(!select.cursor.is_empty());
+        assert!(
+            select.cursor.iter().all(|at| *at < painted.lines.len()),
+            "every painted cursor row is a row the pane has"
+        );
+        assert!(
+            shown(&painted.lines)[select.cursor[0]].contains("second"),
+            "and it is the newest line that still exists: {:?}",
+            shown(&painted.lines)
+        );
+
+        // A transcript with nothing left to stand on: the mode paints as off —
+        // no cursor, and no clause promising the copy key.
+        chat.root.clear();
+        let painted = chat.painted(&pane, 40, 8);
+        assert!(painted.select.is_none(), "no cursor over nothing");
+        assert!(
+            !painted.title.contains("Enter copies"),
+            "and no clause promising one: {}",
+            painted.title
+        );
     }
 
     /// A transcript belongs to one agent: what a child was told is in the

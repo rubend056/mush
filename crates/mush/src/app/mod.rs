@@ -1181,6 +1181,11 @@ impl App {
     /// actor still writes into a path that no longer exists. A second call on
     /// the same repository is nearly free: the branches it took are no longer
     /// named.
+    ///
+    /// Every reservation here saturates (`saturating_add`): the id comes from a
+    /// branch name, and a name at the top of the id space has no `id + 1` —
+    /// `worktree_id` refuses that name at the door, and this is the belt for a
+    /// floor that arrives anyway (D3).
     fn reclaim_isolated(&mut self) {
         let root = self.ws.root().to_path_buf();
         for id in git::isolated_ids(&root).unwrap_or_default() {
@@ -1201,12 +1206,12 @@ impl App {
                     // certify — so the number is spent anyway, exactly as the
                     // residue loop below treats a live `mush/<id>`.
                     if branch_kept.is_some() {
-                        self.tree.reserve_agents(id + 1);
+                        self.tree.reserve_agents(id.saturating_add(1));
                     }
                 }
                 git::Reclaimed::Kept(why) => {
                     // Kept work is not a reason to hand the number out again.
-                    self.tree.reserve_agents(id + 1);
+                    self.tree.reserve_agents(id.saturating_add(1));
                     // A restored agent has a row already; a leftover's is
                     // registered below, and the next git read fills its line in.
                     self.tree.mark_kept(AgentId(id), Some(why));
@@ -1257,8 +1262,22 @@ impl App {
             .map(|node| node.id)
             .collect();
         self.tree.reap(&gone);
+        // A name in mush's own branch namespace that [`git::worktree_id`]
+        // refuses — `mush/x`, a hand-made name, or an id with no room above it
+        // for the floor — is not a child's, and it is not another program's
+        // either. Git's own branches are not mush's to mention, but a name that
+        // claims a child's shape and is not one is refused *by name*, with a
+        // sentence: a name mush cannot read is not a child (D3).
+        let mut refused: Vec<String> = Vec::new();
         for worktree in worktrees {
             let Some(id) = worktree.id else {
+                if let Some(branch) = worktree
+                    .branch
+                    .as_deref()
+                    .filter(|branch| git::is_child_branch(branch))
+                {
+                    refused.push(branch.to_string());
+                }
                 continue;
             };
             // Every id the repository still names raises the floor, checkout or
@@ -1268,8 +1287,10 @@ impl App {
             // even though `on_disk` says there is nothing here; leaving the
             // number free spends a spawn on a name git will keep refusing
             // (finding B1, P13). No row is registered for the residue below:
-            // reserving a number claims nothing about work.
-            self.tree.reserve_agents(id + 1);
+            // reserving a number claims nothing about work. The add saturates:
+            // a name at the top of the space has no `id + 1`, and refusing that
+            // name is `worktree_id`'s job, not this arithmetic's.
+            self.tree.reserve_agents(id.saturating_add(1));
             // A dead registry entry is git's residue, not a worktree: a row for
             // it would claim a directory that is not there (finding P13).
             if !worktree.on_disk() {
@@ -1321,6 +1342,12 @@ impl App {
                 result_unread: false,
                 tx: None,
             });
+        }
+        if !refused.is_empty() {
+            self.say(format!(
+                "{} names no agent id mush can hold — left alone",
+                refused.join(", ")
+            ));
         }
         self.tree.repair_focus();
     }
@@ -8551,6 +8578,45 @@ mod tests {
         assert_eq!(app.focus, Focus::Agents, "and cycles the pane it names");
     }
 
+    /// A fold replaces the transcript under the select mode, and the mode must
+    /// not be left pointing at rows that are gone: the automatic fold fires at
+    /// nine tenths of the budget, so this is an ordinary long session's road,
+    /// and the frame it panicked was the process's last — the UI thread's draw
+    /// path takes every actor, every child's worktree and the unsent draft with
+    /// it (D1, `chat.rs:1768`). The fold reaches the chat exactly as the actor
+    /// sends it, `AgentEvent::Compact`, and either the cursor lands on a line
+    /// that exists or the pane paints no cursor and no `Enter copies` clause.
+    #[test]
+    fn a_fold_while_selecting_does_not_panic_the_frame() {
+        let (mut app, _rx) = test_app("probe-fold");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        app.chat.push_message(AgentId::ROOT, Message::user("third"));
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on");
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::Compact {
+                in_run: false,
+                summary: "the summary".to_string(),
+            },
+        });
+        assert!(
+            !app.chat.selecting(),
+            "the fold takes the mode with the rows"
+        );
+        let grid = frame_grid(&mut app, 80, 24);
+        assert!(
+            !grid.iter().any(|row| row.contains("Enter copies")),
+            "no clause promises a cursor the pane is not painting"
+        );
+        assert!(
+            grid.iter().any(|row| row.contains("the summary")),
+            "the fold's own line is what the pane paints now"
+        );
+    }
+
     /// `Enter` in the select mode is the copy: the app hands the text to the
     /// writer it holds (never to a program the machine may not have, and never
     /// to the human's real clipboard), queues the line the copy built for the
@@ -12370,6 +12436,74 @@ mod tests {
         );
     }
 
+    /// A session can hold two rows of one id — the restore's refusal of a
+    /// duplicate is the secrets audit's C9, and this pane must survive whatever
+    /// state it is handed. Two lengths used to decide one question: `rows()`
+    /// de-duplicated by id while the cursor was bounded by the storage length,
+    /// so a session with two rows of id 2 was `agents=3 rows=2` and `G` indexed
+    /// `rows[2]` — an index panic on a real keypress, in release builds too, with
+    /// the hidden twin an agent the human could not see before it (D2,
+    /// `screen.rs:472`). The cursor is now bounded by the rows that were
+    /// painted, and the pane indexes those rows with something that cannot
+    /// panic.
+    #[test]
+    fn the_pane_never_indexes_past_the_rows_it_painted() {
+        let (mut app, _rx) = test_app("pane-twin-rows");
+        for _ in 0..2 {
+            app.tree.register(Existing {
+                id: AgentId(2),
+                parent: None,
+                depth: 1,
+                brief: "twin".to_string(),
+                title: None,
+                phase: Phase::Done,
+                branch: None,
+                fork: None,
+                summary: None,
+                leftover: false,
+                landed: None,
+                result_unread: false,
+                tx: None,
+            });
+        }
+        assert_eq!(app.tree.agents.len(), 3, "the root and both twins");
+        assert_eq!(
+            app.tree.rows().len(),
+            3,
+            "every node is a row the pane paints"
+        );
+
+        app.focus = Focus::Agents;
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.tree.cursor(),
+            app.tree.rows().len() - 1,
+            "G names the last painted row"
+        );
+        assert_eq!(
+            app.tree.rows()[app.tree.cursor()].id,
+            AgentId(2),
+            "and the last painted row is the twin's"
+        );
+
+        let (screen, _) = painted(&mut app, 80, 24);
+        let Screen::Panes(panes) = screen else {
+            panic!("80x24 is above the floor")
+        };
+        assert_eq!(panes.agents.rows.len(), 3, "both twins are painted");
+        assert_eq!(
+            panes.agents.cursor, 2,
+            "and the cursor names the last painted row"
+        );
+        assert!(
+            !panes.agents.footer.is_empty(),
+            "the row under the cursor has its footer, not a skipped index"
+        );
+    }
+
     /// `←` in the chat pane is the message box's cursor and moves nothing in the
     /// tree: the two panes keep their own meaning for the same key.
     #[test]
@@ -14891,6 +15025,114 @@ mod tests {
             app.tree.handles().ids.agents_floor() >= 8,
             "but its id is not handed to the next child"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An id at the top of the `u64` space has no `id + 1`, and a branch can
+    /// name one: `git::worktree_id` parses any `mush/<digits>` branch, and an
+    /// unmerged commit on `mush/18446744073709551615` reached the reservation as
+    /// `id + 1`. Reproduced in this worktree before the fix — a real repository
+    /// under `/tmp` with an unmerged commit on that branch, started through
+    /// `App::new`:
+    ///
+    /// ```text
+    /// thread 'app::tests::audit_probe_a_branch_naming_the_largest_agent_id'
+    /// panicked at crates/mush/src/app/mod.rs:1209:46:
+    /// attempt to add with overflow
+    /// ```
+    ///
+    /// In a release build the add wraps to 0 instead, and the floor is silently
+    /// left unset. The name is now refused *by name* — a name mush cannot hold
+    /// as a child is not a child — and the floor stays usable for the next
+    /// spawn. The file half of the audit's test (`mod.rs:743`) is C9's door and
+    /// is not this wave's.
+    #[test]
+    fn no_agent_id_can_overflow_the_floor() {
+        use std::fs;
+
+        let root = repo("max-agent-id");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "mush/18446744073709551615",
+                ".mush/wt/max",
+            ],
+        );
+        // Unmerged work: a branch already in HEAD is reclaimed before any
+        // reservation, and the overflow lives on the reservation road.
+        let worktree = root.join(".mush/wt/max");
+        fs::write(worktree.join("work.txt"), "unmerged\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "work"]);
+
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        // `App::new` already discovered the repository; this is the same pass,
+        // read back through the bar, so the sentence asserted below is the
+        // one this road wrote and not something a later refresh replaced.
+        app.discover_worktrees();
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id.0 == u64::MAX),
+            "the name is refused, not registered as a child"
+        );
+        assert!(
+            app.tree.handles().ids.agents_floor() < u64::MAX,
+            "and the floor is left usable: {}",
+            app.tree.handles().ids.agents_floor()
+        );
+        assert!(
+            git::resolve(&root, "mush/18446744073709551615").is_some(),
+            "the branch mush cannot hold as a child is left where it is"
+        );
+        assert!(
+            text_of(&app).contains("mush/18446744073709551615"),
+            "and the refusal names it: {:?}",
+            text_of(&app)
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A branch in mush's namespace that names no id at all — `mush/x`, a
+    /// hand-made name — is refused by name with a sentence too: no row, no
+    /// reservation, and the human who wrote it is told rather than left to
+    /// wonder why their branch was passed over (D3, "a name mush cannot read is
+    /// not a child").
+    #[test]
+    fn a_branch_that_names_no_agent_is_refused_by_name() {
+        use std::fs;
+
+        let root = repo("unreadable-branch");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/x", ".mush/wt/x"],
+        );
+
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        app.discover_worktrees();
+
+        assert!(
+            !app.tree
+                .agents
+                .iter()
+                .any(|node| node.branch.as_deref() == Some("mush/x")),
+            "a name mush cannot read is not a child"
+        );
+        assert_eq!(
+            app.tree.handles().ids.agents_floor(),
+            1,
+            "the next child still takes the first number"
+        );
+        assert!(
+            text_of(&app).contains("mush/x") && text_of(&app).contains("left alone"),
+            "and the refusal names the branch: {:?}",
+            text_of(&app)
+        );
+        drop(app);
         let _ = fs::remove_dir_all(&root);
     }
 

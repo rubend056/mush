@@ -464,14 +464,21 @@ impl App {
         // a short (compact) pane still owes the selected row one line — under
         // six inner rows it got none, so in compact the selected row's branch,
         // worktree and landing commands were nowhere on screen (finding P12).
-        let footer = if inner.width == 0 || inner.height < 3 || nodes.is_empty() {
+        //
+        // The cursor names a row `tree.rows()` painted, and the two vectors the
+        // pane would index are that call's own; `get` rather than `[]` keeps a
+        // pane handed a cursor past its rows painting a list with no footer
+        // instead of taking the frame — and the session — down with it (D2).
+        let footer = if inner.width == 0 || inner.height < 3 {
             Vec::new()
         } else {
             let budget = if inner.height >= 8 { 3 } else { 1 };
-            compact_footer(
-                agent_footer(self, nodes[cursor], &rows[cursor], inner.width as usize),
-                budget,
-            )
+            match nodes.get(cursor).zip(rows.get(cursor)) {
+                Some((node, row)) => {
+                    compact_footer(agent_footer(self, node, row, inner.width as usize), budget)
+                }
+                None => Vec::new(),
+            }
         };
         // One row is the separator between the list and the facts.
         let footer_rows = if footer.is_empty() {

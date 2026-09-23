@@ -1505,7 +1505,7 @@ impl AgentTree {
         if !self.has(self.focused) {
             self.focused = AgentId::ROOT;
         }
-        self.agent_cursor = self.agent_cursor.min(self.agents.len().saturating_sub(1));
+        self.agent_cursor = self.agent_cursor.min(self.row_count().saturating_sub(1));
     }
 
     /// The tree's rows, in the order the pane paints them: pre-order over the
@@ -1518,23 +1518,42 @@ impl AgentTree {
     /// disagree with the tree the human is looking at. A node whose parent is
     /// not in the tree — a leftover worktree, an agent whose parent was reaped
     /// — is a top-level row, so a broken link can never hide an agent.
+    ///
+    /// The walk marks a node painted by its *place* in `agents`, never by its
+    /// id: a stored session can hold two rows of one id (the restore's refusal
+    /// is C9's door), and keying this by id made the second one vanish from the
+    /// screen while the cursor could still be walked onto its row — the pane
+    /// then indexed a row it never painted (D2). Every node is painted exactly
+    /// once, whatever two of them share.
     pub fn rows(&self) -> Vec<&AgentNode> {
         let mut rows = Vec::with_capacity(self.agents.len());
-        for node in &self.agents {
+        let mut seen = vec![false; self.agents.len()];
+        for (index, node) in self.agents.iter().enumerate() {
             if self.parent_in_tree(node).is_none() {
-                self.grow(node, &mut rows);
+                self.grow(index, &mut rows, &mut seen);
             }
         }
         // A link that pointed back up its own line (which nothing here can
         // build) would leave part of the tree unreachable, and a missing row is
         // an agent the human cannot see: whatever the walk missed is taken in
         // storage order. Every node is therefore painted exactly once.
-        for node in &self.agents {
-            if !rows.iter().any(|row| row.id == node.id) {
+        for (index, node) in self.agents.iter().enumerate() {
+            if !seen[index] {
                 rows.push(node);
             }
         }
         rows
+    }
+
+    /// The number of rows the pane paints: exactly [`Self::rows`]'s length, and
+    /// the only bound the cursor is held to.
+    ///
+    /// One spelling, because the cursor names a row the pane can index: the
+    /// storage length and the painted length were two answers to one question,
+    /// and two nodes of one id made them differ — the pane painted two rows and
+    /// the cursor could name a third (D2).
+    fn row_count(&self) -> usize {
+        self.rows().len()
     }
 
     /// The parent this node hangs under, when that parent is still in the tree.
@@ -1542,15 +1561,23 @@ impl AgentTree {
         node.parent.filter(|parent| self.has(*parent))
     }
 
-    /// `node` and then its subtree, in spawn order among siblings — the order a
-    /// later brother appears after the earlier one's whole family.
-    fn grow<'a>(&'a self, node: &'a AgentNode, rows: &mut Vec<&'a AgentNode>) {
-        if rows.iter().any(|row| row.id == node.id) {
+    /// `agents[index]` and then its subtree, in spawn order among siblings —
+    /// the order a later brother appears after the earlier one's whole family.
+    ///
+    /// Recursion and cycles are cut by *place*, not by id: a node already
+    /// painted is skipped wherever it is reached from, and two nodes that share
+    /// an id are two rows.
+    fn grow<'a>(&'a self, index: usize, rows: &mut Vec<&'a AgentNode>, seen: &mut [bool]) {
+        if seen[index] {
             return;
         }
+        seen[index] = true;
+        let node = &self.agents[index];
         rows.push(node);
-        for child in self.agents.iter().filter(|n| n.parent == Some(node.id)) {
-            self.grow(child, rows);
+        for (child, candidate) in self.agents.iter().enumerate() {
+            if candidate.parent == Some(node.id) {
+                self.grow(child, rows, seen);
+            }
         }
     }
 
@@ -1694,8 +1721,13 @@ impl AgentTree {
     /// painted ones: `j`/`k` walk the tree the human sees, not the order the
     /// agents happened to be spawned in (finding U4).
     pub fn move_cursor(&mut self, delta: i64) {
+        // The bound is the rows the pane painted, and a cursor left past them
+        // is walked back onto the last row before it moves: the storage length
+        // is not the pane's answer any more (D2).
+        let rows = self.row_count();
+        self.agent_cursor = self.agent_cursor.min(rows.saturating_sub(1));
         if delta > 0 {
-            if self.agent_cursor + 1 < self.agents.len() {
+            if self.agent_cursor + 1 < rows {
                 self.agent_cursor += 1;
             }
         } else {
@@ -1708,15 +1740,18 @@ impl AgentTree {
     }
 
     pub fn cursor_bottom(&mut self) {
-        // One row per agent, so the storage length is the number of rows.
-        self.agent_cursor = self.agents.len().saturating_sub(1);
+        // The last row the pane painted, not the last node in storage: the two
+        // are one number because `rows` paints every node, and the cursor names
+        // the row the pane can index at the bottom (D2).
+        self.agent_cursor = self.row_count().saturating_sub(1);
     }
 
     /// The row the agent pane paints as selected.
     pub fn cursor(&self) -> usize {
-        // Clamped by the storage length, which is the row count: `rows` paints
-        // every agent exactly once (finding U4).
-        self.agent_cursor.min(self.agents.len().saturating_sub(1))
+        // Clamped by the rows the pane painted — the length of the vector it
+        // indexes — so the row painted as selected and the row a key acts on
+        // are the same row, whatever state the tree was handed (D2).
+        self.agent_cursor.min(self.row_count().saturating_sub(1))
     }
 
     /// Whether `id` is in the tree: the question [`Self::node`] also answers.
@@ -2290,6 +2325,35 @@ mod tests {
         let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
         assert_eq!(ids, vec![0, 1, 2, 3]);
         assert_eq!(tree.rows().len(), tree.agents.len());
+    }
+
+    /// Two nodes of one id are two rows: the walk is keyed by a node's place in
+    /// `agents`, never by its id, so a duplicate cannot silently vanish from the
+    /// screen while the cursor still walks onto its row (D2). The bound the
+    /// cursor is held to is that painted length itself — one spelling, which is
+    /// also the vector the pane indexes.
+    #[test]
+    fn rows_paints_every_node_even_when_two_share_an_id() {
+        let mut tree = AgentTree::bare();
+        let _first = spawn(&mut tree, 2, 0, 1);
+        let _second = spawn(&mut tree, 2, 0, 1);
+
+        let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 2, 2],
+            "the root, then both twins in storage order"
+        );
+        assert_eq!(tree.rows().len(), tree.agents.len());
+
+        tree.cursor_bottom();
+        assert_eq!(tree.cursor(), 2, "the cursor names the last painted row");
+        assert_eq!(tree.cursor_id(), Some(AgentId(2)));
+
+        // And a cursor left past the rows by anything at all reads as the last
+        // row that exists, never as an index the pane cannot take.
+        tree.agent_cursor = 9;
+        assert_eq!(tree.cursor(), 2);
     }
 
     /// A status that arrives after the run ended must not put a finished agent
