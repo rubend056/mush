@@ -50,6 +50,8 @@ spec: the spec is the doc comments beside the code, written as the reason, and
 - Architecture is a single-owner **event loop**: `Msg` in, `App::update`,
   `ui::draw` (§6).
 - KISS is enforced by the dependency budget of §7.
+- **Linux is the platform**: built and gated there; macOS is expected by
+  reading, ungated; Windows is not supported (§1).
 
 ---
 
@@ -73,6 +75,14 @@ spec: the spec is the doc comments beside the code, written as the reason, and
 - A CRDT / collaborative-OT server. One human, the filesystem is truth.
 - Provider-specific, plugin-based, or extensible via a scripting language.
 - An agent framework. It ships one small agent loop, not an orchestration layer.
+
+**Platforms.** Linux is the platform mush is built and gated on. macOS is
+expected to build and run — nothing in the program is Linux-specific, only
+POSIX — but it has never been built there, so that is a claim from reading, not
+a measurement, and no promise follows it. Windows is not supported: the shell
+every command goes through (`sh -c`), the process-group cleanup that ends a
+command's tree, the one-mush-per-workspace lock (`flock`), the attach socket,
+and the signal road are POSIX facilities, and each of the five is structural.
 
 ### Why there are file tools beside a shell
 
@@ -969,7 +979,7 @@ mush/
       app/screen.rs  every painted value, derived by `App` (layout, rows, words)
       agent.rs       agent actors, model loop, tool dispatch, shell execution
       clipboard.rs   the system clipboard: wl-paste / xclip / pngpaste read an image,
-                     and wl-copy / xclip / pbcopy write text
+                     and wl-copy / xclip / pbcopy / clip write text
       jobs.rs        the job registry: detached commands, the machine lock
       model.rs       the `ModelClient` seam, the HTTP client, the transport retry
       machine.rs     the shell seam: spawn, poll, kill a command
@@ -1145,8 +1155,10 @@ them should ask rather than build.
   the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the endpoint-free pty scenarios are the
-  whole gate; they run anywhere rust and python3 do, so any CI can call them.
-  `scripts/census.py` prints the production/test/comment split.
+  whole gate; they run on any POSIX machine with rust and python3 (the pty
+  scenarios and several fixtures use a pty, `setsid` and `/proc`), so any POSIX
+  CI can call them. `scripts/census.py` prints the production/test/comment
+  split.
 - **Screen review.** `scripts/screen.py` drives the real binary over a pty and
   prints the painted screen as text at 200×50 down to 30×8, which is how the ten
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
