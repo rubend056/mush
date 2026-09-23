@@ -538,9 +538,11 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   road — from the row or a command — or a sweep that can tell "compiled" from
   "delivered".
 
-`docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
-and left on purpose); each of its rows carries its price and the commit that
-closed it.
+`docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
+(judged and left on purpose), and the four blind duplication passes of §8.70
+have added `R30`–`R73` to it as open rows — each row carries its price, and
+the commit that closed it once it lands (`R37`, `R39`, `R41` and `R44` were
+closed by the store wave, §8.70).
 
 The two §6 interactions with H9 are closed: an attach op no longer disarms the
 human's armed quit (`626ac3d`), and a stopped agent that owns a live job is
