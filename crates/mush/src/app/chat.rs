@@ -6892,9 +6892,9 @@ mod tests {
         assert_eq!(
             shown(&rows),
             vec![
-                "mush › name  │   age".to_string(),
-                "       ──────┼──────".to_string(),
-                "       ana   │     3".to_string(),
+                "mush › name   │  age".to_string(),
+                "       ───────┼─────".to_string(),
+                "       ana    │    3".to_string(),
                 String::new(),
             ]
         );
@@ -6929,6 +6929,28 @@ mod tests {
         assert!(
             painted.iter().any(|row| row.contains("ana")),
             "the body is painted: {painted:?}"
+        );
+
+        // And the table the report was read off, through a pane: the short
+        // columns stop at their content, so the path is painted whole instead
+        // of broken mid-word and the token's column is not a field of blanks.
+        let source = "| lane | agent | report | hunting for |\n| --- | --- | --- | --- |\n| 3 | #156 | docs/audits/runtime-risks.md | whether the table's cells share the pane's width fairly at every width the pane can have |";
+        let mut rows = Vec::new();
+        render_message(
+            &mut rows,
+            &Message::assistant(source),
+            None,
+            60,
+            false,
+            Fold::DEFAULT,
+            &[],
+        );
+        let painted = shown(&rows);
+        assert!(
+            painted
+                .iter()
+                .any(|row| row.contains("docs/audits/runtime-risks.md")),
+            "the path is whole through the pane: {painted:?}"
         );
     }
 
