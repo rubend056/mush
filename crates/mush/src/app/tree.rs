@@ -986,6 +986,13 @@ impl AgentTree {
     /// was doing is still in the transcript, where every tool call writes an
     /// `⚙` line.
     ///
+    /// A `⊘` is refused the same way, for the human's sake rather than the
+    /// fold's: `⊘ cancelling…` is their own keystroke's feedback on the row they
+    /// are watching, and a label in the actor's hand when a Stop crossed it in
+    /// flight must not erase it. Letting the label win would also make the
+    /// stale-cancel backstop never fire, because [`Self::expire_cancels`] only
+    /// retires a phase still `Cancelling` (finding D10).
+    ///
     /// The label lasts until the next label, or until the model's next turn
     /// ([`Self::thinking`]): a tool that has finished is not what the row
     /// should say while the model is being asked again.
@@ -994,7 +1001,7 @@ impl AgentTree {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            if node.phase.compacting().is_some() {
+            if node.phase.compacting().is_some() || matches!(node.phase, Phase::Cancelling) {
                 return;
             }
             node.phase = Phase::Activity(label.into());
@@ -1012,9 +1019,12 @@ impl AgentTree {
     ///
     /// The guards are [`Self::activity`]'s, each for its own reason: only a run
     /// in flight can report it (a late or duplicated event must not put a
-    /// finished agent back to work — finding B5), and a fold is never replaced
-    /// by it (the run behind a *parked* fold keeps announcing its phases, and
-    /// the request the human is waiting for outranks them). `since` restarts,
+    /// finished agent back to work — finding B5), a fold is never replaced by
+    /// it (the run behind a *parked* fold keeps announcing its phases, and the
+    /// request the human is waiting for outranks them), and the `⊘` goes the
+    /// same way: the cancel the human just asked for outranks the model's next
+    /// turn too, and erasing it would leave the stale-cancel backstop nothing
+    /// to retire (finding D10). `since` restarts,
     /// so the age the pane paints is the age of *this* request — not of the
     /// tool that finished before it.
     pub fn thinking(&mut self, id: AgentId) {
@@ -1022,7 +1032,7 @@ impl AgentTree {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            if node.phase.compacting().is_some() {
+            if node.phase.compacting().is_some() || matches!(node.phase, Phase::Cancelling) {
                 return;
             }
             node.phase = Phase::Thinking;
@@ -3104,6 +3114,58 @@ mod tests {
         tree.finish(id, Some("did the thing".into()));
         assert_eq!(tree.node(id).unwrap().phase, Phase::Done);
         assert!(!tree.busy());
+    }
+
+    /// `⊘ cancelling…` is the human's own keystroke's feedback on the row they
+    /// are watching: a tool label or a thinking event arriving in the window
+    /// between the actor's check and its emit must not erase it — and erasing
+    /// it would also leave the stale-cancel backstop nothing to retire,
+    /// because [`AgentTree::expire_cancels`] only finds a phase still
+    /// `Cancelling` (finding D10).
+    ///
+    /// The audit's probe: after Ctrl-C set `Cancelling`, one
+    /// `activity(id, "edit_file src/a.rs")` became
+    /// `Activity("edit_file src/a.rs")`, one `thinking(id)` became `Thinking`,
+    /// and `expire_cancels()` then returned false.
+    #[test]
+    fn a_status_never_erases_the_cancelling_mark() {
+        let mut tree = AgentTree::bare();
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
+
+        assert!(!tree.cancel_requested(id), "a live mailbox hears the Stop");
+        let asked_at = tree.node(id).unwrap().since;
+
+        tree.activity(id, "edit_file src/a.rs");
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Cancelling,
+            "a tool label must not erase the cancel the human just asked for"
+        );
+        assert_eq!(
+            tree.node(id).unwrap().since,
+            asked_at,
+            "nor restart the clock the ⊘ is spinning on"
+        );
+
+        tree.thinking(id);
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Cancelling,
+            "and the model's next turn must not either"
+        );
+        assert_eq!(
+            tree.node(id).unwrap().since,
+            asked_at,
+            "the ⊘ still spins on the cancel's own clock"
+        );
+
+        // And the mark a status could not erase is still the live one the
+        // backstop retires: a phase that changed underneath would leave
+        // `⊘ cancelling…` spinning forever.
+        tree.age(id, Duration::from_secs(11));
+        assert!(tree.expire_cancels());
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Idle);
     }
 
     /// A cancel the actor never acknowledges goes quiet rather than spinning
