@@ -245,8 +245,14 @@ pub enum Outcome {
 pub enum Work {
     /// The run committed its work on `branch`.
     Committed { branch: String, revision: String },
-    /// The run changed nothing: the branch stands clean where it was.
+    /// The run changed nothing at all: the branch stands clean where it was.
     Clean { branch: String },
+    /// The run changed only paths the repository ignores, so there was nothing
+    /// to commit and nothing a commit could keep. Its own answer because
+    /// "nothing changed" is false about a run that changed the filesystem —
+    /// and because the sweep now keeps the checkout those paths live in
+    /// (finding F1).
+    Ignored { branch: String, paths: Vec<String> },
     /// The commit itself failed; the worktree may be dirty and unlanded.
     Uncommitted { branch: String, error: String },
 }
@@ -261,6 +267,10 @@ impl Work {
                 Some(format!("committed {revision} on {branch}"))
             }
             Work::Clean { .. } => None,
+            Work::Ignored { branch, paths } => Some(format!(
+                "{branch} holds ignored work only: {} — a commit cannot keep it",
+                git::named_paths(paths)
+            )),
             Work::Uncommitted { error, .. } => {
                 Some(format!("could not commit the worktree: {error}"))
             }
@@ -273,6 +283,10 @@ impl Work {
         match self {
             Work::Committed { branch, revision } => format!(" · committed {revision} on {branch}"),
             Work::Clean { branch } => format!(" · {branch} clean — nothing changed"),
+            Work::Ignored { branch, paths } => format!(
+                " · {branch} holds ignored work only: {}",
+                truncate(&git::named_paths(paths), 60)
+            ),
             Work::Uncommitted { branch, error } => {
                 format!(" · {branch} uncommitted ({})", truncate(error, 60))
             }
@@ -1599,11 +1613,10 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
         let work = actor.branch.clone().map(|branch| {
-            match commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome) {
-                Ok(Some(revision)) => Work::Committed { branch, revision },
-                Ok(None) => Work::Clean { branch },
-                Err(error) => Work::Uncommitted { branch, error },
-            }
+            work_from_commit(
+                branch,
+                commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome),
+            )
         });
         if let Some(line) = work.as_ref().and_then(Work::status_line) {
             actor.ctx.emit(actor.id, AgentEvent::Status(line));
@@ -3780,7 +3793,8 @@ fn too_many_worktrees(held: &[u64]) -> String {
     };
     format!(
         "cannot spawn: {} isolated worktrees already exist and none of them is landable \
-         (the limit is {}) — each holds an unmerged branch or uncommitted work: {named}{more}. \
+         (the limit is {}) — each holds an unmerged branch, uncommitted work, or ignored \
+         paths a commit cannot keep: {named}{more}. \
          Land or drop one first: merge or delete its branch, then \
          `git worktree remove --force .mush/wt/<id>` and `git branch -d mush/<id>`.",
         held.len(),
@@ -4766,17 +4780,30 @@ fn message_agent(
 }
 
 /// Commit whatever an isolated agent left in its worktree, so the branch the
-/// row names actually carries the work. Returns the
-/// short revision when something was committed, `None` when the run changed
-/// nothing. The subject is built above, next to the id, brief and outcome it is
-/// made of.
+/// row names actually carries the work. Returns what was there — a revision,
+/// or [`git::Commit::Nothing`] / [`git::Commit::Ignored`], the two answers that
+/// mean no commit (finding F1). The subject is built above, next to the id,
+/// brief and outcome it is made of.
 fn commit_worktree(
     root: &Path,
     id: u64,
     brief: &str,
     outcome: &Outcome,
-) -> Result<Option<String>, String> {
+) -> Result<git::Commit, String> {
     git::commit_all(root, &commit_subject(id, brief, outcome))
+}
+
+/// What the run's end makes of the worktree commit: the fact the parent reads.
+/// Its own function so the third answer — ignored paths, which are emphatically
+/// not "nothing changed" — is decided in one place a test can call (finding
+/// F1).
+fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work {
+    match found {
+        Ok(git::Commit::Made(revision)) => Work::Committed { branch, revision },
+        Ok(git::Commit::Nothing) => Work::Clean { branch },
+        Ok(git::Commit::Ignored(paths)) => Work::Ignored { branch, paths },
+        Err(error) => Work::Uncommitted { branch, error },
+    }
 }
 
 /// `read_file`: a window of a text file, or an image.
@@ -5856,6 +5883,56 @@ mod tests {
         );
         assert!(!lines.contains("mush/2"), "{lines}");
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A run whose only changes are ignored paths changed the filesystem: the
+    /// row must never read "clean — nothing changed", and the parent has to be
+    /// able to see where the deliverable is (finding F1).
+    #[test]
+    fn an_ignored_run_is_never_nothing_changed() {
+        let work = work_from_commit(
+            "mush/1".into(),
+            Ok(git::Commit::Ignored(vec![
+                "ignored/report.txt".into(),
+                "run.log".into(),
+            ])),
+        );
+        let digest = work.digest();
+        assert!(!digest.contains("nothing changed"), "{digest}");
+        assert!(digest.contains("ignored/report.txt"), "{digest}");
+        let line = work
+            .status_line()
+            .expect("a kept deliverable is news the human hears");
+        assert!(line.contains("ignored/report.txt"), "{line}");
+        assert!(
+            line.contains("a commit cannot keep"),
+            "and why it was not committed: {line}"
+        );
+
+        // The other two answers still mean what they always did.
+        assert_eq!(
+            work_from_commit("mush/1".into(), Ok(git::Commit::Nothing)),
+            Work::Clean {
+                branch: "mush/1".into()
+            }
+        );
+        assert_eq!(
+            work_from_commit("mush/1".into(), Ok(git::Commit::Made("abc1234".into()))),
+            Work::Committed {
+                branch: "mush/1".into(),
+                revision: "abc1234".into()
+            }
+        );
+        // A refusal is the failure it says: the sentence names the directory a
+        // commit would have left (finding F8).
+        assert_eq!(
+            work_from_commit(
+                "mush/1".into(),
+                Err("/repo/.mush/wt/1 is no longer a worktree".into())
+            )
+            .digest(),
+            " · mush/1 uncommitted (/repo/.mush/wt/1 is no longer a worktree)"
+        );
     }
 
     /// The work fact is a listing, not a signal: it starts no run and changes
