@@ -825,6 +825,10 @@ pub struct App {
     /// (`Msg::Clipboard`), and pressing `Ctrl-V` where the machine has no
     /// reader costs a status line and nothing else.
     write_clipboard: ClipboardWrite,
+    /// The road every worker thread on the UI side is started through, so a
+    /// spawn the OS refuses is answered and not raised ([`WorkerSpawn`]); a
+    /// test replaces it to drive that refusal.
+    worker_spawn: WorkerSpawn,
     /// The agents, their phases, the focus and the per-agent mailboxes,
     /// cancel flags and git stats.
     pub tree: AgentTree,
@@ -901,6 +905,33 @@ pub(crate) fn window_mark(source: WindowSource) -> &'static str {
         WindowSource::Advertised => "≈",
         WindowSource::Complaint => "≤",
     }
+}
+
+/// How the UI starts a worker thread: `std::thread::Builder`, so a box at its
+/// thread limit is a returned error and not a raised panic.
+///
+/// `std::thread::spawn` panics when the OS refuses a thread — a container's
+/// `pids.max`, a `ulimit -u`, a fork storm — and that panic unwinds the UI
+/// thread, taking the whole TUI down mid-run; every other thread road in this
+/// tree answers the refusal instead (the session writer, the job watcher, the
+/// attach accept loop), and this is the UI's one road to the same contract
+/// (finding R11). Each caller beside a use says what *it* does with the
+/// answer: the flag that must fall so the fact is not frozen for the session,
+/// and the line the human reads.
+///
+/// The road is a function value on [`App`] rather than a bare free function
+/// because a test has to drive a refusal without exhausting the machine's own
+/// threads: replacing it with a refuser asks every caller the question the OS
+/// would ask at the limit, with nothing else on the machine disturbed.
+type WorkerSpawn = fn(&str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+/// The production [`WorkerSpawn`]: a named `Builder` thread, whose refusal is
+/// the `Err` that `std::thread::spawn` would have panicked on.
+fn spawn_worker(name: &str, job: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(job)
+        .map(|_| ())
 }
 
 impl App {
@@ -1046,6 +1077,7 @@ impl App {
             picker: None,
             git: None,
             write_clipboard: Arc::new(clipboard::write_text),
+            worker_spawn: spawn_worker,
             tree: AgentTree::rooted(root),
             session_save,
             session_dirty_at: None,
@@ -1544,30 +1576,44 @@ impl App {
         // half — and the guard drops them with the app.
         self.worktree_facts.set(facts);
         let tx = self.ui_tx.clone();
-        std::thread::spawn(move || {
-            let mut stats = HashMap::new();
-            for (id, base, branch) in branches {
-                if let Some(stat) = git::branch_stat(&root, &base, &branch) {
-                    stats.insert(id, stat);
+        let started = (self.worker_spawn)(
+            "mush-git",
+            Box::new(move || {
+                let mut stats = HashMap::new();
+                for (id, base, branch) in branches {
+                    if let Some(stat) = git::branch_stat(&root, &base, &branch) {
+                        stats.insert(id, stat);
+                    }
                 }
-            }
-            // One answer per at-rest worktree, read here and acted on there:
-            // this thread never removes anything.
-            let sweep = sweep
-                .into_iter()
-                .map(|(id, base, fork)| {
-                    let found = git::reclaimable(&root, id.0, &base, fork.as_deref());
-                    (id, found)
-                })
-                .collect();
-            let status = git::status(&root);
-            let _ = tx.send(Msg::Git {
-                conversation,
-                stats,
-                status,
-                sweep,
-            });
-        });
+                // One answer per at-rest worktree, read here and acted on there:
+                // this thread never removes anything.
+                let sweep = sweep
+                    .into_iter()
+                    .map(|(id, base, fork)| {
+                        let found = git::reclaimable(&root, id.0, &base, fork.as_deref());
+                        (id, found)
+                    })
+                    .collect();
+                let status = git::status(&root);
+                let _ = tx.send(Msg::Git {
+                    conversation,
+                    stats,
+                    status,
+                    sweep,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // The read did not start, so the flag it set must fall: left up,
+            // no later ask could ever start one and the git facts would freeze
+            // for the session — and the human is told, because a bar that keeps
+            // painting yesterday's facts as today's is the lie the flag was
+            // protecting against. The next tick or transition asks again.
+            self.git_in_flight = false;
+            self.fail(format!(
+                "could not start the git read: {error} — the facts stay as they are"
+            ));
+        }
     }
 
     /// Adopt a repository read that finished on its own thread. Only a read
@@ -3670,10 +3716,25 @@ impl App {
         self.models_in_flight = Some(endpoint.clone());
         let cfg = self.cfg().clone();
         let tx = self.ui_tx.clone();
-        std::thread::spawn(move || {
-            let models = http::list_models(&cfg);
-            let _ = tx.send(Msg::Models { endpoint, models });
-        });
+        let started = (self.worker_spawn)(
+            "mush-models",
+            Box::new(move || {
+                let models = http::list_models(&cfg);
+                let _ = tx.send(Msg::Models { endpoint, models });
+            }),
+        );
+        if let Err(error) = started {
+            // No list will ever come back for this ask, so `models_in_flight`
+            // must clear or a second ask at the same endpoint would be refused
+            // as already-in-flight — the picker's one road would be dead for
+            // the session. The human is told and can ask again with `/model`;
+            // the startup road says its own line (`main` hands an empty list
+            // in when the discovery thread is refused).
+            self.models_in_flight = None;
+            self.fail(format!(
+                "could not start the model fetch: {error} — ask again with /model"
+            ));
+        }
     }
 
     /// Adopt a model list that finished fetching on its own thread.
@@ -4652,14 +4713,24 @@ impl App {
         // The road the app holds is what the thread runs, so a test's writer is
         // the one `Enter` reaches — no program is spawned by it.
         let write = Arc::clone(&self.write_clipboard);
-        std::thread::spawn(move || {
-            let result = write(&copied.text);
-            let _ = tx.send(Msg::Copied {
-                conversation,
-                line: copied.line,
-                result,
-            });
-        });
+        let started = (self.worker_spawn)(
+            "mush-clipboard-write",
+            Box::new(move || {
+                let result = write(&copied.text);
+                let _ = tx.send(Msg::Copied {
+                    conversation,
+                    line: copied.line,
+                    result,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // The copy never started, so nothing will report through
+            // `Msg::Copied`: the refusal is said on the bar now, in the shape
+            // the write's own failure road uses, because the human pressed a
+            // key and silence is the one answer the copy must not give.
+            self.fail(format!("could not copy to the clipboard: {error}"));
+        }
     }
 
     /// `Ctrl-V`: read the clipboard for an image and attach it to the box.
@@ -4674,13 +4745,25 @@ impl App {
         let ws = self.ws.clone();
         let tx = self.ui_tx.clone();
         let conversation = self.tree.conversation();
-        std::thread::spawn(move || {
-            let result = clipboard::read_image(&ws);
-            let _ = tx.send(Msg::Clipboard {
-                conversation,
-                result,
-            });
-        });
+        let started = (self.worker_spawn)(
+            "mush-clipboard-read",
+            Box::new(move || {
+                let result = clipboard::read_image(&ws);
+                let _ = tx.send(Msg::Clipboard {
+                    conversation,
+                    result,
+                });
+            }),
+        );
+        if let Err(error) = started {
+            // Nothing will report through `Msg::Clipboard`, so the refusal is
+            // said here: the read could not start, and the key still has a
+            // road — the path of an image file — which the line names rather
+            // than leaving the human to guess why `Ctrl-V` did nothing.
+            self.fail(format!(
+                "could not read the clipboard: {error} — paste the image's path instead"
+            ));
+        }
     }
 
     /// The images to carry to the agent at `id`: every one whose path that
@@ -20961,5 +21044,115 @@ mod tests {
         let error =
             attach::Transcript::read(&broken).expect_err("a line missing `text` is refused");
         assert!(error.contains("text"), "the missing key is named: {error}");
+    }
+
+    /// A `WorkerSpawn` that refuses every thread, like a box at its limit
+    /// (`ulimit -u`, a container's `pids.max`, a fork storm).
+    fn refuse_spawn(_name: &str, _job: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+        Err(std::io::Error::other("the box is at its thread limit"))
+    }
+
+    /// A refused spawn on the git read is a returned refusal, not a panic
+    /// (finding R11). Two facts are the caller's: the flag falls — left up, no
+    /// later ask could start a read and the facts would freeze for the session
+    /// — and the bar says the facts are stale instead of painting them as
+    /// live. The read has to be *askable again*: a later call with a working
+    /// road starts one.
+    #[test]
+    fn a_refused_git_read_clears_the_flag_and_says_the_facts_are_stale() {
+        let (mut app, rx) = test_app("refused-git-read");
+        // The startup read is out (`App::new` asks for one); adopt it so the
+        // road below is the test's own ask and not that one.
+        wait_git(&mut app, &rx);
+
+        app.worker_spawn = refuse_spawn;
+        app.refresh_git();
+
+        assert!(
+            !app.git_in_flight,
+            "a read that never started must not keep the flag up"
+        );
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not start the git read")),
+            "the human is told: {line:?}"
+        );
+
+        // The same road the tree believes in: a refusal is a fact about *this*
+        // ask, not a dead road. With a working spawn the next ask starts.
+        app.worker_spawn = spawn_worker;
+        app.refresh_git();
+        assert!(app.git_in_flight, "the next ask tries again");
+    }
+
+    /// The model fetch's refusal, the same shape: `models_in_flight` names the
+    /// endpoint being fetched, so a refused spawn that left it up would refuse
+    /// every later ask at that endpoint as already-in-flight — `/model` dead
+    /// for the session — and the human would wait for a list nobody is
+    /// fetching.
+    #[test]
+    fn a_refused_model_fetch_clears_the_flag_and_can_be_asked_again() {
+        let (mut app, _rx) = test_app("refused-models");
+
+        app.worker_spawn = refuse_spawn;
+        app.refresh_models();
+
+        assert!(app.models_in_flight.is_none(), "no fetch is out");
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not start the model fetch")),
+            "the human is told: {line:?}"
+        );
+
+        app.worker_spawn = spawn_worker;
+        app.refresh_models();
+        assert!(
+            app.models_in_flight.is_some(),
+            "the next ask reaches the endpoint"
+        );
+    }
+
+    /// `Enter` in the select mode refused a thread: nothing will report through
+    /// `Msg::Copied`, so the refusal is said on the bar at once — in the shape
+    /// the write's own failure road uses — because silence over a key the human
+    /// pressed is the one answer the copy must not give.
+    #[test]
+    fn a_refused_clipboard_write_says_the_copy_did_not_happen() {
+        let (mut app, _rx) = test_app("refused-copy");
+
+        app.worker_spawn = refuse_spawn;
+        app.copy_text(Copied {
+            text: "the reply".to_string(),
+            line: "copied 1 line from #1's reply — 9 bytes".to_string(),
+        });
+
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("could not copy to the clipboard")),
+            "the human is told the copy did not happen: {line:?}"
+        );
+    }
+
+    /// `Ctrl-V` refused a thread: the read cannot report through
+    /// `Msg::Clipboard`, so the bar says the read did not start and names the
+    /// road that still works — the path of an image file.
+    #[test]
+    fn a_refused_clipboard_read_says_the_read_did_not_start() {
+        let (mut app, _rx) = test_app("refused-paste");
+
+        app.worker_spawn = refuse_spawn;
+        app.attach_clipboard_image();
+
+        let line = app.status_line().map(|(line, _)| line.to_string());
+        assert!(
+            line.as_deref().is_some_and(|line| {
+                line.contains("could not read the clipboard")
+                    && line.contains("paste the image's path instead")
+            }),
+            "the human is told, and told what still works: {line:?}"
+        );
     }
 }
