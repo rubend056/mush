@@ -83,19 +83,33 @@ impl RunUsage {
         }
     }
 
-    /// The line the run reports. A server that omits the total still gets one:
+    /// The line a *run* reports. A server that omits the total still gets one:
     /// the two parts are what it counted, and adding them invents nothing. That
     /// sum is of endpoint numbers too, so it saturates like the stored ones: a
     /// run whose parts are both over reads as a saturated count
     /// (`18446744073709.6M`) rather than as a wrapped one.
     fn line(&self) -> String {
+        self.words("this run")
+    }
+
+    /// The same numbers for a fold that no run owns — a `/compact` asked from
+    /// rest. The summarize call is a model call like any other and costs the
+    /// same; the only thing that changes is which noun is true, and "this run"
+    /// would name a run that does not exist.
+    fn fold_line(&self) -> String {
+        self.words("this fold")
+    }
+
+    /// The one spelling of the sentence, so the run's line and the fold's
+    /// cannot drift apart.
+    fn words(&self, what: &str) -> String {
         let total = if self.total_missing {
             self.prompt.saturating_add(self.completion)
         } else {
             self.total
         };
         format!(
-            "the endpoint counted {} prompt + {} completion tokens this run ({} total)",
+            "the endpoint counted {} prompt + {} completion tokens {what} ({} total)",
             tokens_label(self.prompt as usize),
             tokens_label(self.completion as usize),
             tokens_label(total as usize),
@@ -103,9 +117,15 @@ impl RunUsage {
     }
 }
 
-/// Report the endpoint's own numbers once, when the run ends. Cheap and rare
-/// (one line per run), and the only place a real count can come from: the
-/// UI's meter is bytes/3, which is all a server without `usage` offers.
+/// Report the endpoint's own numbers once, when the run ends — *every* ending,
+/// not only the clean one. Cheap and rare (one line per run), and the only place
+/// a real count can come from: the UI's meter is bytes/3, which is all a server
+/// without `usage` offers.
+///
+/// It is called by the wrapper around the run's turns ([`run_loop`]) rather than
+/// at the clean end inside them: a Stop, a failure, the loop guard, a refusal
+/// and the over-window refusal all end a run before that point, and the counts
+/// the endpoint already reported are the run's however it ended (finding A6).
 fn report_usage(actor: &Actor, usage: Option<RunUsage>) {
     if let Some(usage) = usage {
         actor.ctx.emit(actor.id, AgentEvent::Notice(usage.line()));
@@ -2612,11 +2632,36 @@ fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, did_no
 /// Nothing counts turns: the run goes on until the model calls no more tools.
 /// Its one early end is [`LOOP_ROUNDS`] identical rounds (finding H45); the
 /// other is the human's Stop.
+///
+/// This is the run's *ending*: every road out of [`run_turns`] — the answer, a
+/// Stop, a failure, the loop guard, a refusal, a request that does not fit —
+/// passes back through here, and the endpoint's own counts are reported on all
+/// of them ([`report_usage`]). A run that was stopped, cancelled or refused has
+/// spent the money just the same, and its number is the only non-estimate there
+/// is (finding A6).
 fn run_loop(
     actor: &Actor,
     state: &mut ActorState,
     messages: &mut Vec<Message>,
     cancel: &Arc<AtomicBool>,
+) -> Result<Option<String>, String> {
+    // What the endpoint itself counted over this run's calls, folds included:
+    // `run_turns` feeds it as replies arrive, so it survives every early
+    // return.
+    let mut usage: Option<RunUsage> = None;
+    let result = run_turns(actor, state, messages, cancel, &mut usage);
+    report_usage(actor, usage);
+    result
+}
+
+/// The turn loop itself: asking, running the batch, and the roads that end the
+/// run early. [`run_loop`] owns the ending and the usage report.
+fn run_turns(
+    actor: &Actor,
+    state: &mut ActorState,
+    messages: &mut Vec<Message>,
+    cancel: &Arc<AtomicBool>,
+    usage: &mut Option<RunUsage>,
 ) -> Result<Option<String>, String> {
     let schemas = tool_schemas(actor);
     // A run that follows a loop-stop opens with the guard's own words: the one
@@ -2657,9 +2702,6 @@ fn run_loop(
     state.waited = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
-    // What the endpoint itself counted, when it says: the UI's meter is an
-    // estimate, and this is the one number that is not.
-    let mut usage: Option<RunUsage> = None;
 
     loop {
         drain_mailbox(actor, cancel, messages, state);
@@ -2681,7 +2723,7 @@ fn run_loop(
             // says so itself: the run carries on, and the phase the fold put on
             // the row goes back to what a run wears between the request and the
             // tool it names.
-            compact_history(actor, &cfg, messages, cancel, state, true)?;
+            compact_history(actor, &cfg, messages, cancel, state, true, usage)?;
         }
         // Keep the whole request inside the endpoint's context window. The
         // trimmer is the fallback the fold cannot help with: it bites only when
@@ -3007,7 +3049,6 @@ fn run_loop(
             if steered {
                 continue;
             }
-            report_usage(actor, usage);
             return Ok(if content.is_empty() {
                 None
             } else {
@@ -3162,6 +3203,7 @@ fn compact_history(
     cancel: &Arc<AtomicBool>,
     state: &mut ActorState,
     in_run: bool,
+    usage: &mut Option<RunUsage>,
 ) -> Result<bool, String> {
     // Whether the human asked for this fold, as opposed to the window filling
     // on its own. Only the first is owed a line when there is nothing to do:
@@ -3327,6 +3369,16 @@ fn compact_history(
             return Ok(false);
         }
     };
+    // The fold is a model call like any other, and usually the largest one of
+    // the run: it re-sends the whole history. What the endpoint counted for it
+    // belongs to the run's number, so it goes into the same accumulator the
+    // run's own replies feed — a fold read only for its summary is the one
+    // place the endpoint's real counts were dropped (finding A6). A fold from
+    // rest has no run to belong to: its caller ([`compact_now`]) owns the
+    // line.
+    if let Some(reported) = reply.usage.as_ref() {
+        usage.get_or_insert_with(RunUsage::default).add(reported);
+    }
     let summary = reply
         .choices
         .into_iter()
@@ -3388,10 +3440,15 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     // a fold that spins an hourglass while no key can stop it is worse than one
     // nobody can see.
     let cancel = Arc::new(AtomicBool::new(false));
+    // A fold from rest has no run behind it, so this is the only accumulator it
+    // has: the summarize call costs money like any other, and the count is
+    // reported below whether the fold landed or failed (finding A6).
+    let mut usage: Option<RunUsage> = None;
     // A fold that landed needs nothing here: its `Compact` event is what the
     // pane, the session and the meter read. A fold that came to nothing emits
     // its own ending too, so only its *failures* are left to report.
-    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false) {
+    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false, &mut usage)
+    {
         // The human stopped it. A stop is its own event, not a failure: the
         // actor is alive and resumable, and the row must say which of the two
         // just happened.
@@ -3409,6 +3466,16 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
                 .ctx
                 .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
         }
+    }
+    // What the endpoint counted for the fold is reported last, after whatever
+    // the fold had to say about itself: the human who typed `/compact` is the
+    // one paying for the call, and this is the only line that says what it
+    // cost. `fold_line` and not `line`: there is no run here for "this run" to
+    // name (finding A6).
+    if let Some(usage) = usage {
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::Notice(usage.fold_line()));
     }
 }
 
@@ -11555,6 +11622,88 @@ mod tests {
         let _ = mailbox;
     }
 
+    /// A run is more than the calls that carry its result: a fold is a call
+    /// like any other, and usually the largest one of the run — it re-sends the
+    /// whole history. What the endpoint counted for it belongs to the run's
+    /// number, whatever the final reply does or does not report.
+    #[test]
+    fn a_fold_and_the_final_reply_both_report_the_endpoints_counts() {
+        let scripted = Arc::new(
+            Scripted::new()
+                // The fold the human asked for. The counts written for it are
+                // dropped by `compact_history` today: it reads the summary's
+                // text and never the reply's `usage`.
+                .says("the summary")
+                .with_usage(9_000, 100, 9_100)
+                .says("all done")
+                .with_usage(7, 5, 12),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-fold", &scripted);
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("working on it"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("all done"));
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 9k prompt + 105 completion tokens this run (9.1k total)",
+            "the fold's call is the run's largest, and its counts are the run's"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A run that ended by a Stop is the one where the money number matters
+    /// most: the work in flight is gone, and what the endpoint counted so far
+    /// is the only honest account of what it cost. Every ending reports, not
+    /// only the clean one.
+    #[test]
+    fn a_cancelled_run_still_reports_what_the_endpoint_counted() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
+                .with_usage(4_040, 0, 4_040)
+                .cancels(),
+        );
+        let (actor, events, mailbox) = build_actor_about(
+            "usage-cancel",
+            scripted,
+            test_cfg(),
+            Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("ok"))),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("look around")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel);
+        assert_eq!(result.unwrap_err(), CANCELLED);
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 4k prompt + 0 completion tokens this run (4k total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
     /// A server that reports nothing leaves mush's own estimate as the only
     /// number there is, and the run says nothing it was not told.
     #[test]
@@ -15452,6 +15601,55 @@ mod tests {
             transcript[2].text().len(),
             37_210,
             "the transcript is untouched: a refused fold is not a trim"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A `/compact` from rest is a model call like any other: the endpoint's
+    /// own counts for it are reported, and the sentence says "this fold"
+    /// because there is no run for "this run" to name.
+    #[test]
+    fn an_idle_fold_reports_the_endpoints_own_counts_for_this_fold() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("the summary")
+                .with_usage(1_111, 222, 1_333),
+        );
+        let (actor, events, _mailbox) = build_actor_about(
+            "idle-fold-usage",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        let lines: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("endpoint counted") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "the endpoint counted 1.1k prompt + 222 completion tokens this fold \
+                 (1.3k total)"
+                    .to_string()
+            ],
+            "the fold's call is reported, and the noun is the fold's"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
