@@ -12409,6 +12409,74 @@ mod tests {
         );
     }
 
+    /// A session can hold two rows of one id — the restore's refusal of a
+    /// duplicate is the secrets audit's C9, and this pane must survive whatever
+    /// state it is handed. Two lengths used to decide one question: `rows()`
+    /// de-duplicated by id while the cursor was bounded by the storage length,
+    /// so a session with two rows of id 2 was `agents=3 rows=2` and `G` indexed
+    /// `rows[2]` — an index panic on a real keypress, in release builds too, with
+    /// the hidden twin an agent the human could not see before it (D2,
+    /// `screen.rs:472`). The cursor is now bounded by the rows that were
+    /// painted, and the pane indexes those rows with something that cannot
+    /// panic.
+    #[test]
+    fn the_pane_never_indexes_past_the_rows_it_painted() {
+        let (mut app, _rx) = test_app("pane-twin-rows");
+        for _ in 0..2 {
+            app.tree.register(Existing {
+                id: AgentId(2),
+                parent: None,
+                depth: 1,
+                brief: "twin".to_string(),
+                title: None,
+                phase: Phase::Done,
+                branch: None,
+                fork: None,
+                summary: None,
+                leftover: false,
+                landed: None,
+                result_unread: false,
+                tx: None,
+            });
+        }
+        assert_eq!(app.tree.agents.len(), 3, "the root and both twins");
+        assert_eq!(
+            app.tree.rows().len(),
+            3,
+            "every node is a row the pane paints"
+        );
+
+        app.focus = Focus::Agents;
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.tree.cursor(),
+            app.tree.rows().len() - 1,
+            "G names the last painted row"
+        );
+        assert_eq!(
+            app.tree.rows()[app.tree.cursor()].id,
+            AgentId(2),
+            "and the last painted row is the twin's"
+        );
+
+        let (screen, _) = painted(&mut app, 80, 24);
+        let Screen::Panes(panes) = screen else {
+            panic!("80x24 is above the floor")
+        };
+        assert_eq!(panes.agents.rows.len(), 3, "both twins are painted");
+        assert_eq!(
+            panes.agents.cursor, 2,
+            "and the cursor names the last painted row"
+        );
+        assert!(
+            !panes.agents.footer.is_empty(),
+            "the row under the cursor has its footer, not a skipped index"
+        );
+    }
+
     /// `←` in the chat pane is the message box's cursor and moves nothing in the
     /// tree: the two panes keep their own meaning for the same key.
     #[test]
