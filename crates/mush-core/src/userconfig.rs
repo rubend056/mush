@@ -41,7 +41,9 @@ fn comment() -> Vec<String> {
     vec![
         "mush home config — hand-editable, and every field is optional.".to_string(),
         "Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.".to_string(),
-        "api_key: the provider's secret; also read from MUSH_API_KEY. Never written into a workspace.".to_string(),
+        "api_key: the provider's secret; also read from MUSH_API_KEY, and a \
+         control character in it is refused. Never written into a workspace."
+            .to_string(),
         format!(
             "provider: {}; `{}` defaults to the local endpoint {}.",
             names_hint(),
