@@ -12,10 +12,17 @@
 //! **The grid.** One reading of a pane's width, `width`:
 //!
 //! ```text
-//!   ❯ cargo test                              → exit 0 · 41 lines
+//!   ❯ cargo test                              → 41 lines
+//!   │ 3 failed · 12 passed
 //!   │←mark→│←  ask_w  →│←gap→│←  outcome_w    →│
 //!   0      2            arrow_x-2    arrow_x   width
 //! ```
+//!
+//! The second row is the call's own block: the pipe stands in the mark's two
+//! columns ([`details`]), so a result's payload is painted under the header of
+//! the call that made it without either row knowing the other's text — and a
+//! clean command's outcome carries no `exit 0`, which is the digest's own rule
+//! (`→ 41 lines`; only a failure keeps its whole sentence).
 //!
 //! - `outcome_w = (width / 3).clamp(12, 28)` — the whole right-hand column,
 //!   arrow included. A third of the pane is the news' share; 12 columns is the
@@ -58,6 +65,12 @@ use crate::ui::dim;
 /// The gap between the ask's column and the arrow: two columns, so the `…` of a
 /// cut ask never touches the `→`.
 const GAP: usize = 2;
+
+/// The pipe a call's block stands at, where this module pads a row by hand
+/// instead of through [`crate::app::symbols::Symbols::GUTTER_MARK`]: the same
+/// character, read from the glyph table where the gutter's own spelling is
+/// authored, so the two cannot drift apart.
+const PIPE: char = crate::app::symbols::Symbols::GUTTER_PIPE;
 
 /// The outcome column's bounds. See the module doc for why these two.
 const OUTCOME_MIN: usize = 12;
@@ -171,13 +184,27 @@ pub(crate) fn header(
 }
 
 /// The dim fact rows the unfolded view paints under a call's header, each at
-/// the call's own **mark width** ([`crate::app::symbols`]'s gutter) and cut to
-/// what the pane has left of it. The compact log paints none of them: its one
-/// row per call is the header, and these are what the human reads when the call
-/// is open.
+/// the block's own **gutter** ([`crate::app::symbols`]'s pipe) and cut to what
+/// the pane has left of it. The compact log paints none of them: its one row
+/// per call is the header, and these are what the human reads when the call is
+/// open.
+///
+/// The gutter is the same one the result's payload wears ([`crate::app::chat`]
+/// paints it through the same constant), so the header, its facts and the dump
+/// under them read as one block — which is what the human's `Ctrl-Y` walk and
+/// the pane's own columns both measure against.
 pub(crate) fn details(facts: &CallFacts, width: usize, mark: &str) -> Vec<Line<'static>> {
     let gutter = UnicodeWidthStr::width(mark);
-    let pad = " ".repeat(gutter.min(width));
+    // The block's own gutter: the pipe every row under a call's header stands
+    // at, padded to the width the header's mark takes — two columns for every
+    // mark the table hands out ([`crate::app::symbols::Symbols::GUTTER_MARK`]),
+    // and the mark's own columns for a caller that hands this module a wider
+    // one (the mark-width test above). A pipe of a narrower gutter would let
+    // the row out of the block it belongs to.
+    let pad = match gutter.min(width) {
+        0 => String::new(),
+        take => format!("{}{}", PIPE, " ".repeat(take - 1)),
+    };
     let budget = width.saturating_sub(gutter);
     facts
         .details
@@ -301,11 +328,12 @@ mod tests {
             }
         }
         // The details follow the mark too, so a wider glyph moves the whole
-        // block — header, details and payload — and not just the ask.
+        // block — header, details and payload — and not just the ask; the pipe
+        // leads each of them, padded to the same width ([`details`]).
         let mut read = facts.clone();
         read.details = vec!["of 812 lines".into()];
-        assert_eq!(text(&details(&read, 60, "▤ ")[0]), "  of 812 lines");
-        assert_eq!(text(&details(&read, 60, "▤▤ ")[0]), "   of 812 lines");
+        assert_eq!(text(&details(&read, 60, "▤ ")[0]), "│ of 812 lines");
+        assert_eq!(text(&details(&read, 60, "▤▤ ")[0]), "│  of 812 lines");
     }
 
     /// The mark *is* the tool's name: a call of a tool the table knows leads
@@ -426,10 +454,7 @@ mod tests {
     fn every_row_fits_and_every_arrow_stands_at_the_same_column() {
         for width in 0..=220 {
             let grid = Grid::of(width);
-            let facts = facts(
-                &"a call with a long ask ".repeat(20),
-                Some("exit 0 · 41 lines"),
-            );
+            let facts = facts(&"a call with a long ask ".repeat(20), Some("41 lines"));
             let rows = header(&call("run_command"), &facts, width, "❯ ");
             for row in &rows {
                 let row = text(row);
@@ -460,9 +485,9 @@ mod tests {
         read.details = vec!["of 812 lines".into(), "x".repeat(200)];
         let rows = details(&read, 60, "▤ ");
         assert_eq!(rows.len(), 2);
-        assert_eq!(text(&rows[0]), "  of 812 lines");
+        assert_eq!(text(&rows[0]), "│ of 812 lines");
         assert_eq!(UnicodeWidthStr::width(text(&rows[1]).as_str()), 60);
-        assert!(text(&rows[1]).starts_with("  "));
+        assert!(text(&rows[1]).starts_with("│ "));
         assert!(details(&facts("x", None), 60, "▤ ").is_empty());
     }
 
@@ -471,7 +496,7 @@ mod tests {
     /// one layout.
     #[test]
     fn a_cut_ask_and_a_cut_outcome_keep_the_arrow_on_its_column() {
-        let long = format!("exit 0 · {} lines", "9".repeat(60));
+        let long = format!("{} lines", "9".repeat(60));
         let rows = header(
             &call("run_command"),
             &facts(&"a long ask ".repeat(30), Some(&long)),

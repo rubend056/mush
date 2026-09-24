@@ -2039,6 +2039,23 @@ impl AgentTree {
             .unwrap_or(false)
     }
 
+    /// When the tool call this agent's own phase says it is running began, or
+    /// `None` for every other phase: the moment [`Self::activity`] last set
+    /// the phase, which is the instant the row beside the pane ages from too
+    /// (`phase_detail`).
+    ///
+    /// The compact log's in-flight row wears this age ([`super::Chat`]), and
+    /// the fact is *already here* — the row's own `⚙ run_command cargo test
+    /// 4s` and the pane's `… 4s` are one clock, not two. Only
+    /// [`Phase::Activity`] answers: a thought, a fold, a wait that is really
+    /// parked elsewhere and every ending are not a call running, and a status
+    /// the tree refused ([`Self::activity`]'s guards) leaves the phase it
+    /// refused to replace, which is exactly right for the same reason.
+    pub fn call_started_at(&self, id: AgentId) -> Option<Instant> {
+        let node = self.node(id)?;
+        matches!(node.phase, Phase::Activity(_)).then_some(node.since)
+    }
+
     /// Age a node, so the tests that assert a rendered age do not have to wait.
     #[cfg(test)]
     pub fn age(&mut self, id: AgentId, by: Duration) {

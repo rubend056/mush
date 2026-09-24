@@ -7582,6 +7582,20 @@ fn read_total(text: &str) -> Option<usize> {
     None
 }
 
+/// The picture a read's own label names, where this result is one: `read
+/// shots/x.png — a png image, 4198 bytes` is `("png", "4198 bytes")`.
+///
+/// One reader for the two places that must agree about what a picture is — the
+/// outcome above, which names it instead of counting lines, and the pane's
+/// numbering, which counts nothing of a payload that is not the file's lines
+/// (`chat::payload_numbers` in `crate::app`).
+pub(crate) fn read_picture(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("read ")?;
+    let (_, facts) = rest.split_once(" — a ")?;
+    let (format, size) = facts.split_once(" image, ")?;
+    Some((format, size))
+}
+
 /// A read's outcome: `{n} lines · {size}` over the window's own payload, the
 /// picture a read can hand back instead named as what it is, the empty file
 /// as `empty`, and the unbounded read's fallback as `outline · {n}
@@ -7601,19 +7615,15 @@ fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
         }
     }
     // An image: `read shots/x.png — a png image, 4198 bytes`.
-    if let Some(rest) = text.strip_prefix("read ") {
-        if let Some((_, facts)) = rest.split_once(" — a ") {
-            if let Some((format, size)) = facts.split_once(" image, ") {
-                let bytes = size
-                    .trim_end_matches(" bytes")
-                    .parse::<usize>()
-                    .unwrap_or_default();
-                return Some(CallOutcome {
-                    text: format!("a {format} image · {}", size_label(bytes)),
-                    tone: Tone::Ok,
-                });
-            }
-        }
+    if let Some((format, size)) = read_picture(text) {
+        let bytes = size
+            .trim_end_matches(" bytes")
+            .parse::<usize>()
+            .unwrap_or_default();
+        return Some(CallOutcome {
+            text: format!("a {format} image · {}", size_label(bytes)),
+            tone: Tone::Ok,
+        });
     }
     // `{path} is empty`: nothing was read because there is nothing there.
     if text.ends_with(" is empty") {
@@ -7826,11 +7836,23 @@ fn match_file(line: &str) -> Option<&str> {
     None
 }
 
-/// A command's outcome, read off the report's closing note: `exit 0 · 41 lines
-/// · 5s`, `killed by signal 9`, `cancelled`, `timed out after 120s`. The line
-/// count is the payload's own — the command's output, with the end note and
-/// every `[mush: …]` trailer left out — and a command that printed nothing has
-/// no line clause, because `0 lines` is a number that says nothing.
+/// A command's outcome, read off the report's closing note: `41 lines · 5s`,
+/// `exit 1 · 3 lines`, `killed by signal 9`, `cancelled`, `timed out after
+/// 120s`. The line count is the payload's own — the command's output, with the
+/// end note and every `[mush: …]` trailer left out — and a command that printed
+/// nothing has no line clause, because `0 lines` is a number that says nothing.
+///
+/// **The clean end is not news.** `exit 0` is the case every successful command
+/// already is, so the clause is dropped and the line count beside it — the fact
+/// the row exists to carry — takes the column; the row used to read `exit 0 ·
+/// 41 lines`, spending its most valuable columns on the expected. A *failure* is
+/// the opposite and keeps its whole sentence, red: `exit 1 · 3 lines` says both
+/// what happened and how much of it there was. The same rule is the digest's
+/// everywhere: a clean result's outcome is the smallest true sentence and a
+/// failed one's is the whole one ([`failure`]). A clean command with nothing
+/// else to say — no output, no time worth a clause — has no outcome at all: an
+/// arrow with an empty sentence behind it is the claim the grid already refuses
+/// for a call whose result has not landed.
 ///
 /// A command handed to the job registry builds no report at all
 /// ([`detached_line`]), so its outcome is that handover and there is no exit
@@ -7845,7 +7867,7 @@ fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     // how long the command was *given*, so it is read whole and never grows the
     // call's own time; the arms that carry no duration of their own read the
     // ` after 5s` clause `end_note` appends.
-    let (mut outcome, tone, duration) = if note.starts_with("timed out after ") {
+    let (outcome, tone, duration) = if note.starts_with("timed out after ") {
         (note.to_string(), Tone::Alert, None)
     } else if let Some(job) = note.strip_prefix("still running — detached as ") {
         let job = job.split(';').next().unwrap_or("").trim();
@@ -7860,16 +7882,11 @@ fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
             None => (note, None),
         };
         let (outcome, tone) = match head {
-            // `[exit 0]`: the code is the command's own, and only `0` is a clean
-            // end.
-            head if head.starts_with("exit ") => (
-                head.to_string(),
-                if head == "exit 0" {
-                    Tone::Ok
-                } else {
-                    Tone::Alert
-                },
-            ),
+            // The clean end says nothing the human did not already expect; what
+            // follows it — the lines, the time — is the news.
+            "exit 0" => (String::new(), Tone::Ok),
+            // Every other code is the command's own story and is told whole.
+            head if head.starts_with("exit ") => (head.to_string(), Tone::Alert),
             "cancelled" => ("cancelled".to_string(), Tone::Warn),
             // A signal death is not an exit code ([`end_note`]'s own rule).
             head if head.starts_with("killed by signal ") => (head.to_string(), Tone::Alert),
@@ -7879,14 +7896,24 @@ fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     };
     let payload = payload(text);
     let lines = payload.lines().count();
+    let mut clauses: Vec<String> = Vec::new();
+    if !outcome.is_empty() {
+        clauses.push(outcome);
+    }
     if lines > 0 {
-        outcome.push_str(&format!(" · {}", count_label(lines, "line")));
+        clauses.push(count_label(lines, "line"));
     }
     if let Some(duration) = duration {
-        outcome.push_str(&format!(" · {duration}"));
+        clauses.push(duration.to_string());
+    }
+    if clauses.is_empty() {
+        // A clean command that printed nothing and took no time worth a
+        // clause: there is no sentence to paint, and the row keeps its ask
+        // alone rather than a bare `→`.
+        return None;
     }
     Some(CallOutcome {
-        text: outcome,
+        text: clauses.join(" · "),
         tone,
     })
 }
@@ -8275,7 +8302,7 @@ fn line_ending(line: &str) -> Option<CallOutcome> {
 /// the same goes for a command report's end note (`[exit 0]`, `[cancelled]`, the
 /// group clause behind it) — a line count that counted them would say a silent
 /// command printed one line.
-fn payload(result: &str) -> String {
+pub(crate) fn payload(result: &str) -> String {
     let result = result.trim_end();
     let mut lines: Vec<&str> = result.split('\n').collect();
     while lines.last().is_some_and(|line| note_line(line.trim_end())) {
@@ -8453,7 +8480,7 @@ mod tests {
                 json!({"command": "cargo test"}),
                 "ok\nstill ok\n[exit 0 after 5s]",
                 "cargo test",
-                "exit 0 · 2 lines · 5s",
+                "2 lines · 5s",
                 Tone::Ok,
                 &[],
             ),
@@ -8890,14 +8917,20 @@ mod tests {
         };
         assert_eq!(
             command("out\n[exit 0]"),
-            expect("exit 0 · 1 line", Tone::Ok)
+            expect("1 line", Tone::Ok),
+            "the clean end is not news: the output is"
         );
         assert_eq!(command("[exit 101]"), expect("exit 101", Tone::Alert));
         assert_eq!(
             command("out\n[exit 0 after 5s]"),
-            expect("exit 0 · 1 line · 5s", Tone::Ok),
+            expect("1 line · 5s", Tone::Ok),
             "the command's own time travels in the note and is read back out of it"
         );
+        // The one command with nothing else to say: a clean end and no output
+        // and no time worth a clause paints no sentence at all, so its row
+        // keeps the ask alone.
+        assert_eq!(command("[exit 0]"), None);
+        assert_eq!(command("[exit 0 after 5s]"), expect("5s", Tone::Ok));
         assert_eq!(
             command("out\n[killed by signal 9]"),
             expect("killed by signal 9 · 1 line", Tone::Alert)
@@ -8921,7 +8954,7 @@ mod tests {
         // mush's own note too, and it is not a line of the command's output.
         assert_eq!(
             command("out\n[exit 0][2 processes in its group were stopped]"),
-            expect("exit 0 · 1 line", Tone::Ok)
+            expect("1 line", Tone::Ok)
         );
         // The handover: a command the registry took builds no report, so there
         // is no exit clause — the job is where the end will be said.
@@ -8934,7 +8967,7 @@ mod tests {
         // the last line.
         assert_eq!(
             command("out\n[exit 0]\n[mush: the first 4096 bytes; the rest is in the file]"),
-            expect("exit 0 · 1 line", Tone::Ok)
+            expect("1 line", Tone::Ok)
         );
     }
 
@@ -11705,14 +11738,15 @@ mod tests {
             Duration::from_secs(2),
             "the clock the note was read off"
         );
-        // And the compact log reads `exit 0 · 2s` back out of that note.
+        // And the compact log reads `2s` back out of that note: the clean end
+        // is not news, the time it took is.
         let facts = digest(
             ToolName::RunCommand,
             &json!({"command": "true"}),
             Some(&report),
             Path::new("/w"),
         );
-        assert_eq!(facts.outcome.unwrap().text, "exit 0 · 2s");
+        assert_eq!(facts.outcome.unwrap().text, "2s");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

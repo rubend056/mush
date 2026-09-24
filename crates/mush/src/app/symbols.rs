@@ -18,10 +18,11 @@
 //! row per tool, so the human can check what their font does with it.
 //!
 //! **Every glyph is one column.** That is what lets a result message — which
-//! the transcript does not let know which call produced it — paint its payload
-//! under a blank of the same width ([`Symbols::GUTTER_MARK`]), so a call still
-//! reads as one block. The tests below are the pin: a glyph two columns wide
-//! would be caught there rather than as a ragged gutter.
+//! the transcript does not let know which call produced it — stand its whole
+//! block at the same two-column gutter ([`Symbols::GUTTER_MARK`], the pipe
+//! every payload row wears), so a call still reads as one block. The tests
+//! below are the pin: a glyph two columns wide would be caught there rather
+//! than as a ragged gutter.
 //!
 //! **The table has no wildcard arm.** A new [`ToolName`] cannot compile until
 //! it has been given a mark in both rungs, the same house rule the digest
@@ -186,14 +187,24 @@ impl Symbols {
         self.mark(name).trim_end()
     }
 
-    /// The blank a result's payload is indented by, in every rung: the mark's
-    /// own width with its glyph replaced by a space.
+    /// The gutter every row of a result's block stands at, in every rung: two
+    /// columns, the mark's own width, with the pipe the pane uses for what a
+    /// call said back.
     ///
     /// A `tool` message carries the call's id and not the tool's name, so a
-    /// result cannot ask the table which glyph asked for it; the blank is the
-    /// one shape every mark shares ([`Self::GUTTER_MARK`], pinned by the test
-    /// below).
-    pub(crate) const GUTTER_MARK: &'static str = "  ";
+    /// result cannot ask the table which glyph asked for it; the gutter is the
+    /// one shape every mark shares (two columns, pinned by the test below). It
+    /// is **not** a blank any more: a payload's rows wear this on
+    /// every row — the first row's mark *is* it, and [`crate::app::chat`]'s
+    /// fold hangs the wrapped rows and the `…` on the same pipe — so a dump is
+    /// bound to the call that made it and can never be read as prose.
+    pub(crate) const GUTTER_MARK: &'static str = "│ ";
+
+    /// The pipe [`Self::GUTTER_MARK`] is made of, on its own: one character,
+    /// read by a surface that pads a row by the pipe alone
+    /// ([`crate::app::call_grid`]'s detail rows). Spelled here, beside the
+    /// gutter it is the first column of, and pinned by the test below.
+    pub(crate) const GUTTER_PIPE: char = '│';
 
     /// The columns [`Self::GUTTER_MARK`] and every mark take: one glyph and one
     /// space. See the module doc for why a constant is honest here.
@@ -274,7 +285,7 @@ fn sample(tool: ToolName) -> (&'static str, &'static str) {
         ToolName::EditFile => ("src/lex.rs", "3 hunks"),
         ToolName::ListFiles => ("src", "12 files"),
         ToolName::Search => ("\"markdown_rows\" in crates", "7 hits · 3 files"),
-        ToolName::RunCommand => ("cargo test -p mush", "exit 0 · 41 lines · 5s"),
+        ToolName::RunCommand => ("cargo test -p mush", "41 lines · 5s"),
         ToolName::SpawnAgent => ("table layout fixes", "#188 on mush/188"),
         ToolName::Status => ("", "3 agents · 1 job"),
         ToolName::Control => ("#4 message \"one more line\"", "#4 messaged"),
@@ -318,13 +329,18 @@ mod tests {
 
     /// Every mark is one glyph and one space, and every glyph is **one** pane
     /// column: the mark width is what the grid measures the ask against, and
-    /// the payload's blank is the same width in a message that cannot know
-    /// which call it belongs to.
+    /// the block's gutter is the same width in a message that cannot know which
+    /// call it belongs to.
     #[test]
     fn every_mark_is_the_gutter() {
         assert_eq!(
             UnicodeWidthStr::width(Symbols::GUTTER_MARK),
             Symbols::GUTTER
+        );
+        assert!(
+            Symbols::GUTTER_MARK.starts_with(Symbols::GUTTER_PIPE),
+            "the pipe is the gutter's first column: {:?}",
+            Symbols::GUTTER_MARK
         );
         for rung in [Symbols::SYMBOLS, Symbols::ASCII] {
             for tool in ToolName::ALL {

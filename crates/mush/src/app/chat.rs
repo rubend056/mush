@@ -56,7 +56,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -65,9 +65,12 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::message::{Image, Message};
 use mush_core::session;
 use mush_core::text::{markdown_row_counts, wrap_text, wrap_text_capped};
+use mush_core::tools::ToolName;
 use mush_core::transcript;
+use mush_core::ToolCall;
+use serde_json::Value;
 
-use crate::agent::{call_digest, CallFacts, FAILED};
+use crate::agent::{call_digest, payload, read_picture, CallFacts, CallOutcome, Tone, FAILED};
 use crate::app::call_grid;
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
@@ -443,20 +446,55 @@ struct Lost {
 }
 
 /// One stop of the select cursor: a source line of the message it stands in,
-/// or the tail a folded block's cap hid — the rows a pane paints as one `…`.
+/// or the lines a folded block's `…` stands for.
 ///
-/// The order is the transcript's: `Line(n)` before `Line(n+1)`, and a message's
-/// `Tail` after every one of its lines. The copy reads that order too: a
-/// selection's text is the source lines its stops cover ([`Stops::span`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// The order is the pane's, and it is *not* the enum's own declaration order
+/// any more: a `Line` sorts by its number, and the `…` sorts between the two
+/// lines it stands between — after every line the head painted, before the
+/// first line the tail paints. [`Stop::rank`] is that order, spelled once
+/// because the enum's derive could not know it: `Tail`'s place is a fact about
+/// the block's shape, not about the variant. [`Stops`] is where the shape
+/// lives, and the copy reads the order too ([`Stops::span`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     /// An index into `Message::text().split('\n')`.
     Line(usize),
-    /// Every source line the fold painted no row for. It names no line because
-    /// *which* line that is is the pane's measure and the block's kind
-    /// ([`Fold::shown`] rows), not the transcript's: this is the one spelling of
-    /// "the hidden tail", wherever the fold falls.
-    Tail,
+    /// The `…` a folded block paints, and the first and last source lines it
+    /// stands for — the lines with no row of their own on the pane. Which
+    /// lines those are is the pane's measure and the block's kind
+    /// ([`Fold::shown`] rows) and not the transcript's, which is why the
+    /// elision names its own span rather than leaving a reader to count from
+    /// the rows around it: the span is what `Enter` copies
+    /// ([`Stops::span`]) and what the head and the tail leave between them.
+    Tail(usize, usize),
+}
+
+impl Stop {
+    /// Where this stop sits in the pane's own order.
+    ///
+    /// `Line(n)` is `(n, 0, 0)`; the `…` before it — the elision stands for
+    /// lines at and after `first` and the pane paints it under every line the
+    /// head painted — is `(first - 1, 1, last)`. So `Line(n-1) < Tail(n, _) <
+    /// Line(n)`, and two elisions order by their own spans. `saturating_sub`
+    /// because the key must exist for every value, span or not.
+    fn rank(self) -> (usize, u8, usize) {
+        match self {
+            Stop::Line(line) => (line, 0, 0),
+            Stop::Tail(first, last) => (first.saturating_sub(1), 1, last),
+        }
+    }
+}
+
+impl Ord for Stop {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for Stop {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The select mode: a cursor over the transcript's *stops*, and the window a
@@ -664,7 +702,7 @@ fn lines_of(message: &Message) -> Option<Vec<&str>> {
 }
 
 /// One message's cursor stops at a pane's measure: the source lines the pane
-/// painted a row for, and whether its fold hid a tail after them.
+/// painted a row for, and the lines its fold hid behind the one `…`.
 ///
 /// Built from the painter's own wrap walk ([`folded_rows`]), so the boundary
 /// the cursor steps over is the boundary the pane painted — never a second wrap
@@ -674,15 +712,19 @@ struct Stops {
     /// The message's source lines.
     lines: usize,
     /// How many of them have a painted row, counted from the first: every line
-    /// up to the last painted row's line has a row. The rest are the one
-    /// [`Stop::Tail`] when `tail` is set — and this is also the first line that
-    /// tail covers, because wrapped rows run in source order. Without a tail
-    /// the rest have no stop at all: that is a block the fold gave no rows (the
-    /// failure row a hidden one keeps is line one), and the cursor never lands
-    /// on a line the pane did not paint.
+    /// up to the last painted row's line has one. Without a tail the rest have
+    /// no stop at all: that is a block the fold gave no rows (the failure row a
+    /// hidden one keeps is line one), and the cursor never lands on a line the
+    /// pane did not paint.
     visible: usize,
-    /// Whether the fold hid rows after the last painted one.
-    tail: bool,
+    /// The source lines the `…` stands for, where the fold painted one — the
+    /// span the elision row's own [`Stop::Tail`] carries, read back so the
+    /// clamp, the step and the copy agree with the row on the pane.
+    hidden: Option<(usize, usize)>,
+    /// The first line the fold paints *after* the `…`, where it paints a tail:
+    /// the fold's head and tail shape ([`folded_rows`]). `None` with a `hidden`
+    /// set is the head-only shape, whose `…` is the newest stop of the block.
+    tail_from: Option<usize>,
 }
 
 impl Stops {
@@ -701,17 +743,26 @@ impl Stops {
     /// lose a line the pane would have shown. A kind the fold gives no rows at
     /// all is the exception, and it does not wait for a width: the nothing is
     /// the fold's, not the wrap's, so such a block has no stop at any measure.
+    ///
+    /// `numbers` is the read window's line numbering, where the block is a
+    /// payload: it costs the rows columns, so the walk has to be given it to
+    /// wrap the block the way the pane did ([`Chat::payload_numbers`]).
     fn of(
         message: &Message,
         voice: Option<Voice>,
         measure: Option<usize>,
         fold: Fold,
+        numbers: Option<Numbering>,
     ) -> Option<Stops> {
         let lines = lines_of(message)?.len();
+        // Nothing is measured yet: with no tail and no elision every source
+        // line is a stop, which is the reading that cannot lose one the pane
+        // would have shown. The walk below is what narrows it.
         let mut stops = Stops {
             lines,
             visible: lines,
-            tail: false,
+            hidden: None,
+            tail_from: None,
         };
         let Some((kind, head)) = folded_block(message, voice) else {
             return Some(stops);
@@ -729,54 +780,85 @@ impl Stops {
             return fails(kind, message.text()).then_some(Stops {
                 lines,
                 visible: 1,
-                tail: false,
+                hidden: None,
+                tail_from: None,
             });
         }
         let Some(width) = measure else {
             return Some(stops);
         };
-        let (_, rows) = folded_rows(head, message.text(), width, kind, fold);
-        if rows.last().is_some_and(|(_, stop)| *stop == Stop::Tail) {
-            stops.visible = rows
-                .iter()
-                .filter_map(|(_, stop)| match stop {
-                    Stop::Line(line) => Some(line + 1),
-                    Stop::Tail => None,
-                })
-                .max()
-                .unwrap_or(0);
-            stops.tail = true;
+        let (_, rows) = folded_rows(head, message.text(), width, kind, fold, numbers);
+        // The shape, read off the rows the painter really built: the head's own
+        // lines up to the elision, the elision's span, and the tail's first
+        // line under it. The walk *narrows* the unmeasured answer, so `visible`
+        // starts at zero: seeded with `lines` it would never come down, and
+        // every hidden line would read as painted.
+        stops.visible = 0;
+        for (_, stop) in &rows {
+            match stop {
+                Stop::Line(line) if stops.hidden.is_none() => {
+                    stops.visible = stops.visible.max(line + 1);
+                }
+                Stop::Line(line) => {
+                    stops.tail_from = Some(stops.tail_from.map_or(*line, |from| from.min(*line)));
+                }
+                Stop::Tail(first, last) => stops.hidden = Some((*first, *last)),
+            }
         }
+        // The fold always paints at least one row of a kind it shows anything
+        // of, so this is a floor rather than a case — but `visible - 1` must
+        // have a `visible` to subtract from whatever a caller hands this.
+        stops.visible = stops.visible.max(1);
         Some(stops)
     }
 
+    /// Whether the pane painted a row for `line`: every line the head reaches,
+    /// and every line the tail paints. The hidden middle is the one gap — the
+    /// lines the `…` stands for, which are one stop of their own.
+    fn painted(self, line: usize) -> bool {
+        line < self.lines
+            && (line < self.visible || self.tail_from.is_some_and(|from| line >= from))
+    }
+
+    /// The elision's own stop, where this block paints one.
+    fn elision(self) -> Option<Stop> {
+        self.hidden.map(|(first, last)| Stop::Tail(first, last))
+    }
+
     /// The stop a cursor's line names at this measure: the line itself where
-    /// the pane painted a row for it, and the one tail where the fold hid it.
+    /// the pane painted a row for it, and the one elision where the fold hid
+    /// it.
     fn clamp(self, stop: Stop) -> Stop {
-        match (stop, self.tail) {
-            (Stop::Tail, true) => Stop::Tail,
-            (Stop::Tail, false) => Stop::Line(self.visible - 1),
-            (Stop::Line(line), true) if line >= self.visible => Stop::Tail,
-            (Stop::Line(line), _) => Stop::Line(line.min(self.visible - 1)),
+        match stop {
+            Stop::Tail(..) => self
+                .elision()
+                .unwrap_or_else(|| Stop::Line(self.visible - 1)),
+            Stop::Line(line) if self.painted(line) => Stop::Line(line),
+            Stop::Line(_) => self
+                .elision()
+                .unwrap_or_else(|| Stop::Line(self.visible - 1)),
         }
     }
 
     /// The newest stop of the message.
     fn last(self) -> Stop {
-        if self.tail {
-            Stop::Tail
-        } else {
-            Stop::Line(self.visible - 1)
+        match (self.tail_from, self.elision()) {
+            // A tail: the block's own last line, painted four rows down.
+            (Some(_), _) => Stop::Line(self.lines - 1),
+            // The head-only shape: the `…` is the newest row the pane painted.
+            (None, Some(elision)) => elision,
+            (None, None) => Stop::Line(self.visible - 1),
         }
     }
 
-    /// The source lines `stop` covers: one line for [`Stop::Line`], and every
-    /// line the fold hid for [`Stop::Tail`]. Clamp first ([`Self::clamp`]): a
-    /// `Tail` on a message the pane did not clip is not a stop at all.
+    /// The source lines `stop` covers: one line for [`Stop::Line`], and the
+    /// whole span the elision stands for — the lines with no row of their own —
+    /// for [`Stop::Tail`]. Clamp first ([`Self::clamp`]): an elision on a
+    /// message the pane did not clip is not a stop at all.
     fn span(self, stop: Stop) -> (usize, usize) {
         match stop {
             Stop::Line(line) => (line, line),
-            Stop::Tail => (self.visible, self.lines - 1),
+            Stop::Tail(first, last) => (first, last),
         }
     }
 }
@@ -1034,6 +1116,19 @@ pub struct Chat {
     /// [`Fold`] behind every pane, so two panes cannot fold the same kind to
     /// two numbers — and so a view that sets one has one place to set it.
     fold: Fold,
+    /// When the tool call the tree says each agent is running began, keyed by
+    /// the agent, for the in-flight row's `… 12s`.
+    ///
+    /// The *tree* owns the fact — a node's `Phase::Activity` carries the
+    /// moment it began in `AgentNode::since`, the same instant the row beside
+    /// the pane ages from — and the app hands the pane a copy of it on every
+    /// agent event ([`Self::set_call_clock`]). The frame reads the copy
+    /// ([`Self::call_age`]), because a call's row is painted from the
+    /// transcript and a message has no wall clock: this is the one way the
+    /// pane can answer "is it stuck?" without a key. A *view* of a fact the
+    /// tree already holds — nothing is stored, and an agent whose phase is not
+    /// an activity has no clock here at all.
+    call_at: HashMap<AgentId, Instant>,
 }
 
 /// Every tool call's digest in one message, and the length the agent's
@@ -1071,6 +1166,7 @@ impl Chat {
             output: false,
             symbols: Symbols::from_env(),
             fold: Fold::DEFAULT,
+            call_at: HashMap::new(),
         }
     }
 
@@ -2073,7 +2169,8 @@ impl Chat {
     fn stops_at(&self, on: AgentId, index: usize, measure: Option<usize>) -> Option<Stops> {
         let message = self.transcript(on).get(index)?;
         let voice = self.voice_at(on, index, message);
-        Stops::of(message, voice, measure, self.painted_fold())
+        let numbers = self.payload_numbers(on, index, message);
+        Stops::of(message, voice, measure, self.painted_fold(), numbers)
     }
 
     /// The cursor as the transcript *and the pane's last paint* are now: a
@@ -2116,12 +2213,25 @@ impl Chat {
         let stops = self.stops_at(on, cursor.0, measure)?;
         if forward {
             if let Stop::Line(line) = cursor.1 {
-                if line + 1 < stops.visible {
+                // The next line with a row of its own: the head's run, or the
+                // tail's. They are not contiguous — the hidden middle sits
+                // between them — so each side asks the pane's own shape
+                // ([`Stops::painted`]) rather than counting.
+                if stops.painted(line + 1) {
                     return Some((cursor.0, Stop::Line(line + 1)));
                 }
             }
-            if stops.tail && cursor.1 != Stop::Tail {
-                return Some((cursor.0, Stop::Tail));
+            // Off the end of a row the pane painted: the `…` is next where one
+            // stands ahead of the cursor — it sits under every head row, and
+            // behind a tail row there is none (a tail row past the last line is
+            // the block's end) — and the next message otherwise.
+            if let Some(elision) = stops.elision() {
+                if cursor.1 < elision {
+                    return Some((cursor.0, elision));
+                }
+            }
+            if let (Stop::Tail(..), Some(from)) = (cursor.1, stops.tail_from) {
+                return Some((cursor.0, Stop::Line(from)));
             }
             ((cursor.0 + 1)..transcript.len()).find_map(|index| {
                 self.stops_at(on, index, measure)
@@ -2129,12 +2239,18 @@ impl Chat {
             })
         } else {
             match cursor.1 {
-                Stop::Tail => Some((cursor.0, Stop::Line(stops.visible - 1))),
+                // Back onto the `…` where the pane paints one over this row
+                // (the tail's first row), and onto the last head row otherwise
+                // (the elision's own predecessor).
+                Stop::Tail(..) => Some((cursor.0, Stop::Line(stops.visible - 1))),
                 Stop::Line(0) => (0..cursor.0).rev().find_map(|index| {
                     self.stops_at(on, index, measure)
                         .map(|stops| (index, stops.last()))
                 }),
-                Stop::Line(line) => Some((cursor.0, Stop::Line(line - 1))),
+                Stop::Line(line) if stops.painted(line - 1) => {
+                    Some((cursor.0, Stop::Line(line - 1)))
+                }
+                Stop::Line(_) => stops.elision().map(|elision| (cursor.0, elision)),
             }
         }
     }
@@ -2557,6 +2673,63 @@ impl Chat {
         (body, cut)
     }
 
+    /// The app's copy of the tree's own clock: the moment the phase naming
+    /// `id`'s running call began, or `None` when the tree's phase is no longer
+    /// an activity (a thought, a fold, an ending).
+    ///
+    /// One caller, on every agent event ([`crate::app::App`]'s `on_agent`),
+    /// which is what keeps this a *copy* and not a second clock to maintain:
+    /// the phase is the fact, and this is the pane's reading of it. A phase
+    /// the tree refused a status for leaves no clock either — the refusals in
+    /// [`crate::app::tree::AgentTree::activity`] are exactly the cases where a
+    /// call is not running.
+    pub fn set_call_clock(&mut self, id: AgentId, at: Option<Instant>) {
+        match at {
+            Some(at) => self.call_at.insert(id, at),
+            None => self.call_at.remove(&id),
+        };
+    }
+
+    /// How long the call `on` is running has been running, where this message
+    /// is the one that made it: `None` for every other message.
+    ///
+    /// A run executes the calls of its newest assistant message, so the call
+    /// the tree's phase names is always the newest *call-bearing* message's own
+    /// — and no older message is asked: a result-less call further up is a
+    /// transcript that lost its ending (a restored session, a reaped actor),
+    /// and the clock belongs to the phase that named the newest call. The age
+    /// itself is the tree's, read here so the row moves with the frame the tick
+    /// already owes while anything runs ([`crate::app`]'s `DOT_PERIOD`).
+    fn call_age(&self, on: AgentId, index: usize) -> Option<Duration> {
+        let started = *self.call_at.get(&on)?;
+        let newest = self
+            .transcript(on)
+            .iter()
+            .rposition(|message| !message.tool_calls().is_empty())?;
+        (newest == index).then(|| started.elapsed())
+    }
+
+    /// The file window a message's payload is, where the pane can prove it is
+    /// one: the transcript's own pairing ([`Message::tool_call_id`]) walked
+    /// *back* to the call that made it — the window is the call's fact, and the
+    /// payload's lines are the result's ([`payload_numbers`]) — or `None` for
+    /// every message that is not a read's window.
+    ///
+    /// The walk is short by construction: the messages between a result and its
+    /// call are the other results of the same batch, and none of them carries a
+    /// call. A call id two turns share (a model that repeats `call_1`) cannot
+    /// be read wrong either, because this walks backwards: the nearest message
+    /// that made a call of this id is the one it belongs to.
+    fn payload_numbers(&self, on: AgentId, index: usize, message: &Message) -> Option<Numbering> {
+        let id = message.tool_call_id.as_deref()?;
+        let call = self.transcript(on)[..index]
+            .iter()
+            .rev()
+            .flat_map(Message::tool_calls)
+            .find(|call| call.id == id)?;
+        payload_numbers(call, message.text())
+    }
+
     /// Both views' reading of every tool call in one message: the ask, the
     /// outcome of the result the transcript pairs with the call, and that
     /// result's detail rows — computed once per call and kept.
@@ -2623,6 +2796,17 @@ impl Chat {
         // of both views — the unfolded one paints each result's details and
         // payload under it, and the compact log hides both ([`call_grid`]).
         let facts = self.call_facts(on, index, message);
+        // The two facts the transcript does not carry but the frame does: the
+        // read window this message's payload is, and the message's own share of
+        // the agent's running call. Both are read at the frame the pane is
+        // painting, which is what lets them move without the transcript moving.
+        let numbers = self.payload_numbers(on, index, message);
+        // Whether the next message is another result: the blank rule's one
+        // fact from outside this message ([`render_message`]).
+        let followed_by_result = self
+            .transcript(on)
+            .get(index + 1)
+            .is_some_and(|next| next.role == "tool");
         let mut lines = Vec::new();
         let rows = render_message(
             &mut lines,
@@ -2633,6 +2817,9 @@ impl Chat {
             fold,
             self.symbols,
             &facts,
+            self.call_age(on, index),
+            numbers,
+            followed_by_result,
         );
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
@@ -3161,6 +3348,8 @@ fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize,
         width,
         Kind::Reasoning,
         fold,
+        // A thought is nobody's file window: its rows carry no numbers.
+        None,
     );
 }
 
@@ -3623,12 +3812,23 @@ fn folded_block(message: &Message, voice: Option<Voice>) -> Option<(Kind, Head<'
             // stands under the header and the detail rows it belongs to — and
             // the failure mark is the same two columns, so a failure is not the
             // one result that reads out of the block.
-            let (mark, style) = if message.text().trim_start().starts_with(FAILED) {
+            let failure = message.text().trim_start().starts_with(FAILED);
+            let (mark, style) = if failure {
                 ("! ", Style::default().fg(Color::Red))
             } else {
                 (Symbols::GUTTER_MARK, dim())
             };
-            Some((Kind::Result, Head::solid(mark, style)))
+            // A failure is not a dump: its `! error: …` row is the news, and
+            // the log under it hangs under the mark's own width of blank rather
+            // than under a pipe that would read as payload ([`Head::solid`]).
+            // Everything else a result says *is* the dump, and the whole block
+            // stands at the one `│ ` ([`Head::block`]).
+            let head = if failure {
+                Head::solid(mark, style)
+            } else {
+                Head::block(mark, style)
+            };
+            Some((Kind::Result, head))
         }
         "user" => {
             // Mush's own line about a child or a job, and the words another
@@ -3646,12 +3846,44 @@ fn folded_block(message: &Message, voice: Option<Voice>) -> Option<(Kind, Head<'
 /// The one row a fold spends on saying what it hid: the `…` and the tree's own
 /// excerpt count ([`more_label`]) — the same words the foot's count row and the
 /// pane's title use, so no surface invents a second.
+///
+/// This is the spelling of the *head-only* fold: a budget too small for a
+/// head, an elision and a tail paints its rows from the top and this row last,
+/// and `+N more` is a count of everything behind it. Where the fold paints a
+/// tail, [`elision_between`] is the spelling instead.
 fn elision(hidden: usize) -> String {
     format!("… {}", more_label(hidden))
 }
 
-/// The head of a folded block: the mark that leads its first row, and the
-/// styles its mark and its words are painted in.
+/// The elision of a block the fold paints a *tail* of: `… 116 lines …`, the
+/// count between the rows above it and the rows below.
+///
+/// The same fact as [`elision`] and deliberately not a second spelling of it:
+/// the `+N more` counts what is *behind* the `…`, which is true of a block
+/// whose end is hidden and false of one whose end is painted four rows down —
+/// there the lines between the two are the whole story.
+fn elision_between(first: usize, last: usize) -> String {
+    let lines = last - first + 1;
+    let noun = if lines == 1 { "line" } else { "lines" };
+    format!("… {lines} {noun} …")
+}
+
+/// How many of a clipped block's rows the unfold paints from its **head**,
+/// with the elision row and the tail below it: the first three rows,
+/// `… N lines …`, the last four.
+///
+/// An output's end is usually where its answer is — a test summary, the
+/// failure at the bottom of a dump — and the fold used to hide it behind
+/// `… +N more lines`, so a human reading a command that failed at line 900 had
+/// to copy the block out to see why. The two numbers are the human's own: the
+/// head is the shape of the thing, the tail is the answer. [`TAIL_ROWS`] rows
+/// are the budget's own when the elision row is counted inside it
+/// ([`folded_rows`]), so the number of painted rows does not grow.
+const HEAD_ROWS: usize = 3;
+const TAIL_ROWS: usize = 4;
+
+/// The head of a folded block: the mark that leads its first row, the mark
+/// every row under it wears, and the styles both are painted in.
 ///
 /// One value because the two styles can differ: a tool result and a working
 /// note paint the whole row in one colour, while a voice colours only its mark
@@ -3659,15 +3891,35 @@ fn elision(hidden: usize) -> String {
 #[derive(Clone, Copy)]
 struct Head<'a> {
     mark: &'a str,
+    /// The mark a row *under* the first wears, where the block carries its own
+    /// gutter: a tool result's `│ `. `None` is the mark's own width of blank,
+    /// which is how a voice's words hang under them.
+    gutter: Option<&'a str>,
     mark_style: Style,
     body: Style,
 }
 
 impl<'a> Head<'a> {
-    /// A row painted in one style throughout: a tool result, a reasoning row.
+    /// A row painted in one style throughout: a reasoning row, a failed
+    /// result's `! error: …` and the log under it.
     fn solid(mark: &'a str, style: Style) -> Self {
         Self {
             mark,
+            gutter: None,
+            mark_style: style,
+            body: style,
+        }
+    }
+
+    /// A tool result's block: every row stands at the same `│ `, the block's
+    /// own gutter ([`Symbols::GUTTER_MARK`]) — so the dump is bound to the call
+    /// that made it, a wrapped line hangs visibly under the pipe above it, and
+    /// no command's output can be read as prose (the human's item 3). The mark
+    /// on the first row *is* that gutter: one shape for the whole block.
+    fn block(mark: &'a str, style: Style) -> Self {
+        Self {
+            mark,
+            gutter: Some(Symbols::GUTTER_MARK),
             mark_style: style,
             body: style,
         }
@@ -3678,6 +3930,7 @@ impl<'a> Head<'a> {
     fn spoken(mark: &'a str, style: Style) -> Self {
         Self {
             mark,
+            gutter: None,
             mark_style: style,
             body: Style::default(),
         }
@@ -3685,90 +3938,342 @@ impl<'a> Head<'a> {
 }
 
 /// One folded block's rows at the pane's width, and the stop each is the
-/// reading of: at most [`Fold::shown`] wrapped rows, and, where the text ran
-/// on, the one `…` row [`elision`] spells — whose stop is [`Stop::Tail`].
+/// reading of: the fold's own number of wrapped rows ([`Fold::shown`]), and —
+/// where the text ran on — the `…` row and, where the budget can hold one, the
+/// block's **tail** below it.
+///
+/// **The shape.** A clipped block paints [`HEAD_ROWS`] rows from its top, the
+/// `…`, and [`TAIL_ROWS`] rows from its bottom — the elision row is one of the
+/// fold's rows, so the number of painted rows does not grow: at
+/// [`Fold::DEFAULT`]'s eight, three and four either side of the `…`. An
+/// output's end is where its answer usually is, and the old `… +N more lines`
+/// hid it. A budget too small for a head, the elision and at least one tail row
+/// — the compact log's one-row reports, and any setting that low — keeps the
+/// head-only shape: the first `shown` rows and the `+N more` elision
+/// ([`elision`]) the fold always painted, because a report's own first row is
+/// what that shape exists to keep.
 ///
 /// A kind the fold gives no rows at all paints none — not even the `…` — and
 /// the one exception is the failure row [`Fold::shown`] keeps: a block that
 /// reports a failure paints its first row and nothing else ([`Fold`]).
 ///
-/// One walk, shared by the painter ([`folded_marked`]) and the select mode's
-/// stop boundary ([`Stops::of`]): the rows the cursor steps over are the rows
-/// the pane painted, never a second wrap with arithmetic of its own that could
-/// disagree with them. The returned head is the one the rows were wrapped
-/// under: a pane too narrow for the mark and a few words drops it, exactly as
-/// [`marked`] does for a voice's rows.
+/// **One walk, two readers.** The painter ([`folded_marked`]) and the select
+/// mode's stop boundary ([`Stops::of`]) both read these rows: the rows the
+/// cursor steps over are the rows the pane painted, never a second wrap with
+/// arithmetic of its own that could disagree with them. The returned head is
+/// the one the rows were wrapped under: a pane too narrow for the mark and a
+/// few words drops it, exactly as [`marked`] does for a voice's rows.
 ///
-/// `hidden` is the number of source lines the `…` stands for (the first line no
-/// painted row is the reading of, and every line after it), counted without
-/// wrapping them: counting painted rows would wrap the very text the fold
-/// exists not to wrap, and a line is what a reader counts in a dump anyway.
+/// **The elision's span.** The `…` is one stop for every line with no row of
+/// its own between the head and the tail ([`Stop::Tail`]): one `↓` steps the
+/// hidden middle, a selection that reaches it copies those lines whole, and the
+/// count it paints is the same number — the lines are counted, not wrapped,
+/// because counting painted rows would wrap the very text the fold exists not
+/// to wrap.
+///
+/// `numbers` is a read window's own line numbering, where the block is a
+/// payload ([`Numbering`]): it takes columns from every row, so the wrap is
+/// done per line rather than in one `wrap_text` over the block.
 fn folded_rows<'a>(
     head: Head<'a>,
     text: &str,
     width: usize,
     kind: Kind,
     fold: Fold,
+    numbers: Option<Numbering>,
 ) -> (Head<'a>, Vec<(String, Stop)>) {
     // A mark the pane clips is a row that says who spoke and nothing about what
-    // was said, so the words get the whole width instead.
+    // was said, so the words get the whole width instead — and the block's
+    // gutter goes with the mark: it is two of the columns the mark was taking.
     let head = if width >= head.mark.width() + MIN_BODY {
         head
     } else {
-        Head { mark: "", ..head }
+        Head {
+            mark: "",
+            gutter: None,
+            ..head
+        }
     };
     let lead = head.mark.width();
     let wrap = width.saturating_sub(lead);
     let shown = fold.shown(kind, text);
-    // Wrapped only as far as the fold: one row past the number is what tells
-    // the fold it has more to stand for.
-    let wrapped = wrap_text_capped(text, wrap, shown.saturating_add(1));
-    let clipped = wrapped.len() > shown;
-    // Which source line each painted row is the reading of, and how many lines
-    // the block has: the walk wraps only the lines the fold may paint and scans
-    // the rest, so the count cannot cost what the fold exists to avoid.
-    let mut tags: Vec<usize> = Vec::new();
+    // A kind the fold gives no rows at all paints none — not even the `…` (the
+    // hidden half of `Ctrl-O`) — and the failure row it keeps is a `1` that
+    // comes through the walk below.
+    if shown == 0 {
+        return (head, Vec::new());
+    }
+    // The head's own rows, wrapped only as far as the fold needs: one row past
+    // the budget is what tells the fold it has more to stand for. The walk
+    // counts the block's lines as it goes and stops wrapping once the budget is
+    // spent — the count cannot cost what the fold exists to avoid.
+    let budget = shown.saturating_add(1);
+    let mut head_rows: Vec<(String, usize)> = Vec::new();
     let mut total = 0usize;
-    let mut left = shown.saturating_add(1);
+    // Whether the head's last line ran on past the budget: a line that fills
+    // the room exactly may or may not have another row, and the difference is
+    // what a tail below would repeat. The probe is one extra row's wrap, once,
+    // on the row the fold is clipping at.
+    let mut head_cut = false;
     for (line, raw) in text.split('\n').enumerate() {
         total = line + 1;
-        if left == 0 {
+        if head_rows.len() >= budget {
             continue;
         }
-        let count = wrap_text_capped(raw, wrap, left).len();
-        tags.extend(std::iter::repeat(line).take(count));
-        left -= count;
+        let room = budget - head_rows.len();
+        let rows = line_rows(raw, line, wrap, numbers, room);
+        head_cut = rows.len() == room && line_rows(raw, line, wrap, numbers, room + 1).len() > room;
+        for row in rows {
+            head_rows.push((row, line));
+        }
     }
-    debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
-    let mut rows: Vec<(String, Stop)> = wrapped
+    let clipped = head_rows.len() > shown;
+    if !clipped || fold.hides(kind) {
+        // The whole block, or the failure row a hidden kind keeps: the head is
+        // all of it, and a kind the fold gives no rows has no head for an `…`
+        // to stand behind.
+        let rows = head_rows
+            .into_iter()
+            .take(shown)
+            .map(|(row, line)| (row, Stop::Line(line)))
+            .collect();
+        return (head, rows);
+    }
+    // The head-and-tail shape, where the budget can hold all three of its
+    // parts (see the fn's own doc): the head keeps [`HEAD_ROWS`], the elision
+    // its one row, and the tail whatever is left up to [`TAIL_ROWS`].
+    let tail_n = TAIL_ROWS.min(shown.saturating_sub(HEAD_ROWS + 1));
+    if tail_n > 0 {
+        let head_n = shown - 1 - tail_n;
+        let (tail, at_line_start) = tail_rows(text, wrap, tail_n, numbers);
+        let head_last = head_rows[head_n - 1].1;
+        let tail_first = tail[0].1;
+        // Whether the head stopped inside its last line: the block's next row
+        // is a wrap of the same source line, and the elision owns the rest of
+        // it — the same counting the head-only shape does, and *not*
+        // `head_cut`'s, which probes the row the fold stopped wrapping at
+        // [`TAIL_ROWS`] rows further down.
+        let runs_on = head_rows
+            .get(head_n)
+            .is_some_and(|(_, line)| *line == head_last);
+        let first_hidden = head_last + usize::from(!runs_on);
+        let last_hidden = tail_first - usize::from(at_line_start);
+        // The elision stands for the lines with no row of their own between the
+        // two halves. Where the wraps meet on one line there is no such line —
+        // a single line taller than the budget, or a tail that starts on the
+        // head's own line — and the head-only shape paints the block instead,
+        // rather than an `…` that stands for nothing or a tail that repeats a
+        // row.
+        if tail_first > head_last && first_hidden <= last_hidden {
+            let mut rows: Vec<(String, Stop)> = head_rows
+                .into_iter()
+                .take(head_n)
+                .map(|(row, line)| (row, Stop::Line(line)))
+                .collect();
+            rows.push((
+                elision_between(first_hidden, last_hidden),
+                Stop::Tail(first_hidden, last_hidden),
+            ));
+            rows.extend(tail.into_iter().map(|(row, line)| (row, Stop::Line(line))));
+            return (head, rows);
+        }
+    }
+    // The head-only shape: the first `shown` rows, and the `…` standing for
+    // every line from the first one with no row of its own on — the first row
+    // the fold did not paint, whether that is the next line or the rest of this
+    // one. The count includes a line the head cut in half, exactly as the fold
+    // always counted it: a reader counts lines in a dump, and half of one is
+    // still a line behind the `…`.
+    let head_last = head_rows[shown - 1].1;
+    let first = head_last + usize::from(!head_cut);
+    let mut rows: Vec<(String, Stop)> = head_rows
         .into_iter()
         .take(shown)
-        .zip(tags.iter().map(|line| Stop::Line(*line)))
+        .map(|(row, line)| (row, Stop::Line(line)))
         .collect();
-    if clipped && !fold.hides(kind) {
-        // The `…` is part of *showing* a block: it stands for the first wrapped
-        // row the fold did not paint, and it is one stop for every line from
-        // there on: one `↓` steps the whole hidden tail, and a selection that
-        // reaches the `…` copies it whole. A kind the fold gives no rows at all
-        // has no head for it to stand behind — the hidden half of `Ctrl-O` — so
-        // nothing is elided there: a `…` on top of the failure row
-        // [`Fold::shown`] keeps would count lines the human asked the pane not
-        // to show.
-        let hidden = total - tags[shown];
-        rows.push((elision(hidden), Stop::Tail));
-    }
+    rows.push((
+        elision(total - first),
+        Stop::Tail(first, total.saturating_sub(1)),
+    ));
     (head, rows)
 }
 
+/// The last `tail` wrapped rows of a block, with the source line each is the
+/// reading of and whether the first of them starts its line — the two facts
+/// [`folded_rows`]'s shape needs of the half below the `…`.
+///
+/// Walked from the end, so a block the fold is hiding a megabyte of costs the
+/// lines the tail really needs ([`wrap_text_capped`]'s own reason, read
+/// backwards). The last line is wrapped *whole* where the walk has to reach
+/// into it: a line can be as long as a result's own cap, and the rows such a
+/// line hides are its last ones, which no forward-capped wrap can give.
+fn tail_rows(
+    text: &str,
+    wrap: usize,
+    tail: usize,
+    numbers: Option<Numbering>,
+) -> (Vec<(String, usize)>, bool) {
+    // Rows newest-first: each line's own rows in reverse, the last line first.
+    // One row past the tail is the walk's stop — it is what tells a line that
+    // *ends* the tail from one the tail starts inside.
+    let mut rows: Vec<(String, usize, usize)> = Vec::new();
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (at, raw) in lines.iter().enumerate().rev() {
+        if rows.len() > tail {
+            break;
+        }
+        let line = line_rows(raw, at, wrap, numbers, usize::MAX);
+        for (row, text) in line.into_iter().enumerate().rev() {
+            rows.push((text, at, row));
+        }
+    }
+    rows.truncate(tail);
+    // In paint order again: oldest first. `rows.last()` is now the tail's first
+    // row, and row zero of its line is the line's own first row — the case
+    // where the lines above it are hidden *whole*.
+    let at_line_start = rows.last().is_some_and(|(_, _, row)| *row == 0);
+    rows.reverse();
+    (
+        rows.into_iter().map(|(text, at, _)| (text, at)).collect(),
+        at_line_start,
+    )
+}
+
+/// The file's own line numbers a *read's* payload wears, where the pane can
+/// prove the payload is the file's own lines: `<n>: ` on each payload row —
+/// `740: pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;` under the block's
+/// `│ ` gutter — the shape `search` prints (`path:line: text`), so a row on
+/// the pane can be named, and the same shape `Ctrl-Y` copies.
+///
+/// `None` is the common case and the safe one. A command's output has no file's
+/// lines to name, and the reads whose payload is *not* the file's lines are
+/// exactly the ones the read's own outcome reader names
+/// (`read_outcome` in `crate::agent`): a refusal
+/// (`error: …`), a picture's label, an empty file, and the outline `read_file`
+/// falls back to when an unbounded read hits the cap. An unbounded read is the
+/// fifth: with no window named there is no `offset` to count from — and a wrong
+/// number is worse than none, which is why every one of these has to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Numbering {
+    /// The window's first line: the call's own `offset` argument, the fact the
+    /// digest reads too ([`crate::agent::digest`]).
+    first: usize,
+    /// How many of the block's source lines are the file's. The lines after
+    /// them are mush's own trailer (`[mush: lines 4–5 of 9 — read on with
+    /// offset=6]`), which wears the number column's blank and no number: a
+    /// number on a sentence would be a number on the wrong thing.
+    lines: usize,
+    /// The number column's digits: the widest number a payload line carries, so
+    /// the colons line up down the block.
+    digits: usize,
+}
+
+impl Numbering {
+    /// The columns the number and its `: ` take.
+    fn width(self) -> usize {
+        self.digits + 2
+    }
+
+    /// What source line `at`'s wrapped row `row` wears before its text: the
+    /// number on the line's first row, and the number column's blank under it —
+    /// a wrapped line hangs under its own text and never under its number.
+    fn prefix(self, at: usize, row: usize) -> String {
+        if at >= self.lines || row > 0 {
+            return " ".repeat(self.width());
+        }
+        format!("{:>digits$}: ", self.first + at, digits = self.digits)
+    }
+}
+
+/// One source line as a folded block paints it: wrapped to the width the
+/// numbering leaves, and every row prefixed — `cap` rows at most, the fold's
+/// own budget ([`wrap_text_capped`]'s reason), and the whole line where the
+/// caller asks for it (`usize::MAX`).
+fn line_rows(
+    line: &str,
+    at: usize,
+    wrap: usize,
+    numbers: Option<Numbering>,
+    cap: usize,
+) -> Vec<String> {
+    let (body, numbers) = match numbers {
+        Some(numbers) => (wrap.saturating_sub(numbers.width()).max(1), Some(numbers)),
+        None => (wrap, None),
+    };
+    wrap_text_capped(line, body, cap)
+        .into_iter()
+        .enumerate()
+        .map(|(row, text)| match numbers {
+            Some(numbers) => format!("{}{text}", numbers.prefix(at, row)),
+            None => text,
+        })
+        .collect()
+}
+
+/// The window a *read_file* call named, where the result is the file's own
+/// lines: the call's `offset` that the payload's first row is, the payload's
+/// line count, and the width of the widest number among them.
+///
+/// The pane's one reader of that fact, on the painting side of the transcript:
+/// the call it pairs with is found by the id the result carries
+/// ([`Chat::payload_numbers`]), because the result message alone does not know
+/// which tool wrote it — the mark names the tool, not the message. The rules
+/// for *not* answering are [`Numbering`]'s own doc; `arg_usize` is the same
+/// reader of the argument JSON the digest uses, so a window the digest calls
+/// `1408→1530` and a window the pane numbers cannot be two windows.
+fn payload_numbers(call: &ToolCall, result: &str) -> Option<Numbering> {
+    if ToolName::parse(&call.function.name)? != ToolName::ReadFile {
+        return None;
+    }
+    let args: Value = serde_json::from_str(&call.function.arguments).ok()?;
+    // An unbounded read names no window: it is answered by the whole file *or*
+    // by the file's outline, and the rows that come back are then not a run of
+    // lines at all. Only the call's own arguments can tell the two apart — the
+    // outline answer looks like any other payload — so a read that named no
+    // offset or limit is never numbered.
+    if args.get("offset").is_none() && args.get("limit").is_none() {
+        return None;
+    }
+    let first = mush_core::tools::arg_usize(&args, "offset", 1)
+        .unwrap_or(1)
+        .max(1);
+    let trimmed = result.trim_end();
+    if trimmed.starts_with(FAILED)
+        || read_picture(trimmed).is_some()
+        || trimmed.ends_with(" is empty")
+        || mush_core::outline::is_outline_answer(trimmed)
+    {
+        return None;
+    }
+    // The payload's own lines: [`payload`] drops mush's trailing notes, so the
+    // window's trailer is neither numbered nor counted.
+    let lines = payload(trimmed).lines().count();
+    if lines == 0 {
+        return None;
+    }
+    Some(Numbering {
+        first,
+        lines,
+        digits: (first + lines - 1).to_string().len(),
+    })
+}
+
 /// The rows of one folded block, painted: [`folded_rows`]'s walk, laid out with
-/// the mark on the first row and its own width of blank under it, exactly as
-/// [`marked`] paints a voice's rows.
+/// the mark on the first row and the block's own gutter — or the mark's width of
+/// blank, for a voice — on every row under it.
 ///
 /// The block is always a plain line: a folded block is a dump, a report or a
 /// working note, and never the reply the markdown view is for. The `…` row is
 /// part of the fold's own sentence rather than the block's words, so it wears
 /// the mark's style and carries [`Stop::Tail`] — one stop for every line the
-/// fold hid, so the cursor cannot sit on a row the pane never painted.
+/// fold hid, so the cursor cannot sit on a row the pane never painted. It wears
+/// the block's gutter too: a `…` between two runs of `│ ` lines is the fold
+/// speaking about *those* rows.
+///
+/// The arguments are [`folded_rows`]'s own, threaded one by one for the same
+/// reason ([`render_message`]'s `#[allow]` is the same argument): this is the
+/// painter of that walk, and its callers are its only readers.
+#[allow(clippy::too_many_arguments)]
 fn folded_marked(
     out: &mut Vec<Line<'static>>,
     rows: &mut Vec<Option<Stop>>,
@@ -3777,27 +4282,35 @@ fn folded_marked(
     width: usize,
     kind: Kind,
     fold: Fold,
+    numbers: Option<Numbering>,
 ) {
     let start = out.len();
     let base = rows.len();
-    let (head, folded) = folded_rows(head, text, width, kind, fold);
+    let (head, folded) = folded_rows(head, text, width, kind, fold, numbers);
     let lead = head.mark.width();
+    // What every row under the first wears in the mark's place: the block's own
+    // gutter where it has one (a tool result's `│ `), and the mark's own width
+    // of blank for a voice ([`Head::gutter`]). A wrapped payload line then
+    // hangs under the same pipe as the row it continues, and a command's dump
+    // cannot be read as prose.
+    let hang = || match head.gutter {
+        Some(gutter) => gutter.to_string(),
+        None => " ".repeat(lead),
+    };
     for (index, (line, stop)) in folded.into_iter().enumerate() {
-        let row = if stop == Stop::Tail {
-            Line::from(Span::styled(
-                format!("{}{}", " ".repeat(lead), line),
-                head.mark_style,
-            ))
-        } else if index == 0 {
-            Line::from(vec![
+        let row = match stop {
+            Stop::Tail(..) => Line::from(vec![
+                Span::styled(hang(), head.mark_style),
+                Span::styled(line, head.mark_style),
+            ]),
+            _ if index == 0 => Line::from(vec![
                 Span::styled(head.mark.to_string(), head.mark_style),
                 Span::styled(line, head.body),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled(" ".repeat(lead), head.body),
+            ]),
+            _ => Line::from(vec![
+                Span::styled(hang(), head.body),
                 Span::styled(line, head.body),
-            ])
+            ]),
         };
         out.push(row);
         rows.push(Some(stop));
@@ -3823,7 +4336,14 @@ fn folded_marked(
 /// entry of `message.tool_calls()`, the reading [`Chat::call_facts`] cached, and
 /// empty — or short of the call — for a caller that has none, when the header
 /// falls back to the call's own arguments read with no result and no workspace
-/// to trim a path against rather than guessing one.
+/// to trim a path against rather than guessing one. `age` is the third: how long
+/// the agent's running call has been running, where this message is the one that
+/// made it ([`Chat::call_age`]) — the in-flight row's `… 12s`. `numbers` is the
+/// fourth: the file window this message's payload is, where it is a read's own
+/// lines ([`Chat::payload_numbers`]), so the dump carries the numbers a row can
+/// be cited by. And `followed_by_result` is the one fact the closing blank needs
+/// from *outside* the message: whether another result's payload comes next,
+/// whose blank would sit inside one call block ([`closing_blank`]).
 ///
 /// A tool call's rows are the *same* rows in both views — the digest header
 /// [`call_grid`] paints — and the views differ only in what follows it: the
@@ -3845,6 +4365,9 @@ fn render_message(
     fold: Fold,
     symbols: Symbols,
     facts: &[CallFacts],
+    age: Option<Duration>,
+    numbers: Option<Numbering>,
+    followed_by_result: bool,
 ) -> Vec<Option<Stop>> {
     let start = out.len();
     let mut rows: Vec<Option<Stop>> = Vec::new();
@@ -3878,9 +4401,16 @@ fn render_message(
                 // mush's own line about a child or a job, and the words another
                 // agent addressed to this pane — the brief a child's pane opens
                 // with, a parent's steering — which are read the same way.
-                Some((kind, head)) => {
-                    folded_marked(out, &mut rows, head, message.text(), width, kind, fold)
-                }
+                Some((kind, head)) => folded_marked(
+                    out,
+                    &mut rows,
+                    head,
+                    message.text(),
+                    width,
+                    kind,
+                    fold,
+                    None,
+                ),
             }
             image_rows(out, message, width);
             closing_blank(out, &mut rows, start);
@@ -3920,6 +4450,12 @@ fn render_message(
             // Every other compact turn (a reply, a thought, a picture) keeps its
             // blank, and the shown view keeps the blank either way.
             let spoke = out.len() > words;
+            // The one clock this turn's rows carry: a call still in flight
+            // wears the elapsed time on its row, and the first call without a
+            // result is the one running (a batch's results land in order, so
+            // the calls behind it have not started). Consumed on that row, so
+            // a pending call behind it paints the ask alone.
+            let mut age = age;
             for (at, call) in message.tool_calls().iter().enumerate() {
                 let fallback;
                 let facts = match facts.get(at) {
@@ -3938,6 +4474,26 @@ fn render_message(
                         &fallback
                     }
                 };
+                // The age is *not* a result: the transcript still has no
+                // outcome for this call, and the row's sentence is the app's
+                // own reading of the tree's phase. It is a borrowed-or-owned
+                // fact because the cache's own entry is shared with the other
+                // rows of the batch.
+                let aged;
+                let facts = match (age, facts.outcome.is_none()) {
+                    (Some(elapsed), true) => {
+                        age = None;
+                        aged = CallFacts {
+                            outcome: Some(CallOutcome {
+                                text: format!("… {}", crate::app::short_age(elapsed)),
+                                tone: Tone::Running,
+                            }),
+                            ..facts.clone()
+                        };
+                        &aged
+                    }
+                    _ => facts,
+                };
                 let mark = symbols.mark(&call.function.name);
                 for row in call_grid::header(call, facts, width, mark) {
                     out.push(row);
@@ -3950,7 +4506,21 @@ fn render_message(
                     }
                 }
             }
-            if spoke || !compact {
+            // The blank a turn closes with — and its one exception: in the
+            // shown view a turn that made calls closes with none, because the
+            // rows under it are those calls' payloads and the blank would sit
+            // *inside* the block the human reads as one thing (finding: the
+            // blank the payload used to be pushed away from its header by).
+            // The compact log is untouched: a call block paints no payload
+            // there, so there is no inside for a blank to fall into, and its
+            // own rule (`spoke`) is what keeps consecutive command-only turns
+            // one dense list.
+            let closes = if compact {
+                spoke
+            } else {
+                message.tool_calls().is_empty()
+            };
+            if closes {
                 closing_blank(out, &mut rows, start);
             } else {
                 rows.resize(out.len() - start, None);
@@ -3961,10 +4531,26 @@ fn render_message(
             // [`Kind::Result`]; the failure row it may never give up is the
             // fold's own rule ([`Fold`]).
             if let Some((kind, head)) = folded_block(message, None) {
-                folded_marked(out, &mut rows, head, message.text(), width, kind, fold);
+                folded_marked(
+                    out,
+                    &mut rows,
+                    head,
+                    message.text(),
+                    width,
+                    kind,
+                    fold,
+                    numbers,
+                );
             }
             image_rows(out, message, width);
-            closing_blank(out, &mut rows, start);
+            // A payload closes its block only where the next thing is not
+            // another payload: two results of one turn are one call block, and
+            // the blank between them was the last one the pane spent inside it.
+            if !followed_by_result {
+                closing_blank(out, &mut rows, start);
+            } else {
+                rows.resize(out.len() - start, None);
+            }
         }
         _ => {}
     }
@@ -4186,6 +4772,9 @@ mod tests {
             fold,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         lines
     }
@@ -4734,11 +5323,12 @@ mod tests {
         );
     }
 
-    /// A line behind a folded result's cap still has a row to stand on — the `…`
-    /// that hides it, which the frame clamps the cursor onto — and that row is
-    /// the whole hidden tail's one stop: the copy takes every line it stands
-    /// for, because the fold is the pane's, not the transcript's. The chat asks
-    /// for the shown view: the compact log paints no row of a result at all.
+    /// A line behind a folded result's fold still has a row to stand on — the
+    /// `…` that hides it, which the frame clamps the cursor onto — and that row
+    /// is the whole hidden middle's one stop: the copy takes every line it
+    /// stands for, because the fold is the pane's, not the transcript's. The
+    /// chat asks for the shown view: the compact log paints no row of a result
+    /// at all.
     #[test]
     fn a_line_behind_a_tool_results_cap_stands_on_the_ellipsis() {
         let result = (0..12)
@@ -4749,15 +5339,16 @@ mod tests {
         chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
         chat.start_select(AgentId::ROOT);
-        // The pane's own measure first: that is where its cap falls, and the
-        // hidden lines are one stop only once it has painted one.
+        // The pane's own measure first: that is where its fold falls — three
+        // head rows, the `…` for the five hidden lines, four tail rows — and
+        // the hidden lines are one stop only once it has painted one.
         let pane = pane(AgentId::ROOT);
         chat.painted(&pane, 40, 8);
         chat.select_apply(AgentId::ROOT, SelectKey::First);
-        chat.select_apply(AgentId::ROOT, SelectKey::Move(11));
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(3));
         let painted = chat.painted(&pane, 40, 8);
         let cursor = painted.select.as_ref().expect("painted").cursor.clone();
-        assert_eq!(cursor.len(), 1, "the hidden tail has one row to stand on");
+        assert_eq!(cursor.len(), 1, "the hidden middle has one row to stand on");
         assert!(
             shown(&painted.lines[cursor[0]..=cursor[0]])[0].contains('…'),
             "and it is the ellipsis"
@@ -4766,13 +5357,30 @@ mod tests {
             .select_apply(AgentId::ROOT, SelectKey::Copy)
             .expect("Enter copies");
         assert_eq!(
-            copied.text, "line 8\nline 9\nline 10\nline 11",
-            "the whole tail, not the one line the press landed on"
+            copied.text, "line 3\nline 4\nline 5\nline 6\nline 7",
+            "the whole hidden middle, not the one line the press landed on"
         );
         assert_eq!(
             copied.line,
-            "copied 4 lines from #0's tool result — 29 bytes"
+            "copied 5 lines from #0's tool result — 34 bytes"
         );
+
+        // And the tail's own rows are stops of their own now: the row below the
+        // `…` is the first line the pane paints there, and `Enter` on it copies
+        // that line alone — the fold is still the pane's, but the rows it *did*
+        // paint are lines like any other.
+        chat.start_select(AgentId::ROOT);
+        chat.painted(&pane, 40, 8);
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(4));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(
+            copied.text, "line 8",
+            "the tail's first row is its own line"
+        );
+        assert_eq!(copied.line, "copied 1 line from #0's tool result — 6 bytes");
     }
 
     /// The `…` a folded block's cap paints is one stop, not one stop per line it
@@ -4802,40 +5410,55 @@ mod tests {
         };
         assert!(row(&chat).contains("after the result"), "the newest line");
 
-        // Back over the elided stop in one: the `…` row, then the result's last
-        // painted line — not another hidden line under the same `…`.
+        // Back over the tail the pane paints: every row the fold painted has a
+        // stop of its own, newest first — line 29, 28, 27, 26...
+        for at in (26..=29).rev() {
+            chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+            assert!(
+                row(&chat).contains(&format!("line {at}")),
+                "the tail's own rows are stops: line {at} is {:?}",
+                row(&chat)
+            );
+        }
+        // ... and then the `…` in one, standing for the 23 lines between the
+        // head and the tail — the one step the hidden middle costs, however
+        // many lines it holds.
         chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
         assert!(
-            row(&chat).contains('…'),
+            row(&chat).contains("… 23 lines …"),
             "one step back is the elided stop: {:?}",
             row(&chat)
         );
         chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
         assert!(
-            row(&chat).contains("line 7"),
-            "and the next is line 7, the last line the pane painted: {:?}",
+            row(&chat).contains("line 2"),
+            "and the next is line 2, the last line the head painted: {:?}",
             row(&chat)
         );
 
         // Forward the same way: one `↓` is the elided stop, the next is the
-        // message after the result.
+        // tail's own first row, and from there the rest of the tail.
         chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
         assert!(row(&chat).contains('…'), "down is the elided stop again");
         chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
         assert!(
-            row(&chat).contains("after the result"),
-            "and down again is the next message: {:?}",
+            row(&chat).contains("line 26"),
+            "and down again is the tail's first row: {:?}",
             row(&chat)
         );
-
-        // And `↑` reverses it exactly.
-        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
-        assert!(row(&chat).contains('…'), "up is the elided stop");
-        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
-        assert!(row(&chat).contains("line 7"), "and up again is line 7");
+        for at in 27..=29 {
+            chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+            assert!(row(&chat).contains(&format!("line {at}")), "line {at}");
+        }
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        assert!(
+            row(&chat).contains("after the result"),
+            "and past the tail is the next message: {:?}",
+            row(&chat)
+        );
     }
 
-    /// `Shift-↓` onto the elided stop selects the whole block it stands for:
+    /// `Shift-↓` onto the elided stop selects the whole span it stands for:
     /// `Enter` hands the writer every source line behind the `…`, in order and
     /// byte for byte — the message's own text, not the pane's screen — and the
     /// line mush says counts them. Before this, the same gesture copied the one
@@ -4853,29 +5476,33 @@ mod tests {
         chat.push_message(AgentId::ROOT, message.clone());
         chat.push_message(AgentId::ROOT, Message::assistant("after the result"));
         chat.start_select(AgentId::ROOT);
-        // The pane's measure, then the cursor onto the result's last painted
-        // line: the stop above it is the elided one.
+        // The pane's measure, then the cursor onto the head's own last line:
+        // the stop below it is the elided one, and `Shift-↓` selects from the
+        // row the human started on through the whole hidden middle.
         let pane = pane(AgentId::ROOT);
         chat.painted(&pane, 40, 12);
-        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1)); // the elided stop
-        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1)); // line 7
+        chat.select_apply(AgentId::ROOT, SelectKey::First); // line 0
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(2)); // line 2, the head's last
         chat.select_apply(AgentId::ROOT, SelectKey::Extend(1)); // onto the `…`
         let copied = chat
             .select_apply(AgentId::ROOT, SelectKey::Copy)
             .expect("Enter copies");
         let lines: Vec<&str> = message.text().split('\n').collect();
-        let tail = lines[7..].join("\n");
-        assert_eq!(copied.text, tail, "lines 7 on, source for source");
+        let hidden = lines[2..=25].join("\n");
+        assert_eq!(
+            copied.text, hidden,
+            "line 2 through the hidden middle, source for source"
+        );
         assert!(
-            copied.text.ends_with(&lines[8..].join("\n")),
+            copied.text.ends_with(&lines[3..=25].join("\n")),
             "every hidden line is in it, in order"
         );
         assert_eq!(
             copied.line,
             format!(
                 "copied {} lines from #0's tool result — {} bytes",
-                lines.len() - 7,
-                tail.len()
+                24,
+                hidden.len()
             )
         );
     }
@@ -5485,7 +6112,7 @@ mod tests {
         // payload is not painted, the report keeps its one row, and the
         // reasoning — `Ctrl-T`'s block, not output — is no row at all.
         assert!(
-            fresh.iter().any(|row| row.contains("→ exit 0 · 1 line")),
+            fresh.iter().any(|row| row.contains("→ 1 line")),
             "the call's row carries its outcome: {fresh:?}"
         );
         assert!(
@@ -5787,7 +6414,7 @@ mod tests {
             "{painted:?}"
         );
         assert!(
-            painted.iter().any(|row| row == "  wrote 3 lines"),
+            painted.iter().any(|row| row == "│ wrote 3 lines"),
             "{painted:?}"
         );
 
@@ -5807,6 +6434,84 @@ mod tests {
         assert_ne!(
             ok.spans.first().map(|span| span.style.fg),
             Some(Some(Color::Red))
+        );
+    }
+
+    /// The human's item 3: a call and its result are **one block**. Every row
+    /// under the header stands at the block's own `│ ` — the wrapped rows of a
+    /// long line too, so output that runs on hangs visibly under the row it
+    /// continues — and no blank stands *inside* the block: the header, its
+    /// detail rows and the payload are one turn's own rows, and the blank comes
+    /// after the last of them.
+    ///
+    /// It is the blank the payload used to be pushed away from its header by
+    /// that made a command's output read as a second, unrelated message.
+    #[test]
+    fn a_result_is_bound_to_the_call_above_it() {
+        let mut chat = Chat::bare();
+        chat.set_output(true);
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    r#"{"command":"cat notes.txt"}"#,
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        // One long line of output — two wrapped rows at this width — and the
+        // end note that gives the command its outcome.
+        let long = format!("seen {}\n[exit 0]", "x".repeat(90));
+        chat.push_message(AgentId::ROOT, Message::tool("c1", long));
+        chat.push_message(AgentId::ROOT, Message::mush("#1 done: wrote notes"));
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12));
+        let header = rows
+            .iter()
+            .position(|row| row.contains('→'))
+            .expect("the call's header");
+        let payload: Vec<&String> = rows[header + 1..]
+            .iter()
+            .take_while(|row| row.starts_with("│ "))
+            .collect();
+        assert_eq!(
+            payload.len(),
+            4,
+            "the payload's rows follow the header with nothing between: {rows:?}"
+        );
+        assert_eq!(
+            payload[0].as_str(),
+            "│ seen",
+            "the payload leads the row under the header: {rows:?}"
+        );
+        let wrapped = payload[1..3].to_vec();
+        assert!(
+            wrapped.iter().all(|row| row.starts_with("│ xxx")),
+            "the long line's own rows, each at the block's pipe: {rows:?}"
+        );
+        assert_eq!(
+            wrapped
+                .iter()
+                .map(|row| row.chars().count() - 2)
+                .sum::<usize>(),
+            90,
+            "the wrapped rows are the line's own columns: {rows:?}"
+        );
+        assert_eq!(
+            payload[3].as_str(),
+            "│ [exit 0]",
+            "the command's end note is the block's own last row: {rows:?}"
+        );
+        assert_eq!(
+            rows[header + 1 + payload.len()],
+            "",
+            "the block closes with one blank, after its last payload row: {rows:?}"
+        );
+        assert!(
+            rows[header + 2 + payload.len()].starts_with('·'),
+            "and the next message follows that blank: {rows:?}"
         );
     }
 
@@ -7355,6 +8060,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(
             shown(&rows),
@@ -7415,6 +8123,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         let painted = shown(&rows);
         let rule = painted
@@ -7452,6 +8163,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         let painted = shown(&rows);
         assert_eq!(painted[0], "mush › │ quoted words");
@@ -7488,6 +8202,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(
             shown(&rows),
@@ -7526,6 +8243,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(shown(&rows)[0], "mush › a b c");
         let spans: Vec<(&str, bool, bool)> = rows[0]
@@ -7570,6 +8290,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(
             shown(&rows),
@@ -7631,6 +8354,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         let painted = shown(&rows);
         assert!(
@@ -7660,15 +8386,18 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(
             shown(&rows),
             vec![
-                "  # not a heading".to_string(),
-                "  ".to_string(),
-                "  - **not strong** `not code`".to_string(),
-                "  ".to_string(),
-                "  [not a link](https://example.com/a)".to_string(),
+                "│ # not a heading".to_string(),
+                "│ ".to_string(),
+                "│ - **not strong** `not code`".to_string(),
+                "│ ".to_string(),
+                "│ [not a link](https://example.com/a)".to_string(),
                 String::new(),
             ]
         );
@@ -7692,6 +8421,9 @@ mod tests {
             Fold::DEFAULT,
             Symbols::SYMBOLS,
             &[],
+            None,
+            None,
+            false,
         );
         assert_eq!(shown(&rows)[0], format!("you › {source}"));
 
@@ -7732,6 +8464,9 @@ mod tests {
                 Fold::DEFAULT,
                 Symbols::SYMBOLS,
                 &[],
+                None,
+                None,
+                false,
             );
             let painted = shown(&rows);
             for row in &painted {
@@ -7793,20 +8528,24 @@ mod tests {
         chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::mush(report.clone()));
 
-        // Eight wrapped rows, the `…` that stands for the rest; the pane trims
+        // The fold's own shape: the head's three rows, the `…` standing for
+        // the eighteen in the middle, and the block's last four. The pane trims
         // the blank that closes the message when the transcript ends there.
-        let painted = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 20));
-        let mut want: Vec<String> = (0..8)
-            .map(|n| {
-                if n == 0 {
-                    format!("· #1 done: line {n} of the report")
-                } else {
-                    format!("  #1 done: line {n} of the report")
-                }
-            })
-            .collect();
-        want.push("  … +17 more lines".to_string());
-        assert_eq!(painted, want, "the report folds like a result");
+        let n = |at: usize| format!("#1 done: line {at} of the report");
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 20)),
+            vec![
+                format!("· {}", n(0)),
+                format!("  {}", n(1)),
+                format!("  {}", n(2)),
+                "  … 18 lines …".to_string(),
+                format!("  {}", n(21)),
+                format!("  {}", n(22)),
+                format!("  {}", n(23)),
+                format!("  {}", n(24)),
+            ],
+            "the report folds like a result"
+        );
 
         // The cap is the pane's; the copy's is the text. `Ctrl-Y`'s `Enter`
         // still hands out every byte of the report, the folded lines included.
@@ -7819,6 +8558,153 @@ mod tests {
         assert_eq!(
             copied.line,
             format!("copied 25 lines from your message — {} bytes", report.len())
+        );
+    }
+
+    /// The human's item 5: a *read's* payload wears the file's own line
+    /// numbers — `1408: alpha`, the shape `search` prints — and only where the
+    /// pane can prove the payload is a run of the file's lines. The window is
+    /// the call's own `offset`, and the rules for saying nothing are the ones
+    /// that matter, because a number that is wrong is worse than no number at
+    /// all: an unbounded read is answered by the whole file *or* by its outline
+    /// (two answers that look alike on the pane), a picture's label, an empty
+    /// file and a failure are none of them the file's first line, and the
+    /// trailer mush appends wears the number column's blank, because a number
+    /// on mush's own sentence would be a number on the wrong thing.
+    #[test]
+    fn a_reads_payload_wears_its_files_own_line_numbers() {
+        // One windowed read, `offset: 1408`, answered with three lines and the
+        // trailer mush adds when the window was not the file's end.
+        let body = "alpha\nbeta\ngamma\n\
+                    [mush: lines 1408–1410 of 9000 — read on with offset=1411]";
+        let mut chat = Chat::bare();
+        chat.set_output(true);
+        let read = |chat: &mut Chat, id: &str, arguments: &str, text: &str| {
+            chat.push_message(
+                AgentId::ROOT,
+                Message {
+                    tool_calls: Some(vec![tool_call(id, "read_file", arguments)]),
+                    ..Message::assistant("")
+                },
+            );
+            chat.push_message(AgentId::ROOT, Message::tool(id, text.to_string()));
+        };
+        let numbered = |rows: &[String]| rows.iter().any(|row| row.starts_with("│ 1408: "));
+
+        read(
+            &mut chat,
+            "c1",
+            r#"{"path":"text.rs","offset":1408,"limit":3}"#,
+            body,
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 80, 12));
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("│ 1408: "))
+            .expect("the window's first numbered row");
+        assert_eq!(
+            rows[at..at + 4].to_vec(),
+            vec![
+                "│ 1408: alpha".to_string(),
+                "│ 1409: beta".to_string(),
+                "│ 1410: gamma".to_string(),
+                "│       [mush: lines 1408–1410 of 9000 — read on with offset=1411]".to_string(),
+            ],
+            "the file's own numbers, and mush's sentence hanging under none: {rows:?}"
+        );
+
+        // The refusals, each the same call shape as the one above: no window
+        // named, a picture, an empty file, a failure. The first is the one a
+        // reader has to trust most — the outline answer *is* lines of text, and
+        // only the call's own arguments say it is not the file's window.
+        let outline = format!(
+            "text.rs — 12 definitions; textual, Rust-first — not a compiler's answer ({})",
+            "1 of 12 rows shown"
+        );
+        for (id, arguments, text) in [
+            ("c2", r#"{"path":"text.rs"}"#, body),
+            (
+                "c3",
+                r#"{"path":"shots/x.png","offset":1}"#,
+                "read shots/x.png — a png image, 4198 bytes",
+            ),
+            (
+                "c4",
+                r#"{"path":"empty.rs","offset":1}"#,
+                "empty.rs is empty",
+            ),
+            (
+                "c5",
+                r#"{"path":"text.rs","offset":1408}"#,
+                "error: text.rs is outside the workspace",
+            ),
+            ("c6", r#"{"path":"text.rs"}"#, outline.as_str()),
+        ] {
+            let mut chat = Chat::bare();
+            chat.set_output(true);
+            read(&mut chat, id, arguments, text);
+            let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 80, 12));
+            assert!(
+                !numbered(&rows),
+                "{arguments} must not be numbered: {rows:?}"
+            );
+        }
+    }
+
+    /// The human's item 6: a call still in flight says how long it has been
+    /// running, on its own row — `❯ cargo test → … 12s` — off the clock the
+    /// tree's own activity row reads, so the two cannot disagree about the call
+    /// they are both describing. The clock is the tree's, handed to the pane on
+    /// every agent event (`App::on_agent`), and the age is a *view* of it:
+    /// nothing running means no clock, which means no age — the tick owes a
+    /// frame only while something runs, so a row that carried one anyway would
+    /// be a stale number on a still pane.
+    #[test]
+    fn a_call_in_flight_shows_how_long_it_has_run() {
+        let mut chat = Chat::bare();
+        chat.set_output(true);
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    r#"{"command":"cargo test"}"#,
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        let pane = pane(AgentId::ROOT);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 4)),
+            vec!["❯ cargo test".to_string()],
+            "a still tree means a row with no age at all"
+        );
+
+        chat.set_call_clock(
+            AgentId::ROOT,
+            Some(Instant::now() - Duration::from_secs(12)),
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 4))[0],
+            grid_row("❯ cargo test", "… 12s", 60),
+            "the clock the tree keeps is read on the call's own row"
+        );
+
+        // The result lands and the clock goes with it — one reading of "is this
+        // call still running", not two: the row is the outcome's own, and a
+        // landed call carries no age.
+        chat.push_message(AgentId::ROOT, Message::tool("c1", "ok\n[exit 0 after 5s]"));
+        chat.set_call_clock(AgentId::ROOT, None);
+        let rows = shown(&pane_rows(&chat, &pane, 60, 6));
+        assert_eq!(
+            rows[0],
+            grid_row("❯ cargo test", "1 line · 5s", 60),
+            "the result speaks for the call: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains('…')),
+            "and no age is left on the pane: {rows:?}"
         );
     }
 
@@ -7849,21 +8735,36 @@ mod tests {
             "a thought is shown whole until a setting says otherwise"
         );
 
-        // The result, the report and the brief each paint eight rows and the
-        // `…` — the same ten rows with the blank, whatever their mark.
+        // The result, the report and the brief each paint the fold's eight
+        // rows — three head rows, the `…` and four tail rows — and the blank
+        // after them, whatever their mark.
         let result = message_rows(&Message::tool("call_1", &many), None, 60, true);
         let report = message_rows(&Message::user(&many), Some(Voice::Mush), 60, true);
         let brief = message_rows(&Message::user(&many), Some(Voice::Brief), 60, true);
         for painted in [&result, &report, &brief] {
             let rows = shown(painted);
-            assert_eq!(rows.len(), 10, "eight rows and the `…`: {rows:?}");
+            assert_eq!(rows.len(), 9, "the fold's eight and the blank: {rows:?}");
             assert!(
-                rows[8].ends_with("… +17 more lines"),
-                "the ninth row names what is hidden: {rows:?}"
+                rows[0].ends_with("line 0"),
+                "the head starts at the block's own top: {rows:?}"
             );
-            assert_eq!(rows[9], "", "and the blank closes the message");
+            assert!(rows[2].ends_with("line 2"), "three head rows: {rows:?}");
+            assert!(
+                rows[3].ends_with("… 18 lines …"),
+                "the elision row names the hidden middle: {rows:?}"
+            );
+            assert!(
+                rows[4].ends_with("line 21"),
+                "and the tail starts four lines from the end: {rows:?}"
+            );
+            assert!(
+                rows[7].ends_with("line 24"),
+                "down to the block's own last line: {rows:?}"
+            );
+            assert_eq!(rows[8], "", "and the blank closes the message");
         }
-        assert_eq!(shown(&result)[0], "  line 0", "the result's own gutter");
+        assert_eq!(shown(&result)[0], "│ line 0", "the result's own gutter");
+        assert_eq!(shown(&result)[1], "│ line 1", "on every row of the block");
         assert_eq!(shown(&report)[0], "· line 0", "mush's own mark");
         assert_eq!(shown(&brief)[0], "brief › line 0", "the brief's mark");
 
@@ -8042,7 +8943,7 @@ mod tests {
             hidden,
             vec![
                 "mush › running the tests".to_string(),
-                grid_row("❯ cargo test", "exit 0 · 3 lines", 60),
+                grid_row("❯ cargo test", "3 lines", 60),
                 String::new(),
                 "· #1 done: the parser is written".to_string(),
             ],
@@ -8531,7 +9432,7 @@ mod tests {
                 grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
                 grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
                 grid_row("± text.rs", "3 hunks", 88),
-                grid_row("❯ cargo test -p mush-core", "exit 0 · 41 lines · 5s", 88),
+                grid_row("❯ cargo test -p mush-core", "41 lines · 5s", 88),
                 grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
                 grid_row("↳ table layout fixes", "#185 on mush/185", 88),
                 grid_row("⧗", "#185 done", 88),
@@ -8690,7 +9591,7 @@ mod tests {
         chat.push_message(AgentId::ROOT, Message::tool("c1", "ok\n[exit 0]"));
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 6)),
-            vec![grid_row("❯ cargo test", "exit 0 · 1 line", 60)],
+            vec![grid_row("❯ cargo test", "1 line", 60)],
             "the result landed: the arrow is read from the message that carried it"
         );
     }
@@ -8698,14 +9599,15 @@ mod tests {
     /// The shown view (`Ctrl-O` off), row for row, for the very transcript the
     /// compact log is drawn from: the **same digest header** the compact log
     /// paints, the paired result's detail rows under it, and the result's
-    /// payload at the grid's gutter — every block still at the fold's own eight
-    /// rows with its `…`, the failure and the report as they were, and a blank
-    /// closing every message.
+    /// payload at the block's own `│ ` gutter — every block at the fold's own
+    /// eight rows, three head and four tail either side of the `…`, the failure
+    /// and the report as they were, and a blank only where a block that said
+    /// words closes.
     ///
     /// This is the promise that one transcript and one header have two views:
     /// the compact log hides what the folded one shows and moves nothing the
     /// two share. The shown view is pinned whole — its fold numbers, its `…`
-    /// rows and its blanks included.
+    /// rows, its numbering and its blanks included.
     #[test]
     fn the_shown_view_keeps_its_rows_for_the_same_transcript() {
         let mut chat = drawn_transcript();
@@ -8717,77 +9619,69 @@ mod tests {
             shown(&pane_rows(&chat, &pane, 88, 400)),
             vec![
                 // The calls' own headers — the same rows the compact log paints,
-                // arrow and all — and the detail rows their results hold.
+                // arrow and all — and the detail rows their results hold, every
+                // one of them at the block's own `│ ` gutter.
                 grid_row("◐", "2 agents · 1 job · 1 unread", 88),
-                "  #1 running".to_string(),
-                "  #2 done".to_string(),
-                "  #c1 running".to_string(),
+                "│ #1 running".to_string(),
+                "│ #2 done".to_string(),
+                "│ #c1 running".to_string(),
                 grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
-                "  of 9000 lines".to_string(),
+                "│ of 9000 lines".to_string(),
                 grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
-                "  7 hits in crates/a.rs, crates/b.rs, crates/c.rs".to_string(),
+                "│ 7 hits in crates/a.rs, crates/b.rs, crates/c.rs".to_string(),
                 grid_row("± text.rs", "3 hunks", 88),
-                grid_row("❯ cargo test -p mush-core", "exit 0 · 41 lines · 5s", 88),
+                grid_row("❯ cargo test -p mush-core", "41 lines · 5s", 88),
                 grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
                 grid_row("↳ table layout fixes", "#185 on mush/185", 88),
-                "  mush/185 · .mush/wt/185".to_string(),
+                "│ mush/185 · .mush/wt/185".to_string(),
                 grid_row("⧗", "#185 done", 88),
-                "  from #185".to_string(),
+                "│ from #185".to_string(),
                 grid_row("⧗", "user spoke", 88),
                 grid_row("⇄ #9 stop", "error: no such child agent #9 — status lists yours", 88),
-                String::new(),
-                // Each result at the fold's eight rows (or fewer, where the
-                // result is shorter), with the `…` where it runs on — and every
-                // payload row at the headers' own gutter.
-                "  agents:".to_string(),
-                "  #1 ◐ running on mush/1".to_string(),
-                "  #2 ✉ ✓ wrote the lexer".to_string(),
-                "  jobs:".to_string(),
-                "  #c1 running 3s · cargo test".to_string(),
-                String::new(),
-                "  line 000 in the table's own column".to_string(),
-                "  line 001 in the table's own column".to_string(),
-                "  line 002 in the table's own column".to_string(),
-                "  line 003 in the table's own column".to_string(),
-                "  line 004 in the table's own column".to_string(),
-                "  line 005 in the table's own column".to_string(),
-                "  line 006 in the table's own column".to_string(),
-                "  line 007 in the table's own column".to_string(),
-                "  … +116 more lines".to_string(),
-                String::new(),
-                "  crates/a.rs:1: let column_widths = 1;".to_string(),
-                "  crates/a.rs:2: let column_widths = 2;".to_string(),
-                "  crates/a.rs:3: let column_widths = 3;".to_string(),
-                "  crates/b.rs:1: let column_widths = 4;".to_string(),
-                "  crates/b.rs:2: let column_widths = 5;".to_string(),
-                "  crates/c.rs:9: let column_widths = 6;".to_string(),
-                "  crates/c.rs:12: let column_widths = 7;".to_string(),
-                String::new(),
-                "  edited text.rs — 3 edits".to_string(),
-                String::new(),
-                "  test 0 ... ok".to_string(),
-                "  test 1 ... ok".to_string(),
-                "  test 2 ... ok".to_string(),
-                "  test 3 ... ok".to_string(),
-                "  test 4 ... ok".to_string(),
-                "  test 5 ... ok".to_string(),
-                "  test 6 ... ok".to_string(),
-                "  test 7 ... ok".to_string(),
-                "  … +34 more lines".to_string(),
-                String::new(),
-                "  [exit 101]".to_string(),
-                String::new(),
-                "  spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · wait"
+                // No blank between a call's header and the payload under it —
+                // the block is one thing — and the fold's own shape under each
+                // result: three head rows, the `…` counting the hidden middle,
+                // four tail rows. The read's window is numbered (`1408: `), its
+                // trailer taking the number column's blank, and the command's
+                // last note is one of its tail rows.
+                "│ agents:".to_string(),
+                "│ #1 ◐ running on mush/1".to_string(),
+                "│ #2 ✉ ✓ wrote the lexer".to_string(),
+                "│ jobs:".to_string(),
+                "│ #c1 running 3s · cargo test".to_string(),
+                "│ 1408: line 000 in the table's own column".to_string(),
+                "│ 1409: line 001 in the table's own column".to_string(),
+                "│ 1410: line 002 in the table's own column".to_string(),
+                "│ … 117 lines …".to_string(),
+                "│ 1528: line 120 in the table's own column".to_string(),
+                "│ 1529: line 121 in the table's own column".to_string(),
+                "│ 1530: line 122 in the table's own column".to_string(),
+                "│       [mush: lines 1408–1530 of 9000 — read on with offset=1531]".to_string(),
+                "│ crates/a.rs:1: let column_widths = 1;".to_string(),
+                "│ crates/a.rs:2: let column_widths = 2;".to_string(),
+                "│ crates/a.rs:3: let column_widths = 3;".to_string(),
+                "│ crates/b.rs:1: let column_widths = 4;".to_string(),
+                "│ crates/b.rs:2: let column_widths = 5;".to_string(),
+                "│ crates/c.rs:9: let column_widths = 6;".to_string(),
+                "│ crates/c.rs:12: let column_widths = 7;".to_string(),
+                "│ edited text.rs — 3 edits".to_string(),
+                "│ test 0 ... ok".to_string(),
+                "│ test 1 ... ok".to_string(),
+                "│ test 2 ... ok".to_string(),
+                "│ … 35 lines …".to_string(),
+                "│ test 38 ... ok".to_string(),
+                "│ test 39 ... ok".to_string(),
+                "│ test 40 ... ok".to_string(),
+                "│ [exit 0 after 5s]".to_string(),
+                "│ [exit 101]".to_string(),
+                "│ spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · wait"
                     .to_string(),
-                "  returns its summary".to_string(),
-                String::new(),
-                "  #185 done: the table is laid out".to_string(),
-                String::new(),
-                "  interrupted — the human wrote to you while you waited; it is in your transcript."
+                "│ returns its summary".to_string(),
+                "│ #185 done: the table is laid out".to_string(),
+                "│ interrupted — the human wrote to you while you waited; it is in your transcript."
                     .to_string(),
-                "  Answer it; your work is still running. use wait again when you need it."
+                "│ Answer it; your work is still running. use wait again when you need it."
                     .to_string(),
-                String::new(),
                 // The failure row, the report, the other agent's words, the
                 // human's line and the reply: all as they are in both views.
                 "! error: no such child agent #9 — status lists yours".to_string(),
@@ -8863,10 +9757,11 @@ mod tests {
     }
 
     /// The two states are the folded number and none, and the *shown* one is
-    /// exactly the fold's own table: eight wrapped rows and the `…` for a long
-    /// result, before and after the toggle — the key does not touch a number,
-    /// it only decides which state the pane paints. The chat asks for the shown
-    /// view first: the compact log is what a fresh chat opens in.
+    /// exactly the fold's own table: the head's three rows, the `…` and the
+    /// tail's four for a long result, before and after the toggle — the key
+    /// does not touch a number, it only decides which state the pane paints.
+    /// The chat asks for the shown view first: the compact log is what a fresh
+    /// chat opens in.
     #[test]
     fn ctrl_o_keeps_the_folds_numbers_in_the_shown_state() {
         let many = (0..25)
@@ -8879,9 +9774,12 @@ mod tests {
         let pane = pane(AgentId::ROOT);
 
         let before = shown(&pane_rows(&chat, &pane, 60, 20));
-        assert_eq!(before.len(), 9, "eight rows and the `…`: {before:?}");
-        assert_eq!(before[0], "  line 0");
-        assert_eq!(before[8], "  … +17 more lines");
+        assert_eq!(before.len(), 8, "the fold's eight rows: {before:?}");
+        assert_eq!(before[0], "│ line 0");
+        assert_eq!(before[2], "│ line 2");
+        assert_eq!(before[3], "│ … 18 lines …", "the hidden middle, counted");
+        assert_eq!(before[4], "│ line 21", "and the block's end, painted");
+        assert_eq!(before[7], "│ line 24");
 
         toggle_output(&mut chat);
         assert!(
@@ -8938,7 +9836,10 @@ mod tests {
             stops.visible, 1,
             "the failure row is the block's first line"
         );
-        assert!(!stops.tail, "no `…` paints, so there is no tail stop");
+        assert!(
+            stops.hidden.is_none(),
+            "no `…` paints, so there is no elision stop"
+        );
         assert_eq!(stops.span(Stop::Line(0)), (0, 0), "it covers its own line");
     }
 
@@ -9020,7 +9921,7 @@ mod tests {
             let rows = shown(&painted.lines);
             let (m, k) = match cursor {
                 (m, Stop::Line(k)) => (m, k),
-                (_, Stop::Tail) => panic!("no block of this transcript is capped"),
+                (_, Stop::Tail(..)) => panic!("no block of this transcript is capped"),
             };
             let line = texts[m].split('\n').nth(k).expect("a source line");
             let first = line.split(' ').next().unwrap();
@@ -9119,7 +10020,7 @@ mod tests {
             let cursor = chat.select.as_ref().expect("the mode is on").cursor;
             let (m, k) = match cursor {
                 (m, Stop::Line(k)) => (m, k),
-                (_, Stop::Tail) => panic!("no block of this transcript is capped"),
+                (_, Stop::Tail(..)) => panic!("no block of this transcript is capped"),
             };
             let line = texts[m].split('\n').nth(k).expect("a source line");
             assert!(

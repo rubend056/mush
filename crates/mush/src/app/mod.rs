@@ -2804,6 +2804,14 @@ impl App {
                 }
             }
         }
+        // The compact log's in-flight row wears the age of the call the tree
+        // says is running (`Chat::call_age`): one sync of the pane's copy of
+        // that clock per event, after the event has moved the phase — a phase
+        // that is no longer an activity (a thought, a fold, an ending) hands
+        // `None`, and the row stops claiming a call. The frame moves with it
+        // without a key, because the tick already repaints a second at a time
+        // while anything runs (`DOT_PERIOD`).
+        self.chat.set_call_clock(id, self.tree.call_started_at(id));
     }
 
     /// Whether anything in the tree is working: derived from the phases and the
@@ -12077,19 +12085,16 @@ mod tests {
         assert!(app.chat.selecting(), "the chat pane opens the mode");
     }
 
-    /// The text of the rows one frame paints the select cursor on, for the
-    /// tests that read the mode through the frame rather than the state.
-    fn cursor_rows(screen: &Screen) -> Vec<String> {
+    /// The rows one frame paints a pane's transcript on, each row's spans
+    /// joined: the rows the select mode's cursor indexes into.
+    fn transcript_rows(screen: &Screen) -> Vec<String> {
         let Screen::Panes(panes) = screen else {
             return Vec::new();
         };
         let Some(transcript) = &panes.chat.transcript else {
             return Vec::new();
         };
-        let Some(select) = &transcript.select else {
-            return Vec::new();
-        };
-        let rows: Vec<String> = transcript
+        transcript
             .lines
             .iter()
             .map(|line| {
@@ -12098,8 +12103,36 @@ mod tests {
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
             })
-            .collect();
-        select.cursor.iter().map(|at| rows[*at].clone()).collect()
+            .collect()
+    }
+
+    /// The rows the select cursor stands on, as indices into the pane's
+    /// transcript rows ([`transcript_rows`]): a test about the fold's *boundary*
+    /// asks which row the cursor stands on, which the words of a row cannot
+    /// answer — the row under a `…` can be a wrap of the line the tail starts
+    /// inside, and reads as the middle of no line at all.
+    fn cursor_indexes(screen: &Screen) -> Vec<usize> {
+        let Screen::Panes(panes) = screen else {
+            return Vec::new();
+        };
+        panes
+            .chat
+            .transcript
+            .as_ref()
+            .and_then(|transcript| {
+                transcript
+                    .select
+                    .as_ref()
+                    .map(|select| select.cursor.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The row the `…` a folded block paints stands on, if the pane paints one.
+    fn elision_row(screen: &Screen) -> Option<usize> {
+        transcript_rows(screen)
+            .iter()
+            .position(|row| row.contains('…'))
     }
 
     /// The audit's PM5: a resize and a key in the same drain stepped the cursor
@@ -12128,7 +12161,9 @@ mod tests {
         app.chat.set_output(true);
 
         // Frame one, at 40 columns: the paint publishes the measure, and the
-        // cursor is walked onto the second source line.
+        // cursor is walked onto the block's own fold boundary — at this width
+        // the head's three rows are the whole of line 1, so line 2 is behind
+        // the `…` and one `↓` stands on it.
         painted(&mut app, 40, 24);
         assert!(
             app.chat.start_select(AgentId::ROOT).is_none(),
@@ -12137,10 +12172,11 @@ mod tests {
         app.chat.select_apply(AgentId::ROOT, SelectKey::First);
         app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
         let at_40 = painted(&mut app, 40, 24).0;
-        assert!(
-            cursor_rows(&at_40).iter().any(|row| row.contains("row02")),
-            "the narrow pane paints the cursor on line 2: {:?}",
-            cursor_rows(&at_40)
+        assert_eq!(
+            cursor_indexes(&at_40),
+            elision_row(&at_40).into_iter().collect::<Vec<_>>(),
+            "the narrow pane paints the cursor on the `…`: {:?}",
+            transcript_rows(&at_40)
         );
 
         // The resize and the key in one drain, the order `main`'s loop reads
@@ -12149,33 +12185,44 @@ mod tests {
         app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
         let after = painted(&mut app, 120, 24).0;
 
-        // One `↓` is one source line down, and the wide pane paints it there.
-        assert!(
-            cursor_rows(&after).iter().any(|row| row.contains("row03")),
-            "one step lands on line 3: {:?}",
-            cursor_rows(&after)
+        // One `↓` is the first row the *wide* pane paints under the `…` — the
+        // tail's own first row — and not the tail's last line, which is where
+        // the narrow pane's fold ended and the leap the stale measure made.
+        let under = elision_row(&after).expect("the wide pane folds the block") + 1;
+        assert_eq!(
+            cursor_indexes(&after),
+            vec![under],
+            "one step lands under the `…`: {:?}",
+            transcript_rows(&after)
         );
 
-        // And `↑` returns: the step is reversible, which a `…` the cursor
-        // leapt onto is not (backward from it is the wide pane's last line).
+        // And `↑` returns: the step is reversible, which a step taken at the
+        // measure of the frame before is not — backward from the tail's first
+        // row is the `…`, and the leap left the cursor on the block's last line
+        // with the `…` four rows above it.
         app.chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
         let back = painted(&mut app, 120, 24).0;
-        assert!(
-            cursor_rows(&back).iter().any(|row| row.contains("row02")),
-            "`↑` brings the cursor back to line 2: {:?}",
-            cursor_rows(&back)
+        assert_eq!(
+            cursor_indexes(&back),
+            elision_row(&back).into_iter().collect::<Vec<_>>(),
+            "`↑` brings the cursor back to the `…`: {:?}",
+            transcript_rows(&back)
         );
 
         // And the copy still takes the stop the pane paints the cursor on —
         // the whole walk is pinned by `enter_copies_the_line_the_pane_painted_
-        // the_cursor_on` in `chat.rs`; this is the resize's own case.
+        // the_cursor_on` in `chat.rs`; this is the resize's own case, and the
+        // `…`'s stop is the whole middle the fold hid: from the line the head
+        // did not reach to the line the tail starts inside.
         let copied = app
             .chat
             .select_apply(AgentId::ROOT, SelectKey::Copy)
             .expect("Enter copies");
         assert!(
-            copied.text.starts_with("row02 "),
-            "the copy names the line the pane painted the cursor on: {:?}",
+            copied.text.starts_with("row02 ")
+                && copied.text.ends_with(&format!("row29 {}", "x".repeat(96)))
+                && copied.text.lines().count() == 28,
+            "the copy is the `…`'s own middle: {:?}",
             copied.text
         );
     }

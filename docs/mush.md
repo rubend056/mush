@@ -551,8 +551,9 @@ the `→` at `width - outcome_w`, two columns of gap before it, and the ask in
 what is left after the call's own **mark** — the tool's glyph and the space
 after it, two columns wide, measured rather than assumed so a wider glyph moves
 the ask and nothing else. The ask and the outcome are each cut with `…`
-from the right (the first clause is the one that matters, and the digest orders
-an outcome's clauses exit-status first); where the ask's column would fall under
+from the right (the first clause is the one that matters, and the digest puts
+the status clause first where the result has one); where the ask's column would
+fall under
 fourteen columns the outcome moves to a row of its own, under the ask and in the
 same outcome column, and the ask takes the pane — an outcome is never dropped.
 The ask is built from the call's own arguments — a path shown relative to the
@@ -561,25 +562,44 @@ it looked, a command's redundant leading `cd <workspace root> &&` and its
 trailing output shaping (`2>&1`, `2>/dev/null`, `| cat`, `| head -N`, `| tail
 -N`) stripped, because what the shaping cost is already in the outcome's line
 count. The outcome is read from the result's own sentences: an exit code with
-the command's own time (`exit 0 · 41 lines · 5s`), a read's line and byte
+the command's own time (`exit 1 · 41 lines · 5s`), a read's line and byte
 counts, a listing's rows, a wait's delivered `#185 done`/`#c2 done`, the words
 that outranked it (`user spoke`, `parent spoke`), and mush's own `nothing to
 wait for`; the tone colours it: clean green, failure red, in-flight or unknown
-dim.
+dim. **A clean end is not news**: `exit 0` is dropped and the row keeps what the
+command did (`41 lines · 5s`), while a failure keeps its whole sentence (`exit 1
+· 3 lines`), and a clean command with nothing else to say — no output, no time
+worth a clause — has no outcome at all and keeps its ask alone. A call whose
+result has not landed yet says how long it has been running instead, `→ … 12s`,
+dim, off the same clock the tree's own activity row reads.
 
 In the unfolded view the facts the outcome does not carry are painted under the
-call's header, dim, at the header's own gutter — a read's `of 812 lines`, the
-files a search hit, a command's `stderr 12 lines`, a spawn's `mush/188 ·
-.mush/wt/188` — and the result's payload is painted at that same gutter, so a
-call reads as one block. mush's own report about a child or a job and another
-agent's words are one row each, with the usual `… +N more lines` where they run
-on, so only what was actually spoken keeps whole words: the human's lines and
-the model's reply, which the fold never touches. A message paints its closing
-blank only where it painted rows of its own, and in the compact log a turn whose
-only rows are its call lines paints no blank either, so consecutive command-only
-turns read as one dense list. Like `Ctrl-T` the key writes nothing and is not
-stored, and the same press brings every row back — a restart opens compact
-again, because the launch view is the default and not a remembered one. Two rows
+call's header, dim, at the two columns the header's mark stands in — a read's
+`of 812 lines`, the files a search hit, a command's `stderr 12 lines`, a spawn's
+`mush/188 · .mush/wt/188` — and a result's payload is painted at that same `│ `,
+every row of it, so a call reads as one block and a wrapped line of output hangs
+visibly under the row it continues. Nothing blank stands *inside* a call: the
+header, its detail rows and its payload are one turn's own rows, and a message
+paints its closing blank only where the message after it is not the result that
+answers it — and in the compact log a turn whose only rows are its call lines
+paints no blank either, so consecutive command-only turns read as one dense
+list. A read's payload wears its file's own line numbers where the call named a
+window — `1408: pub const IMAGE_FILE_CAP: …`, the same `<n>: ` shape `search`
+prints — and no numbers where the payload is not the file's lines: an unbounded
+read, an outline's answer, a picture's label and a failure have no first line to
+count from, and a number that might be wrong is worse than none — the same
+reason the trailer mush appends (`[mush: lines 1408–1530 of 9000 — read on with
+offset=1531]`) wears the number column's blank and no number of its own. mush's
+own report about a child or a job and another agent's words are one row each,
+and a block the fold clips shows its first three rows, a `… N lines …` row and
+its last four — an output's end is where its answer usually is, and the eight
+rows a dump gets are the same eight; the compact log's one-row reports, with no
+room for a tail, keep the older `… +N more lines`, whose count is everything
+behind it. So only what was actually spoken keeps whole words: the human's lines
+and the model's reply, which the fold never touches. Like `Ctrl-T` the key
+writes nothing and is not stored, and the same press brings every row back — a
+restart opens compact again, because the launch view is the default and not a
+remembered one. Two rows
 stay in both states,
 because a hidden failure would be a lie about what happened: a failed result's
 own `! error: …` row and a `#1 failed: …` report.
@@ -707,18 +727,18 @@ row painter, and a whole frame at 100×28 with one row per mark:
 │   ⧗ #1  waiting on results 3s  ││                                                                │
 │     ◐ #2 tests                 ││mush › Spawning the children.                                   │
 │   ✗ #3 probe  no route to host ││↳ tests probe                              → #2 on mush/2       │
-│   ⊘ #4 run                     ││  mush/2 · .mush/wt/2                                           │
-│   ⚠ #5 build                   ││                                                                │
-│   ≡ #6 fold  compacting 2s     ││  spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops   │
-│   ✓ #7 ✉ docs  wrote README.md ││  calling tools · wait returns its summary                      │
-│   ✓ #8 ⚮  wrote src/lex.rs     ││                                                                │
-│                                ││⧗                                          → #2 still running   │
-│                                ││                                                                │
-│                                ││  wait timed out — #2 still running                             │
+│   ⊘ #4 run                     │││ mush/2 · .mush/wt/2                                           │
+│   ⚠ #5 build                   │││ spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops   │
+│   ≡ #6 fold  compacting 2s     │││ calling tools · wait returns its summary                      │
+│   ✓ #7 ✉ docs  wrote README.md ││                                                                │
+│   ✓ #8 ⚮  wrote src/lex.rs     ││⧗                                          → #2 still running   │
+│                                │││ wait timed out — #2 still running                             │
 │                                ││                                                                │
 │                                ││· #3 failed: no route to host                                   │
 │                                ││                                                                │
 │                                ││mush › Every mark is on a row above.                            │
+│                                ││                                                                │
+│                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │

@@ -14,13 +14,13 @@ and see what changed.
 │   ◐ #1 lexer  mush/1 +12−3     ││                                                                │
 │   ✓ #2 docs  wrote README.md   ││mush › Starting with the rename.                                │
 │                                ││± src/lex.rs                               → 3 hunks            │
-│                                ││                                                                │
-│                                ││  edited src/lex.rs — 3 edits                                   │
+│                                │││ edited src/lex.rs — 3 edits                                   │
 │                                ││                                                                │
 │                                ││· #2 done: wrote README.md                                      │
 │                                ││                                                                │
 │                                ││mush › The tests are next.                                      │
 │                                ││· waiting on #1                                                 │
+│                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │

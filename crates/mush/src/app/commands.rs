@@ -746,10 +746,22 @@ pub(crate) mod tests {
     }
 
     /// One block painted in one colour throughout, the shape a tool result's
-    /// payload wears: mush's own gutter ([`Symbols::GUTTER_MARK`]) and the
-    /// result's words, wrapped under it.
-    fn solid(mark: &str, style: Style, text: &str) -> Vec<Line<'static>> {
-        marked_rows(mark, style, style, text)
+    /// payload wears: mush's own gutter ([`Symbols::GUTTER_MARK`]) leads every
+    /// row — the first one *is* the gutter ([`crate::app::chat`]'s `Head::block`)
+    /// and each wrapped row under it wears the same pipe, so a dump cannot be
+    /// read as prose and a wrapped line hangs visibly under the row it
+    /// continues — and the result's words are the style.
+    fn payload(mark: &str, style: Style, text: &str) -> Vec<Line<'static>> {
+        let lead = UnicodeWidthStr::width(mark);
+        mush_core::text::wrap_text(text, TRANSCRIPT_WIDTH.saturating_sub(lead))
+            .into_iter()
+            .map(|line| {
+                Line::from(vec![
+                    Span::styled(mark.to_string(), style),
+                    Span::styled(line, style),
+                ])
+            })
+            .collect()
     }
 
     /// One tool call's rows as the pane paints them: the digest header and the
@@ -906,9 +918,10 @@ pub(crate) mod tests {
     /// The transcript is the pane's own rows: every message paints its rows and
     /// then the blank `chat::closing_blank` closes it with, the calls are
     /// painted by the grid the pane uses ([`call_rows`]), their results at the
-    /// gutter the pane indents them by ([`solid`]), and the blank after the
-    /// last message is the foot's to trim (`chat::body`) — which is why the
-    /// foot's own row sits right under the reply.
+    /// gutter the pane indents them by ([`payload`]) — one call's own rows, with
+    /// no blank between the header and the payload it belongs to — and the blank
+    /// after the last message is the foot's to trim (`chat::body`) — which is
+    /// why the foot's own row sits right under the reply.
     pub(crate) fn readme_sample_screen() -> Screen {
         let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
         root.focused = true;
@@ -926,7 +939,8 @@ pub(crate) mod tests {
         ));
         // The reply and the call are one assistant message: the call's row
         // follows the words with no blank between them, and the blank under it
-        // closes the turn.
+        // closes the turn. The result below is that call's own payload — one
+        // block, so no blank stands between the header and it.
         transcript.extend(call_rows(
             "edit_file",
             "src/lex.rs",
@@ -934,8 +948,7 @@ pub(crate) mod tests {
             Tone::Ok,
             &[],
         ));
-        transcript.push(Line::from(""));
-        transcript.extend(solid(
+        transcript.extend(payload(
             Symbols::GUTTER_MARK,
             dim(),
             "edited src/lex.rs — 3 edits",
@@ -989,8 +1002,8 @@ pub(crate) mod tests {
     /// §4.5's sample: one row per phase and one per row mark, so the picture
     /// says the same thing about the marks the `marks` block names. Its chat is
     /// the pane's own rows too ([`readme_sample_screen`]): a spawn and a wait,
-    /// their payloads at the grid's gutter, and the report rows the tree's
-    /// phases were built from.
+    /// their payloads at the grid's gutter ([`payload`]), and the report rows
+    /// the tree's phases were built from.
     ///
     /// The child is spawned and its wait times out while it still works, which
     /// is the phase the tree's `◐ #2 tests` row shows: the chat is the same
@@ -1022,10 +1035,10 @@ pub(crate) mod tests {
             Tone::Running,
             &["mush/2 · .mush/wt/2"],
         ));
-        transcript.push(Line::from(""));
         // The result's own sentence is long enough to wrap under the call: the
-        // grid's gutter leads every row of it.
-        transcript.extend(solid(
+        // grid's gutter leads every row of it, and the block follows its header
+        // with no blank of its own — one call is one block.
+        transcript.extend(payload(
             Symbols::GUTTER_MARK,
             dim(),
             "spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops calling tools · wait \
@@ -1039,8 +1052,7 @@ pub(crate) mod tests {
             Tone::Running,
             &[],
         ));
-        transcript.push(Line::from(""));
-        transcript.extend(solid(
+        transcript.extend(payload(
             Symbols::GUTTER_MARK,
             dim(),
             "wait timed out — #2 still running",
