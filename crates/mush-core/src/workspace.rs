@@ -82,6 +82,14 @@ pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 /// is the road to that file.
 pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
 
+/// The most `context` lines `search` shows on each side of a match: a bigger
+/// ask is clamped to this, not refused, because a giant context is a real
+/// request and "as many as fit" is its honest answer. Ten either side is a
+/// function's neighbourhood — the "what is this" a context is for — and still
+/// leaves a 200-row answer room for the several matches a search exists to
+/// find; past it the request is a file read, and `read_file` is the road.
+pub const SEARCH_CONTEXT_MAX: usize = 10;
+
 /// The sentence a read of a CRLF file appends, from its one home: the window
 /// road ([`Workspace::read_window`]) writes it under the text it shows, and
 /// [`crate::outline`] writes the same sentence under the rows it shows, because
@@ -94,9 +102,9 @@ pub(crate) const CRLF_NOTE: &str =
      line's own text still edits exactly, and run_command (`sed -i`, `perl -pi`) or \
      write_file is the road for anything across lines]";
 
-/// How much of one matching line `search` shows, in *bytes*, so one minified
+/// How much of one row's line `search` shows, in *bytes*, so one minified
 /// line cannot spend the whole result. A line past the cap is cut on a
-/// character boundary and the cut is marked ([`match_line`]): a partial line a
+/// character boundary and the cut is marked ([`row_line`]): a partial line a
 /// model mistakes for the whole is a wrong fact, not a short one.
 const MATCH_LINE_CAP: usize = 240;
 
@@ -343,21 +351,27 @@ pub struct Workspace {
     opened: u128,
 }
 
-/// What a search found: the matching lines, whether the cap cut the list short,
+/// What a search found: the answer's rows, whether the cap cut them short,
 /// how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]), and
 /// how many it found whose name cannot travel on the model's road
 /// (`Workspace::name_for_model`: a line break in the name, bytes that are
 /// not UTF-8, or ends `resolve` would trim).
 ///
-/// The third field is the one that keeps "no match" honest. A model reads a
+/// A row is one line of the answer, and it has two shapes: a match is
+/// `path:line: text` and a `context` neighbour is `path-line- text`
+/// ([`Workspace::search`] argues both). The field is named for the rows and
+/// not the matches because the cap counts rows: with a context, the row the
+/// cap cut can be one no match landed on.
+///
+/// `skipped` is the field that keeps "no match" honest. A model reads a
 /// miss as "the symbol does not exist", so a search that skipped a file must
 /// say so — the count is what the tool tells it instead of a false negative.
-/// The fourth is the same honesty for the *name*: a match line is prefixed
+/// `unnamed` is the same honesty for the *name*: a row is prefixed
 /// with the path, and a path the model cannot pass back to `read_file` is a
 /// dead end, so such files are not searched and are counted instead — the same
 /// reason [`Workspace::list_files`] leaves them out (finding B9).
 pub struct Matches {
-    pub matches: Vec<String>,
+    pub rows: Vec<String>,
     pub more: bool,
     pub skipped: usize,
     pub unnamed: usize,
@@ -1371,8 +1385,8 @@ impl Workspace {
     }
 
     /// Every line under `rel` matching `pattern` — a regex, compiled once
-    /// before the walk — as `path:line: text`, capped at `limit` matches plus
-    /// the fact that there were more.
+    /// before the walk — as rows of `path:line: text`, capped at `limit` rows
+    /// plus the fact that there were more.
     ///
     /// The pattern *is* the whole syntax (the human's decision, reversing the
     /// literal this doc used to argue for): there is no flag argument to set,
@@ -1386,14 +1400,49 @@ impl Workspace {
     /// the cost of two syntax differences the schema states rather than lets a
     /// model discover: no `\p{…}` classes, and `\w`/`\b` are ASCII-only.
     ///
+    /// **A row is a match's line or a neighbour of one.** `context` is how many
+    /// lines either side of each match the answer shows, like `rg -C`, and it
+    /// is clamped to [`SEARCH_CONTEXT_MAX`] rather than refused: a giant
+    /// context is a real request, and "as many as fit" is its honest answer —
+    /// past ten either side the question is what the whole file holds, and
+    /// `read_file` is the road. The cap counts **rows**, not matches, and that
+    /// is the same decision seen from the other side: `limit` is the answer's
+    /// own size, so a `context` that could grow the answer with every match
+    /// would spend the whole result on one window's surroundings and hide the
+    /// matches the search exists for. With `context = 0` every row is a match
+    /// and the answer is byte for byte the one this tool has always given;
+    /// with a context, [`Matches::more`] keeps its meaning — there was one
+    /// more row than could be shown, and the row that proved it is not shown.
+    ///
+    /// The two shapes are grep's own, and that familiarity is the argument:
+    /// match rows stay exactly `path:line: text`, and a context row is
+    /// `path-line- text` — the separators are the whole difference, so a reader
+    /// of `rg -C` output reads the answer without learning a second grammar,
+    /// and a reader that keeps only `path:line:` rows keeps the matches. A
+    /// context row is numbered as the file numbers it, so it is still the
+    /// anchor a `read_file {offset}` is built from.
+    ///
+    /// **One window per run of rows, not one per match.** Two matches close
+    /// enough that their windows touch share one window — three lines apart
+    /// with `context = 2` is one run — so no line is emitted twice, and a
+    /// window is clipped to the file's first and last line, so a match on line
+    /// 1 opens at line 1. The file's lines are walked once: each is matched,
+    /// held only while it could still become a hit's pre-context (at most
+    /// `context` of them, as slices of the file's own text, not copies), and
+    /// emitted exactly once, as a match row or a context row according to the
+    /// window state it lands in. Gathering every matching line number first
+    /// would hold a minified file's million numbers to emit a window of ten:
+    /// the bound is the answer's, the same trade
+    /// [`crate::usages::rows_within`] makes.
+    ///
     /// The match is per line and stays per line ([`text::file_lines`] is the
-    /// haystack, so a huge file is never held whole): a row is `path:line:
-    /// text`, `^` and `$` anchor a line, and a `\n` in the pattern can never
-    /// match. Binary files (a NUL byte) and files past [`SEARCH_FILE_CAP`] are
-    /// skipped — the read is bounded to the cap + 1 like `Self::whole_read`'s,
-    /// so a file that grew behind the stat is caught by its length rather than
-    /// loaded whole — and a matching line is cut to `MATCH_LINE_CAP` bytes with
-    /// the cut said, so one minified file cannot spend the result.
+    /// haystack, so a huge file is never held whole): `^` and `$` anchor a
+    /// line, and a `\n` in the pattern can never match. Binary files (a NUL
+    /// byte) and files past [`SEARCH_FILE_CAP`] are skipped — the read is
+    /// bounded to the cap + 1 like `Self::whole_read`'s, so a file that grew
+    /// behind the stat is caught by its length rather than loaded whole — and a
+    /// row's line is cut to `MATCH_LINE_CAP` bytes with the cut said, so one
+    /// minified file cannot spend the result.
     ///
     /// A pattern the engine refuses is a refusal, not a "no match": the parse
     /// error travels back and the model fixes the pattern instead of reading a
@@ -1402,7 +1451,7 @@ impl Workspace {
     /// line, so a patternless call would be a capped listing rather than a
     /// search.
     ///
-    /// The match line is the *file's* line: no paint-time sanitizing, no
+    /// A row's line is the *file's* line: no paint-time sanitizing, no
     /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
     /// is a model road, and the model's roads are data — a line a search shows
     /// that the file does not hold is a line the model copies into an
@@ -1418,19 +1467,25 @@ impl Workspace {
     /// the skip counter is for the files (blobs, NUL-bearing) that have no text
     /// to search at all.
     ///
-    /// What it skipped is counted and travels back with the matches
+    /// What it skipped is counted and travels back with the rows
     /// ([`Matches::skipped`]): a search that says "no match" while it never
     /// opened a file is a false negative a model will act on. Files whose name
     /// cannot travel on the model's road (`Self::name_for_model`) are not
     /// opened either, and are counted the same way ([`Matches::unnamed`]) — a
-    /// match line is prefixed with the path, and a path the model cannot pass
+    /// row is prefixed with the path, and a path the model cannot pass
     /// back to `read_file` would be a dead end (finding B9).
     ///
     /// Like the listing, the name is checked for real before the walk
     /// (`Self::real_path`): a link inside the root cannot make the search
     /// read files outside it, and the files it does read are the ones under
     /// the name the model gave.
-    pub fn search(&self, pattern: &str, rel: &str, limit: usize) -> Result<Matches, String> {
+    pub fn search(
+        &self,
+        pattern: &str,
+        rel: &str,
+        limit: usize,
+        context: usize,
+    ) -> Result<Matches, String> {
         if pattern.is_empty() {
             return Err("`pattern` must not be empty".to_string());
         }
@@ -1444,13 +1499,18 @@ impl Workspace {
         if fs::symlink_metadata(&start).is_err() {
             return Err(format!("no such path: `{rel}`"));
         }
-        let mut matches = Vec::new();
+        // A giant context is clamped, not refused: the ask is real and a
+        // window of "as many as fit" answers it honestly. The clamp is here
+        // and not in the schema because a caller that forgets it must still be
+        // bounded.
+        let context = context.min(SEARCH_CONTEXT_MAX);
+        let mut rows = Vec::new();
         let mut more = false;
         let mut skipped = 0usize;
         let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
-            // The name is needed before the file is opened: it is the match
-            // line's prefix, and a name that cannot travel is not searched.
+            // The name is needed before the file is opened: it is the row's
+            // prefix, and a name that cannot travel is not searched.
             let Some(name) = self.name_for_model(path) else {
                 unnamed += 1;
                 return true;
@@ -1479,20 +1539,22 @@ impl Workspace {
                 return true;
             }
             let text = String::from_utf8_lossy(&bytes);
-            for (number, line) in text::file_lines(&text).enumerate() {
-                if !regex.is_match(line) {
-                    continue;
-                }
-                if matches.len() == limit {
-                    more = true;
-                    return false;
-                }
-                matches.push(format!("{}:{}: {}", name, number + 1, match_line(line)));
+            // The room the answer has left is the room this file's rows are
+            // built against: `search_rows` answers one row past it when there
+            // was more, which is this walk's proof, not the file's cost.
+            let room = limit.saturating_sub(rows.len());
+            rows.extend(search_rows(&regex, &name, &text, room, context));
+            if rows.len() > limit {
+                // The cap's own row is the proof of "there is more": it is not
+                // shown, `more` is set, and the walk ends here.
+                rows.truncate(limit);
+                more = true;
+                return false;
             }
             true
         });
         Ok(Matches {
-            matches,
+            rows,
             more,
             skipped,
             unnamed,
@@ -2222,7 +2284,94 @@ fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// One matched line, as `search` hands it to a model: the file's own bytes,
+/// One file's rows for [`Workspace::search`]: the match rows and the context
+/// lines around them, at most `room + 1` rows.
+///
+/// The window state is one line wide of memory. `window_end` is the last line
+/// the hit that opened the current window reaches; `pending` holds the lines
+/// walked since the last emitted row that a later hit could still reach back
+/// to — at most `context` of them, as slices of the file's own text, so a file
+/// with no matches costs no allocation and a minified file's million matches
+/// cost the answer's rows. A line inside an open window is emitted the moment
+/// it is walked; the lines between windows are held until a hit claims them as
+/// its pre-context or the next line proves they are out of reach. Every line
+/// is walked once and emitted once, and no line is emitted twice — a hit
+/// inside the open window it lands in only extends that window's end.
+///
+/// The bound is the answer's, the same shape [`crate::usages::rows_within`]
+/// argues: one past `room`, and exactly `room + 1` rows when the file held a
+/// further row — the caller's cut is then the walk's, and the row that made the
+/// answer one over the room is the whole proof that there was more.
+fn search_rows(
+    regex: &regex_lite::Regex,
+    name: &str,
+    text: &str,
+    room: usize,
+    context: usize,
+) -> Vec<String> {
+    // One past the room: `room + 1` rows are the proof of "there is more",
+    // and nothing beyond them can enter the answer the caller builds.
+    let keep = room.saturating_add(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut pending: Vec<(usize, &str)> = Vec::new();
+    let mut window_end: Option<usize> = None;
+    for (number, line) in text::file_lines(text).enumerate() {
+        if regex.is_match(line) {
+            // The held lines are this match's pre-context and the window it
+            // opens reaches back over them; they go out first, in line order.
+            for (held, text) in pending.drain(..) {
+                if rows.len() == keep {
+                    return rows;
+                }
+                rows.push(context_row(name, held, text, context));
+            }
+            if rows.len() == keep {
+                return rows;
+            }
+            rows.push(match_row(name, number, line));
+            window_end = Some(number + context);
+            continue;
+        }
+        if let Some(end) = window_end {
+            if number <= end {
+                // Inside the open window: this line is context of the hit that
+                // opened it, and a later hit inside the window would make it
+                // interior — the same row either way, emitted once.
+                if rows.len() == keep {
+                    return rows;
+                }
+                rows.push(context_row(name, number, line, context));
+                continue;
+            }
+            window_end = None;
+        }
+        // No window reaches this line: it can only become the pre-context of a
+        // *later* hit, and only while fewer than `context` lines stand between
+        // it and that hit. An older line is out of reach of every hit to come,
+        // so it is dropped rather than carried.
+        pending.push((number, line));
+        if pending.len() > context {
+            pending.remove(0);
+        }
+    }
+    rows
+}
+
+/// A match row: `path:line: text`, the shape this tool has always printed,
+/// with the line's own number after the colon.
+fn match_row(name: &str, number: usize, line: &str) -> String {
+    format!("{name}:{}: {}", number + 1, row_line(line, None))
+}
+
+/// A context row: `path-line- text`, grep's shape for a line the match is not
+/// on but the window shows. The separators are what tell it apart from a match
+/// row, and the file's own line number stays in it so a context row is still an
+/// anchor for `read_file {offset}`.
+fn context_row(name: &str, number: usize, line: &str, context: usize) -> String {
+    format!("{name}-{}- {}", number + 1, row_line(line, Some(context)))
+}
+
+/// One row's line, as `search` hands it to a model: the file's own bytes,
 /// cut only past [`MATCH_LINE_CAP`] and with the cut said.
 ///
 /// It is deliberately not [`text::truncate`]: that sanitizes for a pane, and it
@@ -2233,13 +2382,22 @@ fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
 /// [`text::boundary_at_or_before`] and the marker names the road that prints
 /// the whole line, the same shape [`truncate_for_model`] uses for output; a
 /// line the cap did not touch comes back exactly.
-fn match_line(line: &str) -> String {
+///
+/// The road is the row's own: the pattern alone (`rg -n`) prints a match line
+/// whole, while a context line needs the window it sits in (`rg -n -C n`) — a
+/// marker naming the wrong road would send the model to a command whose output
+/// cannot hold the line.
+fn row_line(line: &str, context: Option<usize>) -> String {
     if line.len() <= MATCH_LINE_CAP {
         return line.to_string();
     }
     let cut = text::boundary_at_or_before(line, MATCH_LINE_CAP);
+    let road = match context {
+        Some(context) => format!("rg -n -C {context}"),
+        None => "rg -n".to_string(),
+    };
     format!(
-        "{}… [mush: line cut at {MATCH_LINE_CAP} bytes — run_command (`rg -n`) prints it whole]",
+        "{}… [mush: line cut at {MATCH_LINE_CAP} bytes — run_command (`{road}`) prints it whole]",
         &line[..cut]
     )
 }
@@ -2575,16 +2733,16 @@ mod tests {
         // The search names the file the same way, and its path opens too. The
         // three unnameable files are counted, not reported under a name that
         // opens something else (or nothing).
-        let found = ws.search("the real file", "", 10).unwrap();
-        assert_eq!(found.matches, vec![r"a\b.txt:1: the real file".to_string()]);
+        let found = ws.search("the real file", "", 10, 0).unwrap();
+        assert_eq!(found.rows, vec![r"a\b.txt:1: the real file".to_string()]);
         assert_eq!(found.unnamed, 3);
-        let named = found.matches[0].split(':').next().unwrap();
+        let named = found.rows[0].split(':').next().unwrap();
         assert_eq!(ws.read_file(named).unwrap(), "the real file\n");
 
         // A search that never looked into the newline-named file is not a
         // silent miss, and a directory of only such names is not "no files".
-        let found = ws.search("the newline file", "", 10).unwrap();
-        assert!(found.matches.is_empty());
+        let found = ws.search("the newline file", "", 10, 0).unwrap();
+        assert!(found.rows.is_empty());
         assert_eq!(found.unnamed, 3);
         let dir = ws.root().join("only");
         fs::create_dir_all(&dir).unwrap();
@@ -2636,8 +2794,8 @@ mod tests {
         assert!(ws.list_files(".mush/wt", 10).is_err());
 
         // The search never reads the sibling's file.
-        let found = ws.search("fn sibling", "", 100).unwrap();
-        assert!(found.matches.is_empty(), "{:?}", found.matches);
+        let found = ws.search("fn sibling", "", 100, 0).unwrap();
+        assert!(found.rows.is_empty(), "{:?}", found.rows);
 
         // A read of the path the old listing handed over is refused...
         let refused = ws
@@ -2699,8 +2857,8 @@ mod tests {
         );
 
         // A search is the same walk, so it cannot spend a match on a gate log.
-        let found = ws.search("held", "", 100).unwrap();
-        assert_eq!(found.matches, vec!["src.rs:1: fn held() {}".to_string()]);
+        let found = ws.search("held", "", 100, 0).unwrap();
+        assert_eq!(found.rows, vec!["src.rs:1: fn held() {}".to_string()]);
 
         // Reach: the start directory is never name-checked, so a walk asked for
         // `.mush` still lists it, and the paste's own file still opens by name.
@@ -4092,11 +4250,11 @@ mod tests {
         ];
         // `Matches` carries no `Debug`, so the search's refusal is matched out
         // by hand rather than unwrapped.
-        refusals.push(match ws.search("DEEP", "out", 100) {
+        refusals.push(match ws.search("DEEP", "out", 100, 0) {
             Err(refused) => refused,
             Ok(found) => panic!(
                 "a search through a link out of the root must be refused, not run: {:?}",
-                found.matches
+                found.rows
             ),
         });
         for refused in refusals {
@@ -4741,24 +4899,24 @@ mod tests {
             format!("{line}\n"),
             "the strict read and the search line are the same bytes"
         );
-        let found = ws.search("needle", ".", 10).unwrap();
+        let found = ws.search("needle", ".", 10, 0).unwrap();
         assert_eq!(
-            found.matches,
+            found.rows,
             vec![format!("raw.txt:1: {line}")],
             "no sanitizing, no trim_end: the line comes back byte for byte"
         );
 
         // The `\r` of a CRLF ending is the file's byte too.
         fs::write(ws.root().join("crlf.txt"), "needle\r\nnext\r\n").unwrap();
-        let found = ws.search("needle", "crlf.txt", 10).unwrap();
-        assert_eq!(found.matches, vec!["crlf.txt:1: needle\r".to_string()]);
+        let found = ws.search("needle", "crlf.txt", 10, 0).unwrap();
+        assert_eq!(found.rows, vec!["crlf.txt:1: needle\r".to_string()]);
 
         // A line past the cap is cut on a character boundary and marked, never
         // silently shortened.
         let long = format!("needle{}", "x".repeat(2 * MATCH_LINE_CAP));
         ws.write_file("long.txt", &format!("{long}\n")).unwrap();
-        let found = ws.search("needle", "long.txt", 10).unwrap();
-        let reported = &found.matches[0];
+        let found = ws.search("needle", "long.txt", 10, 0).unwrap();
+        let reported = &found.rows[0];
         assert!(
             reported.starts_with(&format!("long.txt:1: {}", &long[..MATCH_LINE_CAP])),
             "{reported}"
@@ -4776,10 +4934,10 @@ mod tests {
     fn a_pattern_is_a_regex_and_a_metacharacter_is_escaped_for_it() {
         let ws = temp_workspace("search-regex");
         fs::write(ws.root().join("a.txt"), "a(1)\na1\n").unwrap();
-        let grouped = ws.search("a(1)", "", 10).unwrap();
-        assert_eq!(grouped.matches, vec!["a.txt:2: a1".to_string()]);
-        let escaped = ws.search(r"a\(1\)", "", 10).unwrap();
-        assert_eq!(escaped.matches, vec!["a.txt:1: a(1)".to_string()]);
+        let grouped = ws.search("a(1)", "", 10, 0).unwrap();
+        assert_eq!(grouped.rows, vec!["a.txt:2: a1".to_string()]);
+        let escaped = ws.search(r"a\(1\)", "", 10, 0).unwrap();
+        assert_eq!(escaped.rows, vec!["a.txt:1: a(1)".to_string()]);
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -4790,19 +4948,19 @@ mod tests {
     fn case_insensitivity_is_the_patterns_own_i_flag() {
         let ws = temp_workspace("search-ignore-case");
         fs::write(ws.root().join("a.txt"), "NEEDLE\nneedle\n").unwrap();
-        let found = ws.search("(?i)needle", "", 10).unwrap();
+        let found = ws.search("(?i)needle", "", 10, 0).unwrap();
         assert_eq!(
-            found.matches,
+            found.rows,
             vec!["a.txt:1: NEEDLE".to_string(), "a.txt:2: needle".to_string()]
         );
-        let exact = ws.search("needle", "", 10).unwrap();
-        assert_eq!(exact.matches, vec!["a.txt:2: needle".to_string()]);
+        let exact = ws.search("needle", "", 10, 0).unwrap();
+        assert_eq!(exact.rows, vec!["a.txt:2: needle".to_string()]);
 
         // The fold a model might expect from the old flag is not there: `(?i)é`
         // is not `É`, because `regex-lite` folds ASCII only.
         fs::write(ws.root().join("unicode.txt"), "É\n").unwrap();
-        let unicode = ws.search("(?i)é", "unicode.txt", 10).unwrap();
-        assert!(unicode.matches.is_empty(), "{:?}", unicode.matches);
+        let unicode = ws.search("(?i)é", "unicode.txt", 10, 0).unwrap();
+        assert!(unicode.rows.is_empty(), "{:?}", unicode.rows);
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -4814,10 +4972,10 @@ mod tests {
     fn a_word_boundary_is_ascii() {
         let ws = temp_workspace("search-word-boundary");
         fs::write(ws.root().join("a.txt"), "held\nbeheld\nβββ\n").unwrap();
-        let found = ws.search(r"\bheld\b", "", 10).unwrap();
-        assert_eq!(found.matches, vec!["a.txt:1: held".to_string()]);
-        let unicode = ws.search(r"\bβββ\b", "", 10).unwrap();
-        assert!(unicode.matches.is_empty(), "{:?}", unicode.matches);
+        let found = ws.search(r"\bheld\b", "", 10, 0).unwrap();
+        assert_eq!(found.rows, vec!["a.txt:1: held".to_string()]);
+        let unicode = ws.search(r"\bβββ\b", "", 10, 0).unwrap();
+        assert!(unicode.rows.is_empty(), "{:?}", unicode.rows);
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -4829,10 +4987,10 @@ mod tests {
     fn the_match_is_one_line_and_the_anchors_are_a_lines() {
         let ws = temp_workspace("search-per-line");
         fs::write(ws.root().join("a.txt"), "one\ntwo\n").unwrap();
-        let anchored = ws.search("^two$", "", 10).unwrap();
-        assert_eq!(anchored.matches, vec!["a.txt:2: two".to_string()]);
-        let across = ws.search("one\ntwo", "", 10).unwrap();
-        assert!(across.matches.is_empty(), "{:?}", across.matches);
+        let anchored = ws.search("^two$", "", 10, 0).unwrap();
+        assert_eq!(anchored.rows, vec!["a.txt:2: two".to_string()]);
+        let across = ws.search("one\ntwo", "", 10, 0).unwrap();
+        assert!(across.rows.is_empty(), "{:?}", across.rows);
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -4843,9 +5001,9 @@ mod tests {
     fn a_pattern_that_matches_every_line_still_respects_the_cap() {
         let ws = temp_workspace("search-cap-everything");
         fs::write(ws.root().join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        let found = ws.search(".*", "", 2).unwrap();
+        let found = ws.search(".*", "", 2, 0).unwrap();
         assert_eq!(
-            found.matches,
+            found.rows,
             vec!["a.txt:1: one".to_string(), "a.txt:2: two".to_string()]
         );
         assert!(found.more, "the third line is the proof of more");
@@ -4862,12 +5020,9 @@ mod tests {
         fs::write(ws.root().join("a.txt"), "needle\n").unwrap();
         // `Matches` carries no `Debug`, so the refusal is matched out by hand
         // rather than unwrapped.
-        let refused = match ws.search("needle(", "", 10) {
+        let refused = match ws.search("needle(", "", 10, 0) {
             Err(refused) => refused,
-            Ok(found) => panic!(
-                "a bad pattern must be refused, not run: {:?}",
-                found.matches
-            ),
+            Ok(found) => panic!("a bad pattern must be refused, not run: {:?}", found.rows),
         };
         assert!(refused.contains("`pattern`"), "{refused}");
         assert!(
@@ -4884,14 +5039,255 @@ mod tests {
     fn an_empty_pattern_is_refused() {
         let ws = temp_workspace("search-empty-pattern");
         fs::write(ws.root().join("a.txt"), "one\ntwo\n").unwrap();
-        let refused = match ws.search("", "", 10) {
+        let refused = match ws.search("", "", 10, 0) {
             Err(refused) => refused,
             Ok(found) => panic!(
                 "an empty pattern must be refused, not run: {:?}",
-                found.matches
+                found.rows
             ),
         };
         assert_eq!(refused, "`pattern` must not be empty");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `context` is the neighbours, and the answer is `rg -C`'s: a match with
+    /// `context = 2` shows exactly the two lines either side of it, numbered as
+    /// the file numbers them. The match keeps the `path:line: text` shape and a
+    /// neighbour is `path-line- text` — the two separators are the whole
+    /// grammar, and every model has read it.
+    #[test]
+    fn a_match_with_context_shows_the_lines_either_side() {
+        let ws = temp_workspace("search-context");
+        fs::write(ws.root().join("a.txt"), "one\ntwo\nNEEDLE\nthree\nfour\n").unwrap();
+        let found = ws.search("NEEDLE", "a.txt", 10, 2).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![
+                "a.txt-1- one".to_string(),
+                "a.txt-2- two".to_string(),
+                "a.txt:3: NEEDLE".to_string(),
+                "a.txt-4- three".to_string(),
+                "a.txt-5- four".to_string(),
+            ],
+            "the file's lines 1..5, its own numbers, one row shape each"
+        );
+        assert!(!found.more);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// Two matches whose windows overlap are one window: three lines apart with
+    /// `context = 2` shares the lines between them, and each line comes back
+    /// once — the answer is a run of the file, not a window per match with the
+    /// shared rows said twice.
+    #[test]
+    fn two_nearby_matches_share_one_window_and_no_line_twice() {
+        let ws = temp_workspace("search-context-merge");
+        fs::write(
+            ws.root().join("a.txt"),
+            "one\ntwo\nHIT\nfour\nHIT\nsix\nseven\n",
+        )
+        .unwrap();
+        let found = ws.search("HIT", "a.txt", 10, 2).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![
+                "a.txt-1- one".to_string(),
+                "a.txt-2- two".to_string(),
+                "a.txt:3: HIT".to_string(),
+                "a.txt-4- four".to_string(),
+                "a.txt:5: HIT".to_string(),
+                "a.txt-6- six".to_string(),
+                "a.txt-7- seven".to_string(),
+            ],
+            "windows [1..5] and [3..7] are one run of [1..7]"
+        );
+        for row in &found.rows {
+            assert_eq!(
+                found.rows.iter().filter(|other| *other == row).count(),
+                1,
+                "a line is shown once: {row}"
+            );
+        }
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A window is clipped to the file: a match on the first line opens at line
+    /// 1 and a match on the last line closes at it. There is no line 0 and no
+    /// line past the end for a window to reach for.
+    #[test]
+    fn a_window_never_runs_past_the_files_ends() {
+        let ws = temp_workspace("search-context-ends");
+        fs::write(ws.root().join("top.txt"), "NEEDLE\none\ntwo\n").unwrap();
+        let top = ws.search("NEEDLE", "top.txt", 10, 2).unwrap();
+        assert_eq!(
+            top.rows,
+            vec![
+                "top.txt:1: NEEDLE".to_string(),
+                "top.txt-2- one".to_string(),
+                "top.txt-3- two".to_string(),
+            ]
+        );
+        fs::write(ws.root().join("bottom.txt"), "one\ntwo\nNEEDLE\n").unwrap();
+        let bottom = ws.search("NEEDLE", "bottom.txt", 10, 2).unwrap();
+        assert_eq!(
+            bottom.rows,
+            vec![
+                "bottom.txt-1- one".to_string(),
+                "bottom.txt-2- two".to_string(),
+                "bottom.txt:3: NEEDLE".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `context = 0` is the answer this tool has always given, byte for byte:
+    /// every row is a match row and nothing stands between two matches. A
+    /// neighbour is the next answer, so zero is a real choice and not an
+    /// accidental default.
+    #[test]
+    fn context_zero_is_the_answer_the_tool_has_always_given() {
+        let ws = temp_workspace("search-context-zero");
+        fs::write(ws.root().join("a.txt"), "one\nNEEDLE\ntwo\nNEEDLE\nfour\n").unwrap();
+        let zero = ws.search("NEEDLE", "a.txt", 10, 0).unwrap();
+        assert_eq!(
+            zero.rows,
+            vec!["a.txt:2: NEEDLE".to_string(), "a.txt:4: NEEDLE".to_string()]
+        );
+        assert!(
+            zero.rows
+                .iter()
+                .all(|row| row.contains(":2: ") || row.contains(":4: ")),
+            "no context row at all: {:?}",
+            zero.rows
+        );
+        let one = ws.search("NEEDLE", "a.txt", 10, 1).unwrap();
+        assert_ne!(one.rows, zero.rows);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A huge `context` is clamped to [`SEARCH_CONTEXT_MAX`] and answered, not
+    /// refused: a thousand is a real request — "show me the whole
+    /// neighbourhood" — and the ten either side that fit is its honest answer.
+    /// The clamp is the constant and the constant is the answer: the two calls
+    /// agree byte for byte and the window is exactly the clamped width.
+    #[test]
+    fn a_huge_context_is_clamped_to_the_named_maximum() {
+        let ws = temp_workspace("search-context-clamp");
+        let mut lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+        lines[15] = "NEEDLE".to_string();
+        fs::write(ws.root().join("a.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+        let asked = ws.search("NEEDLE", "a.txt", 100, 1000).unwrap();
+        let clamped = ws
+            .search("NEEDLE", "a.txt", 100, SEARCH_CONTEXT_MAX)
+            .unwrap();
+        assert_eq!(asked.rows, clamped.rows);
+        assert_eq!(
+            asked.rows.len(),
+            2 * SEARCH_CONTEXT_MAX + 1,
+            "the match and its ten either side: {:?}",
+            asked.rows
+        );
+        assert_eq!(asked.rows.first().unwrap(), "a.txt-6- line 6");
+        assert_eq!(asked.rows[SEARCH_CONTEXT_MAX], "a.txt:16: NEEDLE");
+        assert_eq!(asked.rows.last().unwrap(), "a.txt-26- line 26");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The cap counts **rows**, so a context cannot blow past it: four rows
+    /// fit, the fifth is the proof, and `more` says there was one — the second
+    /// match is not shown, and the window it opens is not pretended closed. The
+    /// rows the answer does hold are the answer's first four, not a whole
+    /// window and not a count of matches.
+    #[test]
+    fn the_cap_counts_rows_so_context_cannot_blow_past_it() {
+        let ws = temp_workspace("search-context-cap");
+        let mut lines: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        lines[0] = "NEEDLE".to_string();
+        lines[9] = "NEEDLE".to_string();
+        fs::write(ws.root().join("a.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+        let found = ws.search("NEEDLE", "a.txt", 4, 2).unwrap();
+        assert_eq!(
+            found.rows,
+            vec![
+                "a.txt:1: NEEDLE".to_string(),
+                "a.txt-2- line 2".to_string(),
+                "a.txt-3- line 3".to_string(),
+                "a.txt-8- line 8".to_string(),
+            ],
+            "the first four rows of the whole answer"
+        );
+        assert!(found.more, "the second match is the proof of more");
+        // The room is the answer's and not the file's: a wider cap shows the
+        // second window whole and clears `more`.
+        let wider = ws.search("NEEDLE", "a.txt", 20, 2).unwrap();
+        assert_eq!(wider.rows.len(), 8, "3 rows then 5: {:?}", wider.rows);
+        assert!(!wider.more);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The two shapes are told apart by the row's own punctuation: a match row
+    /// is `path:line: text` and a context row is `path-line- text`, so the
+    /// digest's own parse of a row names a file for a match and for a context
+    /// row names nothing — a reader that keeps only match rows keeps exactly
+    /// the matches.
+    #[test]
+    fn a_context_row_is_told_from_a_match_row_by_its_own_shape() {
+        let ws = temp_workspace("search-context-shapes");
+        fs::write(ws.root().join("a.txt"), "one\nNEEDLE\ntwo\n").unwrap();
+        let found = ws.search("NEEDLE", "a.txt", 10, 1).unwrap();
+        assert_eq!(found.rows.len(), 3);
+        // The digest's `match_file` rule, run here: the first `:` followed by
+        // digits and another `:` names the file a match row is in. A context
+        // row's separators are dashes, so it parses as no row at all.
+        fn match_file(row: &str) -> Option<&str> {
+            for (at, byte) in row.bytes().enumerate() {
+                if byte != b':' {
+                    continue;
+                }
+                let rest = &row[at + 1..];
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if digits > 0 && rest.as_bytes().get(digits) == Some(&b':') {
+                    return Some(&row[..at]);
+                }
+            }
+            None
+        }
+        assert_eq!(match_file(&found.rows[0]), None, "{}", found.rows[0]);
+        assert_eq!(
+            match_file(&found.rows[1]),
+            Some("a.txt"),
+            "{}",
+            found.rows[1]
+        );
+        assert_eq!(match_file(&found.rows[2]), None, "{}", found.rows[2]);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A cut context row names the road that prints *it* whole: the pattern
+    /// alone (`rg -n`) prints a match line and never a neighbour, so the marker
+    /// carries the window — `rg -n -C 2` — and a model sent to the wrong road
+    /// would come back without the line it asked to see.
+    #[test]
+    fn a_cut_context_row_names_the_context_road() {
+        let ws = temp_workspace("search-context-cut");
+        let long = format!("{}NEEDLE", "x".repeat(2 * MATCH_LINE_CAP));
+        fs::write(ws.root().join("a.txt"), format!("{long}\nNEEDLE\n")).unwrap();
+        let found = ws.search("^NEEDLE$", "a.txt", 10, 1).unwrap();
+        assert!(
+            found.rows[0].contains("`rg -n -C 1`"),
+            "the neighbour's road is its window: {:?}",
+            found.rows
+        );
+        assert_eq!(found.rows[1], "a.txt:2: NEEDLE");
+        // A match row's cut still names the plain road, unchanged.
+        let long_match = format!("NEEDLE{}", "x".repeat(2 * MATCH_LINE_CAP));
+        fs::write(ws.root().join("b.txt"), format!("{long_match}\n")).unwrap();
+        let found = ws.search("NEEDLE", "b.txt", 10, 0).unwrap();
+        assert!(
+            found.rows[0].contains("`rg -n`") && !found.rows[0].contains("-C"),
+            "a match row's marker is the one it has always carried: {:?}",
+            found.rows
+        );
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -5042,11 +5438,11 @@ mod tests {
 
         // The byte roads keep every byte.
         assert!(ws.read_file("bom.rs").unwrap().starts_with('\u{feff}'));
-        let searched = ws.search("held", "bom.rs", 10).unwrap();
+        let searched = ws.search("held", "bom.rs", 10, 0).unwrap();
         assert!(
-            searched.matches[0].starts_with("bom.rs:1: \u{feff}fn held() {}"),
+            searched.rows[0].starts_with("bom.rs:1: \u{feff}fn held() {}"),
             "{:?}",
-            searched.matches
+            searched.rows
         );
 
         // A file that is nothing but a signature holds no text: the readers
@@ -5126,16 +5522,16 @@ mod tests {
         // The search road is the bytes road: it shows the lines as the file
         // holds them, ending and all (`text::file_lines`, finding B8).
         assert_eq!(
-            ws.search("held", "crlf.txt", 10).unwrap().matches,
+            ws.search("held", "crlf.txt", 10, 0).unwrap().rows,
             vec!["crlf.txt:1: held\r", "crlf.txt:2: held\r"]
         );
         assert_eq!(
-            ws.search("held", "pair.txt", 10).unwrap().matches,
+            ws.search("held", "pair.txt", 10, 0).unwrap().rows,
             vec!["pair.txt:1: held", "pair.txt:2: \rheld"],
             "a `\\n\\r` pair leaves the `\\r` at the head of the next line"
         );
         assert_eq!(
-            ws.search("held", "final.txt", 10).unwrap().matches,
+            ws.search("held", "final.txt", 10, 0).unwrap().rows,
             vec!["final.txt:1: held"],
             "a last line without a line feed is a line"
         );
@@ -5179,8 +5575,8 @@ mod tests {
         assert_eq!(found.scanned, 1);
         assert_eq!(found.skipped, 1, "the cap is counted, not silent");
         // The search road has the same cap and the same count.
-        let searched = ws.search("held", ".", 10).unwrap();
-        assert_eq!(searched.matches.len(), 1);
+        let searched = ws.search("held", ".", 10, 0).unwrap();
+        assert_eq!(searched.rows.len(), 1);
         assert_eq!(searched.skipped, 1);
 
         let rendered = ws.outline("giant.rs").unwrap().render(1_000, "");
@@ -5237,8 +5633,8 @@ mod tests {
 
         let refused = ws.outline("mostly.txt").unwrap_err();
         assert!(refused.contains("binary"), "{refused}");
-        let found = ws.search("held", ".", 10).unwrap();
-        assert!(found.matches.is_empty());
+        let found = ws.search("held", ".", 10, 0).unwrap();
+        assert!(found.rows.is_empty());
         assert_eq!(found.skipped, 1);
 
         // The NUL-and-nothing-else shape is the same fact.
@@ -5867,14 +6263,14 @@ mod tests {
             shown.starts_with("caf\u{fffd} = 1\nna\u{fffd}ve = 2"),
             "the window still shows the file, lossily: {shown}"
         );
-        let found = ws.search("caf", "", 10).unwrap();
+        let found = ws.search("caf", "", 10, 0).unwrap();
         assert!(
             found
-                .matches
+                .rows
                 .iter()
                 .any(|line| line.starts_with("latin.txt:1:")),
             "search still searches it, lossily: {:?}",
-            found.matches
+            found.rows
         );
 
         // The positive twin: valid UTF-8 with multi-byte characters reads whole.

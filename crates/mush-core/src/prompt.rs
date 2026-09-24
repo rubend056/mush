@@ -252,14 +252,18 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::Search,
             "Find a Rust regex in the workspace's text files: one `path:line: text` per match, \
              each line matched on its own — so `^`/`$` anchor a line and `\\n` can never match. \
-             `(?i)` is how case-insensitive is said, and a metacharacter meant literally is \
-             escaped (`foo\\(bar\\)`). No lookaround or backreference, no `\\p{…}` classes, and \
-             `\\w`/`\\b` are ASCII-only. Binary files are skipped.",
+             `context` (default 0) adds up to 10 lines either side of each match, like `rg -C`: \
+             context rows are `path-line- text`, so a match is told from its neighbours by the \
+             separator, and overlapping windows merge; a bigger ask is clamped to the 10, not \
+             refused. `(?i)` is how case-insensitive is said, and a metacharacter meant literally \
+             is escaped (`foo\\(bar\\)`). No lookaround or backreference, no `\\p{…}` classes, \
+             and `\\w`/`\\b` are ASCII-only. Binary files are skipped.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "The Rust regex to find; every line is matched on its own." },
-                    "path": { "type": "string", "description": "Directory or file to search. Default the root." }
+                    "path": { "type": "string", "description": "Directory or file to search. Default the root." },
+                    "context": { "type": "integer", "description": "Lines either side of each match, like `rg -C`. Default 0; clamped to 10." }
                 },
                 "required": ["pattern"]
             }),
@@ -489,6 +493,47 @@ mod tests {
         assert!(
             !properties.contains_key("ignore_case"),
             "the flag is gone from the schema: {properties:?}"
+        );
+    }
+
+    /// A search's `context` is how many lines either side of a match the answer
+    /// carries, and the schema states the three things a model must be able to
+    /// count on: the clamp's own number (a giant context is answered with the
+    /// ten that fit, not refused), the row shape that tells a neighbour from a
+    /// match, and the default that keeps the old answer. The figure is read
+    /// from [`crate::workspace::SEARCH_CONTEXT_MAX`] rather than repeated here,
+    /// because unlike a job's output limit this constant lives in the same
+    /// crate as the schema.
+    #[test]
+    fn the_search_schema_names_context_its_shape_and_its_clamp() {
+        use crate::workspace::SEARCH_CONTEXT_MAX;
+        let search = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "search")
+            .expect("search has a schema");
+        let description = search["function"]["description"].as_str().unwrap();
+        assert!(
+            description.contains(&format!("{SEARCH_CONTEXT_MAX} lines either side")),
+            "the clamp is stated with the constant's number: {description}"
+        );
+        assert!(description.contains("clamped"), "{description}");
+        assert!(
+            description.contains("path-line- text"),
+            "the context row's shape is spelled: {description}"
+        );
+        let properties = search["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("the properties are an object");
+        let context = &properties["context"];
+        assert_eq!(context["type"], "integer");
+        let context_description = context["description"].as_str().unwrap();
+        assert!(
+            context_description.contains("Default 0"),
+            "{context_description}"
+        );
+        assert!(
+            context_description.contains(&SEARCH_CONTEXT_MAX.to_string()),
+            "the property carries the clamp too: {context_description}"
         );
     }
 

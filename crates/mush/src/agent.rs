@@ -6563,10 +6563,25 @@ fn list_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, 
 }
 
 /// `search`: a regex in the workspace's text files.
+///
+/// `context` rides straight through to the walk, which owns the clamp, the two
+/// row shapes and the window merge ([`mush_core::workspace::Workspace::search`]
+/// argues all three); what this function owns is the argument read — a
+/// `context` that is not a whole number is refused like every other typed
+/// argument ([`tools::arg_usize`]) and never defaulted to 0, because a model
+/// that asked for neighbours and silently got none would read a match as a
+/// lonelier fact than it is.
+///
+/// The cap's note follows the unit the cap counts. With no context every row is
+/// a match, so the sentence is the one this tool has always written — `the
+/// first 200 matches` — and with a context the cap can cut a window's context
+/// line, so it says `rows`: the matches shown are then a floor the answer does
+/// not know, and a count of matches would be a number the answer cannot back.
 fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let pattern = tools::arg_string(args, "pattern")?;
     let rel = tools::arg_path(args, "path")?;
-    let found = actor.ws.search(&pattern, &rel, SEARCH_LIMIT)?;
+    let context = tools::arg_usize(args, "context", 0)?;
+    let found = actor.ws.search(&pattern, &rel, SEARCH_LIMIT, context)?;
     let mut skipped = Vec::new();
     if found.skipped > 0 {
         skipped.push(skipped_note(found.skipped));
@@ -6574,7 +6589,7 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
     if found.unnamed > 0 {
         skipped.push(unnamed_note(found.unnamed));
     }
-    if found.matches.is_empty() {
+    if found.rows.is_empty() {
         // A miss that never opened every file is not a miss. "No match" is
         // what a model reads as "it is not there", so the files the walk
         // skipped are named along with the road to them.
@@ -6588,12 +6603,14 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
             )
         });
     }
-    let mut out = found.matches.join("\n");
+    let mut out = found.rows.join("\n");
     let mut notes = Vec::new();
     if found.more {
-        notes.push(format!(
-            "the first {SEARCH_LIMIT} matches — narrow the pattern or the path"
-        ));
+        notes.push(if context == 0 {
+            format!("the first {SEARCH_LIMIT} matches — narrow the pattern or the path")
+        } else {
+            format!("the first {SEARCH_LIMIT} rows — narrow the pattern, the path, or the context")
+        });
     }
     if found.skipped > 0 {
         notes.push(skipped_note(found.skipped));
@@ -15031,6 +15048,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inside, "src/lib.rs:1: fn needle() {}", "{inside}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `search`'s `context` argument reaches the walk: a match with `context =
+    /// 2` comes back as `path-line- text` neighbours around the `path:line:
+    /// text` match, absent and zero are the old one-row answer, and a `context`
+    /// that is not a whole number is refused like every other typed argument
+    /// rather than defaulted to 0 — silently showing no neighbours would answer
+    /// a question the model did not ask.
+    #[test]
+    fn a_search_context_reaches_the_walk_and_a_non_number_is_refused() {
+        let (actor, _mailbox) = test_actor("search-context");
+        fs::create_dir_all(actor.ws.root().join("src")).unwrap();
+        fs::write(
+            actor.ws.root().join("src/a.rs"),
+            "one\ntwo\nthree\nNEEDLE\nfive\nsix\nseven\n",
+        )
+        .unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let found = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "NEEDLE", "context": 2 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            "src/a.rs-2- two\nsrc/a.rs-3- three\nsrc/a.rs:4: NEEDLE\nsrc/a.rs-5- five\n\
+             src/a.rs-6- six",
+            "{found}"
+        );
+
+        // Absent and zero are the same answer, and it is the one this tool has
+        // always given.
+        let none = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "NEEDLE" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(none, "src/a.rs:4: NEEDLE", "{none}");
+
+        // A wrong type is refused, not defaulted: `"two"` is not a number of
+        // lines, and the sentence names the argument the model has to fix.
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "NEEDLE", "context": "two" }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(
+            refused.text().contains("`context` must be a whole number"),
+            "{}",
+            refused.text()
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
