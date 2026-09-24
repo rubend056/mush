@@ -7705,6 +7705,31 @@ pub struct CallFacts {
     /// without the digest copying it ([`crate::app::call_grid`]). The painter
     /// cuts each row to the pane's gutter ([`crate::app`]'s call grid); nothing
     /// here is cut.
+    ///
+    /// **A detail row is news only when it is not a substring of the payload
+    /// painted under it** — the result's own text, row for row, in the same
+    /// unfolded view — **except when it hoists one fact out of a payload too
+    /// big to read at a glance**: a read's own total, which waits at the end of
+    /// a window's trailer; a listing's cap note; a search's counts, derived
+    /// from its match rows. Hoisting is a service — the fact is *collapsed* to
+    /// the one row a reader wants — while repeating the sentence below you is
+    /// noise, and the copy is the worse half of it because the payload says the
+    /// sentence whole. The `control` aside was the plain case: `messaged agent
+    /// #224 — it is mid-run, so it reads this at its next step` is one
+    /// sentence, the payload *is* that sentence, and the aside was its second
+    /// half on the row above it. This is [`failure`]'s rule ("the same words
+    /// twice on one screen, the second a truncated copy of the first") applied
+    /// to the rows under the verdict.
+    ///
+    /// **A fold does not rescue a repeated row.** The `… N lines …` elision
+    /// hides a payload's middle, and the sentence a detail would repeat sits in
+    /// its head; a one-sentence result is a row or two, well under the fold's
+    /// eight-row budget, so it is painted whole. The compact log paints neither
+    /// the detail rows nor the payload, so it has no view in which the
+    /// repetition earns its keep either. An arm with nothing to hoist says
+    /// nothing — the `Vec::new()` the `status`, `control` and `wait` arms pass —
+    /// and every arm that does hoist says which side of the rule it is on in
+    /// its reader's own doc.
     pub details: Vec<String>,
 }
 
@@ -7777,8 +7802,11 @@ pub enum Tone {
 /// **The details.** Each arm also fills [`CallFacts::details`] from the result's
 /// other own sentences — the files a search hit, the lines a command's stderr
 /// section holds, the total a read's trailer names. The readers live beside the
-/// outcome readers and read the same result, and an arm with nothing to say
-/// says nothing (see the field's doc for what each tool leaves out).
+/// outcome readers and read the same result, and each is one side of the one
+/// rule the field's own doc argues: an arm whose row is painted in the payload
+/// under it hoists a fact out of a body too big to read at a glance and says so
+/// in its reader's doc, and an arm with nothing to say says nothing (the
+/// `Vec::new()` its arm passes, with the reason beside it).
 pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -> CallFacts {
     // A failed call is one sentence for every tool, and it is mush's sentence
     // and not the tool's own: read it before the per-tool grammar below, which
@@ -7824,14 +7852,15 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
             (ask, outcome, measure, command_details(ok))
         }
         ToolName::SpawnAgent => (brief_ask(args), spawn_outcome(ok), None, spawn_details(ok)),
-        ToolName::Status => (String::new(), status_outcome(ok), None, status_details(ok)),
-        ToolName::Control => (
-            control_ask(args),
-            control_outcome(ok),
-            None,
-            control_details(ok),
-        ),
-        ToolName::Wait => (wait_ask(args), wait_outcome(ok), None, wait_details(ok)),
+        // The three whose results *are* the rows the payload paints — a status
+        // listing, `#1 messaged — it is mid-run, …`, the line a wait handed
+        // over — pass `Vec::new()`. Every fact their readers used to lift
+        // (`#1 running`, `it is mid-run, so it reads this at its next step`,
+        // `from #185`) was the sentence below them respelled, which is the one
+        // thing [`CallFacts::details`]'s rule refuses.
+        ToolName::Status => (String::new(), status_outcome(ok), None, Vec::new()),
+        ToolName::Control => (control_ask(args), control_outcome(ok), None, Vec::new()),
+        ToolName::Wait => (wait_ask(args), wait_outcome(ok), None, Vec::new()),
     };
     CallFacts {
         // The ask is the model's own arguments, so it is defanged exactly as the
@@ -8248,6 +8277,11 @@ fn ask_measure(bytes: Option<usize>) -> Option<Measure> {
 /// transcript carries no byte count of a file it read only a window of, so the
 /// size the outcome gives is the window's and not the file's. The file's own
 /// total is the fact the reader cannot otherwise see.
+///
+/// **A hoist** ([`CallFacts::details`]'s rule): the payload paints the trailer,
+/// but its number waits at the end of a window that may be hundreds of rows
+/// long, and this row lifts it to the block's own top in the row's unit
+/// (`of 9000L`).
 fn read_details(ok: Option<&str>) -> Vec<String> {
     match ok.map(read_total) {
         Some(Some(total)) => vec![format!("of {}", lines_label(total))],
@@ -8384,10 +8418,11 @@ fn read_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
 /// header instead of the model's prose is what makes the reading trustworthy,
 /// and the header is written in this file.
 ///
-/// The header's line count is not repeated in the details: the unfolded view
-/// paints the payload, whose first line *is* the header, so a detail row would
-/// be the same number twice on one screen. Nothing else in the result is a fact
-/// the outcome does not already spell.
+/// The header's line count is not repeated in the details
+/// ([`CallFacts::details`]'s rule): the unfolded view paints the payload, whose
+/// first line *is* the header, so a detail row would be the same number twice
+/// on one screen. Nothing else in the result is a fact the outcome does not
+/// already spell.
 fn outline_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
     let Some(text) = ok.map(str::trim_end) else {
         return (None, None);
@@ -8488,6 +8523,9 @@ fn line_count(text: &str) -> String {
 /// walk stopped at its own cap. The outcome already says `· more`; this names
 /// the number the cap was and the road around it, both of which the result's
 /// own note carries.
+///
+/// **A hoist**: that note is the payload's last row, and its number is what
+/// tells a cut walk from a whole listing and names the road around it.
 fn list_details(ok: Option<&str>) -> Vec<String> {
     let Some(text) = ok.map(str::trim_end) else {
         return Vec::new();
@@ -8680,6 +8718,10 @@ fn usages_counts(text: &str) -> Option<(usize, usize)> {
 /// outcome cannot carry, and the first thing a reader wants before opening one.
 /// A miss has no names to give, and a hit line the reader cannot name a file
 /// from (a line the cap cut mid-match) is not a file to invent.
+///
+/// **A hoist**: the payload spells no total at all — the counts are derived
+/// from the match rows — and many rows collapse into the one row a reader wants
+/// before opening a file.
 fn search_details(ok: Option<&str>) -> Vec<String> {
     let Some(text) = ok.map(str::trim_end) else {
         return Vec::new();
@@ -8704,6 +8746,10 @@ fn search_details(ok: Option<&str>) -> Vec<String> {
 /// carry, the same job `search_details` does for the files a hit landed in; the
 /// group headers carry the per-file fact, and this is the whole answer in one
 /// line.
+///
+/// **A hoist**: a group header spells its declaration only as `at 12`, so the
+/// `file:line` pair this row builds out of the headers is a fact the payload
+/// never states, and it collapses every file's site into the one line.
 ///
 /// The lines are read back out of the group headers rather than recomputed: one
 /// sentence, one reader. A group with no declaration-looking row has nothing to
@@ -8891,6 +8937,9 @@ fn output_trimmed(text: &str) -> bool {
 /// A command's details: the stderr a report carries, counted — `stderr 12L`.
 /// The report's stdout is the measure's own line count; stderr is the half
 /// those lines do not count, and a command that wrote none gets no row.
+///
+/// **A hoist**: the section's length is a number the payload never spells, and
+/// the section's own rows are the payload.
 fn command_details(ok: Option<&str>) -> Vec<String> {
     match ok.map(stderr_lines) {
         Some(Some(lines)) => vec![format!("stderr {}", lines_label(lines))],
@@ -8922,6 +8971,12 @@ fn stderr_lines(text: &str) -> Option<usize> {
 /// wants to look at the child's files. A child that shares this workspace is
 /// `#185 spawned` — no branch, no worktree — and gets no row rather than an
 /// invented path.
+///
+/// **A hoist, and the one whose payload is not painted at all**: the pane skips
+/// a spawn's own report (`chat::spawn_report`), so this row is the only place
+/// the child's checkout is named; it pairs the branch the outcome already wears
+/// with the path the result never carries, because a checkout reads as
+/// `mush/185 · .mush/wt/185`.
 fn spawn_details(ok: Option<&str>) -> Vec<String> {
     let Some(text) = ok.map(str::trim_end) else {
         return Vec::new();
@@ -9043,88 +9098,6 @@ fn status_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     })
 }
 
-/// A listing's details: one row per child and per job, `#1 running`,
-/// `#2 done`, `#c1 running` — the ids and their state words, which a counted
-/// outcome cannot carry and a parent steering a tree needs. The rows are read
-/// exactly as [`status_outcome`] reads them: each section's head is not a row,
-/// and a job's indented window is part of the headline above it. An ending
-/// whose state word is not one the listing's own vocabulary names is skipped
-/// rather than guessed.
-fn status_details(ok: Option<&str>) -> Vec<String> {
-    let Some(text) = ok.map(str::trim_end) else {
-        return Vec::new();
-    };
-    let mut rows = Vec::new();
-    let mut listing = false;
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.starts_with(' ') {
-            continue;
-        }
-        if line == "agents:" || line == "jobs:" {
-            listing = true;
-            continue;
-        }
-        if !listing {
-            continue;
-        }
-        let Some((id, rest)) = line.split_once(' ') else {
-            continue;
-        };
-        if !id.starts_with('#') {
-            continue;
-        }
-        // The `✉` is the listing's own unread mark, not part of the state word.
-        let rest = rest.trim_start().trim_start_matches('✉').trim_start();
-        if let Some(state) = state_word(rest) {
-            rows.push(format!("{id} {state}"));
-        }
-    }
-    rows
-}
-
-/// The state word a listing row's own words open with: the glyph the fold and
-/// the tree print (`◐`, `✓`, `✗`, `⊘`, `⚠`) or the word itself. This is the
-/// listing's vocabulary and no other's — a row that opens with neither is
-/// nobody's state, and reads as no row at all.
-fn state_word(rest: &str) -> Option<&'static str> {
-    for (mark, word) in [
-        ('◐', "running"),
-        ('✓', "done"),
-        ('✗', "failed"),
-        ('⊘', "stopped"),
-        ('⚠', "cut off"),
-    ] {
-        if rest.starts_with(mark) {
-            return Some(word);
-        }
-    }
-    [
-        "running", "done", "failed", "stopped", "cut off", "killed", "ended",
-    ]
-    .into_iter()
-    .find(|word| rest.starts_with(*word))
-}
-
-/// A `control`'s details: the aside behind the first sentence, where the result
-/// carries one — a child that was parked, an actor that is gone. It is the
-/// qualification the outcome's tone alone cannot spell, and a delivery with no
-/// aside gets no row.
-fn control_details(ok: Option<&str>) -> Vec<String> {
-    let Some(text) = ok.map(str::trim_end) else {
-        return Vec::new();
-    };
-    let Some((_, aside)) = text.split_once(" — ") else {
-        return Vec::new();
-    };
-    let aside = first_line(aside);
-    if aside.is_empty() {
-        Vec::new()
-    } else {
-        vec![aside]
-    }
-}
-
 /// A `control`'s outcome: `#1 stopping`, `#1 messaged`, and the job that had
 /// already ended answering with its own line. An aside after the first sentence
 /// — a parked actor, one whose actor is gone — is not the ordinary delivery, so
@@ -9157,30 +9130,13 @@ fn control_outcome(ok: Option<&str>) -> Option<CallOutcome> {
 
 /// A `wait`'s outcome, read off the sentence that ended it: a delivered child's
 /// report (`#185 done`), a delivered job's line (`#c2 done`), the words that
-/// outranked the wait (`user spoke`, `parent spoke`), the machine's hold, or
-/// A `wait`'s details: which of the agent's own things the delivered line came
-/// from — `from #185`. Only a result the wait handed over names a source: the
-/// machine's sentences, the words that outranked the wait and mush's own
-/// `nothing to wait for` are nobody's line, and get no row.
-fn wait_details(ok: Option<&str>) -> Vec<String> {
-    let Some(text) = ok.map(str::trim_end) else {
-        return Vec::new();
-    };
-    let line = text.lines().next().unwrap_or("").trim_end();
-    if line_ending(line).is_none() {
-        return Vec::new();
-    }
-    let Some((id, _)) = line.split_once(' ') else {
-        return Vec::new();
-    };
-    vec![format!("from {id}")]
-}
-
-/// `nothing to wait for`, which is mush's own sentence and stays word for word.
+/// outranked the wait (`user spoke`, `parent spoke`), the machine's hold, and a
+/// timeout's own sentence.
 ///
 /// The answer's *first line* is what is read: a wait that times out hands over
 /// what it has and then names what it is still waiting on, and the result is
-/// what the wait was for.
+/// what the wait was for. `nothing to wait for` is mush's own sentence and
+/// stays word for word.
 fn wait_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     let text = ok?.trim_end();
     let line = text.lines().next().unwrap_or("").trim_end();
@@ -9369,15 +9325,10 @@ mod tests {
     /// A sample call and its result for every tool, read as the pane reads
     /// them: the ask the call made, the verdict the result's own sentences give,
     /// the measure its payload earns, and the detail rows the unfolded view
-    /// paints under it.
-    ///
-    /// The table is [`ToolName::ALL`]'s own list, so a tool that falls out of
-    /// it is caught here — and the digest itself has no wildcard arm, so a tool
-    /// *added* cannot build until it has a reading of its own.
-    #[test]
-    fn a_digest_for_every_tool() {
-        let root = Path::new("/w");
-        let cases: Vec<DigestCase> = vec![
+    /// paints under it. One table for the two tests below, so the reading and
+    /// [`CallFacts::details`]'s rule are pinned against the same fixtures.
+    fn digest_cases() -> Vec<DigestCase> {
+        vec![
             (
                 ToolName::EditFile,
                 json!({"path": "src/lex.rs", "edits": [
@@ -9475,13 +9426,14 @@ mod tests {
             (
                 ToolName::RunCommand,
                 json!({"command": "cargo test"}),
-                "ok\nstill ok\n[exit 0 after 5s]",
+                "ok\nstill ok\n--- stderr ---\nwarning one\nwarning two\n[exit 0 after 5s]",
                 "cargo test",
                 // The clean end is not news; the command's own time is, and the
-                // payload's lines are the measure's.
+                // payload's lines are the measure's — the stderr section
+                // included, because those lines travelled too.
                 Some(("5s", Tone::Ok)),
-                Some((Some("2L"), Some("11B"))),
-                &[],
+                Some((Some("5L"), Some("50B"))),
+                &["stderr 2L"],
             ),
             (
                 ToolName::SpawnAgent,
@@ -9501,7 +9453,10 @@ mod tests {
                 "",
                 Some(("2 agents · 1 job · 1 unread", Tone::Running)),
                 None,
-                &["#1 running", "#2 done", "#c1 running"],
+                // The listing *is* the payload, row for row: `#1 running` was
+                // its row respelled and `#c1 running` its job line verbatim, so
+                // the arm says nothing ([`CallFacts::details`]'s rule).
+                &[],
             ),
             (
                 ToolName::Control,
@@ -9510,7 +9465,9 @@ mod tests {
                 "#4 message \"more\"",
                 Some(("#4 messaged", Tone::Ok)),
                 None,
-                &["it is mid-run, so it reads this at its next step"],
+                // The result is one sentence and the payload is that sentence;
+                // the aside was its second half on the row above it.
+                &[],
             ),
             (
                 ToolName::Wait,
@@ -9519,9 +9476,20 @@ mod tests {
                 "",
                 Some(("#185 done", Tone::Ok)),
                 None,
-                &["from #185"],
+                // `from #185` restated the id the payload's own line opens
+                // with, and that line says more.
+                &[],
             ),
-        ];
+        ]
+    }
+
+    /// The table is [`ToolName::ALL`]'s own list, so a tool that falls out of
+    /// it is caught here — and the digest itself has no wildcard arm, so a tool
+    /// *added* cannot build until it has a reading of its own.
+    #[test]
+    fn a_digest_for_every_tool() {
+        let root = Path::new("/w");
+        let cases = digest_cases();
         assert_eq!(cases.len(), ToolName::ALL.len(), "a row per tool");
         for (name, args, result, ask, verdict, measure, details) in cases {
             let facts = digest(name, &args, Some(result), root);
@@ -9548,6 +9516,83 @@ mod tests {
             }
             assert_eq!(facts.details, details, "{name:?}'s details");
         }
+    }
+
+    /// The arms allowed to add a row whose fact the payload also holds, with the
+    /// reason each is news rather than a second copy of the sentence below it
+    /// ([`CallFacts::details`]'s rule). Six tools hoist and the other six say
+    /// nothing, and the split is the rule's own: a row that *collapses* what the
+    /// payload spreads out — a window's total, a capped walk's number, a
+    /// search's counts — is a service, while a row that respells one payload row
+    /// is the copy the rule refuses.
+    const HOISTS: &[(ToolName, &str)] = &[
+        (
+            ToolName::ReadFile,
+            "the file's own total waits at the end of the window's trailer; the row lifts `of 9000L` to the block's top",
+        ),
+        (
+            ToolName::ListFiles,
+            "a capped walk's note is the payload's last row; the row names the number it stopped at and the road around it",
+        ),
+        (
+            ToolName::Search,
+            "the payload spells no total; the counts are derived from the match rows and collapse them into one row",
+        ),
+        (
+            ToolName::Usages,
+            "a group header says `at 12`; the row builds the `file:line` pair out of every header",
+        ),
+        (
+            ToolName::RunCommand,
+            "the stderr section's length is a number the payload never spells; the section's own rows are the payload",
+        ),
+        (
+            ToolName::SpawnAgent,
+            "a spawn's own report is never painted (`chat::spawn_report`), so the child's checkout is this row's to name",
+        ),
+    ];
+
+    /// [`CallFacts::details`]'s one rule, over the same table
+    /// [`a_digest_for_every_tool`] reads: every detail row must fail to appear
+    /// in the result's own text — the payload painted under it — unless the arm
+    /// is on [`HOISTS`] with the reason written beside it. An empty list of rows
+    /// is the other passing side: the arm says nothing.
+    ///
+    /// A substring is the mechanical half of the rule and the half the human
+    /// saw: the `control` aside *was* the payload's second sentence, so the pane
+    /// read the same words twice. The per-arm tests beside this one carry what a
+    /// substring cannot see — whether a row's words agree with the fact.
+    #[test]
+    fn a_detail_row_is_news_unless_the_arm_hoists_it() {
+        let root = Path::new("/w");
+        let cases = digest_cases();
+        for (name, args, result, _, _, _, details) in &cases {
+            let actual = digest(*name, args, Some(result), root).details;
+            assert_eq!(&actual, details, "{name:?}'s details");
+            for row in actual.iter() {
+                let repeated = result.lines().any(|line| line.contains(row.as_str()));
+                assert!(
+                    !repeated || HOISTS.iter().any(|(tool, _)| tool == name),
+                    "{name:?}: {row:?} is painted in the payload under it"
+                );
+            }
+            assert!(
+                actual.is_empty() || HOISTS.iter().any(|(tool, _)| tool == name),
+                "{name:?}: a row needs a reason on HOISTS"
+            );
+        }
+        // The ledger is the whole list and not a stale one: every arm it names
+        // really carries a row, and no arm with a row is left off it.
+        let hoisting: Vec<ToolName> = cases
+            .iter()
+            .filter(|(_, _, _, _, _, _, details)| !details.is_empty())
+            .map(|(name, ..)| *name)
+            .collect();
+        assert_eq!(
+            hoisting,
+            HOISTS.iter().map(|(tool, _)| *tool).collect::<Vec<_>>(),
+            "the ledger and the table's own rows agree"
+        );
     }
 
     /// A call whose result has not landed has no outcome — and therefore no
@@ -9913,7 +9958,9 @@ mod tests {
 
     /// The details are read off the result and never invented: a tool whose
     /// result holds no second fact leaves the list empty, and every reader has
-    /// a road where there is nothing to say.
+    /// a road where there is nothing to say. The three arms whose result *is*
+    /// the text painted under the call — a listing, a delivery, the line a wait
+    /// handed over — say nothing at all ([`CallFacts::details`]'s rule).
     #[test]
     fn the_details_only_say_what_the_result_holds() {
         let root = Path::new("/w");
@@ -9990,10 +10037,35 @@ mod tests {
             "wait timed out — #185 still running"
         )
         .is_empty());
-        // An empty listing has no row to name.
+        // The delivered line names its own source in its opening token, so the
+        // `from #185` row restated the id the payload's first line leads with.
+        assert!(details(
+            ToolName::Wait,
+            json!({}),
+            "#185 done: the table is laid out"
+        )
+        .is_empty());
+        // A listing's rows are the payload painted under the call, row for row:
+        // `#1 running` would be its own row respelled, and `#c1 running` its
+        // job line verbatim.
         assert!(details(ToolName::Status, json!({}), "no children and no jobs").is_empty());
-        // A delivery that carried no aside has nothing behind it.
+        assert!(details(
+            ToolName::Status,
+            json!({}),
+            "agents:\n#1 ◐ running on mush/1\njobs:\n#c1 running 3s · cargo test"
+        )
+        .is_empty());
+        // A delivery has nothing behind it, aside or not: the aside *is* the
+        // payload's own second sentence, and the pane paints the sentence
+        // whole, so a row above it read the same words twice — the defect the
+        // human saw on a `control` call.
         assert!(details(ToolName::Control, json!({}), "stopping agent #4").is_empty());
+        assert!(details(
+            ToolName::Control,
+            json!({"id": "224", "action": "message", "text": "narrow it"}),
+            "messaged agent #224 — it is mid-run, so it reads this at its next step"
+        )
+        .is_empty());
         // Edit and write carry no third fact, whatever their result says: the
         // ask has the path and the outcome the change.
         assert!(details(ToolName::EditFile, json!({}), "edited x — 1 edit").is_empty());
