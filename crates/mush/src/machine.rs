@@ -183,7 +183,11 @@ pub trait Machine: Send + Sync {
 /// human's own shell starts — their editor, their own tests, their typing —
 /// which is the whole point: a build an agent launched queues behind the
 /// human's machine, never in front of it. The value is one constant, so the
-/// human can ask for another one; 19 is the least urgent Linux allows.
+/// human can ask for another one. It is 10 — a courtesy, not a floor: far
+/// enough below the human's own work that an agent's command queues behind it,
+/// and not the 19 Linux allows as the least urgent, because parking a command
+/// behind everything else on the machine is a judgement about the whole
+/// machine, and a guest does not make it.
 ///
 /// Failure is ignored on purpose: the priority is a courtesy, never a
 /// precondition, and a command that cannot be niced still runs. The one

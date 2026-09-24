@@ -693,21 +693,21 @@ row painter, and a whole frame at 100×28 with one row per mark:
 ```
 ┌ agents · 3 working · 1 waiting─┐┌ mush ──────────────────────────────────────────────────────────┐
 │▶◐ #0 ✉2 root  thinking 4s      ││you › make the tree show every state                            │
-│   ⧗ #1  waiting on results 3s  ││mush › Spawning the children.                                   │
-│     ◐ #2 tests                 ││      ⚙ spawn_agent tests probe                                 │
-│   ✗ #3 probe  no route to host ││      · spawned #2 (tests)                                      │
-│   ⊘ #4 run                     ││      ⚙ wait                                                    │
-│   ⚠ #5 build                   ││      · #2 done: 3 tests pass                                   │
-│   ≡ #6 fold  compacting 2s     ││      ✗ #3 failed: no route to host                             │
-│   ✓ #7 ✉ docs  wrote README.md ││      ⚠ #5 cut off · nothing committed                          │
-│   ✓ #8 ⚮  wrote src/lex.rs     ││mush › Every mark is on a row above.                            │
+│   ⧗ #1  waiting on results 3s  ││                                                                │
+│     ◐ #2 tests                 ││mush › Spawning the children.                                   │
+│   ✗ #3 probe  no route to host ││↳ spawn_agent tests probe                  → #2 on mush/2       │
+│   ⊘ #4 run                     ││  mush/2 · .mush/wt/2                                           │
+│   ⚠ #5 build                   ││                                                                │
+│   ≡ #6 fold  compacting 2s     ││  spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops   │
+│   ✓ #7 ✉ docs  wrote README.md ││  calling tools · wait returns its summary                      │
+│   ✓ #8 ⚮  wrote src/lex.rs     ││                                                                │
+│                                ││⧗ wait                                     → #2 still running   │
 │                                ││                                                                │
+│                                ││  wait timed out — #2 still running                             │
 │                                ││                                                                │
+│                                ││· #3 failed: no route to host                                   │
 │                                ││                                                                │
-│                                ││                                                                │
-│                                ││                                                                │
-│                                ││                                                                │
-│                                ││                                                                │
+│                                ││mush › Every mark is on a row above.                            │
 │                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │

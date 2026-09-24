@@ -1194,6 +1194,13 @@ fn event_loop(
     /// draw forever.
     const MAX_EVENTS_PER_FRAME: usize = 4096;
 
+    // The keyboard-protocol query is a *bounded* wait (up to two seconds on a
+    // terminal that never answers), so it is asked here, not by the entry: the
+    // UI must be up first, and it must not be asked under a terminal that
+    // already has keys queued either — `handled == 0` is the first idle tick.
+    let mut painted = false;
+    let mut asked = false;
+
     while !app.should_quit {
         // A signal is read here, on the thread that owns the terminal, the tree
         // and the store: the flag turns into the quit road and the loop stops
@@ -1241,6 +1248,11 @@ fn event_loop(
             }
         }
 
+        if !asked && painted && handled == 0 {
+            asked = true;
+            ask_keyboard_enhancement()?;
+        }
+
         app.tick();
         if app.dirty_screen {
             // One value, painted: `App` derives every word of the frame (the
@@ -1251,6 +1263,7 @@ fn event_loop(
                 ui::draw(frame, &screen, theme)
             })?;
             app.dirty_screen = false;
+            painted = true;
         }
     }
     Ok(())
@@ -1310,8 +1323,7 @@ fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Re
 }
 
 /// The screen step of [`TerminalGuard::enter`]: the alternate screen and
-/// bracketed paste — and, when the terminal says it can, the keyboard
-/// enhancement flags.
+/// bracketed paste.
 ///
 /// Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
 /// keystrokes — one event, one repaint, and a redraw per character — into a
@@ -1322,32 +1334,58 @@ fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Re
 /// lag that made the wheel feel broken was the per-keystroke repaint, which
 /// the event loop no longer does.
 ///
-/// The flags are what make `Shift-Enter`, `Shift-↑` and `Shift-↓` arrive at
-/// all: a terminal that encodes keys the legacy way sends them byte-identical
-/// to their unmodified forms, which is why `Alt-Enter` exists. So mush asks
-/// once, now that raw mode is on, and pushes only when the terminal answers the
-/// protocol's flags query. `supports_keyboard_enhancement` is a query and a
-/// *bounded* wait, and a terminal that stays silent is a terminal that cannot:
-/// no push, and exactly the old behaviour (`Shift-Enter` sends). The query
-/// reaching an outer terminal through tmux needs tmux ≥ 3.2 with
-/// `extended-keys on`; that is the manual's sentence, not code.
+/// The keyboard enhancement flags are *not* pushed here, and the protocol's
+/// flags query is not asked here either: `supports_keyboard_enhancement` is a
+/// query and a *bounded* wait, and paying it before this step had painted
+/// anything was two seconds of blank screen on a terminal that never answers.
+/// [`ask_keyboard_enhancement`] is that half, asked by the event loop once the
+/// first frame is up.
 ///
 /// Entry and undo are the two halves of one shape — queue what the terminal
 /// gets, then a single `flush` — so a half-written set of screen modes is not a
 /// state that exists.
 fn screen_modes() -> io::Result<()> {
-    // An `Err` here is a terminal that did not answer the query in time, which
-    // is no support — never a reason to refuse to start.
-    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    KEYBOARD_ENHANCED.store(enhanced, Ordering::SeqCst);
     let mut stdout = io::stdout();
     queue!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    if enhanced {
-        queue!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
+    stdout.flush()
+}
+
+/// The keyboard-protocol half of the entry: ask whether the terminal speaks
+/// the kitty protocol, and push the flags when it answers yes.
+///
+/// The flags are what make `Shift-Enter`, `Shift-↑` and `Shift-↓` arrive at
+/// all: a terminal that encodes keys the legacy way sends them byte-identical
+/// to their unmodified forms, which is why `Alt-Enter` exists. So mush asks
+/// once — `supports_keyboard_enhancement` is the protocol's flags query and a
+/// *bounded* wait, and a terminal that stays silent is a terminal that cannot:
+/// no push, and exactly the old behaviour (`Shift-Enter` sends). The query
+/// reaching an outer terminal through tmux needs tmux ≥ 3.2 with
+/// `extended-keys on`; that is the manual's sentence, not code.
+///
+/// The wait is why this is not part of [`screen_modes`]: a terminal that never
+/// answers would have held up the first frame for up to two seconds, so the
+/// event loop asks this on its first idle tick, with the UI already painted —
+/// the enhancement arrives a frame later, and nothing the human sees waits on
+/// it. The entry's shape is kept for the push itself (queue, then one
+/// `flush`), and [`KEYBOARD_ENHANCED`] is stored *before* the write: a panic
+/// between the two pops a frame the terminal may never have had — a pop on an
+/// empty stack is the harmless direction — rather than leaving a pushed frame
+/// no road pops.
+///
+/// An `Err` from the query is a terminal that did not answer in time, which is
+/// no support and never a reason to stop; an `Err` from the push travels like
+/// the entry's own write failure did.
+fn ask_keyboard_enhancement() -> io::Result<()> {
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    KEYBOARD_ENHANCED.store(enhanced, Ordering::SeqCst);
+    if !enhanced {
+        return Ok(());
     }
+    let mut stdout = io::stdout();
+    queue!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     stdout.flush()
 }
 
@@ -1359,6 +1397,11 @@ struct TerminalGuard {
 impl TerminalGuard {
     /// Enter the terminal: raw mode, the alternate screen, bracketed paste —
     /// and the ratatui terminal every frame is painted through.
+    ///
+    /// The keyboard enhancement flags are not part of this: the protocol's
+    /// flags query is a bounded wait, and [`ask_keyboard_enhancement`] asks it
+    /// from the event loop once the first frame is painted, so the entry never
+    /// holds the UI up for a terminal that will not answer.
     ///
     /// Each mode is a promise to the human's shell: leaving raw mode on breaks
     /// their typing, and leaving bracketed paste on makes their own pastes

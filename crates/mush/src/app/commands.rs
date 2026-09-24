@@ -364,10 +364,15 @@ pub(crate) mod tests {
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders};
+    use unicode_width::UnicodeWidthStr;
 
+    use crate::agent::{CallFacts, CallOutcome, Tone};
+    use crate::app::call_grid;
     use crate::app::screen::{AgentsPane, BarPane, ChatPane, InputPane, Panes, Screen};
+    use crate::app::symbols::Symbols;
     use crate::app::{AgentId, AgentRow, Focus, Painted, Rank};
-    use crate::ui::HINT;
+    use crate::ui::{dim, HINT};
+    use mush_core::message::{FunctionCall, ToolCall};
 
     /// One typed line for a command: with an argument when the table says one
     /// is required (`<…>`, not the `[…]` of an optional one). Every command's
@@ -705,6 +710,83 @@ pub(crate) mod tests {
         }
     }
 
+    /// The columns a sample frame's transcript rows are painted at: the
+    /// 100-column frame less the 34-column tree `agents_columns` gives it and
+    /// the two columns the chat pane's own border takes. [`sample_screen`] lays
+    /// the frame out at the same figures, so a sample row is the row the pane
+    /// paints in that frame.
+    const TRANSCRIPT_WIDTH: usize = 100 - 34 - 2;
+
+    /// One marked line at the transcript's width, wrapped the way `chat`'s
+    /// `marked` wraps it: the mark leads the first row and its own width of
+    /// blank leads every wrap under it. The pane's replies, its notices and a
+    /// result's payload are all this shape, so a sample paints through it
+    /// rather than writing indents by hand.
+    fn marked_rows(mark: &str, mark_style: Style, body: Style, text: &str) -> Vec<Line<'static>> {
+        let lead = UnicodeWidthStr::width(mark);
+        mush_core::text::wrap_text(text, TRANSCRIPT_WIDTH.saturating_sub(lead))
+            .into_iter()
+            .enumerate()
+            .map(|(at, line)| {
+                let head = if at == 0 {
+                    Span::styled(mark.to_string(), mark_style)
+                } else {
+                    Span::raw(" ".repeat(lead))
+                };
+                Line::from(vec![head, Span::styled(line, body)])
+            })
+            .collect()
+    }
+
+    /// A voice's rows ([`crate::app::chat`]'s `marked`): the mark in its own
+    /// style, the words plain. The human's line, a reply and a notice all wear
+    /// this shape.
+    fn spoken(mark: &str, style: Style, text: &str) -> Vec<Line<'static>> {
+        marked_rows(mark, style, Style::default(), text)
+    }
+
+    /// One block painted in one colour throughout, the shape a tool result's
+    /// payload wears: mush's own gutter ([`Symbols::GUTTER_MARK`]) and the
+    /// result's words, wrapped under it.
+    fn solid(mark: &str, style: Style, text: &str) -> Vec<Line<'static>> {
+        marked_rows(mark, style, style, text)
+    }
+
+    /// One tool call's rows as the pane paints them: the digest header and the
+    /// result's detail rows through [`call_grid`], the one grid both views use,
+    /// with the tool's own mark ([`Symbols`]). The ask, the outcome and the
+    /// details are the fixture's words, but the mark, the columns and the
+    /// arrow's place are the pane's arithmetic — a sample cannot show a row the
+    /// grid would not paint.
+    fn call_rows(
+        name: &str,
+        ask: &str,
+        outcome: &str,
+        tone: Tone,
+        details: &[&str],
+    ) -> Vec<Line<'static>> {
+        let call = ToolCall {
+            id: "call".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let facts = CallFacts {
+            ask: ask.to_string(),
+            outcome: Some(CallOutcome {
+                text: outcome.to_string(),
+                tone,
+            }),
+            details: details.iter().map(|row| row.to_string()).collect(),
+        };
+        let mark = Symbols::SYMBOLS.mark(name);
+        let mut rows = call_grid::header(&call, &facts, TRANSCRIPT_WIDTH, mark);
+        rows.extend(call_grid::details(&facts, TRANSCRIPT_WIDTH, mark));
+        rows
+    }
+
     /// One tree row, with its fields already chosen the way `App::rows`
     /// derives them. A sample frame's words are a fixture's, so no clock and no
     /// endpoint can move them.
@@ -820,9 +902,53 @@ pub(crate) mod tests {
 
     /// The front page's sample: the root and one child working, one child done,
     /// a conversation in the chat, the hint under it and the facts.
+    ///
+    /// The transcript is the pane's own rows: every message paints its rows and
+    /// then the blank `chat::closing_blank` closes it with, the calls are
+    /// painted by the grid the pane uses ([`call_rows`]), their results at the
+    /// gutter the pane indents them by ([`solid`]), and the blank after the
+    /// last message is the foot's to trim (`chat::body`) — which is why the
+    /// foot's own row sits right under the reply.
     pub(crate) fn readme_sample_screen() -> Screen {
         let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
         root.focused = true;
+        let mut transcript: Vec<Line<'static>> = Vec::new();
+        transcript.extend(spoken(
+            "you › ",
+            Style::default().fg(Color::Cyan),
+            "rename the lexer module",
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken(
+            "mush › ",
+            Style::default().fg(Color::Green),
+            "Starting with the rename.",
+        ));
+        // The reply and the call are one assistant message: the call's row
+        // follows the words with no blank between them, and the blank under it
+        // closes the turn.
+        transcript.extend(call_rows(
+            "edit_file",
+            "src/lex.rs",
+            "3 hunks",
+            Tone::Ok,
+            &[],
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(solid(
+            Symbols::GUTTER_MARK,
+            dim(),
+            "edited src/lex.rs — 3 edits",
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken("· ", dim(), "#2 done: wrote README.md"));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken(
+            "mush › ",
+            Style::default().fg(Color::Green),
+            "The tests are next.",
+        ));
+        transcript.extend(spoken("· ", dim(), "waiting on #1"));
         sample_screen(
             &["2 working", "Σ +12 −3"],
             vec![
@@ -854,22 +980,21 @@ pub(crate) mod tests {
                     Style::default().fg(Color::DarkGray),
                 )),
             ],
-            vec![
-                Line::from("you › rename the lexer module"),
-                Line::from("mush › Starting with the rename."),
-                Line::from("      ⚙ edit_file src/lex.rs"),
-                Line::from("      · spawned #1 lexer"),
-                Line::from("      ✓ #1 done: renamed the module"),
-                Line::from("mush › The tests are next."),
-                Line::from("· waiting on #1"),
-            ],
+            transcript,
             None,
             " ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k",
         )
     }
 
     /// §4.5's sample: one row per phase and one per row mark, so the picture
-    /// says the same thing about the marks the `marks` block names.
+    /// says the same thing about the marks the `marks` block names. Its chat is
+    /// the pane's own rows too ([`readme_sample_screen`]): a spawn and a wait,
+    /// their payloads at the grid's gutter, and the report rows the tree's
+    /// phases were built from.
+    ///
+    /// The child is spawned and its wait times out while it still works, which
+    /// is the phase the tree's `◐ #2 tests` row shows: the chat is the same
+    /// moment the tree is.
     pub(crate) fn manual_sample_screen() -> Screen {
         let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
         root.focused = true;
@@ -878,6 +1003,56 @@ pub(crate) mod tests {
         orphan.parent_gone = true;
         let mut unread = row(7, 1, "✓", "docs", "", "wrote README.md");
         unread.result_unread = true;
+        let mut transcript: Vec<Line<'static>> = Vec::new();
+        transcript.extend(spoken(
+            "you › ",
+            Style::default().fg(Color::Cyan),
+            "make the tree show every state",
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken(
+            "mush › ",
+            Style::default().fg(Color::Green),
+            "Spawning the children.",
+        ));
+        transcript.extend(call_rows(
+            "spawn_agent",
+            "tests probe",
+            "#2 on mush/2",
+            Tone::Running,
+            &["mush/2 · .mush/wt/2"],
+        ));
+        transcript.push(Line::from(""));
+        // The result's own sentence is long enough to wrap under the call: the
+        // grid's gutter leads every row of it.
+        transcript.extend(solid(
+            Symbols::GUTTER_MARK,
+            dim(),
+            "spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops calling tools · wait \
+             returns its summary",
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(call_rows(
+            "wait",
+            "",
+            "#2 still running",
+            Tone::Running,
+            &[],
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(solid(
+            Symbols::GUTTER_MARK,
+            dim(),
+            "wait timed out — #2 still running",
+        ));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken("· ", dim(), "#3 failed: no route to host"));
+        transcript.push(Line::from(""));
+        transcript.extend(spoken(
+            "mush › ",
+            Style::default().fg(Color::Green),
+            "Every mark is on a row above.",
+        ));
         sample_screen(
             &["3 working", "1 waiting", "Σ +324 −40"],
             vec![
@@ -900,17 +1075,7 @@ pub(crate) mod tests {
             ],
             0,
             Vec::new(),
-            vec![
-                Line::from("you › make the tree show every state"),
-                Line::from("mush › Spawning the children."),
-                Line::from("      ⚙ spawn_agent tests probe"),
-                Line::from("      · spawned #2 (tests)"),
-                Line::from("      ⚙ wait"),
-                Line::from("      · #2 done: 3 tests pass"),
-                Line::from("      ✗ #3 failed: no route to host"),
-                Line::from("      ⚠ #5 cut off · nothing committed"),
-                Line::from("mush › Every mark is on a row above."),
-            ],
+            transcript,
             Some((
                 Rank::Said,
                 "spawned #8 (orphan) — its parent was reaped".to_string(),

@@ -11,16 +11,16 @@ and see what changed.
 ```
 ┌ agents · 2 working · Σ +12 −3──┐┌ mush ──────────────────────────────────────────────────────────┐
 │▶◐ #0 root  thinking 4s         ││you › rename the lexer module                                   │
-│   ◐ #1 lexer  mush/1 +12−3     ││mush › Starting with the rename.                                │
-│   ✓ #2 docs  wrote README.md   ││      ⚙ edit_file src/lex.rs                                    │
-│                                ││      · spawned #1 lexer                                        │
-│                                ││      ✓ #1 done: renamed the module                             │
+│   ◐ #1 lexer  mush/1 +12−3     ││                                                                │
+│   ✓ #2 docs  wrote README.md   ││mush › Starting with the rename.                                │
+│                                ││± edit_file src/lex.rs                     → 3 hunks            │
+│                                ││                                                                │
+│                                ││  edited src/lex.rs — 3 edits                                   │
+│                                ││                                                                │
+│                                ││· #2 done: wrote README.md                                      │
+│                                ││                                                                │
 │                                ││mush › The tests are next.                                      │
 │                                ││· waiting on #1                                                 │
-│                                ││                                                                │
-│                                ││                                                                │
-│                                ││                                                                │
-│                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
