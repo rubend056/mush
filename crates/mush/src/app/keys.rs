@@ -398,7 +398,10 @@ pub enum Intent {
     Quit,
     /// New chat: Ctrl-N, and the old conversation is gone.
     NewChat,
-    /// Stop the focused agent's run (`Ctrl-C`).
+    /// Stop the work in flight on the focused agent (`Ctrl-C`): its run, or the
+    /// jobs it detached. Never any other agent — the fallback that stopped the
+    /// only busy agent while the focused one was at rest is what killed an agent
+    /// nobody aimed at.
     Interrupt,
     /// Stop every running agent (`Ctrl-X`) — the emergency brake, which used to
     /// be on `Ctrl-C` and killed the wrong agents.
@@ -1199,11 +1202,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// The two stop keys name their scope, so the help cannot repeat the doc's
-    /// old "`Ctrl-C` cancel running agents" (plural): `Ctrl-C` stops the
-    /// *focused* agent and `Ctrl-X` stops every running one (the code side of
-    /// finding K5). A doc that swaps them is then contradicted by the surface a
-    /// human reads.
+    /// The two stop keys name their scope, and it is the scope the code has:
+    /// `Ctrl-C` stops the *focused* agent — never a bystander, which is what a
+    /// removed fallback did when the focused agent was at rest and exactly one
+    /// other was busy — and `Ctrl-X` stops every running one. The help used to
+    /// say "cancel running agents" (plural) for `Ctrl-C` while the code had the
+    /// fallback; the scope words are pinned here, and
+    /// `ctrl_c_at_a_resting_agent_names_the_runner_instead_of_stopping_it` pins
+    /// the arm to them, so a doc that swaps them is contradicted by the surface
+    /// a human reads.
     #[test]
     fn the_two_stop_keys_name_their_scope() {
         let help = |keys: &str| {
@@ -1212,11 +1219,15 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("no `{keys}` row"))
                 .help
         };
-        assert_ne!(
-            help("Ctrl-C"),
-            help("Ctrl-X"),
-            "the two scopes are not the same key's job"
+        let focused = help("Ctrl-C");
+        let all = help("Ctrl-X");
+        assert!(focused.contains("focused"), "{focused}");
+        assert!(
+            !focused.contains("every"),
+            "one agent is not every agent: {focused}"
         );
+        assert!(all.contains("every running agent"), "{all}");
+        assert!(!all.contains("focused"), "{all}");
     }
 
     /// The key that ends everything says so. `Ctrl-N` stops every actor in the

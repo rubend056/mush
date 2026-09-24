@@ -5784,48 +5784,129 @@ impl App {
         }
     }
 
-    /// Ask one agent's current run to stop: flip the flag its in-flight model
-    /// call polls, and leave a Stop in the mailbox for everything else (a
-    /// parked wait, a shell command, the next message boundary).
-    /// Stop the agent the human is looking at. Ctrl-C used to stop *every*
-    /// busy agent at once, which is the wrong default: the agents it killed
-    /// were usually the ones already finished and about to report, and their
-    /// work was lost with them. Stopping one agent is what the key should do;
-    /// stopping the whole tree is `interrupt_all`.
+    /// Stop the agent the human is looking at, and no other. Ctrl-C used to
+    /// stop *every* busy agent at once, which is the wrong default: the agents
+    /// it killed were usually the ones already finished and about to report,
+    /// and their work was lost with them. Stopping one agent is what the key
+    /// should do; stopping the whole tree is `interrupt_all`.
+    ///
+    /// "The agent the human is looking at" is [`AgentTree::focused`], exactly.
+    /// A fallback used to stand here — when nothing on the focus was in flight
+    /// but *one* other agent was busy, stop that one — and it made the key's
+    /// target depend on how many agents happened to be busy elsewhere, a fact
+    /// the pane being read does not show. The human pressed Ctrl-C at the
+    /// resting orchestrator whose transcript they were reading and a child
+    /// died, twice. A key whose target cannot be aimed is not a stop key; when
+    /// the focus is at rest the line names who is running and the roads that
+    /// stop them ([`Self::busy_elsewhere_line`], the shape the several-agents
+    /// line already had, finding D25).
     fn interrupt(&mut self) {
-        // What the human is looking at: the focused agent if it is working, else
-        // the one agent that is — and "working" includes a detached job, which
-        // is work in flight even while its owner naps.
         let busy = self.working_agents();
-        let target = if busy.contains(&self.tree.focused) {
-            Some(self.tree.focused)
-        } else if busy.len() == 1 {
-            Some(busy[0])
-        } else {
-            None
-        };
-        let Some(id) = target else {
-            if busy.is_empty() {
-                self.say(NOTHING_RUNNING);
+        let focused = self.tree.focused;
+        if busy.contains(&focused) {
+            // A run's stop is its own feedback: the row wears `⊘` and the
+            // actor's ending says `agent #2 stopped — send a message to resume
+            // it`. A job has no phase to wear either: the agent it belongs to
+            // is at rest, `cancel_requested` leaves it there, and the kill's
+            // only trace would be the job's own `#c1 stopped after …` a moment
+            // later — which does not say the key is what ended it. So the key
+            // says which work it aimed at before it aims; the jobs come from
+            // the same registry the in-flight check read, so the line cannot
+            // name a job the Stop will not reach.
+            let run = self
+                .tree
+                .node(focused)
+                .is_some_and(|node| node.phase.is_busy());
+            let jobs = if run {
+                Vec::new()
             } else {
-                // Several agents are busy and the focused one is not among
-                // them: stopping the wrong one silently would be worse than
-                // asking, so name the road that stops one instead. It used to
-                // name `Enter`, which sends the box's draft in the chat pane
-                // and only shows a row's transcript in the tree — it stops
-                // nothing (finding D25).
-                self.say(format!(
-                    "{} agents running · agents pane: c stops the row · Ctrl-X stops all",
-                    busy.len()
-                ));
+                self.tree.live_jobs(focused)
+            };
+            if !jobs.is_empty() {
+                self.say(self.stopping_jobs_line(focused, &jobs));
             }
+            self.stop_one(focused);
             return;
+        }
+        if busy.is_empty() {
+            self.say(NOTHING_RUNNING);
+        } else {
+            self.say(self.busy_elsewhere_line(&busy));
+        }
+    }
+
+    /// The line `Ctrl-C` answers with when the focused agent is at rest and
+    /// somebody else is not: who is running, and both roads that stop them,
+    /// because the key reaches none of them on its own any more.
+    ///
+    /// One busy agent is named with its work (`#2 thinking`), which is the
+    /// quit warning's own spelling ([`Self::what_a_quit_kills`]); several keep
+    /// the line finding D25 wrote, and only its count changes. Both are one bar
+    /// row, inside the 73 columns a row has once the badge takes its seven.
+    fn busy_elsewhere_line(&self, busy: &[AgentId]) -> String {
+        match busy {
+            [id] => format!(
+                "nothing running here — {} (c on its row, Ctrl-X stops all)",
+                self.working_words(*id)
+            ),
+            many => format!(
+                "{} agents running · agents pane: c stops the row · Ctrl-X stops all",
+                many.len()
+            ),
+        }
+    }
+
+    /// One in-flight agent as the bar names it: `#2 thinking` when a run is in
+    /// flight, `#2 running a job` when the agent is at rest and only a detached
+    /// job is left.
+    ///
+    /// The phase word is [`Phase::doing`]'s, the one the quit warning reads. The
+    /// job half exists because `doing` answers `idle` there, and the machine is
+    /// not: the agent's command is running even while the agent naps.
+    fn working_words(&self, id: AgentId) -> String {
+        let Some(node) = self.tree.node(id) else {
+            return id.to_string();
         };
-        self.stop_one(id);
+        if node.phase.is_busy() {
+            return format!("{id} {}", node.phase.doing());
+        }
+        match self.tree.live_jobs(id).len() {
+            1 => format!("{id} running a job"),
+            count => format!("{id} running {count} jobs"),
+        }
+    }
+
+    /// What `Ctrl-C` says when the focused agent's only work is the jobs it
+    /// detached: the run case is the row's own feedback, but a job kill leaves
+    /// no phase for the row to wear, so the key names the work and the jobs it
+    /// is taking with it.
+    ///
+    /// Ctrl-C means "stop the work in flight" and a job is work in flight
+    /// (`docs/mush.md` §5.6); leaving the job to run while the key claimed
+    /// nothing was running would be the same class of surprise one turn over.
+    /// The commands are named the way the job's own detached line names them
+    /// (`#c1 cargo build`), and a line with more than one job names the first
+    /// and counts the rest, so the count is never smaller than what dies.
+    fn stopping_jobs_line(&self, id: AgentId, jobs: &[crate::jobs::JobView]) -> String {
+        let names: Vec<String> = jobs
+            .iter()
+            .map(|job| format!("{} {}", crate::jobs::label(job.id), job_title(&job.command)))
+            .collect();
+        let what = match names.len() {
+            1 => "its job".to_string(),
+            count => format!("its {count} jobs"),
+        };
+        let rest = match names.as_slice() {
+            [] => String::new(),
+            [only] => only.clone(),
+            [first, many @ ..] => format!("{first}, +{} more", many.len()),
+        };
+        format!("{id}: stopping {what} · {rest}")
     }
 
     /// Stop every busy agent. The old Ctrl-C, now on its own key: it is the
-    /// emergency brake, not the everyday one.
+    /// emergency brake, not the everyday one — the one key whose fan-out is the
+    /// point, where [`Self::interrupt`]'s is the defect.
     fn interrupt_all(&mut self) {
         let targets = self.working_agents();
         if targets.is_empty() {
@@ -17858,6 +17939,174 @@ mod tests {
         );
     }
 
+    /// The road the human's report confirmed, as a test: the transcript being
+    /// read is the root's, the root is at rest between turns, one child is in
+    /// flight — and Ctrl-C used to stop the child, silently, because a fallback
+    /// aimed the key at "the only agent that is busy" whenever the focused one
+    /// was not. Twice, in the report. This pins the road that replaced it — the
+    /// fallback dropped, so the key stops the focused agent and only it — and
+    /// the bar names who is running with the two keys that really stop them.
+    /// (The other road offered was keeping the fallback and announcing it; that
+    /// one still aims the key somewhere the human is not looking.) Failing on
+    /// the old behaviour is exactly this shape: the child's phase would read
+    /// `Cancelling` and its mailbox would hold the Stop this test proves never
+    /// arrives.
+    #[test]
+    fn ctrl_c_at_a_resting_agent_names_the_runner_instead_of_stopping_it() {
+        let (mut app, _rx) = test_app("ctrl-c-resting");
+        let child = live_child(&mut app, 1, 0);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'c');
+
+        assert!(
+            matches!(
+                child.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "no Stop reached the child: the key was aimed at the root, which is at rest"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).map(|node| node.phase.clone()),
+            Some(Phase::Thinking),
+            "the child keeps running"
+        );
+        assert_eq!(
+            text_of(&app),
+            "nothing running here — #1 thinking (c on its row, Ctrl-X stops all)",
+            "the bar names who is running instead of stopping them"
+        );
+
+        // A second press is the human's own report ("it stopped 204 twice"):
+        // it says the same thing again and still stops no child.
+        ctrl(&mut app, 'c');
+        assert_eq!(
+            text_of(&app),
+            "nothing running here — #1 thinking (c on its row, Ctrl-X stops all)"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).map(|node| node.phase.clone()),
+            Some(Phase::Thinking)
+        );
+    }
+
+    /// The other road the human's "have we wired Ctrl-C to kill every running
+    /// agent?" could have taken: a parent's stop fanning out to its children.
+    /// There is no such road — `cancel_requested` hands one actor one Stop, and
+    /// no ending travels back down the tree — and this pins its absence, because
+    /// a parent's stop killing its children would be the same surprise one level
+    /// over. The fan-out keys are the explicit ones: `Ctrl-X`
+    /// (`interrupt_all`) and `Ctrl-N`/quit (`Shutdown` to every mailbox).
+    #[test]
+    fn stopping_a_parent_does_not_stop_its_children() {
+        let (mut app, _rx) = test_app("no-cascade");
+        let child = live_child(&mut app, 1, 0);
+        begin_run(&mut app, AgentId::ROOT);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'c');
+
+        assert_eq!(
+            app.tree.agents[0].phase,
+            Phase::Cancelling,
+            "the focused run is the one being stopped"
+        );
+        assert_eq!(
+            app.tree.agents[1].phase,
+            Phase::Thinking,
+            "the child keeps running"
+        );
+        assert!(
+            matches!(
+                child.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Empty)
+            ),
+            "and its mailbox never hears the parent's Stop"
+        );
+    }
+
+    /// An agent whose only work is a detached job is in flight for Ctrl-C, and
+    /// the key kills that job — the same Stop the actor's own handlers turn into
+    /// `kill_owned` for every road (`agent::absorb`, `drain_signals`), and the
+    /// contract `docs/mush.md` §5.6 writes down. What is new is the saying: the
+    /// row cannot wear `⊘` for a kill (its agent is at rest, and
+    /// `cancel_requested` leaves a resting phase alone), so the bar names the
+    /// work the key took — in the job's own `#c1` vocabulary — and the job's own
+    /// `#c1 stopped after …` follows it.
+    #[test]
+    fn ctrl_c_on_a_job_only_focus_kills_the_job_and_says_which_work_it_took() {
+        let (mut app, _rx) = test_app("ctrl-c-job");
+        let machine = running_job_on(&mut app, 0);
+
+        ctrl(&mut app, 'c');
+
+        assert_eq!(
+            text_of(&app),
+            "#0: stopping its job · #c1 cargo build --release",
+            "the bar says which work it aimed at"
+        );
+        assert_eq!(
+            app.tree.agents[0].phase,
+            Phase::Idle,
+            "there was no run to cancel, and the key cannot invent one"
+        );
+        // The kill is the actor's to make: the Stop travels to the mailbox, and
+        // the actor's own handler kills what it owns.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while machine.kills() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(machine.kills(), 1, "the job the bar named is killed");
+    }
+
+    /// The job line is bounded like every bar line: what it cannot name it
+    /// counts. The order of a registry's live jobs is a hash map's, so *which*
+    /// job is named is deliberately not pinned — that it is one of them, and
+    /// that the rest are counted, is.
+    #[test]
+    fn the_job_line_counts_the_jobs_it_leaves_unnamed() {
+        let (mut app, _rx) = test_app("ctrl-c-jobs");
+        running_job_on(&mut app, 0);
+        running_job_on(&mut app, 0);
+
+        ctrl(&mut app, 'c');
+
+        let line = text_of(&app).to_string();
+        assert!(line.starts_with("#0: stopping its 2 jobs · "), "{line}");
+        assert!(line.contains("#c1") || line.contains("#c2"), "{line}");
+        assert!(
+            line.ends_with(", +1 more"),
+            "the second job is counted, not dropped: {line}"
+        );
+        assert!(line.chars().count() <= 73, "one bar row: {line}");
+    }
+
+    /// The single-busy-agent line covers the job case too: `Phase::doing` would
+    /// answer `idle` for an agent at rest under a running job, which is the one
+    /// word a line about who is running must not say.
+    #[test]
+    fn the_one_agent_line_names_a_job_when_a_job_is_the_work() {
+        let (mut app, _rx) = test_app("elsewhere-job");
+        spawn_agent(&mut app, 1, 0, 1, "one", None);
+        // A spawned node is thinking; a job-only agent is one whose run ended
+        // and left a command behind, which is the shape this line is for.
+        app.tree.idle(AgentId(1));
+        running_job_on(&mut app, 1);
+
+        ctrl(&mut app, 'c');
+
+        assert_eq!(
+            text_of(&app),
+            "nothing running here — #1 running a job (c on its row, Ctrl-X stops all)"
+        );
+        running_job_on(&mut app, 1);
+        ctrl(&mut app, 'c');
+        assert_eq!(
+            text_of(&app),
+            "nothing running here — #1 running 2 jobs (c on its row, Ctrl-X stops all)"
+        );
+    }
+
     /// The line `Ctrl-C` answers with when several agents run and the focused
     /// one does not: it must name a key that *stops*. It used to name `Enter`,
     /// which sends the chat pane's draft (and only shows a tree row's
@@ -17907,6 +18156,15 @@ mod tests {
             line.chars().count() <= 73,
             "one bar row once the badge takes its seven columns: {line}"
         );
+        // And the line stopped nothing: it names the roads, and reaching for an
+        // agent on its own is what the fallback did.
+        for id in [1, 2] {
+            assert_eq!(
+                app.tree.node(AgentId(id)).map(|node| node.phase.clone()),
+                Some(Phase::Thinking),
+                "the line stops nothing"
+            );
+        }
     }
 
     /// The cancel mark lasts exactly as long as the cancel does: the actor
@@ -18662,6 +18920,30 @@ mod tests {
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
+    }
+
+    /// [`spawn_agent`] with a mailbox a test can read afterwards: the receiver
+    /// comes back, so a test can prove a Stop did — or did not — land on the
+    /// child. [`spawn_agent`] drops its own, which is the shape a *dead* actor's
+    /// mailbox has and the wrong one for a test about who was stopped.
+    fn live_child(app: &mut App, id: u64, parent: u64) -> Receiver<AgentMsg> {
+        let (cmd, rx) = crossbeam_channel::unbounded();
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(parent),
+            event: AgentEvent::Spawned {
+                child: id,
+                parent,
+                depth: 1,
+                brief: format!("task {id}"),
+                branch: None,
+                fork: None,
+                title: None,
+                cmd,
+            },
+        });
+        rx
     }
 
     /// A run in flight on one agent: what its actor reports when it starts.
