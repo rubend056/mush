@@ -60,14 +60,16 @@ the keymap and the commands.
 
 `Tab` moves between the **agents** tree and the **chat**, and `Ctrl-F` hands the
 focused one the whole screen — `Tab` switches which that is. Type in the message
-box and press `Enter`. The agent works the workspace through eleven tools: six
+box and press `Enter`. The agent works the workspace through twelve tools: seven
 touch the files (`edit_file` replaces exact text, because an exact-and-unique
 match is a safety property `sed -i` does not have; `read_file` reads a line
 window and works even while another agent holds the machine; `outline` sketches
-a file's declarations without spending the window on its text), `run_command` is
-the shell for everything else (git, tests, builds), `spawn_agent` delegates, and
-`status`, `control` and `wait` manage the agents and jobs it starts. The schemas
-are `crates/mush-core/src/prompt.rs`; the manual's §3 lists them.
+a file's declarations without spending the window on its text; `search` finds a
+literal string; `usages` answers who mentions a symbol as a word, grouped by
+file), `run_command` is the shell for everything else (git, tests, builds),
+`spawn_agent` delegates, and `status`, `control` and `wait` manage the agents and
+jobs it starts. The schemas are `crates/mush-core/src/prompt.rs`; the manual's §3
+lists them.
 
 It talks to any OpenAI-compatible endpoint with function calling:
 

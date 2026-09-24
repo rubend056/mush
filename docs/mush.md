@@ -35,15 +35,17 @@ spec: the spec is the doc comments beside the code, written as the reason, and
 - `mush` is a TUI in Rust. One binary. **No async runtime.**
 - Workspace-first: `mush [DIR]`, or just `mush` in the folder you are in.
 - An **agent is built in**: it talks to any OpenAI-compatible endpoint (the
-  built-in default is `http://rubendpc:8078`) and works the workspace through ten
-  tools: `read_file`, `write_file`, `list_files` and `search` touch files,
-  `edit_file` replaces exact text, `run_command` is the shell, `spawn_agent`
-  delegates, and `status`, `control` and `wait` manage what it started — a long
-  command becomes a **job** the agent can check on later, and `read_file` is the
-  one *tool* road an image can travel by (§3).
+  built-in default is `http://rubendpc:8078`) and works the workspace through
+  twelve tools: `edit_file` changes exact text, `read_file` reads a line window
+  (and is the one road an image travels by), `outline` sketches a file's
+  declarations, `write_file` replaces whole files, `list_files` and `search` map
+  and grep the tree, `usages` answers who mentions a symbol, `run_command` is the
+  shell, `spawn_agent` delegates, and `status`, `control` and `wait` manage what
+  it started — a long command becomes a **job** the agent can check on later
+  (§3).
 - mush holds **no file state**: agents read and write files directly, and the UI
   shows their tree, their transcripts, and the git facts.
-- The agent's system prompt and the eleven schemas are
+- The agent's system prompt and the twelve schemas are
   `crates/mush-core/src/prompt.rs` (`RULES`, `DELEGATION`, `MACHINE`,
   `ROOT_ROLE`) and `crates/mush-core/src/tools.rs` (`TOOL_NAMES`).
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
@@ -146,7 +148,8 @@ an agent event — becomes a `Msg`, and one thread applies it to `App` (§6).
   `— end of file`). A `read_file` of a file past 32 MB is refused (a window
   cannot get past it — the file is opened whole first), and a `search` past 2 MB
   *in one file* skips it and counts it, so a "no match" that skipped a file says
-  how many and names `run_command` as the road. An image past its cap is refused
+  how many and names `run_command` as the road — `usages` walks the same tree
+  with the same skips and says them the same way. An image past its cap is refused
   with a downscale as the road, and an image the run's model is not documented to
   see is refused *before* it is sent, so a request that cannot be read never
   costs a turn. Edits always work on the complete file — a file whose bytes are
@@ -189,7 +192,7 @@ every turn.
 
 ### Tools
 
-Eleven tools, in schema order — six for the workspace's files, the shell, the
+Twelve tools, in schema order — seven for the workspace's files, the shell, the
 delegation tool, and three that manage what an agent started:
 
 | Tool | Arguments | What it does |
@@ -200,6 +203,7 @@ delegation tool, and three that manage what an agent started:
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush` — mush's own state, session and pastes and the isolated children's checkouts among it, so a listing is the work and not the bookkeeping (a path under it is still opened by name, and a listing asked for `.mush` still descends into it); capped at `LIST_LIMIT` names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
+| `usages` | `symbol` | who mentions a symbol as a *word* — alphanumerics and `_` are the word characters, so `held` in `beheld` is not a row — grouped by file, each group's header counting its hits and naming the declaration-looking line (the outline rule's) first; textual and best-effort, with no identifier resolution, no scope and no call graph (a `.` or `::` does not split a needle, so `method` hits `self.method()` and `Type::method`; a comment or a string can be a row), and a miss says how many files were read and counts the ones it could not open, so it never reads as "the symbol is not here"; `path`, `ignore_case` and a word toggle are deliberately absent — `search` is the tool that takes those |
 | `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group, started at `nice` 10 (§5.6); 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title?`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
@@ -207,7 +211,7 @@ delegation tool, and three that manage what an agent started:
 | `wait` | `on?` | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early; `on` narrows it to one thing, named as `status` prints it — the rest keeps running, but any result you have not read ends the wait too |
 
 The `spawn_agent` row is omitted from a leaf agent's schema, which is what bounds
-the tree, so a root has eleven tools and a leaf ten; the `status`, `control` and
+the tree, so a root has twelve tools and a leaf eleven; the `status`, `control` and
 `wait` rows are not omitted, because they manage the *jobs* a leaf may run in the
 background while it edits. `mush_core::tools::TOOL_NAMES` is the single list of
 names, and a test asserts the schemas match it; the depth and fan-out bounds are
@@ -661,7 +665,8 @@ off the same clock the tree's own activity row reads.
 
 In the unfolded view the facts the verdict and the measure do not carry are
 painted under the call's header, dim, at the two columns the header's mark
-stands in — a read's `of 9000L`, the files a search hit, a command's `stderr
+stands in — a read's `of 9000L`, the files a search hit, a usages answer's
+`declaration at src/a.rs:12`, a command's `stderr
 2L`, a spawn's `mush/188 · .mush/wt/188` — and a result's payload is painted at
 that same `│ `, every row of it, so a call reads as one block and a wrapped line
 of output hangs visibly under the row it continues. Nothing blank stands *inside*
@@ -695,11 +700,11 @@ because a hidden failure would be a lie about what happened: a failed result's
 own `! error: …` row and a `#1 failed: …` report.
 
 Each tool's call wears one glyph *instead of* its name — `▤ src/a.rs 5→7`, `❯
-cargo test`, `⌕ "held" crates`, `↳ #2 on mush/2`, `⧗` — so the row reads as the
+cargo test`, `⌕ "held" crates`, `⤴ "held"`, `↳ #2 on mush/2`, `⧗` — so the row reads as the
 mark and the ask it made, and a result's payload
 stands at that mark's own width, so a call and its output read as one block.
 The table is the tool's: `read_file ▤`, `write_file ✎`, `edit_file ±`,
-`list_files ☰`, `search ⌕`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
+`list_files ☰`, `search ⌕`, `usages ↥`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
 `control ⇄`, `wait ⧗`, `outline ☷`, and `⚙` for a name no tool answers to (the
 model can invent one); each mark is one glyph and one space, and every glyph is
 one
@@ -709,7 +714,7 @@ answers to keeps the generic mark *and* its own name — `⚙ frobnicate x` —
 because `⚙` alone would say nothing about a call mush has never heard of. A
 terminal whose
 encoding cannot be shown to carry UTF-8 gets the **ascii rung** instead: `R`,
-`W`, `E`, `L`, `?`, `$`, `+`, `S`, `!`, `.`, `O`, and `#` for an invented name, one
+`W`, `E`, `L`, `?`, `U`, `$`, `+`, `S`, `!`, `.`, `O`, and `#` for an invented name, one
 seven-bit mark per tool, so a font or a locale that mangles `⧗` still shows
 something for the wait. The rung is the locale's answer — the first non-empty
 of `LC_ALL`, `LC_CTYPE`, `LANG`, with `utf-8`/`utf8` anywhere in it (case-blind)
@@ -1115,7 +1120,8 @@ detached exclusive job holds the lock for its whole life. The lock coordinates
 *agents*; it cannot see the human's own build or an unrelated process, so it is
 “agents do not fight each other”, not isolation. It is a lock on `run_command`
 and nothing else: the file tools take no lock, so `read_file`, `list_files`,
-`search`, `write_file` and `edit_file` all work beside a held one. The root is
+`search`, `usages`, `outline`, `write_file` and `edit_file` all work beside a
+held one. The root is
 exempt from a lock it did not take — it commands beside a held one and is *told*
 it did (`beside_note`) — because being blind for the duration of a child's
 benchmark cost the orchestrator its only lever; its own *exclusive* claim is
