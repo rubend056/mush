@@ -1326,9 +1326,32 @@ mod tests {
                             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
                         );
                         let _ = connection.flush();
-                        // The server dies here; the client reads the cut-off
-                        // body from the stream's end.
-                        drop(connection);
+                        // And the reply ends the way a dying server's does, but
+                        // *cleanly*: `shutdown` puts a FIN behind the bytes
+                        // above, so the client reads the cut-off body and then
+                        // the stream's end — the shape this test is about.
+                        //
+                        // Not a bare `drop`. A close with any of the request
+                        // still unread is answered with an RST instead of a
+                        // FIN, and under load that arrived before the client
+                        // had read the body, making the wire say `Connection
+                        // reset by peer` where this test expects the cut-off
+                        // body (observed once under the loaded suite). Send
+                        // the FIN first, then keep the socket until the client
+                        // has read everything and hung up: reading to the
+                        // stream's end drains whatever of the request the
+                        // first read missed, so the close below cannot RST,
+                        // and it returns as soon as the client is done. The
+                        // timeout is the backstop for a client that never
+                        // hangs up at all.
+                        let _ = connection.shutdown(std::net::Shutdown::Write);
+                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut drain = [0u8; 1024];
+                        while let Ok(read) = connection.read(&mut drain) {
+                            if read == 0 {
+                                break;
+                            }
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));

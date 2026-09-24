@@ -183,12 +183,29 @@ fn holder(file: &mut File) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, Read};
     use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
     use std::sync::OnceLock;
 
     use mush_core::scratch::{Held, Scratch};
 
     use super::*;
+
+    /// The environment variable that puts this test binary on the *holder* road
+    /// of [`a_write_cannot_replace_the_workspace_lock`]: the root whose lock
+    /// the re-exec'd binary is to hold. Set by that test on its child only; a
+    /// plain run of the suite never sees it.
+    const HOLDER_ROOT: &str = "MUSH_LOCK_TEST_HOLDER_ROOT";
+
+    /// The test the re-exec'd binary runs: the one below, by its full name,
+    /// with `--exact` so the child runs nothing else.
+    /// [`HOLDER_ROOT`] is what selects the holder road inside it.
+    const HOLDER_TEST: &str = "lock::tests::a_write_cannot_replace_the_workspace_lock";
+
+    /// What the holder says on stderr once its `acquire` returned: the parent
+    /// waits for exactly this before it asserts anything about the lock.
+    const HOLDER_HELD: &str = "mush-lock-holder: held";
 
     /// A pid that is really gone — a child of this test binary, waited for — for
     /// a test that needs a number no process owns. The child is forked once, by
@@ -303,17 +320,59 @@ mod tests {
 
     /// The lock's *name* is as load-bearing as its shape: `write_file` is a
     /// temp file plus `rename`, so it puts a fresh inode at `.mush/lock` — the
-    /// flock this process holds is then on an orphaned inode, the next process
+    /// flock a mush holds is then on an orphaned inode, the next process
     /// locks the new file, and two mushes write whole-file sessions over each
     /// other on one store. The model's write road refuses the store's own
     /// names, so the road is closed where the tool call lands; the positive
     /// twin keeps the rest of `.mush/` the human's (finding E2).
+    ///
+    /// The holder whose lock refuses this process is a child — this same test
+    /// re-exec'd, by [`HOLDER_ROOT`] — and not a guard held here. A guard held
+    /// here is copied into every child the *rest of the suite* forks, and the
+    /// copy keeps the flock until that child execs (`fork` copies open
+    /// descriptions; `CLOEXEC` closes them only at exec), so "the lock goes
+    /// with its holder" read the workspace as still locked whenever a sibling
+    /// test happened to be forking — it failed twice under load and passed
+    /// alone. A child that has said it holds the lock and that `wait` has
+    /// reaped is the other mush this test can *wait for*: its flock is its own
+    /// open description, which no fork of this process can hold a copy of, and
+    /// the kernel closes it as the child dies, before the parent is told.
     #[test]
     fn a_write_cannot_replace_the_workspace_lock() {
+        if std::env::var_os(HOLDER_ROOT).is_some() {
+            hold_the_lock();
+            return;
+        }
         let root = root("store");
-        let first = acquire(&root).expect("the first acquire takes it");
         let ws = mush_core::workspace::Workspace::new(&root).unwrap();
 
+        let mut holder = Command::new(std::env::current_exe().expect("this test binary's path"))
+            .args(["--exact", HOLDER_TEST, "--nocapture"])
+            .env(HOLDER_ROOT, &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the holder child starts");
+        wait_for_holder(&mut holder);
+
+        // Provably holding: the child writes its marker only after its own
+        // `acquire` returned, so from here the flock is its. This process is
+        // refused by that flock — and the refusal names the pid the child
+        // wrote after taking the lock.
+        let error = acquire(&root).expect_err("the child's lock refuses this process");
+        assert!(
+            error.contains(&format!(
+                "pid {} is the lock file's last known holder",
+                holder.id()
+            )),
+            "the refusal names the holder child: {error}"
+        );
+        assert!(error.contains("already running"), "{error}");
+
+        // The lock the child holds is still the one at the path: the write
+        // cannot have put a fresh inode there, and what refuses it below is
+        // the store's name rule, not the flock.
         let error = ws
             .write_file(".mush/lock", "a file, not a lock\n")
             .expect_err("the lock's own name is refused");
@@ -326,12 +385,6 @@ mod tests {
             "the refusal says what a replace would cost: {error}"
         );
 
-        // The lock the first acquire holds is still the one at the path, and
-        // the flock is still the test: a second process is refused for the same
-        // reason it was before the write was attempted.
-        let error = acquire(&root).expect_err("the second acquire is still refused");
-        assert!(error.contains("already running"), "{error}");
-
         // The positive twin: a name that is not the store's still writes, so the
         // refusal is the store's own files and not the directory.
         ws.write_file(".mush/note.txt", "a note\n")
@@ -341,8 +394,79 @@ mod tests {
             "a note\n"
         );
 
-        drop(first);
+        // Provably gone: the child ends when its stdin does, and `wait`
+        // returns only once the kernel has closed the child's files, the
+        // flock among them. No copy of *its* description lives in this
+        // process, so nothing here can hold the workspace a moment longer.
+        end_holder(holder);
         assert!(acquire(&root).is_ok(), "the lock goes with its holder");
+    }
+
+    /// Wait for the holder child to say it holds the lock.
+    ///
+    /// The marker is written *after* the child's `acquire` returned, so seeing
+    /// it is what makes "the child holds the workspace" a fact the parent can
+    /// assert on. The child's stderr ending without it is a child that never
+    /// took the lock, reported with everything it did say.
+    fn wait_for_holder(holder: &mut Child) {
+        let stderr = holder
+            .stderr
+            .take()
+            .expect("the holder child's stderr is piped");
+        let mut reader = io::BufReader::new(stderr);
+        let mut said = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => panic!("the holder child ended before it held the lock: {said:?}"),
+                Ok(_) => {
+                    said.push_str(&line);
+                    if line.contains(HOLDER_HELD) {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    panic!("reading the holder child failed ({error}); it said: {said:?}")
+                }
+            }
+        }
+    }
+
+    /// End the holder child and reap it.
+    ///
+    /// The child road holds until its stdin ends, so closing the parent's end
+    /// is what ends it; `wait` then blocks until the process is dead and
+    /// reaped. That is the point of the child design: the kernel closes a
+    /// process's files as it dies, so once `wait` returns the child's flock is
+    /// provably gone — there is no inherited copy anywhere to wait out.
+    fn end_holder(mut holder: Child) {
+        drop(holder.stdin.take());
+        let status = holder.wait().expect("the holder child is reaped");
+        assert!(
+            status.success(),
+            "the holder child held the lock and left cleanly: {status}"
+        );
+    }
+
+    /// The holder road, run by this test binary re-exec'd with [`HOLDER_ROOT`]
+    /// set: take the root's lock, say so on stderr, and hold it until stdin
+    /// ends.
+    ///
+    /// It is deliberately a road of the test and not a test of its own:
+    /// nothing it does is worth pinning on its own, and a plain run of the
+    /// suite must never take it — the environment variable is the only door.
+    fn hold_the_lock() {
+        let root = PathBuf::from(std::env::var_os(HOLDER_ROOT).unwrap());
+        let _held = match acquire(&root) {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("mush-lock-holder: {error}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!("{HOLDER_HELD}");
+        let mut end = String::new();
+        let _ = io::stdin().read_to_string(&mut end);
     }
 
     /// Two workspaces do not see each other's lock: the store is the unit.
