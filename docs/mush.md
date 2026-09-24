@@ -487,8 +487,11 @@ nothing on such a send: the pane's own row is the acknowledgement, and
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
 transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
 what puts them in the box, where typing reaches the agent on screen. A page is
-always ten rows, in every pane and every list (`PAGE`,
-`crates/mush/src/app/keys.rs`). `Ctrl-F` is the frame's version of the same
+ten rows in every list — the picker's, the tree's, the select mode's cursor
+(`PAGE`, `crates/mush/src/app/keys.rs`). The conversation is the one exception,
+because it is the surface read in bulk: `PgUp`/`PgDn` there move four fifths of
+the rows the transcript's pane is showing, resolved from the frame the painter
+lays out (`App`'s chat page). `Ctrl-F` is the frame's version of the same
 question — the focused pane takes the whole screen — and because `Tab` already
 cycles the focus it is what switches which pane that is. A hidden pane keeps its
 facts on screen: with the agents pane a zero rect, its `N working` / `N jobs` /

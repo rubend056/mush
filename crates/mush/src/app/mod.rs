@@ -4726,15 +4726,31 @@ impl App {
         self.re_anchor_fold(|chat| chat.set_output(!chat.shows_output()));
     }
 
+    /// The panes the coming frame would paint, from the terminal size `App`
+    /// holds: [`Self::screen`] is the pure function `ui::draw` runs, so a key
+    /// that needs a pane's own geometry reads the geometry the rows on screen
+    /// were made of instead of deriving a second one beside the painter — a
+    /// second layout is how a key starts moving by rows a pane does not show.
+    /// `None` below the floor, where the frame builds no panes at all.
+    ///
+    /// One derivation with two readers: the fold keys take the row at a
+    /// transcript's bottom edge ([`Self::re_anchor_fold`]), and the page keys
+    /// the room that transcript is showing ([`Self::page_chat`]).
+    fn frame_panes(&self) -> Option<Box<screen::Panes>> {
+        match self.screen(Rect::new(0, 0, self.term_width, self.term_height)) {
+            Screen::Panes(panes) => Some(panes),
+            Screen::Floor { .. } => None,
+        }
+    }
+
     /// The half the two fold keys share: the frame on screen is read for the row
     /// at its bottom edge, `view` changes what the panes paint, and the window
     /// the pane is holding is re-based around that row ([`Chat::re_anchor`]) —
     /// so `Ctrl-O` and `Ctrl-T` no longer slide a conversation a human has
     /// scrolled away from the bottom to read.
     ///
-    /// The frame is derived here and not remembered from the last paint:
-    /// [`Self::screen`] is the pure function `ui::draw` runs, so the row the
-    /// fold keeps, and the measure it is kept at
+    /// The frame is [`Self::frame_panes`] and not the last paint remembered: so
+    /// the row the fold keeps, and the measure it is kept at
     /// ([`screen::transcript_measure`]), are the ones the rows on screen were
     /// made of. A layout read anywhere else — the terminal, a remembered size —
     /// is exactly the second derivation that would put the row back at a width
@@ -4744,16 +4760,14 @@ impl App {
     /// window has no source row at its edge all read as `None` here and change
     /// nothing but the view: there is no row of theirs to keep.
     fn re_anchor_fold(&mut self, view: impl FnOnce(&mut Chat)) {
-        let area = Rect::new(0, 0, self.term_width, self.term_height);
-        let held = match self.screen(area) {
-            Screen::Panes(panes) => panes
+        let held = self.frame_panes().and_then(|panes| {
+            panes
                 .chat
                 .transcript
                 .as_ref()
                 .and_then(|painted| painted.anchor)
-                .zip(screen::transcript_measure(panes.chat.transcript_area)),
-            Screen::Floor { .. } => None,
-        };
+                .zip(screen::transcript_measure(panes.chat.transcript_area))
+        });
         // The view is the human's either way: the folded rows are still the
         // ones the fold says they are, held window or not.
         view(&mut self.chat);
@@ -4762,6 +4776,55 @@ impl App {
                 .re_anchor(self.tree.focused, width, height, anchor);
         }
         self.dirty_screen = true;
+    }
+
+    /// The fewest rows a chat page moves. Four fifths of a conversation two
+    /// rows tall is one row, and of a one-row one nothing at all, and a page key
+    /// that moves nothing reads as a broken key rather than as a short pane.
+    const MIN_CHAT_PAGE_ROWS: usize = 2;
+
+    /// How far a chat page moves on a conversation `height` rows tall: four
+    /// fifths of it, floored at [`Self::MIN_CHAT_PAGE_ROWS`].
+    ///
+    /// Four fifths and not nine tenths, the other end of the human's 80–90%:
+    /// what the smaller step buys is the band two consecutive pages share — a
+    /// fifth of the pane, eight rows of a forty-row conversation where 90%
+    /// leaves four — and that band is what the human lands on again rather than
+    /// having to find their place anew.
+    fn chat_page_rows(height: usize) -> i64 {
+        (height * 4 / 5).max(Self::MIN_CHAT_PAGE_ROWS) as i64
+    }
+
+    /// `PgUp`/`PgDn` in the chat pane: a page of the conversation the pane is
+    /// actually showing, not the fixed ten rows every list pages by.
+    ///
+    /// The room is the transcript's own, read from the frame the painter would
+    /// lay out ([`Self::frame_panes`] and [`screen::transcript_measure`], the
+    /// derivation [`Self::re_anchor_fold`] re-bases a held window with), never
+    /// the terminal's height: the agents column, the message box, the bar and
+    /// the layout tiers have already been paid out of that, so a page of the
+    /// terminal would run past the rows the pane shows.
+    ///
+    /// The foot and the queued rows come out of this same room in the pane's
+    /// own split ([`Chat::painted`]); they are not subtracted here. Both are
+    /// capped and bottom-anchored, and pricing them beside the painter is the
+    /// second layout this key must not have — the measure [`Chat::re_anchor`]
+    /// reads is the pane's, foot and all, for the same reason.
+    ///
+    /// The direction is [`keys::ChatKey::Scroll`]'s sign (positive is older), so
+    /// a page and an arrow agree about which way the transcript goes, and what a
+    /// scroll does at either end is unchanged ([`Chat::scroll_by`]): the top
+    /// shows the oldest rows however far a page is asked to go, and a page that
+    /// lands at or past the newest line rejoins it.
+    fn page_chat(&mut self, direction: i64) {
+        let Some(panes) = self.frame_panes() else {
+            return;
+        };
+        let Some((_, height)) = screen::transcript_measure(panes.chat.transcript_area) else {
+            return;
+        };
+        let rows = Self::chat_page_rows(height);
+        self.chat.scroll_by(self.tree.focused, direction * rows);
     }
 
     /// `Ctrl-F`: the focused pane takes the whole screen, and back.
@@ -5129,9 +5192,13 @@ impl App {
         // because "stop this agent" is the opposite of "quit" — and the keys
         // the human is *typing* are the exception: `/quit` is spelled out key
         // by key, and a warning that disarmed itself on the way in could never
-        // run it. What the human sends from the box is judged where it lands,
-        // in `apply_command`.
-        if intent != Intent::Quit && !matches!(intent, Intent::Chat(_) | Intent::Send) {
+        // run it. The chat pane's page keys ride with its other keys: paging the
+        // conversation is the same act of reading as scrolling it an arrow at a
+        // time. What the human sends from the box is judged where it lands, in
+        // `apply_command`.
+        if intent != Intent::Quit
+            && !matches!(intent, Intent::Chat(_) | Intent::ChatPage(_) | Intent::Send)
+        {
             self.disarm_quit();
         }
         // A new chat's warning has no typed road to protect, so anything but
@@ -5177,6 +5244,10 @@ impl App {
             }
             Intent::Send => self.send_message(),
             Intent::AttachClipboardImage => self.attach_clipboard_image(),
+            // The conversation's page carries a direction where every other key
+            // here carries what to do: the distance is the pane's own room,
+            // which is a fact about the frame and not the key ([`Self::page_chat`]).
+            Intent::ChatPage(direction) => self.page_chat(direction),
             // The chat does what the key says to the box, and a key that leaves
             // a line does it here: the box's losses are the chat's fact, the bar
             // is the app's surface, and this is the one place the two meet.
@@ -18695,6 +18766,193 @@ mod tests {
         }
         assert!(repainted > 0, "the hue reached nothing");
         assert!(badge, "the bar's badge did not wear the hue");
+    }
+
+    /// The human's report: a page key moved ten rows on a forty-row
+    /// conversation. It now moves four fifths of the rows the pane is showing —
+    /// the pane's own room, not the terminal's — which at 120×47 is thirty-two.
+    #[test]
+    fn a_chat_page_moves_four_fifths_of_the_conversations_own_rows() {
+        let (mut app, _rx) = test_app("chat-page-tall");
+        app.set_term_size(120, 47);
+        for i in 1..=60 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+        }
+        let size = Rect::new(0, 0, 120, 47);
+        let room = screen::transcript_measure(chat_pane(&app.screen(size)).transcript_area);
+        assert_eq!(
+            room.map(|(_, height)| height),
+            Some(40),
+            "the conversation's own room at 120×47, not the terminal's 47"
+        );
+
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        app.on_key(up);
+        assert_eq!(
+            held_rows(&app.screen(size)),
+            Some(32),
+            "one page up is four fifths of the forty rows on the pane"
+        );
+    }
+
+    /// A conversation too short for four fifths of it to be a move still pages:
+    /// three rows give two, and the two-row pane — where four fifths is one row
+    /// — is floored at two rather than moving nothing. The room is asserted for
+    /// each size, so the test cannot pass on the arithmetic of a taller pane.
+    #[test]
+    fn a_chat_page_on_a_tiny_conversation_is_floored_at_two_rows() {
+        let (mut app, _rx) = test_app("chat-page-tiny");
+        for i in 1..=6 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+        }
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        for (height, rows) in [(12u16, 3usize), (11, 2)] {
+            app.set_term_size(40, height);
+            let size = Rect::new(0, 0, 40, height);
+            let room = screen::transcript_measure(chat_pane(&app.screen(size)).transcript_area);
+            assert_eq!(
+                room.map(|(_, room)| room),
+                Some(rows),
+                "the conversation's own room at 40×{height}"
+            );
+            app.on_key(up);
+            assert_eq!(
+                held_rows(&app.screen(size)),
+                Some(2),
+                "a page of a {rows}-row conversation moves two rows"
+            );
+            app.on_key(down);
+            assert_eq!(
+                held_rows(&app.screen(size)),
+                None,
+                "the page back down leaves the pane at the bottom for the next size"
+            );
+        }
+    }
+
+    /// A page up stops at the oldest rows, the way a page of ten did: the pane
+    /// shows the conversation's beginning, and however many pages are asked for
+    /// the row at its bottom edge stays the same one.
+    #[test]
+    fn a_chat_page_up_stops_at_the_oldest_rows() {
+        let (mut app, _rx) = test_app("chat-page-top");
+        app.set_term_size(120, 47);
+        for i in 1..=60 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+        }
+        let size = Rect::new(0, 0, 120, 47);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        // Five pages of thirty-two rows over a sixty-message conversation:
+        // more than the hundred and nineteen rows there are to scroll.
+        for _ in 0..5 {
+            app.on_key(up);
+        }
+        let top = bottom_edge(&app.screen(size));
+        assert!(
+            top.is_some(),
+            "the window at the top has a source row at its bottom edge"
+        );
+        app.on_key(up);
+        assert_eq!(
+            bottom_edge(&app.screen(size)),
+            top,
+            "a page past the top leaves the pane where it is"
+        );
+    }
+
+    /// A page down that lands at or past the newest line rejoins the bottom,
+    /// the way a step down did: the window stops being held, and the newest
+    /// message's own row is what the pane's edge shows again.
+    #[test]
+    fn a_chat_page_down_past_the_newest_line_rejoins_the_bottom() {
+        let (mut app, _rx) = test_app("chat-page-bottom");
+        app.set_term_size(120, 47);
+        for i in 1..=60 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+        }
+        let size = Rect::new(0, 0, 120, 47);
+        let newest = bottom_edge(&app.screen(size));
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+
+        app.on_key(up);
+        assert_eq!(
+            held_rows(&app.screen(size)),
+            Some(32),
+            "a page up holds the window a page above the newest line"
+        );
+        app.on_key(down);
+        assert_eq!(
+            held_rows(&app.screen(size)),
+            None,
+            "the page back down crosses the newest line and rejoins it"
+        );
+        assert_eq!(
+            bottom_edge(&app.screen(size)),
+            newest,
+            "and the newest message's own row is at the edge again"
+        );
+    }
+
+    /// The conversation is the one surface the human gave the 80% to: on the
+    /// same tall frame where a chat page moves thirty-two rows, a `PgDn` in the
+    /// agents pane moves the constant ten.
+    #[test]
+    fn a_tree_page_is_still_ten_rows_on_a_tall_frame() {
+        let (mut app, _rx) = test_app("tree-page-ten");
+        app.set_term_size(120, 47);
+        app.focus = Focus::Agents;
+        // The receivers are kept for the test's life, so the children's
+        // mailboxes stay open: a child whose actor has gone is a row the pane
+        // still paints, but this is the tree a run builds.
+        let mut _mailboxes = Vec::new();
+        for id in 1..=20u64 {
+            let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+            _mailboxes.push(mailbox);
+            app.tree.insert(Spawn {
+                id: AgentId(id),
+                parent: AgentId::ROOT,
+                brief: format!("child {id}"),
+                depth: 1,
+                branch: None,
+                fork: None,
+                cmd,
+            });
+        }
+        let painted: Vec<AgentId> = app.tree.rows().iter().map(|node| node.id).collect();
+        app.tree.cursor_top();
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(painted[keys::PAGE as usize]),
+            "ten painted rows down — the tree keeps the constant page"
+        );
+    }
+
+    /// The picker is not the exception either: `PgDn` moves its cursor the same
+    /// constant ten down the list.
+    #[test]
+    fn a_picker_page_is_still_ten_rows() {
+        let (mut app, _rx) = test_app("picker-page-ten");
+        app.models = (0..40)
+            .map(|i| http::Model {
+                id: format!("model-{i}"),
+                context: None,
+            })
+            .collect();
+        app.open_model_picker();
+        app.set_picker_cursor(0);
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.picker.as_ref().map(|picker| picker.cursor),
+            Some(keys::PAGE as usize),
+            "ten rows down the list — the picker keeps the constant page"
+        );
     }
 
     /// `PgUp`/`PgDn` in the agents pane move the cursor a whole page, stop at

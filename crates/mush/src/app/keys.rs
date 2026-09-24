@@ -40,9 +40,15 @@ use mush_core::text::columns;
 use super::chat::SelectKey;
 use super::Focus;
 
-/// How many rows a page key moves, in the chat's scrollback, in a picker's
-/// list, in the agent tree and in the select mode. One number, so "a page" is
-/// the same distance wherever a human pages.
+/// How many rows a page key moves, in a picker's list, in the agent tree and
+/// in the select mode. One number, so "a page" is the same distance wherever a
+/// human pages a list.
+///
+/// The conversation is the human's one exception ([`Intent::ChatPage`]): the
+/// transcript is the surface read in bulk, and a page there is four fifths of
+/// the room its pane is showing — resolved in `App`, because no key table has
+/// geometry. Every list keeps the one number, so a page of a picker is still a
+/// page of a tree.
 pub(crate) const PAGE: i64 = 10;
 
 /// The context a binding belongs to, so the help can group the rows the way a
@@ -466,6 +472,18 @@ pub enum Intent {
     Send,
     /// A key the chat owns — see [`ChatKey`].
     Chat(ChatKey),
+    /// The chat pane's `PgUp`/`PgDn`: a page of the conversation, in the
+    /// *direction* alone — `+1` toward the older rows, `-1` toward the newer,
+    /// the sign [`ChatKey::Scroll`] carries.
+    ///
+    /// The transcript is the one surface that does not page by [`PAGE`]: its
+    /// page is the room the pane is showing, and only `App` has the frame that
+    /// measures it (`App`'s chat-page handler reads
+    /// `screen::transcript_measure`), so the distance is resolved there. A
+    /// number in this variant — the terminal's height, a remembered size —
+    /// would be the second layout that makes a page move by rows the pane does
+    /// not show.
+    ChatPage(i64),
 }
 
 /// The whole keymap.
@@ -659,8 +677,13 @@ fn chat(key: KeyEvent) -> Intent {
         KeyCode::Char(c) if !ctrl && !alt => Intent::Chat(ChatKey::Insert(c)),
         KeyCode::Up => Intent::Chat(ChatKey::Scroll(1)),
         KeyCode::Down => Intent::Chat(ChatKey::Scroll(-1)),
-        KeyCode::PageUp => Intent::Chat(ChatKey::Scroll(PAGE)),
-        KeyCode::PageDown => Intent::Chat(ChatKey::Scroll(-PAGE)),
+        // A page of the transcript is the room the pane is showing, so the key
+        // carries the direction and `App` resolves the rows: the table is pure
+        // and has no geometry, and the distance is a fact about the frame. The
+        // sign is the bare arrow's above, so a page and a step cannot disagree
+        // about which way is up.
+        KeyCode::PageUp => Intent::ChatPage(1),
+        KeyCode::PageDown => Intent::ChatPage(-1),
         KeyCode::Esc => Intent::Chat(ChatKey::Clear),
         _ => Intent::Ignore,
     }
@@ -783,8 +806,12 @@ pub(crate) mod tests {
                 KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
                 Intent::Chat(ChatKey::Down),
             ),
-            (none(KeyCode::PageUp), Intent::Chat(ChatKey::Scroll(10))),
-            (none(KeyCode::PageDown), Intent::Chat(ChatKey::Scroll(-10))),
+            // The conversation's page is not a number this table owns: it is
+            // the pane's own room, resolved in `App` from the frame, so the
+            // direction is all a pure keymap can carry. Pinning `Scroll(10)`
+            // again would pin the fixed page the human asked to be rid of.
+            (none(KeyCode::PageUp), Intent::ChatPage(1)),
+            (none(KeyCode::PageDown), Intent::ChatPage(-1)),
             (none(KeyCode::Esc), Intent::Chat(ChatKey::Clear)),
             (ctrl('v'), Intent::AttachClipboardImage),
             (ctrl('u'), Intent::Chat(ChatKey::ClearWords)),
