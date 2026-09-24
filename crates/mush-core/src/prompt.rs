@@ -263,6 +263,23 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
+            ToolName::Usages,
+            "Find `symbol` used as a word in the workspace's text files, grouped by file with \
+             the declaration-looking line first: one `  line  text` row per matching line. \
+             Textual and best-effort — `held` in `beheld` is not a row, `self.held` is; no \
+             identifier resolution, no scope, no call graph — so a comment or a string can be \
+             a row and a miss is not proof the symbol is absent (the files the walk could \
+             not read are counted). No `path`, `ignore_case` or word toggle: `search` is the \
+             tool that takes those.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string", "description": "The word to find, e.g. `Workspace` or `search_tool`." }
+                },
+                "required": ["symbol"]
+            }),
+        ),
+        tool(
             ToolName::RunCommand,
             "Run a shell command. A command that writes past 8 MiB of output is killed and its \
              result says so; the road on is a narrower command. A result too big for the context \
@@ -388,13 +405,15 @@ mod tests {
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         for kept in [
             "edit_file",
             "read_file",
+            "outline",
             "write_file",
             "list_files",
             "search",
+            "usages",
             "run_command",
             "status",
             "control",

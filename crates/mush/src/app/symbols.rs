@@ -161,6 +161,10 @@ impl Symbols {
             ToolName::ListFiles => ("☰ ", "L "),
             // Misc Technical: the one to eyeball, which is what `/glyphs` is for.
             ToolName::Search => ("⌕ ", "? "),
+            // Arrows: the same block `↳` comes from, and the shape the answer
+            // has — an arrow rising from the definition to whoever named it.
+            // The ascii rung takes the letter its own name starts with.
+            ToolName::Usages => ("↥ ", "U "),
             // The ordinary TUI prompt glyph.
             ToolName::RunCommand => ("❯ ", "$ "),
             // Arrows: a child hangs off this.
@@ -323,6 +327,11 @@ fn sample(tool: ToolName) -> Sample {
             "\"markdown_rows\" in crates",
             None,
             Some((Some("7 hits"), Some("2.1KB"))),
+        ),
+        ToolName::Usages => (
+            "\"Workspace\"",
+            Some("12 hits in 4 files"),
+            Some((Some("12 hits"), Some("1.4KB"))),
         ),
         ToolName::RunCommand => (
             "cargo test -p mush",

@@ -12,6 +12,7 @@ use crate::message::Image;
 use crate::outline::Outline;
 use crate::session;
 use crate::text;
+use crate::usages::{FileUsages, Usages};
 
 /// Directories a walk never descends into: VCS metadata and build output, whose
 /// contents are never the workspace's work, and mush's own `.mush` — the
@@ -1458,6 +1459,90 @@ impl Workspace {
             skipped,
             unnamed,
         })
+    }
+
+    /// Every line under the workspace root that mentions `symbol` at a word
+    /// boundary, grouped by file — the `usages` tool's walk.
+    ///
+    /// The walk is [`Self::search`]'s, and a line's rows are
+    /// [`crate::usages::rows`]': the same `SKIP_DIRS`, [`SEARCH_FILE_CAP`],
+    /// bounded read, binary skip, lossy decode, `name_for_model` rule and cap
+    /// semantics, because a second walker would be a second answer to "what is
+    /// a workspace file, and what may a result read?" and the two would drift.
+    /// What differs is the match and the shape of the answer: a word instead of
+    /// a substring, and rows grouped by file with the declaration-looking ones
+    /// first. [`crate::usages`] owns those two rules and argues them.
+    ///
+    /// The name is needed before the file is opened for `search`'s reason: a
+    /// row under a name the model cannot pass back to `read_file` is a dead
+    /// end, so such files are counted in [`Usages::unnamed`] and never
+    /// searched. Files the walk never opened (binary, past the cap, unreadable)
+    /// are counted in [`Usages::skipped`]; the files it *did* read are counted
+    /// in [`Usages::scanned`], because a miss that says how much it read is a
+    /// smaller claim than "no match" — and the claim a miss makes is the whole
+    /// reason these counters exist.
+    ///
+    /// The cap stops the walk where it lands, like the search's and the
+    /// listing's: the first row the cap cannot keep sets [`Usages::more`] and
+    /// ends the walk. The row that made the answer one over the cap is the
+    /// whole proof that there was more, and walking on past it would be the
+    /// tree's cost rather than the answer's.
+    pub fn usages(&self, symbol: &str, limit: usize) -> Result<Usages, String> {
+        if symbol.is_empty() {
+            return Err("`symbol` must not be empty".to_string());
+        }
+        let mut found = Usages::default();
+        self.walk(&self.root, &mut |path: &Path| {
+            // The name is needed before the file is opened: it is the group's
+            // prefix, and a name that cannot travel is not searched.
+            let Some(name) = self.name_for_model(path) else {
+                found.unnamed += 1;
+                return true;
+            };
+            let Ok(meta) = fs::metadata(path) else {
+                found.skipped += 1;
+                return true;
+            };
+            if meta.len() > SEARCH_FILE_CAP {
+                found.skipped += 1;
+                return true;
+            }
+            // Bounded like the other readers: the stat saw a file within the
+            // cap, and one that grew past it since is a skip rather than a
+            // whole load.
+            let Ok(bytes) = read_bounded(path, SEARCH_FILE_CAP) else {
+                found.skipped += 1;
+                return true;
+            };
+            if bytes.len() as u64 > SEARCH_FILE_CAP {
+                found.skipped += 1;
+                return true;
+            }
+            if bytes.contains(&0) {
+                found.skipped += 1;
+                return true;
+            }
+            found.scanned += 1;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut rows = crate::usages::rows(symbol, &text);
+            if rows.is_empty() {
+                return true;
+            }
+            let room = limit.saturating_sub(found.hits());
+            if rows.len() > room {
+                // The cap's own row is the proof of "there is more": nothing
+                // of it is shown, `more` is set, and the walk ends here.
+                rows.truncate(room);
+                found.more = true;
+                if !rows.is_empty() {
+                    found.groups.push(FileUsages { file: name, rows });
+                }
+                return false;
+            }
+            found.groups.push(FileUsages { file: name, rows });
+            true
+        });
+        Ok(found)
     }
 
     /// Walk every file under `start` — files only, [`SKIP_DIRS`] by name, no
@@ -4535,6 +4620,119 @@ mod tests {
         );
         assert!(reported.contains("line cut at"), "{reported}");
         assert!(reported.len() < long.len(), "the cut is real");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `usages`' walk: a word at a boundary and never a substring, grouped by
+    /// file with the declaration-looking rows first — and it is the *search's*
+    /// walk, so build output and mush's own state contribute no row, and the
+    /// counters carry what the walk would not read instead of dropping it
+    /// silently.
+    #[test]
+    fn a_usage_walk_groups_by_file_and_leads_with_the_declaration() {
+        let ws = temp_workspace("usages");
+        fs::write(
+            ws.root().join("a.rs"),
+            "// held\nlet a = held;\nfn held(x: usize) -> usize { x }\nlet beheld = 1;\n",
+        )
+        .unwrap();
+        fs::write(ws.root().join("b.txt"), "held, held\n").unwrap();
+        fs::create_dir_all(ws.root().join("target")).unwrap();
+        fs::write(ws.root().join("target/gen.rs"), "held\n").unwrap();
+        fs::create_dir_all(ws.root().join(".mush")).unwrap();
+        fs::write(ws.root().join(".mush/gate.log"), "held\n").unwrap();
+        fs::write(ws.root().join("blob.bin"), b"held\0\0").unwrap();
+        // A name the model's road cannot carry: a row under it would be a dead
+        // end, so the file is counted and not searched.
+        fs::write(ws.root().join("bad\nname.txt"), "held\n").unwrap();
+
+        let found = ws.usages("held", 100).unwrap();
+        assert_eq!(
+            found
+                .groups
+                .iter()
+                .map(|group| group.file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.rs", "b.txt"],
+            "the walk's own order, and no row from a skipped directory"
+        );
+        assert_eq!(
+            found.groups[0]
+                .rows
+                .iter()
+                .map(|row| row.line)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2],
+            "the declaration line first, then the mentions in file order"
+        );
+        assert_eq!(found.groups[0].declarations(), vec![3]);
+        assert!(found.groups[0].rows[0].definition);
+        assert_eq!(
+            found.groups[1]
+                .rows
+                .iter()
+                .map(|row| row.line)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "one row per line, however many times the word is on it"
+        );
+        assert!(found.groups[1].declarations().is_empty());
+        // `beheld` is a substring and not a row; the binary file and the
+        // unnavigable name are the walk's own counters, not silence.
+        assert_eq!(found.hits(), 4);
+        assert_eq!(found.scanned, 2);
+        assert_eq!(found.skipped, 1);
+        assert_eq!(found.unnamed, 1);
+        assert!(!found.more);
+
+        // Case is part of the spelling, and the empty symbol is refused at the
+        // door rather than walked as a match at every position.
+        assert!(ws.usages("Held", 100).unwrap().groups.is_empty());
+        assert!(ws
+            .usages("", 100)
+            .unwrap_err()
+            .contains("must not be empty"));
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The cap stops the walk at the first row it cannot keep — the row is the
+    /// whole proof that there was more — and `scanned`/`skipped` are what let a
+    /// miss say how much it did read, instead of answering as if it had read
+    /// everything.
+    #[test]
+    fn a_usage_walk_stops_at_the_cap_and_counts_what_it_could_not_read() {
+        let ws = temp_workspace("usages-cap");
+        for n in 0..3 {
+            fs::write(
+                ws.root().join(format!("f{n}.txt")),
+                format!("held {n}\nheld again\n"),
+            )
+            .unwrap();
+        }
+        fs::write(ws.root().join("blob.bin"), b"held\0").unwrap();
+
+        let capped = ws.usages("held", 3).unwrap();
+        assert_eq!(capped.hits(), 3, "the cap kept exactly its rows");
+        assert!(capped.more, "the row it could not keep was seen");
+        assert_eq!(
+            capped
+                .groups
+                .iter()
+                .map(|group| (group.file.as_str(), group.rows.len()))
+                .collect::<Vec<_>>(),
+            vec![("f0.txt", 2), ("f1.txt", 1)],
+            "the walk stopped inside `f1.txt`, and `f2.txt` was never reached"
+        );
+        assert_eq!(capped.scanned, 2);
+        assert_eq!(capped.skipped, 1, "the blob was counted before the cap");
+
+        // With room for everything, the same walk answers the same rows and no
+        // `more`: the cap changed the answer, not the rule.
+        let whole = ws.usages("held", 100).unwrap();
+        assert!(!whole.more);
+        assert_eq!(whole.hits(), 6);
+        assert_eq!(whole.groups.len(), 3);
+        assert_eq!(whole.scanned, 3);
         let _ = fs::remove_dir_all(ws.root());
     }
 

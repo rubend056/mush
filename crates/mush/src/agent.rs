@@ -30,6 +30,7 @@ use mush_core::transcript::{
     needs_compaction, place_dropped_note, repair_tool_pairs, sanitize_tool_calls, trim_history,
     trim_target, COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
 };
+use mush_core::usages::FileUsages;
 use mush_core::workspace::{truncate_for_model, LineCount, READ_FILE_CAP, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
 
@@ -5011,6 +5012,7 @@ fn exec_tool(
         ToolName::WriteFile => write_tool(actor, args),
         ToolName::ListFiles => list_tool(actor, state, args),
         ToolName::Search => search_tool(actor, state, args),
+        ToolName::Usages => usages_tool(actor, state, args),
     };
     answer.map_err(ToolError::Failed).map(ToolOutput::from)
 }
@@ -6600,6 +6602,138 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
     Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
+/// `usages`: every line that mentions a symbol as a word, grouped by file with
+/// the declaration-looking line first.
+///
+/// The tool is deliberately **textual and word-boundary**, and it says so on
+/// its own first line: no identifier resolution, no scope, no call graph. It is
+/// deliberately not named `references` either, because that word promises the
+/// compiler's answer — [`mush_core::usages`] owns the rule and argues it. What
+/// this function owns is the answer's shape and its honesty.
+///
+/// The header counts what is shown — `usages of `held` — 12 hits in 4 files
+/// (textual, word-boundary matching — not a compiler's answer)` — and each
+/// group names its file, its hits and, where the outline rule found one, the
+/// declaration-looking line (`a.rs — 3 hits; declaration at 12`), so the answer
+/// leads a reader to the definition on the same screen. The rows are the
+/// outline's own shape (`  `, the line number, two spaces, the line cut) with
+/// the same reason: the number is the anchor a `read_file {offset}` is built
+/// from.
+///
+/// A **miss** is the sentence the rule owes: it names how many files were read,
+/// and the `skipped_note`/`unnamed_note` sentences `search` uses — the same
+/// words from the same home — say what was not. "No usages" alone would read as
+/// "the symbol is not here", which is the one claim a textual walk may never
+/// make.
+///
+/// **No argument narrows the walk**, and that is a decision, not an omission.
+/// `path` would make this `search` with a different match; the question this
+/// tool exists to answer — who uses this? — is about the whole workspace, and a
+/// scoped question is `search`'s, which has the path and the case knob. There
+/// is no `ignore_case` because a symbol's spelling *is* the thing (`Write` and
+/// `write` are different names), and no `word` toggle because the word rule is
+/// the tool: turning it off is `search` by another name.
+///
+/// The cap is [`SEARCH_LIMIT`]'s number, not a second policy: the unit differs
+/// (rows, grouped by file), the budget does not. The walk stops at the first row
+/// it cannot keep and the result says the road that shows the rest — `rg -n -w`
+/// spells the same boundary the rule does.
+fn usages_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
+    let symbol = tools::arg_string(args, "symbol")?;
+    let found = actor.ws.usages(&symbol, USAGES_LIMIT)?;
+    let mut notes = Vec::new();
+    if found.more {
+        notes.push(format!(
+            "the first {USAGES_LIMIT} hits — run_command (`rg -n -w`) reads the rest"
+        ));
+    }
+    if found.skipped > 0 {
+        notes.push(skipped_note(found.skipped));
+    }
+    if found.unnamed > 0 {
+        notes.push(unnamed_note(found.unnamed));
+    }
+    if found.groups.is_empty() {
+        let mut miss = format!(
+            "no usages of `{symbol}` in {} ({USAGE_RULE})",
+            Count::Files.label(found.scanned)
+        );
+        if !notes.is_empty() {
+            miss.push_str(" — ");
+            miss.push_str(&notes.join("; "));
+        }
+        return Ok(truncate_for_model(miss, result_cap(actor, state)));
+    }
+    let mut out = format!(
+        "usages of `{symbol}` — {} in {} ({USAGE_RULE})",
+        Count::Hits.label(found.hits()),
+        Count::Files.label(found.groups.len())
+    );
+    for group in &found.groups {
+        out.push('\n');
+        out.push('\n');
+        out.push_str(&usages_group_header(group));
+        for row in &group.rows {
+            out.push_str(&format!("\n  {}  {}", row.line, row.text));
+        }
+    }
+    let cap = result_cap(actor, state);
+    if notes.is_empty() {
+        return Ok(truncate_for_model(out, cap));
+    }
+    // The notes are the answer's honesty — what the walk could not read, and
+    // the road around it — so the rows are cut with the notes' room already
+    // kept, the same trade `Outline::render` makes for its closing note: a cut
+    // whose "what I could not read" sentence fell off the end says nothing
+    // about what it left. The reserve is wider than the notes because
+    // `truncate_for_model`'s own marker (about a hundred bytes) lands between
+    // them; the room the body is given is the number that marker names, which
+    // is the truth of where it was cut.
+    let closing = format!("\n[mush: {}]", notes.join("; "));
+    let room = cap.saturating_sub(closing.len() + NOTES_RESERVE);
+    out = truncate_for_model(out, room);
+    out.push_str(&closing);
+    Ok(out)
+}
+
+/// What a `usages` result keeps free for its closing notes and the marker
+/// `truncate_for_model` writes when the rows were cut: enough for the cap note,
+/// the skip note and the unnamed note together with the marker's own sentence.
+const NOTES_RESERVE: usize = 512;
+
+/// The confession every `usages` answer carries: the rule in one clause, in the
+/// header and in the miss alike, because a model that prices this answer as a
+/// compiler's would trust it past what it is.
+const USAGE_RULE: &str = "textual, word-boundary matching — not a compiler's answer";
+
+/// One file's group header: the file, the hits shown in it, and the
+/// declaration-looking line where the outline rule found one —
+/// `src/a.rs — 3 hits; declaration at 12`.
+///
+/// "Declaration" is the outline rule's own word, not a second promise of
+/// semantic accuracy: an `impl Foo` line is declaration-looking without being
+/// the definition of `Foo`, which is exactly why the header above carries the
+/// confession. Multiple declaration-looking lines in one file are named in the
+/// same clause, ascending.
+fn usages_group_header(group: &FileUsages) -> String {
+    let mut header = format!("{} — {}", group.file, Count::Hits.label(group.rows.len()));
+    let declarations = group.declarations();
+    if !declarations.is_empty() {
+        let noun = if declarations.len() == 1 {
+            "declaration"
+        } else {
+            "declarations"
+        };
+        let lines = declarations
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        header.push_str(&format!("; {noun} at {lines}"));
+    }
+    header
+}
+
 /// The files a search did not open, as a sentence. One function for both
 /// numbers, because English will not take one: the note is not decoration — it
 /// is the difference between "the symbol is not here" and "I did not look".
@@ -6629,11 +6763,14 @@ fn unnamed_note(unnamed: usize) -> String {
     }
 }
 
-/// How many files a listing names, and how many matches a search returns,
-/// before saying there are more. Sized to a readable result rather than to the
-/// workspace: a listing is a map, not the territory.
+/// How many files a listing names, how many matches a search returns, and how
+/// many rows a usages walk keeps, before saying there are more. Sized to a
+/// readable result rather than to the workspace: a listing is a map, not the
+/// territory, and the two row caps are one number because the unit differs (a
+/// hit line, a grouped usage row) while the budget does not.
 const LIST_LIMIT: usize = 400;
 const SEARCH_LIMIT: usize = 200;
+const USAGES_LIMIT: usize = 200;
 
 /// How a path argument is named back to the model: the workspace root has no
 /// relative spelling, and "under " with nothing after it reads as a bug.
@@ -7643,6 +7780,10 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
             let (outcome, measure) = search_reading(ok);
             (search_ask(args, root), outcome, measure, search_details(ok))
         }
+        ToolName::Usages => {
+            let (outcome, measure) = usages_reading(ok);
+            (usages_ask(args), outcome, measure, usages_details(ok))
+        }
         ToolName::RunCommand => {
             let (outcome, measure) = command_reading(ok);
             let (ask, dir) = command_ask(args, root);
@@ -7813,6 +7954,23 @@ fn search_ask(args: &Value, root: &Path) -> String {
         ask.push_str(" · ignore_case");
     }
     ask
+}
+
+/// A usages ask: the symbol alone, quoted — `"held"`, `"Type::method"`. There
+/// is no second argument to read: the walk is the workspace and the match is
+/// the rule, so nothing narrows the call. The quotes delimit a symbol that
+/// happens to be a phrase rather than a single word, the same way the search's
+/// pattern is quoted because it is not a word of the ask at all.
+fn usages_ask(args: &Value) -> String {
+    let symbol = args
+        .get("symbol")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if symbol.is_empty() {
+        String::new()
+    } else {
+        format!("\"{symbol}\"")
+    }
 }
 
 /// A command's ask: the first line, whitespace collapsed, with the one `cd`
@@ -8345,6 +8503,81 @@ fn search_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
     )
 }
 
+/// A usages reading: `12 hits in 4 files` as the verdict, `12 hits` and the
+/// payload's bytes as the measure, and `no usages` as the miss's own sentence
+/// (the symbol is already in the ask).
+///
+/// The two counts are read back from the header [`usages_tool`] wrote — one
+/// sentence, one reader, so they cannot drift. The file count is the fact a
+/// search's row has no room for (its measure counts hits alone) and the reason
+/// the two read differently: a usage row is only half the answer without the
+/// file it sits in, and the header already knows both numbers. The bytes are
+/// the payload's own, the same size every other payload measure weighs, and a
+/// walk that stopped at the cap wears the `+` on both counts (`200+ hits in
+/// 1+ file`) — the hits shown and the files they were shown in are both floors
+/// then, and the note that says so is the one `usages_tool` reserved room for.
+fn usages_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
+    if text.starts_with("no usages of `") {
+        return (
+            Some(CallOutcome {
+                text: "no usages".to_string(),
+                tone: Tone::None,
+            }),
+            None,
+        );
+    }
+    let Some((hits, files)) = usages_counts(text) else {
+        return (None, None);
+    };
+    // A walk that stopped at the cap showed the first hits and the first files
+    // and no more; both counts are floors then, and the `+` is the one mark
+    // that keeps a floor from reading as the whole — the same mark a capped
+    // search's measure wears (`trimmed`). The note that says so survived the
+    // cut, because `usages_tool` reserves its room before the rows are spent.
+    let capped = text.contains("[mush: the first ");
+    let (hits, files) = (Count::Hits.label(hits), Count::Files.label(files));
+    let (hits, files) = if capped {
+        (trimmed(hits), trimmed(files))
+    } else {
+        (hits, files)
+    };
+    (
+        Some(CallOutcome {
+            text: format!("{hits} in {files}"),
+            tone: Tone::None,
+        }),
+        Some(Measure {
+            count: Some(hits),
+            size: Some(size_label(payload(text).len())),
+        }),
+    )
+}
+
+/// The counts of a usages header: `usages of `held` — 12 hits in 4 files
+/// (textual, …)` is `(12, 4)`. The confession is cut off first — it holds a
+/// ` — ` of its own — and the counts clause is then read from its *last* ` — `,
+/// so a symbol that happens to hold the separator cannot shift the reading.
+/// `None` for a first line that is not this header: a result a future writer
+/// changes shape under must read as *no measure* rather than as a wrong
+/// number.
+fn usages_counts(text: &str) -> Option<(usize, usize)> {
+    let header = first_line(text);
+    let clause = header.split(" (").next()?;
+    let counts = clause.rsplit_once(" — ")?.1;
+    let hits = counts.split_whitespace().next()?.parse().ok()?;
+    let files = counts
+        .split(" in ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some((hits, files))
+}
+
 /// A search's details: which files the hits landed in — the fact a counted
 /// outcome cannot carry, and the first thing a reader wants before opening one.
 /// A miss has no names to give, and a hit line the reader cannot name a file
@@ -8365,6 +8598,56 @@ fn search_details(ok: Option<&str>) -> Vec<String> {
         Count::Hits.label(hits),
         files.join(", ")
     )]
+}
+
+/// A usages result's details: where the symbol looks defined — one row,
+/// `declaration at src/a.rs:12`, or `declarations at a.rs:12, b.rs:7` when the
+/// walk found several. It is the summary the folded row cannot otherwise
+/// carry, the same job `search_details` does for the files a hit landed in; the
+/// group headers carry the per-file fact, and this is the whole answer in one
+/// line.
+///
+/// The lines are read back out of the group headers rather than recomputed: one
+/// sentence, one reader. A group with no declaration-looking row has nothing to
+/// name, a miss has no groups at all, a row (indented, and possibly holding a
+/// ` — ` of its own) is never a header, and the header's ` — ` is taken from
+/// the right so a *file* that holds the separator still names itself whole.
+fn usages_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    if text.starts_with("no usages of `") {
+        return Vec::new();
+    }
+    let mut found: Vec<String> = Vec::new();
+    for line in payload(text).lines().skip(1) {
+        if line.starts_with("  ") {
+            continue;
+        }
+        let Some((file, rest)) = line.rsplit_once(" — ") else {
+            continue;
+        };
+        let Some((_, lines)) = rest.split_once("; declaration") else {
+            continue;
+        };
+        let Some((_, lines)) = lines.split_once(" at ") else {
+            continue;
+        };
+        for number in lines.split(", ") {
+            if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
+                found.push(format!("{file}:{number}"));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let noun = if found.len() == 1 {
+        "declaration"
+    } else {
+        "declarations"
+    };
+    vec![format!("{noun} at {}", found.join(", "))]
 }
 
 /// The hits and the distinct files of a search's payload, in one walk: a hit is
@@ -9066,6 +9349,23 @@ mod tests {
                 &["3 hits in crates/a.rs, crates/b.rs"],
             ),
             (
+                ToolName::Usages,
+                json!({"symbol": "held"}),
+                "usages of `held` — 3 hits in 2 files (textual, word-boundary matching — not a \
+                 compiler's answer)\n\ncrates/a.rs — 2 hits; declaration at 12\n  12  fn \
+                 held(x: &str) -> bool {\n  40  let held = true;\ncrates/b.rs — 1 hit\n  7  held(&x);",
+                "\"held\"",
+                // The verdict is the header's own two counts — the file count
+                // a search row has no room for — and the measure counts the
+                // hits it spans.
+                Some(("3 hits in 2 files", Tone::None)),
+                Some(("3 hits", Some("236B"))),
+                // The declaration site is the fact the folded row cannot
+                // otherwise carry: the payload's group headers hold it, one
+                // per file.
+                &["declaration at crates/a.rs:12"],
+            ),
+            (
                 ToolName::RunCommand,
                 json!({"command": "cargo test"}),
                 "ok\nstill ok\n[exit 0 after 5s]",
@@ -9248,6 +9548,15 @@ mod tests {
             ask(ToolName::Search, scoped),
             "\"needle\" in crates · ignore_case"
         );
+        // A usages symbol is the whole call: the walk is the workspace and the
+        // match is the rule, so nothing rides the ask but the quoted word —
+        // quoted even when it is one word, so a phrase reads as one piece.
+        assert_eq!(ask(ToolName::Usages, json!({"symbol": "held"})), "\"held\"");
+        assert_eq!(
+            ask(ToolName::Usages, json!({"symbol": "Type::method"})),
+            "\"Type::method\""
+        );
+        assert_eq!(ask(ToolName::Usages, json!({})), "");
         // A detached command and an exclusive one are different events, and
         // the flags that make them so are part of what the call is.
         let detached = json!({"command": "cargo test", "detach": true});
@@ -9293,6 +9602,48 @@ mod tests {
             );
             assert!(facts.details.is_empty(), "{result}");
         }
+    }
+
+    /// A capped usages walk's counts are floors, and the row says so the way a
+    /// capped search's measure does: both numbers wear the `+`, because both
+    /// the hits and the files they were shown in are the first the cap paid
+    /// for. The cap note is the reader's witness — one sentence, one reader.
+    #[test]
+    fn a_capped_usages_row_says_its_counts_are_floors() {
+        let result = "usages of `held` — 200 hits in 1 file (textual, word-boundary matching — \
+                      not a compiler's answer)\n\nmany/held.txt — 200 hits\n  1  held\n  2  \
+                      held\n[mush: the first 200 hits — run_command (`rg -n -w`) reads the \
+                      rest]";
+        let facts = digest(
+            ToolName::Usages,
+            &json!({"symbol": "held"}),
+            Some(result),
+            Path::new("/w"),
+        );
+        assert_eq!(
+            facts.outcome,
+            Some(CallOutcome {
+                text: "200+ hits in 1+ file".to_string(),
+                tone: Tone::None,
+            })
+        );
+        assert_eq!(facts.measure.unwrap().count, Some("200+ hits".to_string()));
+
+        // The same header without the note is read as the whole answer: the
+        // `+` is the note's fact and not a guess from the number 200.
+        let whole = "usages of `held` — 200 hits in 1 file (textual, word-boundary matching — \
+                     not a compiler's answer)\n\nmany/held.txt — 200 hits\n  1  held";
+        let facts = digest(
+            ToolName::Usages,
+            &json!({"symbol": "held"}),
+            Some(whole),
+            Path::new("/w"),
+        );
+        assert_eq!(
+            facts.outcome.unwrap().text,
+            "200 hits in 1 file",
+            "a count with no cap note is no floor"
+        );
     }
 
     /// A failed call is one sentence for every tool — and that sentence is the
@@ -9369,6 +9720,35 @@ mod tests {
             "no match for `x` under the workspace root"
         )
         .is_empty());
+        // A usages miss has no declaration to name, and a hit whose files
+        // hold no declaration-looking row leaves the list empty rather than
+        // inventing one.
+        assert!(details(
+            ToolName::Usages,
+            json!({}),
+            "no usages of `x` in 237 files (textual, word-boundary matching — not a \
+             compiler's answer)"
+        )
+        .is_empty());
+        assert!(details(
+            ToolName::Usages,
+            json!({}),
+            "usages of `x` — 1 hit in 1 file (textual, word-boundary matching — not a \
+             compiler's answer)\n\na.rs — 1 hit\n  7  x(&y);"
+        )
+        .is_empty());
+        // Several declaration-looking rows are one row of details, each with
+        // the file it was found in.
+        assert_eq!(
+            details(
+                ToolName::Usages,
+                json!({}),
+                "usages of `x` — 3 hits in 2 files (textual, word-boundary matching — not a \
+                 compiler's answer)\n\na.rs — 2 hits; declaration at 12\n  12  fn x() {}\n  \
+                 40  x();\nb.rs — 1 hit; declaration at 7\n  7  struct x;"
+            ),
+            vec!["declarations at a.rs:12, b.rs:7"]
+        );
         // A child that shares this workspace has no branch and no worktree.
         assert!(details(
             ToolName::SpawnAgent,
@@ -13575,6 +13955,11 @@ mod tests {
         assert!(listed.contains("src/lib.rs"), "{listed}");
         let found = call(ToolName::Search, json!({ "pattern": "held" })).unwrap();
         assert!(found.contains("src/lib.rs:1"), "{found}");
+        let used = call(ToolName::Usages, json!({ "symbol": "held" })).unwrap();
+        assert!(
+            used.contains("src/lib.rs — 1 hit; declaration at 1"),
+            "{used}"
+        );
         let wrote = call(
             ToolName::WriteFile,
             json!({ "path": "src/new.rs", "content": "fn fresh() {}\n" }),
@@ -14523,6 +14908,124 @@ mod tests {
         let hit = search(json!({ "pattern": "needle" })).unwrap();
         assert!(hit.starts_with("small.txt:1: a needle"), "{hit}");
         assert!(hit.contains("1 file was skipped"), "{hit}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `usages` through the tool's own door: the header counts the hits and the
+    /// files and carries the rule's confession, each group names its file, its
+    /// hits and the declaration-looking line, and that line's row is first —
+    /// the answer leads to the definition. What the rule refuses is pinned in
+    /// the same test, because a substring hit is the false lead this tool
+    /// exists to refuse.
+    #[test]
+    fn the_usages_tool_groups_the_hits_and_leads_with_the_declaration() {
+        let (actor, _mailbox) = test_actor("usages-tool");
+        fs::write(
+            actor.ws.root().join("a.rs"),
+            "// held\nlet a = held;\nfn held() {}\npub struct held;\n",
+        )
+        .unwrap();
+        fs::write(actor.ws.root().join("b.txt"), "held\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut call =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::Usages, &args, &cancel);
+
+        let found = call(json!({ "symbol": "held" })).unwrap();
+        assert_eq!(
+            found,
+            "usages of `held` — 5 hits in 2 files (textual, word-boundary matching — not a \
+             compiler's answer)\n\n\
+             a.rs — 4 hits; declarations at 3, 4\n  3  fn held() {}\n  4  pub struct held;\n  1  \
+             // held\n  2  let a = held;\n\n\
+             b.txt — 1 hit\n  1  held"
+        );
+
+        // A substring and a different case are not rows: the rule is the word,
+        // byte for byte, and the walk keeps looking past a boundary-less
+        // occurrence for one that has a boundary.
+        fs::write(actor.ws.root().join("c.txt"), "beheld held_x Held\n").unwrap();
+        let still = call(json!({ "symbol": "held" })).unwrap();
+        assert_eq!(
+            still.text, found.text,
+            "no substring and no case-blind hit is a row"
+        );
+
+        // An empty symbol is refused at the door, and a missing one is refused
+        // as missing — not walked as a match at every position.
+        let empty = call(json!({ "symbol": "" })).unwrap_err();
+        assert!(
+            empty.text().contains("must not be empty"),
+            "{}",
+            empty.text()
+        );
+        let none = call(json!({})).unwrap_err();
+        assert!(none.text().contains("missing `symbol`"), "{}", none.text());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A usages miss is the sentence the rule owes: how many files were read,
+    /// what could not be read, and the rule's own confession — never a bare
+    /// "no usages", which a model reads as "the symbol is not here". A capped
+    /// walk says the road that shows the rest, and that road's `-w` is the same
+    /// boundary the rule is built from.
+    #[test]
+    fn a_usages_miss_says_what_it_read_and_what_it_could_not() {
+        let (actor, _mailbox) = test_actor("usages-miss");
+        fs::write(
+            actor.ws.root().join("small.txt"),
+            "beheld held_x threshold\n",
+        )
+        .unwrap();
+        fs::write(actor.ws.root().join("blob.bin"), b"held\0\0").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut call =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::Usages, &args, &cancel);
+
+        let miss = call(json!({ "symbol": "held" })).unwrap();
+        assert!(
+            miss.starts_with(
+                "no usages of `held` in 1 file (textual, word-boundary matching — not a \
+                 compiler's answer)"
+            ),
+            "{miss}"
+        );
+        assert!(
+            miss.contains("1 file was skipped (binary or over 2 MB)"),
+            "a miss never reads as `the symbol is not here` while a file was skipped: {miss}"
+        );
+        assert!(miss.contains("run_command"), "names the road: {miss}");
+
+        // The cap of 200 is reached by one file: the group keeps the rows the
+        // cap pays for, the note names the road that prints the rest, and the
+        // skip that was seen before the cap still rides along.
+        fs::create_dir_all(actor.ws.root().join("many")).unwrap();
+        let mut big = String::new();
+        for _ in 0..201 {
+            big.push_str("held\n");
+        }
+        fs::write(actor.ws.root().join("many/held.txt"), big).unwrap();
+        let capped = call(json!({ "symbol": "held" })).unwrap();
+        assert!(
+            capped.starts_with("usages of `held` — 200 hits in 1 file"),
+            "{capped}"
+        );
+        // The rows are cut to the result cap, but the notes survive it: the
+        // cap note and the skip note are the answer's honesty, and a marker
+        // says the rows themselves were cut.
+        assert!(capped.contains("[mush: output truncated at "), "{capped}");
+        assert!(
+            capped.contains(
+                "[mush: the first 200 hits — run_command (`rg -n -w`) reads the rest; 1 file \
+                 was skipped (binary or over 2 MB); run_command (`rg`) reads it]"
+            ),
+            "{capped}"
+        );
+        assert!(
+            capped.ends_with(']'),
+            "the notes close the answer: {capped}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -21039,7 +21542,7 @@ mod tests {
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
         // - ctx/2) bytes. Small enough that the trim's trigger arrives after a
         // few turns, big enough that the fold's own request fits it: with the
-        // schemas' reserve ([`SCHEMA_TOKENS`], 2 500) and the summary's floor
+        // schemas' reserve ([`SCHEMA_TOKENS`], 3 000) and the summary's floor
         // (1 024), a window under ~7k cannot hold the prompt this test builds,
         // and the fold is refused rather than attempted
         // (`a_fold_the_window_cannot_hold_is_not_attempted` pins that road).

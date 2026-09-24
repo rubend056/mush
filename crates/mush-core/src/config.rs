@@ -576,15 +576,15 @@ fn host_of(url: &str) -> &str {
         .unwrap_or(after_scheme)
 }
 
-/// Tokens every request reserves for the tool schemas. Eleven schemas measure
-/// ~6.6 KB (~2.2 K tokens at the 3 bytes/token heuristic), so the reserve
+/// Tokens every request reserves for the tool schemas. Twelve schemas measure
+/// ~7.6 KB (~2.5 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
 /// Ownership keeps it down: the prompts carry how to work (the rules, the
 /// delegation policy, what the machine is like), and a schema carries only its
 /// own call — arguments, defaults, and what comes back. The number has moved
-/// four times, and each time for a reason rather than a drift. A cut from
+/// five times, and each time for a reason rather than a drift. A cut from
 /// twelve tools to six took the payload from ~5.1 KB to ~3.5 KB on the premise
 /// that the shell reads, lists and writes better than a bespoke tool; three of
 /// those tools are back, because that premise fails in two places the shell
@@ -599,9 +599,13 @@ fn host_of(url: &str) -> &str {
 /// a target that is not one name is refused rather than
 /// defaulted. The fourth is `outline`: a file's shape otherwise costs the model
 /// the window it wanted for the work, and one schema is what that road adds to
-/// every request. The `schemas_fit_the_budget_reserve` test is what makes
-/// growth a decision rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 2_500;
+/// every request. The fifth is `usages`: who mentions a symbol is the question
+/// before a rename, and it is the one word rule no schema can spell with
+/// `search`'s substring pattern — the twelfth schema took the payload past
+/// 2 500 tokens' worth of bytes, so the reserve moved rather than the call.
+/// The `schemas_fit_the_budget_reserve` test is what makes growth a decision
+/// rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 3_000;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -2386,8 +2390,10 @@ mod tests {
         // tools took the shell's work off the schema list, 1300 when `wait`
         // took on the machine lock and named its cap, 1900 when the file
         // tools came back and `edit_file` lost its second shape (H31), 2000
-        // when `wait` gained its one optional target (H34), and 2500 when
-        // `outline` joined the file tools. See `SCHEMA_TOKENS`.
+        // when `wait` gained its one optional target (H34), 2500 when
+        // `outline` joined the file tools, and 3000 when `usages` did — the
+        // twelfth schema took the payload past 2 500 tokens' worth of bytes.
+        // See `SCHEMA_TOKENS`.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
         assert_eq!(small.history_budget(), 12_288);
@@ -2400,7 +2406,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 313_500);
+        assert_eq!(big.history_budget(), 312_000);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and the cap — which has

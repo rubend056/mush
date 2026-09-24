@@ -729,11 +729,13 @@ fn ask_roles(tool: ToolName, ask: &str) -> Vec<Piece> {
             ],
             None => vec![(ask.to_string(), Role::Named)],
         },
-        // A path, a title, a wait's target: nothing qualifies them here.
+        // A path, a title, a wait's target, a symbol's own spelling: nothing
+        // qualifies them here.
         ToolName::Outline
         | ToolName::WriteFile
         | ToolName::EditFile
         | ToolName::ListFiles
+        | ToolName::Usages
         | ToolName::SpawnAgent
         | ToolName::Wait => vec![(ask.to_string(), Role::Named)],
         ToolName::Status => Vec::new(),
