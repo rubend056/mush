@@ -1233,9 +1233,8 @@ impl App {
         // The sweep runs before the agents come back: a restored agent's actor
         // is built on its worktree (`agent::revive`), and a branch whose work
         // the main checkout already holds must be gone before that, or the
-        // same breath deletes the directory the actor was just built in — and
-        // the row it answers for is frozen as `merged` while the actor still
-        // writes into a path that no longer exists (finding H21).
+        // same breath deletes the directory the actor was just built in. The
+        // rows themselves are held back from the pass (see the set below).
         //
         // The mutation half of that pass runs on a worker now (finding R10):
         // `App::new` used to pay N × several `git` processes here with no TUI
@@ -1246,7 +1245,14 @@ impl App {
         // paints its first frame exactly as it always has, while a residue
         // defers the restore by one message, to the sweep's own answer
         // ([`SweepOwed::Restore`], the order H21 needs).
-        let removals = app.isolated_removals();
+        //
+        // What it must *not* take is anything the file still names: the stored
+        // rows are the session, and a worktree a row stands for is not residue
+        // however little its branch holds (see [`Self::isolated_removals`]).
+        // The rows are collected here, in one set, before the restore is handed
+        // the list.
+        let held: HashSet<u64> = vetted.iter().map(|agent| agent.id).collect();
+        let removals = app.isolated_removals(&held);
         app.start_sweep(removals, Some(SweepOwed::Restore(vetted)));
         app
     }
@@ -1467,13 +1473,18 @@ impl App {
                 session::StoredLanded::NothingCommitted => Landed::NothingCommitted,
                 session::StoredLanded::Discarded => Landed::Discarded,
             });
-            // One decision, two readers: a stored branch whose worktree is gone
-            // is not this agent's any more. `revive` runs such an agent in the
-            // main checkout, and a node that kept the branch would offer a diff
-            // against a reclaimed directory, paint a dead path
-            // in the footer, and refuse a nudge the actor would have run
-            // (finding U13). Computed once, handed to both.
-            let branch = agent::live_branch(&root, agent.id, agent.branch.clone());
+            // One decision, two readers, and it is the stored branch itself: a
+            // row that was spawned isolated stays isolated, checkout or no
+            // checkout. It used to be dropped when its worktree was gone
+            // (`agent::live_branch`), which read "the branch was landed" and
+            // meant "this agent now runs in the parent's checkout" — the one
+            // place a child must never end up, and where four children in
+            // flight at a close all landed on the way back (the human's report
+            // that forced this rule). A branch git no longer has is
+            // `revive`'s to refuse, not the root's to inherit: the node keeps
+            // the name, the wake refuses with the truth, and nothing writes in
+            // the parent's tree.
+            let branch = agent.branch.clone();
             let parent = agent.parent.map(AgentId);
             // The row is derived and cannot lie; a `⚠` row with nothing under it
             // would say *that* a run never ended without saying what follows
@@ -1623,11 +1634,12 @@ impl App {
                 // The row's `✉` mark: a result nobody has read comes back
                 // unread, so `wait` still hands it over exactly once.
                 read: !node.result_unread,
-                // A stored branch whose worktree is gone became the main
-                // checkout on the way in (`agent::live_branch`), i.e. the
-                // child now runs in a shared workspace like any child with no
-                // branch — the same fact `agent::spawn_tool` records at a
-                // spawn.
+                // A child with no branch of its own runs in this workspace,
+                // like any child a spawn made without a base — the same fact
+                // `agent::spawn_tool` records at a spawn. A child that *has*
+                // a branch is not this, however its checkout looks: a checkout
+                // missing under a live branch is put back by its own run start
+                // (`git::worktree_restore`), never handed to the root.
                 shared: node.branch.is_none(),
             });
         }
@@ -1702,7 +1714,19 @@ impl App {
                 continue;
             };
             let base = self.fork_base(node.id);
-            if !self.in_flight(node) && !waking.contains(&node.id) {
+            // Only a run that ended on its own terms leaves residue. A row that
+            // is stopped (`⊘`), cut off (`⚠`), failed or never asked is one a
+            // message can still wake *into its own worktree* — `agent::revive`
+            // and the actor's own run start both put a checkout back rather than
+            // run in the root — and a sweep that took the branch would leave
+            // that wake with nothing to run in. `Done` is mush's own word that
+            // the run's story is told; nothing else is (the human's report: four
+            // children in flight at a close, three of them with nothing
+            // committed, all of them rebuilt in the parent's checkout).
+            if matches!(node.phase, Phase::Done)
+                && !self.in_flight(node)
+                && !waking.contains(&node.id)
+            {
                 sweep.push((node.id, base.clone(), node.fork.clone()));
             }
             facts.push((node.id.0, base.clone(), node.fork.clone()));
@@ -1903,6 +1927,17 @@ impl App {
     /// no fork revision — the shape a branch found on disk has, because no run
     /// wrote a fork for it into the session file.
     ///
+    /// **`held` is what keeps a live session's own rows out of the pass.** A
+    /// worktree is not residue while the file still names the agent it belongs
+    /// to: that row is a child the human can wake, and a wake into a directory
+    /// this pass took is the defect this rule exists for — four children in
+    /// flight at a close, three of them with nothing committed, all rebuilt in
+    /// the parent's checkout on the way back (finding S1's wake half). What the
+    /// pass is *for* is the residue nobody's row names any more: a branch of a
+    /// forgotten agent, a merge by hand whose row is gone, a worktree left by a
+    /// session whose file was lost. `App::new` passes the vetted rows; a new
+    /// chat passes none, because its old rows go with the conversation.
+    ///
     /// The `for-each-ref` here is the read half of the pass, and it stays on
     /// the UI thread: it is one git process (~2 ms on this checkout), and its
     /// answer is what the caller needs *before* it can say whether there is a
@@ -1916,10 +1951,11 @@ impl App {
     /// [`Msg::Swept`]; a branch the sweep will not take is left exactly where it
     /// was and says why, and its number stays spent
     /// ([`Self::apply_reclaimed`]).
-    fn isolated_removals(&self) -> Vec<Removal> {
+    fn isolated_removals(&self, held: &HashSet<u64>) -> Vec<Removal> {
         git::isolated_ids(self.ws.root())
             .unwrap_or_default()
             .into_iter()
+            .filter(|id| !held.contains(id))
             .map(Removal::against_head)
             .collect()
     }
@@ -3159,17 +3195,23 @@ impl App {
         }
     }
 
-    /// Why a message to `id` cannot run, if it cannot: its worktree is gone.
+    /// Why a message to `id` cannot run, if it cannot: its worktree is gone and
+    /// its branch went with it.
     ///
-    /// A hand-run merge or discard reclaims an isolated agent's worktree and
-    /// branch but leaves its actor alive, and that actor's file tools resolve
-    /// their directory from the workspace it was spawned with — so a run would
-    /// recreate the reclaimed path as a plain directory where no surface could
-    /// see the work (finding S1). The row and its footer already tell the landed
-    /// story; this is the same story for
-    /// typing. A worktree a hand-run `git worktree remove` took reads the same
-    /// way: the branch is named, the worktree is not on disk, so a run would
-    /// write into a phantom.
+    /// An isolated agent's directory can be taken away under a branch that
+    /// stays — a hand-run `git worktree remove`, or the reclaim of a nested
+    /// child whose branch `git branch -d` would not delete — and that is no
+    /// longer a refusal: `agent::revive` (and the actor's own run start) puts
+    /// the checkout back on the branch (`git::worktree_restore`). What is still
+    /// refused is a branch git no longer has: there is nothing to run in, and
+    /// the words must not be allowed to land the child in the parent's checkout
+    /// instead.
+    ///
+    /// A landed agent is the other refusal, and it is the deliberate one: a
+    /// merge, a discard, or a run that committed nothing is a settled worktree,
+    /// and the row already tells that story — this is the same story for
+    /// typing. A hand-run `git worktree remove` on a *landed* row reads the same
+    /// way: the work is where the landing put it, not on a branch to resume.
     fn worktree_gone(&self, id: AgentId) -> Option<String> {
         let node = self.tree.node(id)?;
         if let Some(landed) = node.landed {
@@ -3189,10 +3231,13 @@ impl App {
                 ),
             });
         }
-        if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
-            return Some(format!(
-                "agent {id}'s worktree is gone — spawn a fresh agent or work in the root"
-            ));
+        if let Some(branch) = node.branch.as_deref() {
+            if !git::checkout_restorable(self.ws.root(), id.0, branch) {
+                // The branch is gone with the worktree: the one state the gates
+                // still refuse (`agent::worktree_gone_line`). A branch git still
+                // has is a checkout the wake puts back, so it is not this.
+                return Some(agent::worktree_gone_line(id.0));
+            }
         }
         None
     }
@@ -3640,34 +3685,35 @@ impl App {
         }))
     }
 
-    /// Where an agent works: its worktree when it has one that is still on
-    /// disk, else the main checkout.
+    /// Where an agent works: its worktree when git can still give it that
+    /// checkout, else the main checkout.
     ///
-    /// A merged or discarded agent keeps no branch (`live_branch` drops one
-    /// whose worktree is gone at restore; a stored session may carry a landing),
-    /// and a hand-run
-    /// `git worktree remove` takes the directory out from under a branch that
-    /// still exists — either way, reporting a dead path is a path a client must
-    /// not read files or run commands from (finding A8). The same question
-    /// `worktree_gone` asks, answered for the wire.
+    /// A settled agent keeps no branch (a stored session may carry a landing),
+    /// so there is no worktree of its own; a hand-run `git worktree remove`
+    /// leaves a branch that still names one, and the wake that puts the
+    /// checkout back runs there (`git::worktree_restore`) — so the wire says
+    /// that path rather than the root the agent will not run in. Only a branch
+    /// git no longer has answers with the main checkout, the way the gates
+    /// refuse it (finding A8). The same question `worktree_gone` asks, answered
+    /// for the wire.
     fn attach_worktree(&self, id: AgentId) -> String {
         self.agent_root(id).display().to_string()
     }
 
     /// The root of the workspace an agent's own tools resolve paths in: its
-    /// worktree while it has one on disk, else the shared checkout.
+    /// worktree while git can still put one back, else the shared checkout.
     ///
-    /// The same answer `agent::revive` gives the actor — `live_branch` keeps a
-    /// branch only while its worktree exists, and the workspace is built on the
-    /// worktree when there is one — so the UI and the actor cannot disagree
-    /// about what a workspace-relative path means to this agent. Two surfaces
-    /// ask it: the roster's `worktree` string, through [`Self::attach_worktree`],
-    /// and the attach gate's copy of a picture for an agent that works
-    /// elsewhere ([`Self::carry_images`]).
+    /// The same answer `agent::revive` gives the actor — a branch git still has
+    /// is a checkout away, and the workspace is built on it — so the UI and the
+    /// actor cannot disagree about what a workspace-relative path means to this
+    /// agent (finding S1's census). Two surfaces ask it: the roster's `worktree`
+    /// string, through [`Self::attach_worktree`], and the attach gate's copy of
+    /// a picture for an agent that works elsewhere ([`Self::carry_images`]).
     fn agent_root(&self, id: AgentId) -> std::path::PathBuf {
         let path = git::worktree_path(self.ws.root(), id.0);
-        match self.tree.node(id) {
-            Some(node) if node.branch.is_some() && path.exists() => path,
+        let branch = self.tree.node(id).and_then(|node| node.branch.clone());
+        match branch {
+            Some(branch) if git::checkout_restorable(self.ws.root(), id.0, &branch) => path,
             _ => self.ws.root().to_path_buf(),
         }
     }
@@ -4492,7 +4538,10 @@ impl App {
         // the sweep starts because the sweep's landing asks for the new tree's
         // own read.
         self.git_in_flight = false;
-        let removals = self.isolated_removals();
+        // Nothing is held: the rows of the conversation being cleared are gone
+        // with it, and every branch beside the new tree is the old session's
+        // residue — which is exactly what a new chat is for.
+        let removals = self.isolated_removals(&HashSet::new());
         self.start_sweep(removals, Some(SweepOwed::Discover));
         // The old conversation is gone from this moment: if the write were left
         // to the debounce, a crash would bring it back with the next start.
@@ -6245,6 +6294,16 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// The ignore rule the repository mush itself runs in carries:
+    /// `.mush/` is not the human's work, and a fixture without the rule shows
+    /// every agent checkout as `?? .mush/` in the status assertions a wake test
+    /// is made of. One commit, and it is the fixture's, not the work's.
+    fn ignore_worktrees(root: &std::path::Path) {
+        std::fs::write(root.join(".gitignore"), ".mush/\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-qm", "ignore the agent checkouts"]);
     }
 
     /// The fixture every `App` test starts from: a real workspace at `root`, an
@@ -8267,7 +8326,7 @@ mod tests {
         });
         // The node is thinking: a run is in that directory right now. The pass
         // is the repository's own road, driven to its landing.
-        let removals = app.isolated_removals();
+        let removals = app.isolated_removals(&HashSet::new());
         app.start_sweep(removals, None);
         settle_sweep(&mut app, &rx);
         assert!(held.exists(), "a running agent keeps its worktree");
@@ -8291,7 +8350,7 @@ mod tests {
             fork: None,
             cmd: tx2,
         });
-        let removals = app.isolated_removals();
+        let removals = app.isolated_removals(&HashSet::new());
         app.start_sweep(removals, None);
         settle_sweep(&mut app, &rx);
         assert!(held.exists(), "a parent about to be woken keeps it too");
@@ -8305,19 +8364,34 @@ mod tests {
     /// left on this thread is the read that names the residue (one
     /// `for-each-ref`), and the stored agents come back when the worker's
     /// answer lands — the order H21 needs, one message later.
+    ///
+    /// The residue here is a branch the file does *not* name (`mush/3`): the
+    /// stored row's own worktree (`mush/2`) is held back from the pass
+    /// (`isolated_removals`), so only the orphan branch makes a sweep at all —
+    /// and it is the deferral that this test is about.
     #[test]
     fn the_start_defers_the_sweep_and_the_restore_to_the_worker() {
         let root = repo("start-deferred");
-        git(
-            &root,
-            &["worktree", "add", "-q", "-b", "mush/2", ".mush/wt/2"],
-        );
+        for id in 2..=3 {
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &git::branch_name(id),
+                    &format!(".mush/wt/{id}"),
+                ],
+            );
+        }
         let worktree = root.join(".mush/wt/2");
+        let orphan = root.join(".mush/wt/3");
         let mut stored = stored_with_agent(
             session::StoredStatus::Idle,
             vec![Message::user("port the parser")],
         );
-        stored.agents[0].branch = Some("mush/2".to_string());
+        stored.agents[0].branch = Some(git::branch_name(2));
 
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
@@ -8338,7 +8412,7 @@ mod tests {
             "the sweep is the worker's, and `App::new` does not wait for it"
         );
         assert!(
-            worktree.exists(),
+            worktree.exists() && orphan.exists(),
             "and the removal is not this thread's to make"
         );
         assert!(
@@ -8350,12 +8424,16 @@ mod tests {
         let node = app.tree.node(AgentId(2)).expect("the agent came back");
         assert_eq!(
             node.landed, None,
-            "a branch with no commit of its own is not a merge to claim"
+            "nothing settled this agent's worktree: the file still names it"
         );
-        assert_eq!(node.branch, None, "and the branch went with its worktree");
+        assert_eq!(node.branch.as_deref(), Some(git::branch_name(2).as_str()));
         assert!(
-            !worktree.exists(),
-            "the sweep took it before any actor was built on it"
+            worktree.exists(),
+            "and the checkout the row stands for is still there"
+        );
+        assert!(
+            !orphan.exists() && git::resolve(&root, &git::branch_name(3)).is_none(),
+            "while the residue no row names is swept"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8509,7 +8587,7 @@ mod tests {
         let (mut app, _rx) = app_and_rx(root.to_path_buf());
 
         app.worker_spawn = refuse_spawn;
-        let removals = app.isolated_removals();
+        let removals = app.isolated_removals(&HashSet::new());
         app.start_sweep(removals, Some(SweepOwed::Discover));
 
         assert!(!app.sweep_in_flight, "no worker was started");
@@ -9480,6 +9558,93 @@ mod tests {
         port
     }
 
+    /// A loopback endpoint that makes each revived child write one file and
+    /// stop: requests alternate — a `write_file` call, then "done" — across
+    /// connections.
+    ///
+    /// A system prompt can *say* where an agent works; only a tool call lands a
+    /// file, and a file is what a test can look for in a worktree and must not
+    /// find in the parent's root. The alternation is global rather than
+    /// per-connection because the client's pool reuses one kept connection for
+    /// the whole tree (see `crate::http::Pool`), so no single connection's
+    /// requests can be told apart. A test wakes one child at a time and waits
+    /// for its commit, so the pairs line up: the nth child's first request is
+    /// request `2n - 1`. One thread per connection, because woken children keep
+    /// a connection each.
+    fn writing_endpoint(path: &str) -> u16 {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let args = serde_json::json!({ "path": path, "content": "woken in my own worktree\n" });
+        let write = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "c0",
+                        "type": "function",
+                        "function": { "name": "write_file", "arguments": args.to_string() }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+        let then = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(connection) = connection else {
+                    return;
+                };
+                let (write, then, served) = (write.clone(), then.clone(), served.clone());
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Read, Write};
+
+                    let mut connection = BufReader::new(connection);
+                    loop {
+                        // The head, then exactly the body its `Content-Length`
+                        // promises: the shape `http::write_request` writes.
+                        let mut length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if connection.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                break;
+                            }
+                            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                                length = value.parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        if connection.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let next = served.fetch_add(1, Ordering::SeqCst);
+                        let answer = if next % 2 == 0 { &write } else { &then };
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+                            answer.len()
+                        );
+                        let out = connection.get_mut();
+                        if out.write_all(reply.as_bytes()).is_err() || out.flush().is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
     /// Drive the app's own loop by hand: apply every event the actors emitted
     /// until `until` holds, or the deadline passes.
     ///
@@ -9511,11 +9676,11 @@ mod tests {
 
     /// The reported session, minus the one fact this test has no use for: two
     /// children the human had stopped on purpose before the restart — so they
-    /// come back `⊘ stopped`, and with no branch and no worktree left
-    /// (`live_branch` sends them to the main checkout) — whose stop lines the
-    /// human had already read. Unread stored results would seed the parent's
-    /// books with a line it owes a read, and the fold of *that* line, not the
-    /// wake, would be the restored root's first boundary (finding H25).
+    /// come back `⊘ stopped`, and with no branch of their own (spawned without
+    /// a base, so they ran in the main checkout) — whose stop lines the human
+    /// had already read. Unread stored results would seed the parent's books
+    /// with a line it owes a read, and the fold of *that* line, not the wake,
+    /// would be the restored root's first boundary (finding H25).
     fn stored_continued_children() -> Session {
         let child = |id: u64, brief: &str| session::AgentSession {
             id,
@@ -10108,47 +10273,251 @@ mod tests {
         }
     }
 
-    /// One decision at restore: a stored branch whose worktree is gone is not
-    /// the agent's any more (finding U13). The row must not offer a diff
-    /// for a reclaimed directory, must not paint a dead path in its
-    /// footer, and must not refuse a nudge the actor would happily run in the
-    /// main checkout.
+    /// A stored branch whose branch is gone with its worktree is where the wake
+    /// must stop: an isolated agent never runs in the parent's checkout.
+    ///
+    /// The row keeps the branch it was spawned on — dropping it is what made
+    /// the child a writer in the root — and the refusal is the branch's absence,
+    /// not the directory's (`agent::worktree_gone_line`). The human's own words
+    /// are refused before they are sent, the root is untouched, and no request
+    /// is made at all.
     #[test]
-    fn a_restored_branch_whose_worktree_is_gone_is_dropped() {
-        let root = dir("restore-dead-branch");
+    fn a_restored_branch_whose_branch_is_gone_is_refused_not_run_in_the_root() {
+        let root = repo("restore-dead-branch");
+        ignore_worktrees(&root);
         let mut stored = stored_with_agent(
             session::StoredStatus::Idle,
             vec![Message::user("port the parser")],
         );
         stored.agents[0].branch = Some("mush/2".to_string());
-        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+        let (port, asked) = recording_endpoint();
+        let (mut app, _rx) = app_root_at(
+            &root,
+            Some(stored),
+            session_save::fake::Recorder::new(),
+            &format!("http://127.0.0.1:{port}"),
+        );
 
         let node = app.tree.node(AgentId(2)).expect("the agent is restored");
-        assert!(
-            node.branch.is_none(),
-            "the branch went with its worktree: {:?}",
-            node.branch
+        assert_eq!(
+            node.branch.as_deref(),
+            Some("mush/2"),
+            "the branch stays as the mark of where this agent worked"
         );
         assert!(
-            app.worktree_gone(AgentId(2)).is_none(),
-            "a nudge must not be refused for a branch the agent no longer has"
+            app.worktree_gone(AgentId(2))
+                .is_some_and(|line| line.contains("worktree is gone")),
+            "and the wake is refused in the branch's own words"
+        );
+
+        app.tree.focus(AgentId(2));
+        app.chat.insert("carry on");
+        app.send_message();
+        assert!(
+            asked.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing runs — least of all in the parent's checkout"
+        );
+        assert_eq!(
+            git_of(&root, &["status", "--porcelain"]).unwrap_or_default(),
+            "",
+            "and the parent's tree is untouched"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The same branch, but the worktree is really there and carries nothing:
-    /// the startup sweep takes it (zero commits is `Merged` to a run with no
-    /// stored fork revision — finding H21) and the *order* is what the actor
-    /// sees. Swept before the revive, the child is built in the root it names
-    /// in its system prompt; swept after, the actor's workspace is a directory
-    /// the same breath deleted, and the row is labelled `merged` for work that
-    /// never existed.
+    /// The same row, with its branch still in git: the wake is no longer a
+    /// refusal — the checkout is put back on the branch, and the child runs
+    /// there. This is the road back from a hand-run `git worktree remove` (and
+    /// from the `branch_kept` half of [`git::reclaim`], a nested child whose
+    /// branch the base would not certify).
     #[test]
-    fn a_restored_actor_is_built_after_the_sweep_that_takes_its_worktree() {
-        let root = repo("restore-swept-worktree");
-        // A real worktree on a branch standing on HEAD and nothing else: what a
-        // restored run left behind when the process died before its first
-        // commit.
+    fn a_restored_branch_gets_its_checkout_back_and_runs_in_it() {
+        let root = repo("restore-restored-checkout");
+        ignore_worktrees(&root);
+        // The branch, its commit, and no checkout: what `git worktree remove`
+        // leaves of a child that had committed.
+        isolated_work(&root, 2, "port the parser");
+        let worktree = git::worktree_path(&root, 2);
+        git(
+            &root,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        assert!(!worktree.exists(), "the checkout is gone");
+        let mut stored = stored_with_agent(
+            session::StoredStatus::Idle,
+            vec![Message::user("port the parser")],
+        );
+        stored.agents[0].branch = Some(git::branch_name(2));
+
+        let (port, asked) = recording_endpoint();
+        let (mut app, _rx) = app_root_at(
+            &root,
+            Some(stored),
+            session_save::fake::Recorder::new(),
+            &format!("http://127.0.0.1:{port}"),
+        );
+
+        assert!(
+            worktree.exists(),
+            "the restore put the checkout back on the branch"
+        );
+        assert_eq!(
+            git_of(&worktree, &["rev-parse", "HEAD"]),
+            git_of(&root, &["rev-parse", &git::branch_name(2)]),
+            "at the branch's tip, where the agent's commits left it"
+        );
+
+        app.tree.focus(AgentId(2));
+        app.chat.insert("carry on");
+        app.send_message();
+        let body = asked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the restored child runs");
+        assert!(
+            body.contains("worktree of your own branch"),
+            "and it is told it works in its own worktree: {body}"
+        );
+        assert_eq!(
+            git_of(&root, &["status", "--porcelain"]).unwrap_or_default(),
+            "",
+            "the parent's tree is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reopen road in the shape the human reported: four isolated children
+    /// were in flight when mush went away, three of them with nothing committed,
+    /// and every one of their worktrees has to be waiting when they are woken.
+    ///
+    /// The startup sweep used to take the three empty ones (a branch standing on
+    /// `HEAD` is a merge to a pass that knows no fork — finding H21's shape), the
+    /// restore then dropped their branches (`live_branch`), and each wake ran in
+    /// the parent's checkout with `master` under its tools. The rule that keeps
+    /// them is `isolated_removals`'s: a worktree the stored file names is not
+    /// residue, whatever its branch holds.
+    ///
+    /// The write is what makes the test stronger than a system prompt: every
+    /// child is woken alone and must land `wake.txt` in its *own* worktree,
+    /// commit it on its own branch, and leave `git status --porcelain` in the
+    /// parent empty.
+    #[test]
+    fn children_in_flight_at_close_are_woken_into_their_own_worktrees() {
+        let root = repo("reopen-in-flight");
+        ignore_worktrees(&root);
+        // Four children: #1 had committed, #2..#4 never wrote a thing — the
+        // human's one and three.
+        isolated_work(&root, 1, "the one that wrote");
+        for id in 2..=4 {
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &git::branch_name(id),
+                    &format!(".mush/wt/{id}"),
+                ],
+            );
+        }
+
+        // The file as the process died: every child was running, none had a
+        // landing, and each names the branch it worked on.
+        let child = |id: u64| session::AgentSession {
+            id,
+            parent: Some(0),
+            depth: 1,
+            brief: format!("task {id}"),
+            title: None,
+            branch: Some(git::branch_name(id)),
+            status: session::StoredStatus::Running,
+            landed: None,
+            leftover: false,
+            summary: None,
+            result_unread: false,
+            messages: vec![Message::user(format!("task {id}"))],
+        };
+        let mut stored = stored_with_agent(session::StoredStatus::Running, Vec::new());
+        stored.agents = (1..=4).map(child).collect();
+
+        let port = writing_endpoint("wake.txt");
+        // A scripted root: the completions the woken children file would
+        // otherwise start the root's own run against the same loopback endpoint,
+        // and a request that is not a child's is a `write_file` this test did
+        // not ask for (the alternation is global).
+        let (mut app, _rx) = app_with_scripted_root_at(
+            &root,
+            Some(stored),
+            Arc::new(Scripted::new().says("noted")),
+            &format!("http://127.0.0.1:{port}"),
+        );
+
+        for id in 1..=4 {
+            let worktree = git::worktree_path(&root, id);
+            let branch = git::branch_name(id);
+            let node = app
+                .tree
+                .node(AgentId(id))
+                .unwrap_or_else(|| panic!("child #{id} came back"));
+            assert_eq!(node.branch.as_deref(), Some(branch.as_str()));
+            assert!(
+                worktree.exists(),
+                "child #{id}'s own worktree survived the reopen"
+            );
+            assert!(
+                app.worktree_gone(AgentId(id)).is_none(),
+                "so the wake is not refused"
+            );
+            // Where the branch stood before the wake: the wake's own end is the
+            // commit that has to move it, and a commit on the branch is what
+            // "the work is in the child's own tree" means to git.
+            let before = git_of(&root, &["rev-parse", &branch]).unwrap_or_default();
+
+            app.tree.focus(AgentId(id));
+            app.chat.insert("carry on");
+            app.send_message();
+            let wake = worktree.join("wake.txt");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let moved = |root: &std::path::Path| {
+                git_of(
+                    root,
+                    &["rev-list", "--count", &format!("{before}..{branch}")],
+                )
+                .ok()
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or(0)
+                    > 0
+            };
+            while (!wake.exists() || !moved(&root)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                wake.exists() && moved(&root),
+                "child #{id} wrote `wake.txt` in its own worktree and committed it on \
+                 {branch} — `wake.txt` in the parent's root: {}",
+                root.join("wake.txt").exists()
+            );
+            assert_eq!(
+                git_of(&root, &["status", "--porcelain"]).unwrap_or_default(),
+                "",
+                "and the parent's tree is untouched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same row, its worktree really there and carrying nothing. The sweep
+    /// runs before the restore (finding H21's order), but it must not read a
+    /// row the file still names as residue: the branch stands on `HEAD` and
+    /// carries nothing, and a pass that took it would leave this child with
+    /// nothing to run in.
+    ///
+    /// The actor is built in its own worktree, and its first request names it —
+    /// the one fact a restored actor's books cannot be read without
+    /// (`recording_endpoint`).
+    #[test]
+    fn a_restored_row_keeps_its_worktree_through_the_sweep() {
+        let root = repo("restore-kept-worktree");
         git(
             &root,
             &["worktree", "add", "-q", "-b", "mush/2", ".mush/wt/2"],
@@ -10169,23 +10538,14 @@ mod tests {
         );
 
         let node = app.tree.node(AgentId(2)).expect("the agent is restored");
-        assert_eq!(
-            node.landed, None,
-            "a branch with no commit of its own is not a merge to claim"
-        );
-        assert_eq!(node.branch, None, "and the branch went with its worktree");
+        assert_eq!(node.landed, None, "nothing settled this agent's worktree");
+        assert_eq!(node.branch.as_deref(), Some("mush/2"));
         assert!(
-            !worktree.exists(),
-            "the sweep took it before any actor was built on it"
+            worktree.exists(),
+            "the sweep left the row's own worktree exactly where it was"
         );
-        assert!(
-            app.worktree_gone(AgentId(2)).is_none(),
-            "so nothing refuses a nudge"
-        );
+        assert!(app.worktree_gone(AgentId(2)).is_none());
 
-        // The actor the restore built runs in the root: its first request
-        // names the workspace the model is told to work in, and that is the one
-        // the child can still see — not the worktree the sweep took.
         app.tree.focus(AgentId(2));
         app.chat.insert("carry on");
         app.send_message();
@@ -10193,12 +10553,12 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the restored child runs");
         assert!(
-            body.contains(root.to_str().unwrap()),
-            "the actor's workspace is the root: {body}"
+            body.contains("worktree of your own branch"),
+            "the actor works in its own worktree: {body}"
         );
         assert!(
-            !body.contains(".mush/wt/2"),
-            "not the worktree the sweep took: {body}"
+            body.contains(worktree.to_str().unwrap()),
+            "named where the checkout is: {body}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

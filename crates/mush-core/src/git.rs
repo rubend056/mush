@@ -586,6 +586,96 @@ fn populate_submodules(worktree: &Path) {
     let _ = run(worktree, &["submodule", "update", "--init", "--recursive"]);
 }
 
+/// Whether `path` is a checkout git made: a linked worktree carries a `.git`
+/// *file* at its root (the main checkout's `.git` is a directory, and a
+/// directory the file tools recreated in a worktree's place has neither).
+///
+/// One stat, and the cheapest question that tells a worktree from the plain
+/// path a run in a *gone* directory used to leave behind (finding S1).
+/// [`workspace::Workspace::new`](crate::workspace::Workspace) only knows the
+/// path exists, so this is what keeps a run from being handed a directory git
+/// has never heard of.
+pub fn is_checkout(path: &Path) -> bool {
+    path.join(".git").is_file()
+}
+
+/// What putting a checkout back on its branch did, told apart the way a caller
+/// has to use it: the checkout is there, there is no branch to put back, or git
+/// refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// The checkout is on disk and on `branch`, at the branch's tip — the
+    /// revision the agent's own `HEAD` was on when the directory was taken.
+    Done(PathBuf),
+    /// Git has no such branch: the agent's worktree was settled for good (it
+    /// was merged, discarded or never committed), and there is nothing to put a
+    /// checkout back on.
+    BranchGone,
+    /// Git would not make the checkout, in git's own words.
+    Failed(String),
+}
+
+/// Put the checkout of agent `id` back at [`worktree_path`], on the branch that
+/// outlived it.
+///
+/// The road back from a worktree that was taken away while its branch stayed:
+/// a hand-run `git worktree remove`, or the [`reclaim`] of a nested child whose
+/// branch `git branch -d` would not delete. The branch is checked out as it
+/// stands — the checkout's `HEAD` is the branch's tip, so the agent resumes
+/// exactly where its commits left it — and never recreated: a branch git no
+/// longer has is [`Restored::BranchGone`], the one answer a caller must read as
+/// a refusal rather than a directory to run in (`agent::revive`).
+///
+/// The branch is resolved *before* anything is created, so "there is no branch"
+/// and "git refused" are two answers and not one. A path git still registers
+/// with no directory behind it is pruned first: `worktree add` refuses such an
+/// entry as "a missing but already registered worktree" (measured on git
+/// 2.55), and the entry is the residue of the very removal being undone —
+/// `prune` drops exactly the entries whose directories are gone and touches
+/// nothing that is on disk. A path that exists and is *not* a checkout (a plain
+/// directory left by a run in a gone workspace, finding S1) is left for git to
+/// refuse rather than deleted: it may hold the only copy of something a human
+/// wrote there by hand.
+pub fn worktree_restore(root: &Path, id: u64, branch: &str) -> Restored {
+    let path = worktree_path(root, id);
+    if is_checkout(&path) {
+        return Restored::Done(path);
+    }
+    // Resolved before the add, because "no such branch" is the answer a caller
+    // turns into a refusal, and git's own message for it does not say that.
+    if resolve(root, branch).is_none() {
+        return Restored::BranchGone;
+    }
+    let _ = run(root, &["worktree", "prune"]);
+    let Some(path_arg) = path.to_str() else {
+        return Restored::Failed(format!(
+            "cannot create a worktree at `{}`: the path is not valid UTF-8, and git cannot be given it",
+            path.display()
+        ));
+    };
+    match run_named(root, "worktree add", &["worktree", "add", path_arg, branch]) {
+        Ok(_) => Restored::Done(path),
+        Err(error) => Restored::Failed(error),
+    }
+}
+
+/// Whether the wake of an isolated agent has somewhere to run: its worktree is
+/// on disk (a checkout git made, or the directory a run in a gone workspace
+/// left — both are paths its own tools resolve, and telling them apart is
+/// [`worktree_restore`]'s job at the run itself), or git still has the branch a
+/// checkout is put back from.
+///
+/// The one question every gate before a wake asks — the UI's own
+/// (`App::worktree_gone`), a parent's `control message`, and the actor's run
+/// start — because "the directory is missing" and "the agent cannot work"
+/// stopped being the same fact when [`worktree_restore`] learned to put a
+/// checkout back. A branch git no longer has, with no directory under it, is
+/// where the agent's work went for good, and that is the refusal
+/// `agent::worktree_gone_line` states.
+pub fn checkout_restorable(root: &Path, id: u64, branch: &str) -> bool {
+    worktree_path(root, id).exists() || resolve(root, branch).is_some()
+}
+
 /// Which of the two ways a branch adds nothing to its base: what one word,
 /// "merged", used to say about both, and the two stories that were really
 /// there — a run whose work landed, and a run that never committed at all.
@@ -1462,6 +1552,124 @@ mod tests {
         );
         // The message `has_commits` compares against is the one `run` writes.
         assert_eq!(GIT_UNAVAILABLE, "git binary unavailable");
+    }
+
+    /// The road back from a checkout that was taken away under a branch that
+    /// outlived it: the checkout goes back on the branch, at the branch's tip,
+    /// with the branch's own work in it. A branch git no longer has is the one
+    /// refusal — the answer a caller must turn into "this did not run" rather
+    /// than a directory to run in.
+    #[test]
+    fn a_checkout_is_put_back_on_the_branch_that_outlived_it() {
+        let dir = init_repo("restore-checkout");
+        let (path, branch) = worktree_add(&dir, 3, None).unwrap();
+        fs::write(path.join("work.txt"), "the work\n").unwrap();
+        commit_all(&path, "mush #3: the work").unwrap();
+        let tip = resolve(&dir, &branch).unwrap();
+        assert!(
+            is_checkout(&path),
+            "a linked worktree carries a `.git` file"
+        );
+
+        // A hand-run `git worktree remove`: the checkout goes, the branch stays.
+        run(&dir, &["worktree", "remove", "--force", &worktree_rel(3)]).unwrap();
+        assert!(!path.exists());
+        assert!(
+            checkout_restorable(&dir, 3, &branch),
+            "a branch git still has is a checkout away"
+        );
+        assert_eq!(
+            worktree_restore(&dir, 3, &branch),
+            Restored::Done(path.clone())
+        );
+        assert!(
+            is_checkout(&path),
+            "a checkout git made, not a bare directory"
+        );
+        assert_eq!(
+            resolve(&path, "HEAD").as_deref(),
+            Some(tip.as_str()),
+            "HEAD is the branch's tip — where the agent's own HEAD was"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("work.txt")).unwrap(),
+            "the work\n",
+            "and the branch's work is in it"
+        );
+
+        // A branch git no longer has: nothing to put a checkout back on.
+        run(&dir, &["worktree", "remove", "--force", &worktree_rel(3)]).unwrap();
+        run(&dir, &["branch", "-D", &branch]).unwrap();
+        assert_eq!(worktree_restore(&dir, 3, &branch), Restored::BranchGone);
+        assert!(
+            !checkout_restorable(&dir, 3, &branch),
+            "and no gate may promise a wake for it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other shape a removal leaves: git still registers the path with no
+    /// directory behind it — an `rm -rf`, a process killed mid-removal. `worktree
+    /// add` refuses such an entry as "a missing but already registered
+    /// worktree" (measured on git 2.55), so the restore prunes first and the
+    /// entry goes with the checkout it named.
+    #[test]
+    fn a_stale_registration_is_pruned_before_the_checkout_goes_back() {
+        let dir = init_repo("restore-stale");
+        let (path, name) = worktree_add(&dir, 4, None).unwrap();
+        fs::remove_dir_all(&path).unwrap();
+        assert!(
+            worktrees(&dir)
+                .unwrap()
+                .iter()
+                .any(|worktree| worktree.path == path),
+            "git still lists the checkout whose directory is gone"
+        );
+        assert_eq!(
+            worktree_restore(&dir, 4, &name),
+            Restored::Done(path.clone())
+        );
+        assert!(is_checkout(&path));
+        assert_eq!(branch(&path).as_deref(), Some(name.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory in a checkout's place is what a run in a *gone* workspace
+    /// leaves behind (finding S1), and it is not a checkout: the restore refuses
+    /// rather than hand a second life to a directory git cannot see. With the
+    /// branch gone the answer is the same — `BranchGone`, decided before any
+    /// path is looked at.
+    #[test]
+    fn a_plain_directory_is_not_a_checkout_to_put_back() {
+        let dir = init_repo("restore-plain");
+        let path = worktree_path(&dir, 8);
+        fs::create_dir_all(&path).unwrap();
+        assert!(!is_checkout(&path));
+        assert_eq!(
+            worktree_restore(&dir, 8, &branch_name(8)),
+            Restored::BranchGone
+        );
+        // A branch that exists does not make a plain directory a checkout: the
+        // directory a run in a gone workspace left holds a file (finding S1),
+        // and git refuses to add into a directory that is not empty. The
+        // refusal is git's own words rather than a made-up one, and nothing is
+        // created over the file that is the only copy of whatever was written.
+        worktree_add(&dir, 9, None).unwrap();
+        let real = worktree_path(&dir, 9);
+        run(&dir, &["worktree", "remove", "--force", &worktree_rel(9)]).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("phantom.txt"), "written in a gone workspace\n").unwrap();
+        assert!(matches!(
+            worktree_restore(&dir, 9, &branch_name(9)),
+            Restored::Failed(_)
+        ));
+        assert!(!is_checkout(&real), "nothing was created on top of it");
+        assert_eq!(
+            fs::read_to_string(real.join("phantom.txt")).unwrap(),
+            "written in a gone workspace\n",
+            "and the file a removal would have destroyed is still there"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The two mutating worktree verbs against a real repository: a worktree is
