@@ -14,16 +14,29 @@ use crate::session;
 use crate::text;
 
 /// Directories a walk never descends into: VCS metadata and build output, whose
-/// contents are never the workspace's work. Hidden names are *not* skipped —
-/// `.github/`, `.gitignore` and `.env.example` are exactly the files an agent is
-/// asked about (audit of the prompt vs behaviour, row 8) — and neither is
-/// `.mush`, whose session file a model may well be asked to look at. One
-/// directory under `.mush` *is* skipped, and it is skipped by path rather than
-/// by name: `.mush/wt`, the isolated children's own checkouts
-/// ([`Workspace::is_worktree_path`]). A project's own `wt/` is nobody's
-/// checkout, and `.mush/paste`, `.mush/session.json` and a note beside them are
-/// this workspace's own files.
+/// contents are never the workspace's work, and mush's own `.mush` — the
+/// session and its lock, the pastes, the isolated children's checkouts
+/// (`.mush/wt`), the gate logs, and a note an agent kept beside them.
+///
+/// **`.mush` is here by the human's decision, and it is a narrow rule.** The
+/// walk is the agent's map of the *work*: every root listing and every search
+/// used to answer with mush's own bookkeeping among the sources — a model
+/// reading a listing of this repo saw `session.json` and `.mush/paste/…` beside
+/// the code — which is the noise a listing exists to avoid. Only *discovery*
+/// goes away: a path under `.mush` is still opened by name (`read_file`, and
+/// every road that resolves a path instead of walking one), and a walk
+/// *started* at `.mush` still descends into it, because the start is never
+/// name-checked — which is the road the paste placeholder sends a model down
+/// when a picture's bytes were shed ("read the file again").
+///
+/// Hidden names are otherwise *not* skipped — `.github/`, `.gitignore` and
+/// `.env.example` are exactly the files an agent is asked about (audit of the
+/// prompt vs behaviour, row 8) — and the name `.mush` is mush's own by
+/// convention: a project that keeps something else in a `.mush` of its own
+/// pays for that convention here. One directory under it is skipped by *path*
+/// as well as by name ([`Workspace::is_worktree_path`]).
 const SKIP_DIRS: &[&str] = &[
+    ".mush",
     ".git",
     "target",
     "node_modules",
@@ -528,9 +541,10 @@ impl Workspace {
     /// checked for it (finding IN7).
     ///
     /// The rule is this one directory and not the name `wt`: a project's own
-    /// `wt/` is nobody's checkout. It is not `.mush` either — the session
-    /// file, the pastes and a note beside them are this workspace's own, and
-    /// `SKIP_DIRS`' doc says so. And a workspace rooted *at* a worktree — the
+    /// `wt/` is nobody's checkout. Since `.mush` is skipped by name too
+    /// ([`SKIP_DIRS`]), this one is the *path* half of the same rule — the
+    /// roads that ask a path question ([`Self::real_path`], a write) must not
+    /// depend on how a name is spelled. And a workspace rooted *at* a worktree — the
     /// child's own — has only its own children's checkouts below it, so the
     /// rule never locks an actor out of its own files.
     fn is_worktree_path(&self, path: &Path) -> bool {
@@ -1258,9 +1272,10 @@ impl Workspace {
     /// in the order `Self::walk` reaches them, with the first `limit`,
     /// whether there were more, and how many of the names it reached cannot
     /// travel on the model's road (`Self::name_for_model`). Build and VCS
-    /// directories are skipped (`SKIP_DIRS`) and so is the workspace's worktree
-    /// directory (`Self::is_worktree_path`); a symlinked directory is not
-    /// followed, so a listing cannot leave the workspace.
+    /// directories are skipped (`SKIP_DIRS`) — mush's own `.mush` among them,
+    /// so a listing is the work and not the bookkeeping — and so is the
+    /// workspace's worktree directory (`Self::is_worktree_path`); a symlinked
+    /// directory is not followed, so a listing cannot leave the workspace.
     ///
     /// The cap ends the walk where it lands rather than cutting a whole answer
     /// at the end: `list_files("")` used to visit every file under the root,
@@ -2504,6 +2519,43 @@ mod tests {
         child.write_file("own.rs", "fn own2() {}\n").unwrap();
         let (own, _, _) = child.list_files("", 100).unwrap();
         assert_eq!(own, vec!["own.rs".to_string()]);
+    }
+
+    /// `.mush` is mush's own state and not part of the walk's map of the work
+    /// (the human's decision, [`SKIP_DIRS`]): a root listing and a search answer
+    /// with the sources alone, where they used to carry `session.json`, the
+    /// pastes and the gate logs among them. *Reach* is the other half and is
+    /// untouched — a walk *started* at `.mush` still descends into it, and a
+    /// file under it is still opened by name — because that is the road the
+    /// paste placeholder sends a model down when a picture's bytes were shed.
+    #[test]
+    fn a_root_listing_omits_mushs_own_state_and_a_named_one_still_lists() {
+        let ws = temp_workspace("mush-own-state");
+        fs::write(ws.root().join("src.rs"), "fn held() {}\n").unwrap();
+        fs::create_dir_all(ws.root().join(".mush/paste")).unwrap();
+        fs::write(ws.root().join(".mush/session.json"), "the conversation\n").unwrap();
+        fs::write(ws.root().join(".mush/paste/shot.png"), "PNG\n").unwrap();
+        fs::write(ws.root().join(".mush/gate.log"), "held\n").unwrap();
+
+        let (listed, _, _) = ws.list_files("", 100).unwrap();
+        assert_eq!(
+            listed,
+            vec!["src.rs".to_string()],
+            "the map is the work, not the bookkeeping"
+        );
+
+        // A search is the same walk, so it cannot spend a match on a gate log.
+        let found = ws.search("held", "", false, 100).unwrap();
+        assert_eq!(found.matches, vec!["src.rs:1: fn held() {}".to_string()]);
+
+        // Reach: the start directory is never name-checked, so a walk asked for
+        // `.mush` still lists it, and the paste's own file still opens by name.
+        let (inside, _, _) = ws.list_files(".mush", 100).unwrap();
+        assert!(
+            inside.contains(&".mush/session.json".to_string()),
+            "{inside:?}"
+        );
+        assert_eq!(ws.read_file(".mush/paste/shot.png").unwrap(), "PNG\n");
     }
 
     /// The listing's cap ends the walk where it lands instead of walking and
