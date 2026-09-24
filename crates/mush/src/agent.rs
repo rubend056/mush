@@ -7438,8 +7438,10 @@ impl Count {
 /// the unit in the number's own case. A row never says `lines` ([`Count`] is
 /// the whole noun list). A count of zero has no spelling at all — the readers
 /// that can count zero drop the clause instead of painting it, because `0L` is
-/// a number that says nothing.
-fn lines_label(lines: usize) -> String {
+/// a number that says nothing. The call grid reads it too, for the count a
+/// heredoc's body wears (`app::call_grid`'s script row), so the one
+/// spelling of a line count is this function.
+pub(crate) fn lines_label(lines: usize) -> String {
     format!("{lines}L")
 }
 
@@ -7510,6 +7512,16 @@ pub struct CallFacts {
     /// events), the title a spawn gave its child, and the one target a wait
     /// named. Never cut: the painter owns the pane's columns (the call grid).
     pub ask: String,
+    /// The directory the call's own leading `cd` named, where that is not the
+    /// workspace root: `[.mush/wt/198]`, the chip the pane paints at the row's
+    /// head ([`crate::app`]'s call grid). The ask does not carry it — the
+    /// prefix is stripped like the root's own ([`strip_cd`]) — because a line
+    /// that says where it ran says it once, in the pane's own words, and a
+    /// command in a child's checkout is not the same event as the same command
+    /// in the root. Recovered from the command the model wrote, never guessed:
+    /// a `cd` behind another command, a second one, or one with no tail is not
+    /// this, and the root's own `cd` earns no chip at all.
+    pub cwd: Option<String>,
     /// The **verdict**: the news the result's own sentences carry, and nothing
     /// else. A clean command's `exit 0` is not news ([`command_reading`]), a
     /// failure is the one word `error` because its own `! error: …` row is
@@ -7609,6 +7621,9 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
     // is written for the results each tool really produces.
     let refused = result.and_then(failure);
     let ok = result.filter(|_| refused.is_none());
+    // The one call whose ask can name a directory of its own: the `cd` a shell
+    // line opens with is where it ran and not what it asked ([`command_ask`]).
+    let mut cwd = None;
     let (ask, outcome, measure, details) = match name {
         ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), None, Vec::new()),
         ToolName::ReadFile => {
@@ -7630,12 +7645,9 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
         }
         ToolName::RunCommand => {
             let (outcome, measure) = command_reading(ok);
-            (
-                command_ask(args, root),
-                outcome,
-                measure,
-                command_details(ok),
-            )
+            let (ask, dir) = command_ask(args, root);
+            cwd = dir;
+            (ask, outcome, measure, command_details(ok))
         }
         ToolName::SpawnAgent => (brief_ask(args), spawn_outcome(ok), None, spawn_details(ok)),
         ToolName::Status => (String::new(), status_outcome(ok), None, status_details(ok)),
@@ -7653,6 +7665,10 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
         // come off a result the actor sanitized on its way in, and are read the
         // same way a painted row is — the painter truncates, which sanitizes.
         ask: sanitize(&ask),
+        // The chip is not the ask and is not sanitized with it: it is a
+        // workspace path the pane brackets ([`crate::app`]'s call grid), and
+        // the ask's own defanging has nothing to say about it.
+        cwd,
         // A refused call produced no payload, and every reader above is handed
         // `ok` — the result filtered of refusals — so the measure of a failure
         // is nothing and cannot be read off the refusal's own sentence.
@@ -7678,6 +7694,7 @@ pub(crate) fn call_digest(
     let Some(name) = ToolName::parse(name) else {
         return CallFacts {
             ask: summarize_args(arguments),
+            cwd: None,
             outcome: result.and_then(failure),
             measure: None,
             details: Vec::new(),
@@ -7798,15 +7815,19 @@ fn search_ask(args: &Value, root: &Path) -> String {
     ask
 }
 
-/// A command's ask: the first line, whitespace collapsed, with the one `cd` a
-/// shell line never needs taken out and the output-shaping tail dropped — and
-/// the two flags that change what the call *is* appended, `· background` for a
-/// `detach`, `· exclusive` for an `exclusive`.
+/// A command's ask: the first line, whitespace collapsed, with the one `cd`
+/// that says where the line ran split off ([`strip_cd`]) and the output-shaping
+/// tail dropped — and the two flags that change what the call *is* appended,
+/// `· background` for a `detach`, `· exclusive` for an `exclusive`. It answers
+/// with the ask and the directory the `cd` named, where it named one of its own.
 ///
 /// Every command already runs with the workspace root as its cwd
 /// ([`run_shell`]), so `cd <root> && cargo test` asks for exactly what
 /// `cargo test` does and the `cd` is a lie about the line the human reads. A
-/// `cd` anywhere else stays: it is a real change of directory.
+/// `cd` anywhere else is a real change of directory *and* the fact the row
+/// cannot afford to lose: it is the chip the pane paints at the ask's head
+/// (`app::call_grid`), so the ask carries the command and the chip
+/// carries the directory, once each.
 ///
 /// **The flags are the ask's own and not a detail.** A detached call returns at
 /// once and its row is all the transcript will hear of it until the job ends; an
@@ -7814,17 +7835,18 @@ fn search_ask(args: &Value, root: &Path) -> String {
 /// why it is refused. Both were invisible on the row, and each changes what the
 /// call *is*; they ride the ask as dim qualifiers (`call_grid`'s roles) so
 /// the line the human reads under the mark is `cargo test · exclusive`.
-fn command_ask(args: &Value, root: &Path) -> String {
+fn command_ask(args: &Value, root: &Path) -> (String, Option<String>) {
     let command = command_arg(args)
         .map(|c| first_line(&c))
         .unwrap_or_default();
-    let mut ask = strip_shaping(&strip_cd(&command, root));
+    let (cwd, rest) = strip_cd(&command, root);
+    let mut ask = strip_shaping(&rest);
     for (flag, word) in [("detach", "background"), ("exclusive", "exclusive")] {
         if args.get(flag).and_then(Value::as_bool) == Some(true) {
             ask.push_str(&format!(" · {word}"));
         }
     }
-    ask
+    (ask, cwd)
 }
 
 /// [`command_ask`]'s second rule: the output-shaping tail of a shell line is
@@ -7891,27 +7913,34 @@ fn shaping_stage(stage: &str) -> bool {
 }
 
 /// [`command_ask`]'s `cd` rule, on its own so both halves can be pinned: the
-/// root's own leading `cd <root> &&` goes, and any other `cd` stays — a second
-/// `cd`, one behind another command, one whose directory is not the root, and
-/// one with no `&&` after it.
-fn strip_cd(command: &str, root: &Path) -> String {
+/// leading `cd <dir> &&` a shell line opens with is *where the line ran*, and it
+/// is not part of the ask. The rule hands back both readings — the directory
+/// (`None` for the workspace root, for `.`/`./`, which are the cwd the command
+/// already has, and for a line with no leading `cd` at all) and the rest of the
+/// line.
+///
+/// Any *other* `cd` stays where it is: a second one, one behind another
+/// command, and one with no `&&` after it (a line whose tail is empty is not a
+/// line). `Path` comparison is component-wise, so a trailing slash on the root
+/// is the same directory.
+fn strip_cd(command: &str, root: &Path) -> (Option<String>, String) {
     let Some(rest) = command.trim_start().strip_prefix("cd ") else {
-        return command.to_string();
+        return (None, command.to_string());
     };
     let Some((dir, tail)) = rest.split_once("&&") else {
-        return command.to_string();
+        return (None, command.to_string());
     };
-    // `Path` comparison is component-wise, so a trailing slash on the root is
-    // the same directory, and a model's own spelling of a *different* path is
-    // left alone with the whole line.
-    if Path::new(dir.trim()) != root {
-        return command.to_string();
-    }
+    let dir = dir.trim();
     let tail = tail.trim();
-    if tail.is_empty() {
-        return command.to_string();
+    if dir.is_empty() || tail.is_empty() {
+        return (None, command.to_string());
     }
-    tail.to_string()
+    if Path::new(dir) == root || matches!(dir, "." | "./") {
+        return (None, tail.to_string());
+    }
+    // A directory *inside* the root is shown workspace-relative by the chip,
+    // exactly as a path argument is ([`workspace_path`]).
+    (Some(workspace_path(dir, root)), tail.to_string())
 }
 
 /// A spawn's ask: the **title** the model gave, where it gave one — it is the
@@ -9381,10 +9410,11 @@ mod tests {
     }
 
     /// A path is shown workspace-relative inside the root and as written
-    /// outside it, and a command's one redundant `cd <root> &&` goes — the
-    /// command already runs with the root as its cwd. Every other `cd` stays:
-    /// a second one, one behind another command, one naming a different
-    /// directory, and one with no `&&` after it.
+    /// outside it; a command's leading `cd <dir> &&` leaves the ask and becomes
+    /// the chip's directory instead, and a `cd` naming the root — where the
+    /// command already runs — leaves nothing at all. Every other `cd` stays: a
+    /// second one, one behind another command, one with no `&&` after it, and
+    /// one whose tail is empty.
     #[test]
     fn the_ask_shows_a_path_beside_the_root_and_a_command_without_its_cd() {
         let root = Path::new("/w");
@@ -9416,27 +9446,62 @@ mod tests {
             "src/a.rs 1→40"
         );
 
-        let command = |command: &str| {
+        let run = |command: &str| {
             digest(
                 ToolName::RunCommand,
                 &json!({"command": command}),
                 None,
                 root,
             )
-            .ask
         };
+        let command = |command: &str| run(command).ask;
+        let cwd = |command: &str| run(command).cwd;
+        // A `cd` that names the root — with or without its trailing slash, or as
+        // the `.` that is any directory — is the cwd the command already has:
+        // the ask drops it and no row wears a chip.
         assert_eq!(command("cd /w && cargo test -p mush"), "cargo test -p mush");
+        assert_eq!(cwd("cd /w && cargo test -p mush"), None);
         assert_eq!(command("cd /w/ && cargo test"), "cargo test");
-        assert_eq!(command("cd /tmp && ls"), "cd /tmp && ls");
+        assert_eq!(command("cd . && cargo test"), "cargo test");
+        assert_eq!(command("cd ./ && cargo test"), "cargo test");
+        // Anywhere else it is where the line ran, and the ask is what ran: the
+        // chip carries the directory, workspace-relative inside the root and as
+        // written outside it.
+        assert_eq!(command("cd /tmp && ls"), "ls");
+        assert_eq!(cwd("cd /tmp && ls"), Some("/tmp".to_string()));
+        assert_eq!(command("cd /w/src && cargo test"), "cargo test");
+        assert_eq!(cwd("cd /w/src && cargo test"), Some("src".to_string()));
+        assert_eq!(command("cd src/lexer && cargo test"), "cargo test");
+        assert_eq!(
+            cwd("cd src/lexer && cargo test"),
+            Some("src/lexer".to_string())
+        );
+        // Every other `cd` stays where it is: a second one, one behind another
+        // command, one with no `&&` after it, and one whose tail is empty.
         assert_eq!(
             command("mkdir -p x && cd /w && ls"),
             "mkdir -p x && cd /w && ls"
         );
+        assert_eq!(cwd("mkdir -p x && cd /w && ls"), None);
+        assert_eq!(command("cd /w && cd /tmp && ls"), "cd /tmp && ls");
+        assert_eq!(cwd("cd /w && cd /tmp && ls"), None);
         assert_eq!(command("cd /w"), "cd /w");
         assert_eq!(command("cd /w && "), "cd /w &&");
         assert_eq!(command("ls -la"), "ls -la");
+        assert_eq!(cwd("ls -la"), None);
+        // The ask and the chip are one reading split in two: the command the
+        // human reads is the one that ran, and where it ran is beside it.
+        assert_eq!(
+            command("cd .mush/wt/198 && wc -l note.txt"),
+            "wc -l note.txt"
+        );
+        assert_eq!(
+            cwd("cd .mush/wt/198 && wc -l note.txt"),
+            Some(".mush/wt/198".to_string())
+        );
         // A heredoc is one line in a label and one row in the log.
         assert_eq!(command("cat > x <<EOF\nbody\nEOF"), "cat > x <<EOF");
+        assert_eq!(cwd("cat > x <<EOF\nbody\nEOF"), None);
     }
 
     /// A `wait`'s outcome is the sentence that ended it, and every ending the

@@ -583,26 +583,67 @@ box reaches that eighteen at **60 columns** of pane. Under it every call paints
 one clause rather than two columns of crumbs: the verdict where the result has
 one (`→ exit 3`), the measure's own count where it has only that (`→ 4 hits`),
 and a pair that does not fit falls back whole. A verdict is never crushed to
-make room for a measure. The ask and the clauses are each cut with `…` from the
-right (the first clause is the one that matters).
+make room for a measure: the clauses are each cut with `…` from the right (the
+first clause is the one that matters), and the ask is cut or wrapped by its own
+rule — the paragraphs below.
 
 The ask is built from the call's own arguments — a path shown relative to the
 workspace, a read's window (`text.rs 1408→1530`), a search's pattern and where
-it looked, a command's redundant leading `cd <workspace root> &&` and its
-trailing output shaping (`2>&1`, `2>/dev/null`, `| cat`, `| head -N`, `| tail
--N`) stripped, because what the shaping cost is already in the payload's line
-count. A `wait` names the one target it waited on (`⧗ #2`, `⧗ c3`) and a bare
-`⧗` waits on everything; a `spawn_agent` reads as the child's `title` where it
-was given one and as the brief's first line where it was not (`↳ table layout
-fixes`); a command that ran detached or exclusively says so, dim, after its
-ask (`❯ cargo test · background`). The mark is the row's one bright thing and
-the call's named target keeps the ask's colour — a path, a pattern, a command's
+it looked, a command's leading `cd <dir> &&` (below) and its trailing output
+shaping (`2>&1`, `2>/dev/null`, `| cat`, `| head -N`, `| tail -N`) stripped,
+because what the shaping cost is already in the payload's line count. A `wait`
+names the one target it waited on (`⧗ #2`, `⧗ c3`) and a bare `⧗` waits on
+everything; a `spawn_agent` reads as the child's `title` where it was given one
+and as the brief's first line where it was not (`↳ table layout fixes`); a
+command that ran detached or exclusively says so, dim, after its ask
+(`❯ cargo test · background`). The mark is the row's one bright thing and the
+call's named target keeps the ask's colour — a path, a pattern, a command's
 program per stage — while what *qualifies* it goes dim: a read's window, a
 search's `in crates · ignore_case`, a command's arguments, those flags. A call
 whose arguments as sent are 300 bytes or more wears their size after the ask,
 dim and parenthesised — `❯ python3 - <<'PY' (3KB)` — and the marker is reserved
 **before** the ask is cut, so a long command's own size is never eaten by the
 very cut it explains.
+
+**The compact log's cut ends at a seam.** Where the ask does not fit its one row
+and its line has stages, the row paints the stages it holds whole, the next
+stage as far as the row goes, and the count of what it left:
+`❯ wc -l tools.rs ; grep … ; +2 stages`. The count is the shell's own split
+(`;`, `&&`, `||`) and never an estimate, one stage is spelled without the `s`,
+and a command with no separator keeps the plain cut with its `…`. A cut never
+ends on an operator the row then has nothing behind: that operator gives way to
+the `…`, because a row ending in `;` would say the line stopped there. And where
+the count's own words cannot fit the row whole — or would leave no ask beside
+them — the plain cut is painted instead, because a count the pane cuts is not a
+count.
+
+**The unfolded view wraps the ask; it never cuts it.** `Ctrl-O` gives the ask
+the rows it needs and breaks it where the shell broke it: a `;`, `&&` or `||`
+stage starts a row, the operator that ends a stage is the last thing on its own
+row, and a continuation row hangs under the mark — the row's own blank head,
+the columns the mark took — so a wrapped chain reads as the stages the shell
+ran. A `|` is not a seam: a pipeline is one thing and keeps its row. A word
+wider than a whole row is split between rows rather than cut, because the
+unfolded view drops no byte of the ask, and an ask the ask's column *does* hold
+is one row in both views. Below the mark and four columns of ask the column
+gives up and the compact cut is what is left, rather than a column of letters.
+
+**Where a command ran.** A command's leading `cd <dir> &&` is *where* the line
+ran and not what ran: the ask drops it, and the row wears the directory at its
+head, dim and bracketed — `[.mush/wt/198] ❯ wc -l note.txt`. The workspace
+root's own `cd` (and the `.` that is any directory) leaves nothing at all,
+because every command already runs there, and a directory inside the workspace
+is shown relative to it. Any other `cd` — a second one, one behind another
+command, one with no `&&` after it — stays in the ask where the model wrote it.
+
+**The script a call carries.** A `run_command` whose first line opens a heredoc
+(`python3 - <<'PY'`, `git commit -F - <<'EOF'`) holds its real work in the
+arguments' later lines, which no row of the ask can show: the unfolded view
+paints the body under the call at the call's own gutter, dim, behind one row
+that says what it is — `│ script 40L · input, not output` — and folds it by the
+payload's own rule (the first three rows, `… N lines …`, the last four),
+because the body is the command's *input* and not its output. The compact log
+paints none of it: its one row is the whole design.
 
 The verdict is read from the result's own sentences: an exit code and the
 command's own time (`exit 1`, `5s`), a wait's delivered `#185 done`/`#c2 done`,

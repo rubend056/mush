@@ -247,6 +247,7 @@ impl Symbols {
             };
             let facts = CallFacts {
                 ask: ask.to_string(),
+                cwd: None,
                 outcome: outcome.map(|text| CallOutcome {
                     text: text.to_string(),
                     tone: Tone::Ok,
@@ -258,9 +259,20 @@ impl Symbols {
                 details: Vec::new(),
             };
             let head = format!("{} {}", self.glyph(tool.as_str()), tool.as_str());
-            for (at, row) in call_grid::header(&call, &facts, row_width, self.mark(tool.as_str()))
-                .iter()
-                .enumerate()
+            // One row per tool: the preview's blocks are told by their heads and
+            // its rows line up under one field, which is what the font check is
+            // for. An ask the row cannot hold is cut the way the compact log
+            // cuts one — the unfold's extra rows belong to the transcript, not
+            // to the popup.
+            for (at, row) in call_grid::header(
+                &call,
+                &facts,
+                row_width,
+                self.mark(tool.as_str()),
+                call_grid::AskRows::One,
+            )
+            .iter()
+            .enumerate()
             {
                 let row: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
                 if at == 0 {

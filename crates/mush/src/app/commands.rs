@@ -788,6 +788,7 @@ pub(crate) mod tests {
         };
         let facts = CallFacts {
             ask: ask.to_string(),
+            cwd: None,
             outcome: Some(CallOutcome {
                 text: outcome.to_string(),
                 tone,
@@ -799,8 +800,16 @@ pub(crate) mod tests {
             details: details.iter().map(|row| row.to_string()).collect(),
         };
         let mark = Symbols::SYMBOLS.mark(name);
-        let mut rows = call_grid::header(&call, &facts, TRANSCRIPT_WIDTH, mark);
-        rows.extend(call_grid::details(&facts, TRANSCRIPT_WIDTH, mark));
+        // The sample is the unfolded view: the pane's own rows, the script a
+        // call carries where it carries one, and then the facts.
+        let mut rows = call_grid::header(
+            &call,
+            &facts,
+            TRANSCRIPT_WIDTH,
+            mark,
+            call_grid::AskRows::Many,
+        );
+        rows.extend(call_grid::details(&call, &facts, TRANSCRIPT_WIDTH, mark));
         rows
     }
 

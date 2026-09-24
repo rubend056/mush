@@ -2792,9 +2792,10 @@ impl Chat {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
         let fold = self.painted_fold();
-        // The calls' own reading: one digest per call, which is the header row
-        // of both views — the unfolded one paints each result's details and
-        // payload under it, and the compact log hides both ([`call_grid`]).
+        // The calls' own reading: one digest per call, which is the header of
+        // both views — the unfolded one paints the ask's own rows, the script
+        // it carries, each result's details and its payload under it, and the
+        // compact log hides all but the one row ([`call_grid`]).
         let facts = self.call_facts(on, index, message);
         // The two facts the transcript does not carry but the frame does: the
         // read window this message's payload is, and the message's own share of
@@ -3868,6 +3869,32 @@ fn elision_between(first: usize, last: usize) -> String {
     format!("… {lines} {noun} …")
 }
 
+/// The payload's own fold, for a bundle that is not a transcript message: the
+/// first [`HEAD_ROWS`] lines, the `… N lines …` elision ([`elision_between`])
+/// and the last [`TAIL_ROWS`] — the two constants and the elision row are one
+/// budget, so a bundle of eight lines or fewer is painted whole.
+///
+/// The caller is the call grid, painting the script a `run_command`'s own
+/// arguments carry under the call's header — the body of a heredoc, which is
+/// the command's *input* and lived nowhere on the pane
+/// ([`crate::app::call_grid`]). It is the payload's rule on purpose: the human
+/// asked that a forty-line script cost the rows a payload costs, and a second
+/// folding rule would be a second thing to learn. The lines are already one row
+/// each — a script's lines are code, painted as written and cut to the pane — so
+/// this walks them rather than wrapping them ([`folded_rows`] is that walk, for
+/// text a result carries).
+#[must_use]
+pub(crate) fn folded_head_tail(lines: &[String]) -> Vec<String> {
+    let budget = HEAD_ROWS + TAIL_ROWS + 1;
+    if lines.len() <= budget {
+        return lines.to_vec();
+    }
+    let mut rows: Vec<String> = lines[..HEAD_ROWS].to_vec();
+    rows.push(elision_between(HEAD_ROWS + 1, lines.len() - TAIL_ROWS));
+    rows.extend(lines[lines.len() - TAIL_ROWS..].iter().cloned());
+    rows
+}
+
 /// How many of a clipped block's rows the unfold paints from its **head**,
 /// with the elision row and the tail below it: the first three rows,
 /// `… N lines …`, the last four.
@@ -4345,11 +4372,14 @@ fn folded_marked(
 /// from *outside* the message: whether another result's payload comes next,
 /// whose blank would sit inside one call block ([`closing_blank`]).
 ///
-/// A tool call's rows are the *same* rows in both views — the digest header
-/// [`call_grid`] paints — and the views differ only in what follows it: the
-/// unfolded view paints the result's detail rows and then the result message
-/// itself paints the payload at the grid's gutter, while the compact log hides
-/// both and leaves one row per call.
+/// A tool call's header is the *same grid* in both views — the header
+/// [`call_grid`] paints, with the arrow's column and the measure's edge
+/// unmoved — and the views differ in the ask's own rows and in what follows it:
+/// the compact log gives every ask one row (cut at a seam where its line has
+/// one) and hides the details and the payload, while the unfolded view gives
+/// the ask the rows it needs, then paints the script the call carries ([`call_grid`]
+/// reads it off the call's own arguments) and the result's own detail rows, and
+/// the result message itself paints the payload at the grid's gutter.
 ///
 /// The arguments are the pane's own facts, threaded in one by one — the fold,
 /// the two views, and the cached reading — which is one past clippy's limit and
@@ -4519,12 +4549,20 @@ fn render_message(
                     _ => facts,
                 };
                 let mark = symbols.mark(&call.function.name);
-                for row in call_grid::header(call, facts, width, mark) {
+                // The ask's own view: the compact log gives every call one row,
+                // and the unfolded view gives the ask the rows it needs
+                // ([`call_grid::AskRows`]).
+                let ask_rows = if compact {
+                    call_grid::AskRows::One
+                } else {
+                    call_grid::AskRows::Many
+                };
+                for row in call_grid::header(call, facts, width, mark, ask_rows) {
                     out.push(row);
                     rows.push(None);
                 }
                 if !compact {
-                    for row in call_grid::details(facts, width, mark) {
+                    for row in call_grid::details(call, facts, width, mark) {
                         out.push(row);
                         rows.push(None);
                     }
@@ -9054,6 +9092,23 @@ mod tests {
                 args: r#"{"command":"echo hi"}"#,
                 result: Some("hi\n[exit 0]"),
             },
+            // A chain in a child's checkout: the cwd chip at the head of the
+            // ask, and a `;`/`&&` seam a row may end at. Its outcome measures
+            // the payload like any other command's.
+            Shape {
+                id: "m1b",
+                tool: "run_command",
+                args: r#"{"command":"cd .mush/wt/198 && wc -l note.txt && echo in-the-checkout"}"#,
+                result: Some("1 note.txt\nin-the-checkout\n[exit 0]"),
+            },
+            // A heredoc: the script the call's own arguments carry, which the
+            // compact log hides and the unfolded view paints under the ask.
+            Shape {
+                id: "m1c",
+                tool: "run_command",
+                args: r#"{"command":"python3 - <<'PY'\nimport json\nprint(json.dumps({'rows': 12}))\nPY"}"#,
+                result: Some("{\"rows\": 12}\n[exit 0]"),
+            },
             // A long ask — and one whose output-shaping tail the digest drops.
             Shape {
                 id: "m2",
@@ -9198,20 +9253,35 @@ mod tests {
     /// `→` of its own (`1408→1530`, `41 lines → 3 lines`) — those are text, and
     /// this is the column the layout wrote.
     fn has_grid_arrow(row: &str, width: usize) -> bool {
+        grid_arrow_at(row, width).is_some()
+    }
+
+    /// Where the grid's own arrow stands on a row, in bytes ([`has_grid_arrow`]):
+    /// the cut the two views are compared from.
+    fn grid_arrow_at(row: &str, width: usize) -> Option<usize> {
         let arrow_x = call_grid::Grid::of(width).arrow_x();
-        row.char_indices().any(|(at, _)| {
-            row[at..].starts_with("→ ") && UnicodeWidthStr::width(&row[..at]) == arrow_x
+        row.char_indices().find_map(|(at, _)| {
+            (row[at..].starts_with("→ ") && UnicodeWidthStr::width(&row[..at]) == arrow_x)
+                .then_some(at)
         })
     }
 
     /// The invariants one pane's rows must hold at one width, for one view:
     /// nothing wider than the pane; every settled call's `→` on its own row at
     /// the grid's column; no outcome dropped; the ask never separated from its
-    /// outcome; and the two-row block exactly where the ask floor says.
+    /// outcome; and the block's shape exactly where the view and the ask floor
+    /// say it is.
     ///
-    /// What it returns is the calls' own header rows, in transcript order — the
-    /// row each mark opens, and the row its arrow stands on — so the two views
-    /// can be compared on exactly the rows they share.
+    /// What it returns is each settled call's **outcome box** — its arrow row
+    /// from the arrow on — so the two views can be compared on exactly what they
+    /// share ([`the_call_grid_matrix`]): the verdict's column and the measure's
+    /// edge, which an ask that grew rows may not move.
+    ///
+    /// The arrow's row is the **last row of the ask**: the compact log's own row
+    /// (or the row under it where the pane stacks the outcome), and the row an
+    /// unfolded ask's wrapping ends in. The ask's continuation rows hang under
+    /// the mark ([`call_grid::AskRows::Many`]), which is what the walk below
+    /// checks on its way to the arrow.
     fn check_matrix(
         rows: &[String],
         width: usize,
@@ -9226,7 +9296,7 @@ mod tests {
                 "{view} at {width}: {row:?} is wider than the pane"
             );
         }
-        let mut headers = Vec::new();
+        let mut boxes = Vec::new();
         let mut from = 0;
         for (tool, settled) in calls {
             // The head is the mark alone: the mark *is* the tool's name
@@ -9239,31 +9309,57 @@ mod tests {
                 .position(|row| row.contains(&head))
                 .map(|at| from + at)
                 .unwrap_or_else(|| panic!("{view} at {width}: no row for {tool}: {rows:?}"));
-            headers.push(rows[ask].clone());
             if *settled {
                 // The arrow that belongs to *this* call: the first one on or
-                // after its ask row, and only ever on that row (the outcome
-                // shares it) or the row under it (the floor's two-row block).
+                // after its ask row, and only ever on that row or a row of its
+                // own ask's wrapping.
                 let arrow = rows[ask..]
                     .iter()
                     .position(|row| has_grid_arrow(row, width))
                     .map(|at| ask + at)
                     .unwrap_or_else(|| panic!("{view} at {width}: {tool} lost its outcome"));
-                let expected = if grid.stacked() { ask + 1 } else { ask };
-                assert_eq!(
-                    arrow, expected,
-                    "{view} at {width}: {tool}'s block shape: {rows:?}"
-                );
-                headers.push(rows[arrow].clone());
+                if view == "compact" {
+                    let expected = if grid.stacked() { ask + 1 } else { ask };
+                    assert_eq!(
+                        arrow, expected,
+                        "{view} at {width}: {tool}'s block shape: {rows:?}"
+                    );
+                } else {
+                    // The unfolded ask: every row between the mark and the
+                    // arrow is the same call's ask, hanging under the mark — so
+                    // the arrow is the ask's own last row, and no other call's
+                    // identity stands inside this call's block.
+                    let hang = " ".repeat(UnicodeWidthStr::width(head.as_str()));
+                    // The rows strictly between: nothing at all where the ask
+                    // is one row ([`arrow`] is the ask's own last row).
+                    for row in rows[(ask + 1).min(arrow)..arrow].iter() {
+                        assert!(
+                            row.starts_with(&hang),
+                            "{view} at {width}: {tool}'s ask wraps under its mark: {row:?}"
+                        );
+                        assert!(
+                            !row.contains(&head),
+                            "{view} at {width}: {tool}'s block holds another call: {row:?}"
+                        );
+                    }
+                }
+                // The outcome box: the arrow row from the arrow on. Its own
+                // columns are the pane's, and the ask's rows above it are the
+                // ask's own business ([`the_call_grid_matrix`] compares the two
+                // views on the box alone).
+                let arrow_at =
+                    grid_arrow_at(&rows[arrow], width).expect("the arrow is the grid's own");
+                boxes.push(rows[arrow][arrow_at..].to_string());
+                from = arrow + 1;
             } else {
                 assert!(
                     !has_grid_arrow(&rows[ask], width),
                     "{view} at {width}: {tool} is in flight and paints no arrow: {rows:?}"
                 );
+                from = ask + 1;
             }
-            from = ask + 1;
         }
-        headers
+        boxes
     }
 
     /// The width matrix: **every pane from 20 to 200 columns** against one
@@ -9275,9 +9371,11 @@ mod tests {
     ///
     /// It asserts, at every width and in both views: no painted row is wider
     /// than the pane; every call's `→` stands at the same column — the grid's
-    /// own — in every message and in both views; no outcome is dropped; the ask
-    /// is never separated from its outcome; and the two-row block appears
-    /// exactly where the ask floor says it must. **Both glyph rungs are swept**:
+    /// own — in every message and in both views; the ask never separated from
+    /// its outcome, which stands on the last row of the ask's own block; no
+    /// outcome dropped; the outcome box the *same* in both views; the two-row
+    /// block exactly where the ask floor says it must; and the script a heredoc
+    /// carries in the unfolded view alone. **Both glyph rungs are swept**:
     /// the layout is arithmetic on the mark's measured width, so the ascii
     /// marks must not be a ragged second case.
     ///
@@ -9299,16 +9397,29 @@ mod tests {
             chat.set_output(true);
             for width in 20..=200 {
                 let shown_rows = shown(&pane_rows(&chat, &pane, width, 400));
-                let shown_headers = check_matrix(&shown_rows, width, &calls, "shown", symbols);
+                let shown_boxes = check_matrix(&shown_rows, width, &calls, "shown", symbols);
                 toggle_output(&mut chat);
                 let compact_rows = shown(&pane_rows(&chat, &pane, width, 400));
-                let compact_headers =
-                    check_matrix(&compact_rows, width, &calls, "compact", symbols);
-                // The headers are the *same rows* in both views: `Ctrl-O` hides
-                // the details and the payload and moves no call's line.
+                let compact_boxes = check_matrix(&compact_rows, width, &calls, "compact", symbols);
+                // The outcome box is the *same* in both views: `Ctrl-O` folds
+                // the ask back to one row, hides the details and the payload,
+                // and moves neither the verdict's column nor the measure's
+                // edge.
                 assert_eq!(
-                    shown_headers, compact_headers,
-                    "the same headers in both views at {width}"
+                    shown_boxes, compact_boxes,
+                    "the same columns in both views at {width}"
+                );
+                // The script a heredoc carries is the unfolded view's own row:
+                // the compact log's one row per call is the whole design. The
+                // token is the block's own first word, because a narrow pane
+                // cuts the rest of the saying off (`│ script 2L · input…`).
+                assert!(
+                    compact_rows.iter().all(|row| !row.contains("script")),
+                    "the compact log paints no script at {width}"
+                );
+                assert!(
+                    shown_rows.iter().any(|row| row.contains("script")),
+                    "the unfolded view paints the script at {width}: {shown_rows:#?}"
                 );
                 let rung = symbols.rung().word();
                 printed.push_str(&format!("\n===== {width} columns · {rung} · shown =====\n"));
@@ -9725,6 +9836,55 @@ mod tests {
             "one row each, and the `…` that says what lies behind it (the pane\
              trims the trailing blank)"
         );
+    }
+
+    /// The fold the call grid paints a heredoc's body with is the payload's own
+    /// ([`folded_head_tail`]): the first three rows, the `… N lines …` row and
+    /// the last four, and a bundle of eight lines or fewer whole — the two
+    /// constants and the elision row are one budget, so a script costs a
+    /// payload's rows and not its own.
+    #[test]
+    fn a_heredoc_body_folds_by_the_payloads_own_rule() {
+        let lines =
+            |count: usize| -> Vec<String> { (0..count).map(|at| format!("line {at}")).collect() };
+        // The budget's own edge: eight lines are painted whole, and the ninth
+        // is where the elision row earns its keep.
+        assert_eq!(
+            folded_head_tail(&lines(8)),
+            vec!["line 0", "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7",]
+        );
+        assert_eq!(
+            folded_head_tail(&lines(9)),
+            vec![
+                "line 0",
+                "line 1",
+                "line 2",
+                "… 2 lines …",
+                "line 5",
+                "line 6",
+                "line 7",
+                "line 8",
+            ]
+        );
+        // A script of forty lines costs eight rows, the middle named for what
+        // it is: lines 4 to 36, and never a count of lines there are not.
+        let script = folded_head_tail(&lines(40));
+        assert_eq!(script.len(), 8);
+        assert_eq!(
+            script,
+            vec![
+                "line 0",
+                "line 1",
+                "line 2",
+                "… 33 lines …",
+                "line 36",
+                "line 37",
+                "line 38",
+                "line 39",
+            ]
+        );
+        // Nothing at all is nothing to fold.
+        assert!(folded_head_tail(&[]).is_empty());
     }
 
     /// The outcome lives in a *different* message than the call — the `tool`
