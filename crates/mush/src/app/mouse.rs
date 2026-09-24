@@ -10,12 +10,13 @@
 //! the terminal can no longer spend itself — is spent here.
 //!
 //! Nothing here has a verb of its own but one: a click on a tool call's own row
-//! opens or closes *that* call ([`App::click`] → [`Chat::toggle_call`]), which
-//! no key can name because the keyboard's only cursor over a transcript walks
-//! source lines and a call's header is not one. Every other arm moves what the
-//! keyboard also moves — a row's cursor, the focused pane, a picker's row — so a
-//! mouse that is never touched costs this program nothing but the modes, and a
-//! mouse that is used cannot reach a state the keys could not.
+//! opens or closes *that* call ([`App::click`] →
+//! [`crate::app::Chat::toggle_call`]), which no key can name because the
+//! keyboard's only cursor over a transcript walks source lines and a call's
+//! header is not one. Every other arm moves what the keyboard also moves — a
+//! row's cursor, the focused pane, a picker's row — so a mouse that is never
+//! touched costs this program nothing but the modes, and a mouse that is used
+//! cannot reach a state the keys could not.
 
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
@@ -112,11 +113,11 @@ impl App {
             // The pane under the keyboard, as `Tab` moves it — and, where the
             // row is part of a tool call's block, that one call opens or closes
             // under the pointer. The call named is the one the frame's own
-            // provenance resolved ([`Painted::call_at`]), so the click acts on
-            // the call the pane painted on that row and never on a call a
-            // second derivation of the grid would have put there. A row that
-            // belongs to no call — the reply, a blank, the foot's own lines —
-            // only moves the keyboard.
+            // provenance resolved ([`crate::app::chat::Painted::call_at`]), so
+            // the click acts on the call the pane painted on that row and never
+            // on a call a second derivation of the grid would have put there. A
+            // row that belongs to no call — the reply, a blank, the foot's own
+            // lines — only moves the keyboard.
             Hit::Transcript { row } => {
                 self.focus = Focus::Chat;
                 let call = panes
@@ -148,10 +149,10 @@ impl App {
     ///
     /// `rows` is positive *down* the wheel — toward the newest line, the way a
     /// notch away from the human points — and each pane's own door is handed
-    /// its own sign: [`Chat::scroll_by`] counts *older* positive, while
-    /// [`Self::move_picker`] and [`Self::move_tree_cursor`] count down the list
-    /// positive. One physical direction, three conventions, and the flip is
-    /// written once, here, where the notch is read.
+    /// its own sign: [`crate::app::Chat::scroll_by`] counts *older* positive,
+    /// while [`Self::move_picker`] and [`Self::move_tree_cursor`] count down
+    /// the list positive. One physical direction, three conventions, and the
+    /// flip is written once, here, where the notch is read.
     ///
     /// The picker is modal, so a notch anywhere moves its cursor: the popup is
     /// the only thing on screen answering input while it is up, and scrolling
@@ -210,9 +211,10 @@ enum Hit {
     /// A painted row of the agents pane: the agent that row names.
     Agent(AgentId),
     /// The chat pane's transcript: the row under the pointer, an index into
-    /// the pane's own lines from the transcript's first painted row — the
-    /// index [`Painted::call_at`] and the select mode's maps are both numbered
-    /// by. A click on a call is resolved through it and a notch ignores it.
+    /// the pane's own lines from the transcript's first painted row — the index
+    /// [`crate::app::chat::Painted::call_at`] and the select mode's maps are
+    /// both numbered by. A click on a call is resolved through it and a notch
+    /// ignores it.
     Transcript { row: usize },
     /// The chat pane's message box.
     Input,
