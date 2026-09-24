@@ -7,6 +7,13 @@
 //! TCP+TLS handshake for every call. Keeping it in-tree means no framework and
 //! no runtime to debug.
 //!
+//! A kept connection is asked whether it is still open before it is written
+//! to. A peer's keep-alive timeout closes an idle socket without a word, and
+//! the first the next request otherwise hears of it is a write that fails — the
+//! human's `Broken pipe (os error 32) — retrying (2/3)`. The close is visible
+//! on the socket before a byte of the request goes out, so the ordinary case is
+//! a fresh dial and not a retry.
+//!
 //! A chat request can be *watched*: the socket is read in short slices and the
 //! caller's cancellation flag is polled between them, so Ctrl-C interrupts a
 //! model that is still thinking instead of waiting for its reply.
@@ -84,16 +91,35 @@ pub struct Response {
 /// one supertrait is needed. `Send` because a kept connection is parked in the
 /// pool a whole tree of actors shares.
 ///
-/// Beside reading and writing it says one thing: how to bound a write. A
+/// Beside reading and writing it says two things. How to bound a write: a
 /// socket's own timeout is the only bound that can end a write the kernel is
 /// holding, and it must be *this* call's remainder — a kept connection was
 /// opened under an earlier ask's budget — so the write phase sets it through
 /// this method on whatever connection the pool handed over. A stream with no
 /// syscall to bound (a test's in-memory connection) does nothing, which is
 /// exactly what it has to bound.
+///
+/// And whether a connection the pool kept is still open
+/// ([`ReadWrite::still_open`]): a question only a socket can answer, and one a
+/// stream with no peer — a test's — answers yes by default.
 trait ReadWrite: Read + Write + Send {
     fn set_write_timeout(&self, _bound: Duration) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Whether a connection taken from the pool is still worth writing to.
+    ///
+    /// A peer's keep-alive timeout closes an idle socket with a FIN and no
+    /// other word. Writing to it anyway is the ordinary way mush used to learn
+    /// that: the kernel takes the head, the peer's reset lands, and the body
+    /// write fails with `Broken pipe (os error 32)` — the human's retry line.
+    /// Asking the socket first turns the ordinary case — the endpoint closed a
+    /// connection it had answered on, while it sat idle — into a fresh dial,
+    /// before a request exists to repeat. The check is not a guarantee: the
+    /// peer can still hang up between it and the write, and that race keeps the
+    /// old road.
+    fn still_open(&mut self) -> bool {
+        true
     }
 }
 
@@ -101,11 +127,39 @@ impl ReadWrite for TcpStream {
     fn set_write_timeout(&self, bound: Duration) -> io::Result<()> {
         TcpStream::set_write_timeout(self, Some(bound))
     }
+
+    /// A non-blocking `peek`, because the question must never wait for the
+    /// peer: on a healthy kept connection nothing is pending and the peek says
+    /// `WouldBlock`. A peer's FIN reads as zero bytes; any byte at all is
+    /// something the next reply would have to read around (a keep-alive
+    /// probe's blank line, a record the last exchange did not consume, a
+    /// reset). None of those is the clean idle socket the pool promised, and
+    /// one fresh dial is cheaper than any of them. The non-blocking mode is put
+    /// back whatever the answer, and a socket whose mode cannot be put back is
+    /// dropped rather than written to under the wrong rules.
+    fn still_open(&mut self) -> bool {
+        if self.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let verdict = match retrying_interrupted(None, || self.peek(&mut [0u8; 1])) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Ok(_) | Err(_) => false,
+        };
+        self.set_nonblocking(false).is_ok() && verdict
+    }
 }
 
 impl ReadWrite for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     fn set_write_timeout(&self, bound: Duration) -> io::Result<()> {
         self.sock.set_write_timeout(Some(bound))
+    }
+
+    /// The TCP socket answers this, not the TLS session: a peer that is gone is
+    /// gone whatever records were in flight, and the only check that cannot
+    /// wait for the peer's next flight is a peek at the bytes. A TLS-level read
+    /// would drive the session — the read slice, not a liveness check.
+    fn still_open(&mut self) -> bool {
+        ReadWrite::still_open(&mut self.sock)
     }
 }
 
@@ -255,11 +309,17 @@ type Socket = BufReader<Box<dyn ReadWrite>>;
 /// opens a fresh connection, and no leftover chunk line can be read as its
 /// reply (finding B27). Anything else — a body that ended at the stream's end,
 /// a server that hangs up — leaves the pool empty too, so no request can ever
-/// be handed a connection that failed. The pool never replaces a dead
-/// connection itself: replacing one means writing the request again, and only
-/// the layer that can prove no whole request was ever written may do that
-/// ([`Unsent`]); a connection that dies after the request was written is final
-/// (finding A2).
+/// be handed a connection that failed.
+///
+/// The one thing the pool does not decide is a connection the peer has closed
+/// *while it sat here*: the next request asks it first
+/// ([`ReadWrite::still_open`]) and replaces it with a fresh dial, because
+/// nothing has been written to it yet — there is no request to repeat, and no
+/// human is owed a retry line for it. What neither layer does is replace a
+/// connection a request has already been written to: replacing one means
+/// writing the request again, and only the layer that can prove no whole
+/// request was ever written may do that ([`Unsent`]); a connection that dies
+/// after the request was written is final (finding A2).
 #[derive(Default)]
 struct Pool {
     /// Made on first keep rather than up front, so the pool can be a `static`
@@ -329,7 +389,16 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     };
 
     // The connection the last request to this endpoint left behind, or a fresh
-    // one. Opening is the one step that happens before a request exists, so
+    // one. A kept one is asked whether it is still open before it is written
+    // to, because the peer may have closed it while it sat there — a keep-alive
+    // timeout is normal, silent, and invisible until something is written — and
+    // the way a request otherwise finds out is a write that fails: the kernel
+    // takes the head, the peer's reset lands, and the body write answers
+    // `Broken pipe (os error 32)`, which the human reads as a retry line. The
+    // close is visible on the socket before a byte is written, so the ordinary
+    // case is a fresh dial: no request exists yet to repeat.
+    //
+    // Opening is the one step that happens before a request exists, so
     // everything it can fail with — a name that does not resolve, a connect
     // that is refused or times out, a TLS handshake — is `Unsent`: no byte of
     // the request was written, and asking again cannot duplicate or bill
@@ -337,7 +406,14 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     // Stop or a deadline a phase spent is the watch's own answer, already in
     // the road's words, and marking it `Unsent` would ask a call with nothing
     // left to ask with.
-    let stream = match pool.take(&endpoint) {
+    let mut kept = pool.take(&endpoint);
+    if let Some(stream) = kept.as_mut() {
+        if !stream.get_mut().still_open() {
+            kept = None;
+        }
+    }
+    let reused = kept.is_some();
+    let stream = match kept {
         Some(stream) => stream,
         None => BufReader::new(open(&host, port, tls, &watch).map_err(|error| {
             if watch.spent() {
@@ -354,7 +430,21 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     // charged for it — only the layer that can prove nothing was written may
     // ask again (finding A2). The `?` drops the connection with the error, so
     // a failed exchange is never handed to the next request.
-    let (response, stream, reusable) = exchange(stream, ask, &host, port, &path, &watch)?;
+    let (response, stream, reusable) = match exchange(stream, ask, &host, port, &path, &watch) {
+        Ok(exchanged) => exchanged,
+        // The one failure whose *why* the wire's own words do not carry: a
+        // write that died on a connection the pool had kept. `Broken pipe` says
+        // what happened, not that the endpoint had already finished with a
+        // socket it answered on before — which is the sentence a human asking
+        // "why?" is owed. The facts that make it true live here, where the
+        // connection's origin is known, and only the kinds the peer's own close
+        // raises get it: a write that merely stalled keeps the OS error's own
+        // words.
+        Err(error) if reused && is_unsent(&error) && peer_closed(&error) => {
+            return Err(kept_connection_closed(error))
+        }
+        Err(error) => return Err(error),
+    };
     if reusable {
         pool.keep(endpoint, stream);
     }
@@ -1192,6 +1282,35 @@ fn unsent(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), Unsent(error.to_string()))
 }
 
+/// Whether a write failed because the peer was gone rather than because the
+/// call ran out of time: the kinds a socket the peer has finished with raises.
+/// A stall — `WouldBlock`, `TimedOut` — is the call's own bound wearing the
+/// wire's error kind, and keeps the OS error's own words.
+fn peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
+/// The sentence a write that died on a connection the pool had kept is owed:
+/// the wire's own words, plus *why*. `Unsent` already says that no whole
+/// request went out, so the retry duplicates nothing the endpoint may have —
+/// what the kind cannot say, and the human cannot guess, is that the socket was
+/// one the endpoint had answered on and had since closed, which is what a
+/// keep-alive timeout looks like from this side.
+fn kept_connection_closed(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        Unsent(format!(
+            "the endpoint had closed the connection it kept open ({error})"
+        )),
+    )
+}
+
 /// Whether `error` is a request that never left mush — [`Unsent`] as
 /// [`is_framing`] is [`Framing`]. `model.rs` asks this to decide the one
 /// failure a repeat may ask again.
@@ -1929,6 +2048,370 @@ mod tests {
             "{\"two\":2}"
         );
         assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    /// Read one whole request off a test server's connection: the head, then
+    /// the `Content-Length` body it promised. A server that answers a request
+    /// it has not read whole leaves bytes unread, and closing on those is an
+    /// RST — which can discard the very reply the client is reading. The
+    /// fixtures that close a connection after answering read it with this.
+    fn read_whole_request(connection: &mut TcpStream) {
+        use std::io::Read as _;
+
+        let mut request = Vec::new();
+        let mut scratch = [0u8; 4096];
+        let mut whole: Option<usize> = None;
+        loop {
+            if let Some(whole) = whole {
+                if request.len() >= whole {
+                    return;
+                }
+            }
+            let read = connection.read(&mut scratch).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&scratch[..read]);
+            if whole.is_none() {
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    whole = Some(end + 4 + length);
+                }
+            }
+        }
+    }
+
+    /// An endpoint that answers one connection per reply and then closes it —
+    /// the keep-alive timeout shape, which leaves the client's pool holding a
+    /// socket that is already gone. The close is a real one (the whole request
+    /// is read first, so nothing unread turns it into an RST), and a request
+    /// written onto it fails the way the human's does rather than being
+    /// answered.
+    fn closes_after_each_reply(answers: &'static [&'static str]) -> (u16, Arc<AtomicUsize>) {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                read_whole_request(&mut connection);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = connection.write_all(reply.as_bytes());
+                let _ = connection.flush();
+                drop(connection);
+            }
+        });
+        (port, served)
+    }
+
+    /// A body the endpoint cuts off mid-write is `Unsent`, not an answer: the
+    /// write never handed the whole body over, so the `Content-Length` the
+    /// endpoint holds cannot be satisfied and there is no complete request it
+    /// could have run — however big the body is (a picture's, a long
+    /// transcript's, megabytes). The retry duplicates nothing; the endpoint saw
+    /// a prefix. This is the other face of `Broken pipe`: whether the peer is a
+    /// proxy resetting a large body on a fresh connection or a keep-alive
+    /// socket already gone, the failure is the *write's*, and `Unsent` is what
+    /// makes the retry honest.
+    #[test]
+    fn a_body_cut_off_mid_write_is_unsent() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = seen.clone();
+        std::thread::spawn(move || {
+            let Ok((mut connection, _)) = listener.accept() else {
+                return;
+            };
+            let mut scratch = [0u8; 8192];
+            // A prefix, then gone: bytes of the request are left unread on the
+            // socket, so this close is an RST and the write still in flight
+            // fails on it.
+            let read = connection.read(&mut scratch).unwrap_or(0);
+            counted.fetch_add(read, Ordering::SeqCst);
+            drop(connection);
+        });
+
+        let pool = Pool::new();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let mut opener =
+            |host: &str, port: u16, tls: bool, watch: &Watch<'_>| connect(host, port, tls, watch);
+        // Far past any socket buffer, so the write is still in flight when the
+        // endpoint goes away — the shape a large request makes on a real wire.
+        let body = "x".repeat(16 * 1024 * 1024);
+        let error = send(&pool, &mut opener, &url, &body).unwrap_err();
+
+        assert!(
+            is_unsent(&error),
+            "a write that never handed the body over is unsent: {error}"
+        );
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ),
+            "the peer's own close, not a stall: {error}"
+        );
+        assert!(
+            seen.load(Ordering::SeqCst) < body.len(),
+            "the endpoint saw a prefix, never the request: {} bytes",
+            seen.load(Ordering::SeqCst)
+        );
+    }
+
+    /// What [`ReadWrite::still_open`] answers on real sockets: a live idle peer
+    /// is a connection to keep, and the check never waits for the peer to
+    /// speak; a peer's FIN and a socket with bytes already pending are both
+    /// connections to replace before a request is written onto them.
+    #[test]
+    fn a_kept_connection_is_asked_whether_it_is_still_open() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // A peer that says nothing: the healthy kept connection. The check is
+        // asked while the connection is idle and must answer at once, not wait
+        // for the peer's next flight — the non-blocking peek is the point.
+        let mut live = TcpStream::connect(address).unwrap();
+        let _server = listener.accept().unwrap().0;
+        let started = Instant::now();
+        assert!(live.still_open(), "an idle peer is no reason to dial again");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the check never waits for the peer: {:?}",
+            started.elapsed()
+        );
+
+        // A peer that has closed. Reading the FIN off the socket first makes
+        // the timing deterministic — the read returns zero exactly when the
+        // FIN is in — and the check must then call the connection finished.
+        let mut gone = TcpStream::connect(address).unwrap();
+        let closed = listener.accept().unwrap().0;
+        drop(closed);
+        gone.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut scratch = [0u8; 1];
+        assert_eq!(
+            gone.read(&mut scratch).unwrap(),
+            0,
+            "the peer's FIN is on the socket before the check is asked"
+        );
+        assert!(!gone.still_open(), "a closed peer is a fresh dial");
+
+        // A socket with a byte already pending is not a clean idle one either:
+        // whatever that byte is — a keep-alive probe's blank line, a record the
+        // last exchange did not consume — the next reply would have to read
+        // around it, and one dial is cheaper than that.
+        let mut noisy = TcpStream::connect(address).unwrap();
+        let mut talker = listener.accept().unwrap().0;
+        talker.write_all(b"\r\n").unwrap();
+        talker.flush().unwrap();
+        noisy
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(
+            noisy.peek(&mut scratch).unwrap(),
+            1,
+            "the pending byte is on the socket before the check is asked"
+        );
+        assert!(
+            !noisy.still_open(),
+            "a socket with bytes pending is replaced, not written to"
+        );
+    }
+
+    /// The human's line, at the layer that can prevent it: an endpoint that
+    /// closes the connection it had answered on — a keep-alive timeout, the
+    /// ordinary way, and silent — must not turn the next request into a write
+    /// that fails and a retry the human has to read. The close is visible on
+    /// the socket before a byte of the request is written, so the next call is
+    /// dialled fresh and served first try. Before the check this fixture wrote
+    /// the request onto the dead socket and failed on its body write with
+    /// `Broken pipe (os error 32)` — exactly the line the human reported.
+    #[test]
+    fn a_kept_connection_the_endpoint_had_closed_is_replaced_before_the_request() {
+        let (port, served) = closes_after_each_reply(&["{\"one\":1}", "{\"two\":2}"]);
+        let pool = Pool::new();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let mut opener =
+            |host: &str, port: u16, tls: bool, watch: &Watch<'_>| connect(host, port, tls, watch);
+
+        assert_eq!(
+            send(&pool, &mut opener, &url, "{}").unwrap().body,
+            "{\"one\":1}"
+        );
+        assert_eq!(pool.idle(), 1, "the first reply's connection is kept");
+        // The gap between two calls of a real run, long enough for the idle
+        // close to land: the check is a question asked before the write, not a
+        // race with it, so all this test needs is the close being there.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            send(&pool, &mut opener, &url, "{}").unwrap().body,
+            "{\"two\":2}",
+            "the request is served first try, not written onto the closed socket"
+        );
+        assert_eq!(pool.idle(), 1, "the replacement is kept in its place");
+        assert_eq!(served.load(Ordering::SeqCst), 2, "one dial per reply");
+    }
+
+    /// An in-memory connection that serves one reply and then fails the writes
+    /// of the request after it: what a kept connection does when the peer dies
+    /// *between* the liveness check and the write. The check cannot see it —
+    /// the fake has no syscall to ask, so `still_open` is the default yes — and
+    /// only the write finds out. That is the race the check leaves, and the one
+    /// shape left that earns the human's retry line.
+    struct DiesAfterFirstReply {
+        answers: Vec<Vec<u8>>,
+        current: Vec<u8>,
+        writes: usize,
+        /// The write number this connection starts failing at. One request is
+        /// two writes (head, body), so `3` is the next request's head.
+        fails_from: usize,
+    }
+
+    impl DiesAfterFirstReply {
+        fn serving(answer: &str, fails_from: usize) -> Self {
+            Self {
+                answers: vec![answer.as_bytes().to_vec()],
+                current: Vec::new(),
+                writes: 0,
+                fails_from,
+            }
+        }
+    }
+
+    impl Read for DiesAfterFirstReply {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.current.is_empty() {
+                if self.answers.is_empty() {
+                    return Ok(0);
+                }
+                self.current = self.answers.remove(0);
+            }
+            let take = buf.len().min(self.current.len());
+            buf[..take].copy_from_slice(&self.current[..take]);
+            self.current.drain(..take);
+            Ok(take)
+        }
+    }
+
+    impl Write for DiesAfterFirstReply {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes >= self.fails_from {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Broken pipe (os error 32)",
+                ));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ReadWrite for DiesAfterFirstReply {}
+
+    /// One connection that serves a reply and dies under the next request,
+    /// through a pool and an opener the test owns.
+    fn send_onto_a_dying_kept_connection(fails_from: usize) -> io::Error {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(
+            Box::new(DiesAfterFirstReply::serving(&ok("{\"one\":1}"), fails_from))
+                as Box<dyn ReadWrite>,
+        );
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(stream) => Ok(stream),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"one\":1}",
+            "the reply that keeps the connection"
+        );
+        assert_eq!(pool.idle(), 1, "it is kept for the next request");
+        let error = send(&pool, &mut opener, url, "{}").unwrap_err();
+        assert_eq!(pool.idle(), 0, "the failed connection is never kept");
+        error
+    }
+
+    /// The race the check cannot close, in the sentence the human reads: a
+    /// write that died on a connection the pool had kept says *why* — the
+    /// endpoint had answered on this socket and had since closed it — instead
+    /// of leaving `Broken pipe (os error 32)` to be puzzled over. The class is
+    /// unchanged: `Unsent`, because no whole request went out, so the retry
+    /// duplicates nothing the endpoint may already have.
+    #[test]
+    fn a_write_that_dies_on_a_kept_connection_names_it() {
+        let error = send_onto_a_dying_kept_connection(3);
+
+        assert!(is_unsent(&error), "the request never left whole: {error}");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+        assert_eq!(
+            error.to_string(),
+            "the endpoint had closed the connection it kept open (Broken pipe (os error 32))",
+            "the why is named, and the wire's own words are kept"
+        );
+    }
+
+    /// A write that dies on a **fresh** connection keeps the wire's own words:
+    /// there was no kept connection for the endpoint to have closed, and a
+    /// sentence that said there was would be a story mush cannot support. The
+    /// class is `Unsent` either way — the retry duplicates nothing.
+    #[test]
+    fn a_write_that_dies_on_a_fresh_connection_keeps_the_wires_words() {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Box::new(DiesAfterFirstReply::serving(&ok("{}"), 1)) as Box<dyn ReadWrite>);
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(stream) => Ok(stream),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let error = send(
+            &Pool::new(),
+            &mut opener,
+            "http://models.test:8078/v1/chat/completions",
+            "{}",
+        )
+        .unwrap_err();
+
+        assert!(is_unsent(&error), "the request never left whole: {error}");
+        assert_eq!(error.to_string(), "Broken pipe (os error 32)", "{error}");
     }
 
     /// A chunked reply ends with a trailer section, and the blank line that

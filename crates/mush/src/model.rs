@@ -1058,6 +1058,135 @@ mod tests {
         assert!(lines[0].contains("retrying (2/3)"), "{lines:?}");
     }
 
+    /// Read one whole request off a test server's connection: the head, then
+    /// the `Content-Length` body it promised. A server that answers a request
+    /// it has not read whole leaves bytes unread, and closing on those is an
+    /// RST — which can discard the very reply the client is reading.
+    fn read_whole_request(connection: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+
+        let mut request = Vec::new();
+        let mut scratch = [0u8; 4096];
+        let mut whole: Option<usize> = None;
+        loop {
+            if let Some(whole) = whole {
+                if request.len() >= whole {
+                    return;
+                }
+            }
+            let read = connection.read(&mut scratch).unwrap_or(0);
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&scratch[..read]);
+            if whole.is_none() {
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    whole = Some(end + 4 + length);
+                }
+            }
+        }
+    }
+
+    /// The human's line, on the whole road: an endpoint that closes the
+    /// connection it had answered on — a keep-alive timeout, the ordinary way —
+    /// must not cost a retry when the next call runs. `http.rs` sees the close
+    /// on the socket before it writes, so the pool's dead connection is
+    /// replaced by a fresh dial and the run's transcript holds no
+    /// `Broken pipe (os error 32) — retrying (2/3)`. Before the check this
+    /// fixture produced exactly that line: the head went into the dead socket,
+    /// the body write failed, and the retry — honest, since nothing whole had
+    /// gone out — was one the human should never have had to read.
+    #[test]
+    fn a_kept_connection_the_endpoint_closed_costs_no_retry() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        std::thread::spawn(move || {
+            for answer in ["one", "two"] {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                read_whole_request(&mut connection);
+                let body = format!(
+                    r#"{{"choices":[{{"message":{{"role":"assistant","content":"{answer}"}},"finish_reason":"stop"}}]}}"#
+                );
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = connection.write_all(head.as_bytes());
+                let _ = connection.write_all(body.as_bytes());
+                let _ = connection.flush();
+                // The keep-alive timeout. The whole request was read above, so
+                // this close is the FIN an idle timer sends — not an RST that
+                // could discard the reply the client is still reading.
+                drop(connection);
+            }
+        });
+
+        let cfg = ConfigHandle::own(mush_core::Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "test",
+            None,
+        ));
+        let model = HttpModel::new(cfg);
+        let cancel = AtomicBool::new(false);
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        // The first call: a fresh dial, answered, and its connection kept.
+        let first = model.chat(&request, &cancel, CHAT_DEADLINE).unwrap();
+        assert_eq!(first.choices[0].message.text(), "one");
+        // The idle gap between two calls, long enough for the close to land.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The second call, through the retry layer the run uses: it must be
+        // served on a fresh dial, with nothing announced as a retry.
+        let log = Recorder::new();
+        let reply = retrying(
+            crate::clock::system(),
+            CHAT_DEADLINE,
+            &cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |left| model.chat(&request, &cancel, left),
+        )
+        .unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "two");
+        assert!(
+            retry_lines(&log).is_empty(),
+            "the closed connection cost no retry line: {:?}",
+            retry_lines(&log)
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "a fresh connection served the second call"
+        );
+    }
+
     /// A request the endpoint has read is never sent twice, however the call
     /// fails: the endpoint sees one POST, and the call ends once its one
     /// deadline is spent (finding A2). Before the ruling this shape was three
