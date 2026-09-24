@@ -11,7 +11,7 @@ and see what changed.
 ```
 ┌ agents · 2 working · Σ +12 −3──┐┌ mush ──────────────────────────────────────────────────────────┐
 │▶◐ #0 root  thinking 4s         ││you › rename the lexer module                                   │
-│   ◐ #1 lexer  mush/1 +12−3     ││                                                                │
+│   ◐ #1 lexer  ⎇ +12−3          ││                                                                │
 │   ✓ #2 docs  wrote README.md   ││mush › Starting with the rename.                                │
 │                                ││                                                                │
 │                                ││± src/lex.rs                               → 3 hunks            │
@@ -169,7 +169,7 @@ wear — painted by the code's own row painter:
  ✓ #0 done  wrote README.md
  ✗ #0 failed  no route to host
 ▶◐ #0 the focused row  thinking 3s
- ◐ #0 lexer  mush/1 +12−3 ⚙1  edit_file src/lex.rs 3s
+ ◐ #0 lexer  ⎇ +12−3 ⚙1  edit_file src/lex.rs 3s
  ✓ #0 ✉ result unread  wrote README.md
  · #0 ✉2 two reads owed
  ✓ #0 ⚮ parent gone  wrote src/lex.rs

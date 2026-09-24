@@ -166,6 +166,11 @@ pub(crate) struct Theme {
     /// What chose the accent; the accent alone cannot say whether the human
     /// named the hue or the workspace path hashed it.
     origin: Origin,
+    /// The agents pane's delta inks, fixed in every workspace but resolved in
+    /// the accent's own form ([`ADDED_RGB`]).
+    added: Color,
+    /// The `−M` half of the same pair ([`REMOVED_RGB`]).
+    removed: Color,
 }
 
 /// Where a [`Theme`]'s accent came from.
@@ -203,12 +208,41 @@ fn form(truecolor: bool) -> Form {
     }
 }
 
+/// The two inks of an agents row's line delta: `+N` in `#446901` and `−M` in
+/// `#0d6901`, the human's own pair.
+///
+/// The halves are deliberately not one ink: this pane reads the removed half
+/// as the good direction — a child that deletes lines is one that simplified —
+/// and gives the plus the caution ink. They are fixed *content* inks, not
+/// chrome: what a branch changed reads the same in every workspace, while the
+/// hue only ever says whose window this is (finding D9's two kinds of colour).
+/// They are the content's only inks with bytes of their own, so they travel in
+/// the form the terminal announced, exactly as the accent does — a bare
+/// `Color::Rgb` would be the one ink mush paints at a terminal that never
+/// claimed it.
+const ADDED_RGB: (u8, u8, u8) = (0x44, 0x69, 0x01);
+const REMOVED_RGB: (u8, u8, u8) = (0x0d, 0x69, 0x01);
+
+/// [`ADDED_RGB`] and [`REMOVED_RGB`] in `form`.
+fn delta_inks(form: Form) -> (Color, Color) {
+    let ink = |rgb: (u8, u8, u8)| match form {
+        Form::Rgb => Color::Rgb(rgb.0, rgb.1, rgb.2),
+        Form::Indexed => Color::Indexed(nearest_256(rgb)),
+    };
+    (ink(ADDED_RGB), ink(REMOVED_RGB))
+}
+
 impl Default for Theme {
     fn default() -> Self {
+        // No terminal was read, so there is no form to follow: the fixed
+        // palette takes the human's bytes for the delta's two inks.
+        let (added, removed) = delta_inks(Form::Rgb);
         Self {
             accent: Color::Cyan,
             hue: None,
             origin: Origin::Fixed,
+            added,
+            removed,
         }
     }
 }
@@ -217,6 +251,17 @@ impl Theme {
     /// The colour the chrome sites paint: today's `Color::Cyan`, or the hue.
     pub(crate) fn accent(&self) -> Color {
         self.accent
+    }
+
+    /// The ink a row's `+N` wears: the same in every workspace, in the form
+    /// this terminal is painted in ([`ADDED_RGB`]).
+    pub(crate) fn added(&self) -> Color {
+        self.added
+    }
+
+    /// The ink a row's `−M` wears ([`REMOVED_RGB`]).
+    pub(crate) fn removed(&self) -> Color {
+        self.removed
     }
 
     /// The hue behind the accent, or `None` for the fixed palette.
@@ -241,12 +286,19 @@ impl Theme {
         Ok(match stated {
             // `off` is the fixed palette, and the spelling is kept: a human
             // debugging a window's colours has to know the environment
-            // silenced the hue.
-            Some("off") => Self {
-                accent: Color::Cyan,
-                hue: None,
-                origin: Origin::Off,
-            },
+            // silenced the hue. The delta's two inks are not the hue and are
+            // fixed under every setting, so they still follow the form the
+            // terminal announced.
+            Some("off") => {
+                let (added, removed) = delta_inks(form(env.truecolor()));
+                Self {
+                    accent: Color::Cyan,
+                    hue: None,
+                    origin: Origin::Off,
+                    added,
+                    removed,
+                }
+            }
             // The workspace chooses the hue, and the human the form.
             Some("256") => Self::hued(hue_of(root), Form::Indexed, Origin::Workspace256),
             Some("auto") | None => {
@@ -265,10 +317,13 @@ impl Theme {
             Form::Rgb => Color::Rgb(hue.rgb.0, hue.rgb.1, hue.rgb.2),
             Form::Indexed => Color::Indexed(nearest_256(hue.rgb)),
         };
+        let (added, removed) = delta_inks(form);
         Self {
             accent,
             hue: Some(hue),
             origin,
+            added,
+            removed,
         }
     }
 
@@ -690,6 +745,40 @@ mod tests {
         assert_eq!(theme.accent(), Color::Cyan);
         assert!(theme.hue().is_none());
         assert_eq!(theme.describe(), "off (MUSH_THEME)");
+    }
+
+    /// The delta's two inks are fixed content colours — the same bytes in every
+    /// workspace — but an RGB ink still travels in the form the terminal
+    /// announced, exactly as the accent does. `Theme::default` has no terminal
+    /// to ask, so it takes the human's bytes; `off` silences the *hue*, not the
+    /// form, so a 256-colour terminal still gets the nearest entry.
+    #[test]
+    fn the_delta_inks_follow_the_form_they_are_painted_in() {
+        assert_eq!(Theme::default().added(), Color::Rgb(0x44, 0x69, 0x01));
+        assert_eq!(Theme::default().removed(), Color::Rgb(0x0d, 0x69, 0x01));
+
+        let on_truecolor = Theme::resolve(&truecolor(), &nowhere()).unwrap();
+        assert_eq!(on_truecolor.added(), Color::Rgb(0x44, 0x69, 0x01));
+        assert_eq!(on_truecolor.removed(), Color::Rgb(0x0d, 0x69, 0x01));
+
+        let indexed = Theme::resolve(&text(None, None, Some("linux")), &nowhere()).unwrap();
+        assert_eq!(
+            indexed.added(),
+            Color::Indexed(nearest_256((0x44, 0x69, 0x01)))
+        );
+        assert_eq!(
+            indexed.removed(),
+            Color::Indexed(nearest_256((0x0d, 0x69, 0x01)))
+        );
+
+        // The pair is fixed: a hue changes the chrome and not the delta.
+        let named = Theme::resolve(&text(Some("teal"), None, Some("linux")), &nowhere()).unwrap();
+        assert_eq!(named.added(), indexed.added());
+        assert_eq!(named.removed(), indexed.removed());
+
+        let off = Theme::resolve(&text(Some("off"), Some("truecolor"), None), &nowhere()).unwrap();
+        assert_eq!(off.added(), Color::Rgb(0x44, 0x69, 0x01));
+        assert_eq!(off.removed(), Color::Rgb(0x0d, 0x69, 0x01));
     }
 
     /// A named hue is that hue, whatever the path is, and it follows the same

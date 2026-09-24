@@ -14,7 +14,10 @@
 //! ink while the chat does — and the picker's), the transcript select mode's
 //! cursor band and its selection, and an activity line.
 //! The *content* — dimmed text, the alert red, the floor notice's yellow, the
-//! body gray — stays fixed: a failure reads the same in every workspace.
+//! body gray, and the agents pane's two delta inks — stays fixed: a failure
+//! reads the same in every workspace. The delta's pair is the content's only
+//! ink with bytes of its own, so it is resolved by the theme in the form the
+//! terminal announced ([`Theme::added`], [`Theme::removed`]).
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
@@ -26,7 +29,8 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::text::fit_row;
 
 use crate::app::{
-    elide, AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
+    elide, AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, PlacePiece, Rank, Screen,
+    SelectRows,
 };
 use crate::theme::Theme;
 
@@ -116,7 +120,7 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
         .rows
         .iter()
         .map(|row| {
-            let line = ListItem::new(agent_line(row, row_width));
+            let mut line = agent_line(row, row_width, theme);
             // A row whose parent the history window forgot is history: its
             // stored link was cut, and neither the row nor the `⚮` it wears
             // borrows a colour of its own — the whole row takes `dim()`, the
@@ -124,12 +128,16 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
             // happened. The accent only ever points (whose window this is,
             // where the keyboard is), so it is not this row's to wear; the
             // list's own highlight patches over the dim on the cursor row,
-            // wherever the keyboard is.
+            // wherever the keyboard is. The row's own span styles — the dim id,
+            // the delta's two inks — are *replaced* rather than shadowed,
+            // because a span's colour is patched over the item's style: a
+            // history row wears one ink and its delta is history too.
             if row.parent_gone {
-                line.style(dim())
-            } else {
-                line
+                for span in &mut line.spans {
+                    span.style = dim();
+                }
             }
+            ListItem::new(line)
         })
         .collect();
     // The cursor's mark depends on who has the keyboard, because the band *is*
@@ -177,13 +185,22 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
     }
 }
 
-/// One row of the tree, fitted into the columns the pane has.
+/// One row of the tree, fitted into the columns the pane has, as the spans it
+/// is painted in.
 ///
-/// `fit_row` is the ranked-field rule R1 states: the state (`▶◐ #2)`, then the
-/// branch and its delta, then the activity with its age, then the title — the
+/// `fit_row` is the ranked-field rule R1 states: the state (`▶◐ #2`), then the
+/// place and its delta, then the activity with its age, then the title — the
 /// title yields first because the footer and the transcript carry the brief in
 /// full. The fields themselves are derived by the tree; this only spends the
-/// columns on them.
+/// columns on them and says what each one wears.
+///
+/// The inks are the module's two kinds: the *chrome* accent never appears here
+/// (a row's state is not whose window this is), while the id and the isolation
+/// mark take the content's [`dim`], and the delta's two halves take the fixed
+/// pair the theme resolved ([`Theme::added`], [`Theme::removed`]). Everything
+/// else — the glyph, the `⚮`/`✉` marks, the job count, the brief, the activity
+/// — keeps the terminal's own ink, which is what the row wore before any of
+/// this was coloured.
 ///
 /// The head is where a mark that must never be given up rides: `✉`/`✉N` and
 /// the `⚮` a row wears when its parent is gone. The title yields its columns
@@ -196,14 +213,22 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
 /// a frame has to carry: the sweep fits each row at the width it is painted at
 /// and reads the result, which is the one way a row that silently loses its
 /// tail is caught (refactor B17).
-pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
+///
+/// The head is built here and handed to `fit_row` as the one field that is
+/// never given up; it is the painter's own spans, so the id can wear [`dim`]
+/// without a line ever being cut apart again — the shape the delta's two inks
+/// forced on the row's `place` ([`PlacePiece`]).
+pub(crate) fn agent_line(row: &AgentRow, width: usize, theme: &Theme) -> Line<'static> {
     let indent = "  ".repeat(row.depth);
     let marker = if row.focused { "▶" } else { " " };
-    let mut head = format!(
-        "{indent}{marker}{glyph} {id}",
-        id = row.id,
+    let mut head: Vec<Span<'static>> = vec![Span::raw(format!(
+        "{indent}{marker}{glyph} ",
         glyph = row.glyph
-    );
+    ))];
+    // The id, dim: `#198` and the branch it names are one fact, and the brief
+    // is what the eye should lead with. It rides in the head with the state
+    // because it is the one field `fit_row` never gives up (R1).
+    head.push(Span::styled(format!("{}", row.id), dim()));
     if row.parent_gone {
         // `⚮` — this row's stored parent link was cut, and the row says so
         // while it hangs under its nearest surviving ancestor
@@ -221,24 +246,91 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
         // id it qualifies: the head is the one field `fit_row` never gives up
         // (R1). `draw_agents` paints the whole row in `dim()`, and the mark
         // wears no ink of its own.
-        head.push_str(" ⚮");
+        head.push(Span::raw(" ⚮"));
     }
     if row.result_unread {
         // `✉` — this result has not been read by its parent — and `✉N` for the
         // reads this agent owes its own children (finding H4). Both marks ride
         // with the glyph: they are facts about the agent, and the row says them
         // in the head, before the title it can give up (R1).
-        head.push_str(" ✉");
+        head.push(Span::raw(" ✉"));
     }
     if row.unread_children > 0 {
-        head.push_str(&format!(" ✉{}", row.unread_children));
+        head.push(Span::raw(format!(" ✉{}", row.unread_children)));
     }
+    let head_text: String = head
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
     let tail: Vec<String> = if row.activity.is_empty() {
         Vec::new()
     } else {
         vec![row.activity.clone()]
     };
-    fit_row(&head, &row.title, &row.place, &tail, width)
+    let fit = fit_row(
+        &head_text,
+        &row.title,
+        &row.place.iter().map(PlacePiece::text).collect::<Vec<_>>(),
+        &tail,
+        width,
+    );
+
+    let mut spans = head;
+    if let Some(brief) = fit.brief {
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(brief));
+    }
+    if !fit.place.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.extend(place_spans(row, &fit.place, theme));
+    }
+    for cell in fit.tail {
+        spans.push(Span::raw("  "));
+        spans.push(Span::raw(cell));
+    }
+    Line::from(spans)
+}
+
+/// A row's `place` as painted spans, each piece wearing the ink its role says:
+/// the isolation mark takes the content's [`dim`], and the delta is **two
+/// spans, one per number** — `+N` in [`Theme::added`], `−M` in
+/// [`Theme::removed`]. The job count keeps the terminal's own ink, which is
+/// what it wore before any of this was coloured.
+///
+/// The painter reads the row's own pieces for the roles and `fit`'s texts for
+/// the words: the fit measured the words it hands back, so what is painted is
+/// what was measured, and a piece that did not fit is simply not here. The two
+/// delta halves are built from the numbers and never cut out of the joined
+/// `+N−M`: that string is only ever for measuring, and a successor that read it
+/// for a sign would be reading a branch name's `+` some day — except the branch
+/// name is not on the row any more, and the rule outlives the reason for it.
+///
+/// The two halves are one piece in the row, so they are on the line together or
+/// not at all: half a delta is a fact with its other half missing.
+fn place_spans(row: &AgentRow, fitted: &[String], theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (at, (piece, text)) in row.place.iter().zip(fitted).enumerate() {
+        // One space between two pieces: the fit measured them that way.
+        if at > 0 {
+            spans.push(Span::raw(" "));
+        }
+        match piece {
+            PlacePiece::Delta { added, removed } => {
+                spans.push(Span::styled(
+                    format!("+{added}"),
+                    Style::default().fg(theme.added()),
+                ));
+                spans.push(Span::styled(
+                    format!("−{removed}"),
+                    Style::default().fg(theme.removed()),
+                ));
+            }
+            PlacePiece::Isolated(_) => spans.push(Span::styled(text.clone(), dim())),
+            PlacePiece::Jobs(_) => spans.push(Span::raw(text.clone())),
+        }
+    }
+    spans
 }
 
 /// The pane's rows with the select mode's two marks on them: the cursor, the
@@ -862,7 +954,7 @@ pub(crate) mod tests {
                 result_unread: false,
                 unread_children: 0,
                 title: format!("row {at}"),
-                place: String::new(),
+                place: Vec::new(),
                 activity: String::new(),
             })
             .collect();
@@ -904,7 +996,7 @@ pub(crate) mod tests {
             result_unread: false,
             unread_children: 0,
             title: title.to_string(),
-            place: String::new(),
+            place: Vec::new(),
             activity: String::new(),
         };
         AgentsPane {
@@ -927,8 +1019,11 @@ pub(crate) mod tests {
     /// A row whose stored parent the history window forgot paints dim — the
     /// module's content ink ([`dim`]) — and a leftover worktree on disk does
     /// not: the dim and the `⚮` are one fact, that a link was cut, and a
-    /// leftover never had a link here to cut. The cursor row's highlight still
-    /// wins over the dim ink, whichever pane holds the keyboard.
+    /// leftover never had a link here to cut. The id is [`dim`] on *every*
+    /// row — it is the quiet half of the name the isolation mark stands for —
+    /// so what reads here is that a leftover's row is not *wholly* the history
+    /// ink. The cursor row's highlight still wins over the dim ink, whichever
+    /// pane holds the keyboard.
     #[test]
     fn a_forgotten_row_paints_dim_and_a_leftover_worktree_does_not() {
         let theme = Theme::default();
@@ -976,8 +1071,8 @@ pub(crate) mod tests {
         assert!(
             inks(&quiet, inner.y + 2, inner)
                 .iter()
-                .all(|fg| *fg != dim().fg),
-            "a leftover lost nothing, so it is not dimmed: {:?}",
+                .any(|fg| *fg != dim().fg),
+            "a leftover lost nothing, so its row is not painted in the history ink: {:?}",
             inks(&quiet, inner.y + 2, inner)
         );
         assert_eq!(row_text(&quiet, inner.y + 1), "   ✓ #1 child");
@@ -1003,6 +1098,109 @@ pub(crate) mod tests {
                 "the quiet mark wins over the dim at ({x}, {}): {style:?}",
                 inner.y + 3
             );
+        }
+    }
+
+    /// The row's own inks, role by role: the id and the isolation mark take
+    /// [`dim`] — the branch name a row used to spell is gone, and the one
+    /// column that replaces it is as quiet as the id that already names the
+    /// branch — while the delta's halves take the theme's two fixed inks,
+    /// `+N` and `−M` apart. Everything the ask did not name keeps the ink it
+    /// always had: the glyph, the `✉N` marks and the `⚙K` job count wear the
+    /// terminal's own colour, which is no colour at all.
+    #[test]
+    fn the_row_inks_the_id_the_mark_and_the_delta_apart() {
+        let theme = Theme::default();
+        let row = mark_row(
+            "◐",
+            "lexer",
+            &[
+                PlacePiece::Isolated("⎇"),
+                PlacePiece::Delta {
+                    added: 2157,
+                    removed: 407,
+                },
+                PlacePiece::Jobs(1),
+            ],
+            "edit_file src/lex.rs 3s",
+            false,
+            false,
+            0,
+            false,
+        );
+        let line = agent_line(&row, 70, &theme);
+        let ink = |text: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.as_ref() == text)
+                .map(|span| span.style.fg)
+                .unwrap_or_else(|| panic!("no {text:?} span in {:?}", line.spans))
+        };
+        assert_eq!(ink("#0"), dim().fg, "the id is the row's quiet half");
+        assert_eq!(ink("⎇"), dim().fg, "and the isolation mark is quiet");
+        assert_eq!(ink("+2157"), Some(theme.added()));
+        assert_eq!(ink("−407"), Some(theme.removed()));
+        assert_eq!(ink("⚙1"), None, "the job count is not in the ask");
+        assert_eq!(ink(" ◐ "), None, "nor is the glyph and its indent");
+    }
+
+    /// A delta is a fact in two inks, and a count cut mid-number is not the
+    /// count: at every width a row can be painted at, the pair is whole on the
+    /// line or absent from it — never `+21…`, never a lone `+2157`. The pieces
+    /// are what makes this true ([`PlacePiece::Delta`] is **one** piece, and
+    /// [`fit_row`] drops a piece whole), and this sweep is where the widths
+    /// that would lie are read.
+    #[test]
+    fn a_delta_is_painted_whole_or_not_at_all() {
+        let theme = Theme::default();
+        let places = [
+            vec![
+                PlacePiece::Isolated("⎇"),
+                PlacePiece::Delta {
+                    added: 2157,
+                    removed: 407,
+                },
+                PlacePiece::Jobs(1),
+            ],
+            vec![PlacePiece::Delta {
+                added: 12,
+                removed: 0,
+            }],
+            // A count wider than the widest pane: the row it cannot fit on
+            // must say nothing about it rather than a piece of it.
+            vec![PlacePiece::Delta {
+                added: 5_000_000_000,
+                removed: 407,
+            }],
+        ];
+        for width in 0..=160usize {
+            for place in &places {
+                let row = mark_row("◐", "lexer", place, "thinking 3s", false, false, 0, false);
+                let line = agent_line(&row, width, &theme);
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if width >= 8 {
+                    assert!(
+                        line.width() <= width,
+                        "{width}: {text:?} is wider than the row"
+                    );
+                }
+                for piece in place {
+                    let PlacePiece::Delta { added, removed } = piece else {
+                        continue;
+                    };
+                    let whole = format!("+{added}−{removed}");
+                    let absent = !text.contains(&format!("+{added}"))
+                        && !text.contains(&format!("−{removed}"));
+                    assert!(
+                        text.contains(&whole) || absent,
+                        "{width}: the delta is cut or half on the row: {text:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1221,7 +1419,7 @@ pub(crate) mod tests {
     fn mark_row(
         glyph: &'static str,
         title: &str,
-        place: &str,
+        place: &[PlacePiece],
         activity: &str,
         focused: bool,
         result_unread: bool,
@@ -1237,7 +1435,7 @@ pub(crate) mod tests {
             result_unread,
             unread_children,
             title: title.to_string(),
-            place: place.to_string(),
+            place: place.to_vec(),
             activity: activity.to_string(),
         }
     }
@@ -1249,12 +1447,12 @@ pub(crate) mod tests {
     /// added, moved or removed changes this block and fails its check.
     fn marks_rows() -> Vec<AgentRow> {
         vec![
-            mark_row("·", "idle", "", "", false, false, 0, false),
-            mark_row("◐", "thinking", "", "thinking 3s", false, false, 0, false),
+            mark_row("·", "idle", &[], "", false, false, 0, false),
+            mark_row("◐", "thinking", &[], "thinking 3s", false, false, 0, false),
             mark_row(
                 "◐",
                 "working",
-                "",
+                &[],
                 "edit_file src/lib.rs 12s",
                 false,
                 false,
@@ -1264,7 +1462,7 @@ pub(crate) mod tests {
             mark_row(
                 "≡",
                 "compacting",
-                "",
+                &[],
                 "compacting 2s",
                 false,
                 false,
@@ -1274,7 +1472,7 @@ pub(crate) mod tests {
             mark_row(
                 "⧗",
                 "waiting",
-                "",
+                &[],
                 "waiting on results 3s",
                 false,
                 false,
@@ -1284,7 +1482,7 @@ pub(crate) mod tests {
             mark_row(
                 "⊘",
                 "cancelling",
-                "",
+                &[],
                 "cancelling 0s",
                 false,
                 false,
@@ -1294,7 +1492,7 @@ pub(crate) mod tests {
             mark_row(
                 "⊘",
                 "stopped",
-                "",
+                &[],
                 "stopped · re-send to resume",
                 false,
                 false,
@@ -1304,18 +1502,18 @@ pub(crate) mod tests {
             mark_row(
                 "⚠",
                 "cut off",
-                "",
+                &[],
                 "cut off · nothing committed",
                 false,
                 false,
                 0,
                 false,
             ),
-            mark_row("✓", "done", "", "wrote README.md", false, false, 0, false),
+            mark_row("✓", "done", &[], "wrote README.md", false, false, 0, false),
             mark_row(
                 "✗",
                 "failed",
-                "",
+                &[],
                 "no route to host",
                 false,
                 false,
@@ -1325,7 +1523,7 @@ pub(crate) mod tests {
             mark_row(
                 "◐",
                 "the focused row",
-                "",
+                &[],
                 "thinking 3s",
                 true,
                 false,
@@ -1335,7 +1533,14 @@ pub(crate) mod tests {
             mark_row(
                 "◐",
                 "lexer",
-                "mush/1 +12−3 ⚙1",
+                &[
+                    PlacePiece::Isolated("⎇"),
+                    PlacePiece::Delta {
+                        added: 12,
+                        removed: 3,
+                    },
+                    PlacePiece::Jobs(1),
+                ],
                 "edit_file src/lex.rs 3s",
                 false,
                 false,
@@ -1345,18 +1550,18 @@ pub(crate) mod tests {
             mark_row(
                 "✓",
                 "result unread",
-                "",
+                &[],
                 "wrote README.md",
                 false,
                 true,
                 0,
                 false,
             ),
-            mark_row("·", "two reads owed", "", "", false, false, 2, false),
+            mark_row("·", "two reads owed", &[], "", false, false, 2, false),
             mark_row(
                 "✓",
                 "parent gone",
-                "",
+                &[],
                 "wrote src/lex.rs",
                 false,
                 false,
@@ -1373,7 +1578,16 @@ pub(crate) mod tests {
     #[test]
     fn the_marks_block_matches_the_code() {
         let rows = marks_rows();
-        let painted: Vec<String> = rows.iter().map(|row| agent_line(row, 56)).collect();
+        let painted: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                agent_line(row, 56, &Theme::default())
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
         let rendered = format!("```\n{}\n```", painted.join("\n"));
         for file in ["docs/mush.md", "README.md"] {
             doc_block(

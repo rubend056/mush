@@ -29,7 +29,7 @@ pub use chat::{Chat, Pane, Rank, SelectRows};
 // non-test build.
 #[cfg(test)]
 pub use chat::Painted;
-pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
+pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, PlacePiece, Screen};
 // The one rule that drops a cell whole when a line does not fit: the bar's
 // idle hint is built and cut in the painter, which takes it from here (PM2).
 pub(crate) use screen::elide;
@@ -8243,12 +8243,38 @@ mod tests {
                 .borders(Borders::ALL)
                 .inner(panes.agents.area);
             for row in &panes.agents.rows {
-                let line = crate::ui::agent_line(row, rows_area.width as usize);
-                assert!(
-                    unicode_width::UnicodeWidthStr::width(line.as_str())
-                        <= rows_area.width as usize,
-                    "{at}: an agent row is wider than its pane: {line:?}"
+                let line = crate::ui::agent_line(
+                    row,
+                    rows_area.width as usize,
+                    &crate::theme::Theme::default(),
                 );
+                let text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(text.as_str())
+                        <= rows_area.width as usize,
+                    "{at}: an agent row is wider than its pane: {text:?}"
+                );
+                // A delta is a count, and a count is never cut: the pair is on
+                // the row together and whole, or neither half is there. This
+                // sweep is the widths a `+2157…` would appear at — `place` is
+                // pieces and `fit_row` drops a piece whole
+                // ([`crate::app::PlacePiece::Delta`]).
+                if let Some((added, removed)) = row.place.iter().find_map(|piece| match piece {
+                    crate::app::PlacePiece::Delta { added, removed } => Some((*added, *removed)),
+                    _ => None,
+                }) {
+                    let whole = format!("+{added}−{removed}");
+                    let absent = !text.contains(&format!("+{added}"))
+                        && !text.contains(&format!("−{removed}"));
+                    assert!(
+                        text.contains(&whole) || absent,
+                        "{at}: the delta is cut or half on the row: {text:?}"
+                    );
+                }
             }
 
             // Every line a pane was handed fits the pane it is painted in. A
@@ -20205,13 +20231,19 @@ mod tests {
         keep.push(rx);
 
         // A session restored from a hand-written file: a failed child and the
-        // failure mush wrote about the root's last run.
+        // failure mush wrote about the root's last run. The child's branch is
+        // no longer a *word* of this frame: the row spells no branch name —
+        // `#1` already names `mush/1` — and the one-column isolation mark is
+        // for a run *in flight*, which this failed run is not. The footer that
+        // names the branch belongs to the cursor row, and the cursor is on the
+        // root (`an_unmerged_agent_names_its_worktree_and_the_git_command_to_read_it`
+        // reads that detail itself), so the mark's absence is asserted instead.
         states.push(Sweep {
             name: "a restored session",
             app: restored_session("sweep-restored"),
             words: vec!["· #0", " agents ", " chat ", "mush › "],
-            roomy: vec!["✗ #1", "mush/1", "! the endpoint returned 503"],
-            absent: Vec::new(),
+            roomy: vec!["✗ #1", "! the endpoint returned 503"],
+            absent: vec!["⎇"],
         });
 
         // A pane was scrolled away from the bottom: the title says so.
@@ -20286,7 +20318,11 @@ mod tests {
                 "8 working",
                 "1 waiting",
                 "grandchild",
-                "mush/3",
+                // `#3` is the isolated one, and it is finished: its row wears
+                // the branch's delta and no isolation mark — the mark is the
+                // run, and this run is over — so `mush/3` is a word of no pane
+                // any more (`#3` on the row already names `mush/3`).
+                "+12−4",
                 "main ±3 +9−2",
             ],
             absent: Vec::new(),

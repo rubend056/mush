@@ -1794,14 +1794,36 @@ fn cut(text: &str, max: usize) -> (String, bool) {
     (format!("{body}…"), true)
 }
 
+/// What one row's width holds, field by field.
+///
+/// [`fit_row`] answers with the fields rather than the one joined string it
+/// used to, because a field can be more than one ink: the agents pane's `+N`
+/// and `−M` are one fact in two colours, and the painter has the numbers
+/// themselves instead of a line it would have to cut apart again. The head is
+/// not here: it is never given up and the caller builds it, so only its width
+/// crosses.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowFit {
+    /// The brief, whole or cut to the room it earned, or `None` when it was
+    /// not worth a word (`cre…`).
+    pub brief: Option<String>,
+    /// The `place` pieces that fit: the **leading** ones, because the pieces
+    /// are ranked, and each one whole. A piece is the smallest thing a caller
+    /// can paint — the agents pane's `+2157` and `−407` are one piece — so
+    /// this is where an honest elision happens: `+21…` is not a count.
+    pub place: Vec<String>,
+    /// The activity cells that fit, whole, in order.
+    pub tail: Vec<String>,
+}
+
 /// Lay out one row in the width it has.
 ///
 /// The row answers "what is happening": the state (glyph, id, and the marks
-/// beside it) is never sacrificed, then the branch and the line delta — facts
+/// beside it) is never sacrificed, then the place and its line delta — facts
 /// that exist nowhere else on the screen — then the activity, then the brief.
 ///
 /// The activity is spent *before* the brief, which is the whole point of this
-/// function: a row that fits its brief and its branch but not the sentence
+/// function: a row that fits its brief and its place but not the sentence
 /// saying what the agent is doing has spent its last columns on the one field
 /// the screen can find elsewhere — the brief is one row below in the cursor
 /// row's footer, and again as the transcript's opening line. Truncating the
@@ -1810,40 +1832,59 @@ fn cut(text: &str, max: usize) -> (String, bool) {
 /// call and its age gone (§4.5's first question, unanswered at 200×50).
 ///
 /// A field is dropped whole rather than cut to a letter or two: a brief of
-/// three columns is not a brief, and the footer carries the real one.
+/// three columns is not a brief, and the footer carries the real one. The
+/// place is spent the same way, one piece at a time: a piece is whole or not
+/// on the row, and the pieces are ranked, so the ones that fit are the leading
+/// ones — the mark, then the delta, then the jobs. It is the caller that knows
+/// what its pieces *are*; this only counts the columns they take.
 ///
 /// Every field is [`sanitize`]d before it is measured, because a row is a
-/// terminal too: the head carries the branch a model chose, the tail carries
-/// its own words about what it is doing, and the tail is never truncated, so
-/// the rule cannot ride on [`truncate`] alone (see its doc).
-pub fn fit_row(
-    head: &str,
-    brief: &str,
-    branch_stat: &str,
-    tail: &[String],
-    width: usize,
-) -> String {
+/// terminal too: the brief and the activity carry a model's own words, and the
+/// activity is never truncated, so the rule cannot ride on [`truncate`] alone
+/// (see its doc).
+pub fn fit_row(head: &str, brief: &str, place: &[String], tail: &[String], width: usize) -> RowFit {
     /// The least a field is worth: under this a long brief is dropped rather
     /// than cut (`cre…`), because the row would be spending its last columns on
     /// a word that is not one.
     const MIN_FIELD: usize = 7;
+    /// The columns a place may not spend: the row keeps four beside it, so a
+    /// place that fills the row never takes the brief's or the activity's last
+    /// word with it.
+    const PLACE_RESERVE: usize = 4;
 
     let head = sanitize_upto(head, width);
     let brief = sanitize_upto(brief, width);
-    let branch_stat = sanitize_upto(branch_stat, width);
-
     let head_width = UnicodeWidthStr::width(head.as_str());
     if width <= head_width + 2 {
-        return head;
+        return RowFit::default();
     }
     let budget = width - head_width - 1;
-    let branch_width = UnicodeWidthStr::width(branch_stat.as_str());
-    let show_branch = branch_width > 0 && branch_width + 2 <= budget.saturating_sub(4);
-    let after_branch = budget.saturating_sub(if show_branch { branch_width + 2 } else { 0 });
+
+    // The place, one piece at a time: a piece is whole or not on the row, and
+    // the pieces are ranked, so the ones that fit are the leading ones. Two
+    // columns stand before the column and one between two pieces, so a caller
+    // never has to spell the gaps itself.
+    let room = budget.saturating_sub(PLACE_RESERVE);
+    let mut kept: Vec<String> = Vec::new();
+    let mut spent = 0;
+    for piece in place {
+        let piece = sanitize_upto(piece, width);
+        let piece_width = UnicodeWidthStr::width(piece.as_str());
+        if piece_width == 0 {
+            break;
+        }
+        let gap = if kept.is_empty() { 0 } else { 1 };
+        if spent + gap + piece_width + 2 > room {
+            break;
+        }
+        spent += gap + piece_width;
+        kept.push(piece);
+    }
+    let after_place = budget.saturating_sub(if kept.is_empty() { 0 } else { spent + 2 });
 
     // The tail, reserved first and each cell whole.
     let mut cells = Vec::new();
-    let mut remaining = after_branch;
+    let mut remaining = after_place;
     for cell in tail {
         let cell = sanitize_upto(cell, remaining);
         let cell_width = UnicodeWidthStr::width(cell.as_str());
@@ -1854,7 +1895,7 @@ pub fn fit_row(
         remaining -= cell_width + 2;
     }
 
-    let mut line = head;
+    let mut brief_out = None;
     if !brief.is_empty() {
         // Whole, if it fits — a short title costs nothing — and otherwise only
         // when the columns left are enough to say something: a brief cut to
@@ -1862,19 +1903,14 @@ pub fn fit_row(
         // instead.
         let room = remaining.saturating_sub(1);
         if UnicodeWidthStr::width(brief.as_str()) <= room || room >= MIN_FIELD {
-            line.push(' ');
-            line.push_str(&cut(&brief, room).0);
+            brief_out = Some(cut(&brief, room).0);
         }
     }
-    if show_branch {
-        line.push_str("  ");
-        line.push_str(&branch_stat);
+    RowFit {
+        brief: brief_out,
+        place: kept,
+        tail: cells,
     }
-    for cell in cells {
-        line.push_str("  ");
-        line.push_str(&cell);
-    }
-    line.trim_end().to_string()
 }
 
 /// The nearest character boundary at or before `at`, never past the end of
@@ -1915,6 +1951,34 @@ pub fn mask_key(key: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A row's `place`, as the pane spells it: a branch piece and the delta's
+    /// own text. The painter gives the delta two inks, but one piece is what
+    /// the fit spends and what a caller's elision must not cut into.
+    fn place() -> Vec<String> {
+        vec!["mush/2".to_string(), "+8−0".to_string()]
+    }
+
+    /// One fitted row as its painter joins it: the head, a space and the
+    /// brief, two columns and the place's pieces, two columns and each
+    /// activity cell. This is the layout contract; what the cells are painted
+    /// *in* is the caller's own business.
+    fn row_text(head: &str, fit: &RowFit) -> String {
+        let mut line = head.to_string();
+        if let Some(brief) = &fit.brief {
+            line.push(' ');
+            line.push_str(brief);
+        }
+        if !fit.place.is_empty() {
+            line.push_str("  ");
+            line.push_str(&fit.place.join(" "));
+        }
+        for cell in &fit.tail {
+            line.push_str("  ");
+            line.push_str(cell);
+        }
+        line
+    }
+
     /// A row spends its activity before its brief, and its state never goes.
     ///
     /// "What is each agent doing?" is the first question the screen exists to
@@ -1927,54 +1991,86 @@ mod tests {
     fn a_row_spends_its_activity_before_its_brief() {
         let head = "▶◐ #2";
         let activity = ["write deep.txt 3s".to_string()];
+        let fitted = |brief: &str, width: usize| {
+            row_text(head, &fit_row(head, brief, &place(), &activity, width))
+        };
 
-        // Roomy: state, brief, branch and activity together.
+        // Roomy: state, brief, place and activity together.
         assert_eq!(
-            fit_row(head, "create a file", "mush/2 +8−0", &activity, 70),
+            fitted("create a file", 70),
             "▶◐ #2 create a file  mush/2 +8−0  write deep.txt 3s"
         );
 
-        // 40 columns: the branch and the activity fit and the brief does not,
+        // 40 columns: the place and the activity fit and the brief does not,
         // so the brief is what yields — cut to two columns it would be neither
         // a word nor here, so it goes.
         assert_eq!(
-            fit_row(head, "create a file", "mush/2 +8−0", &activity, 40),
+            fitted("create a file", 40),
             "▶◐ #2  mush/2 +8−0  write deep.txt 3s"
         );
 
         // Narrower: the activity no longer fits whole, so it is dropped and the
         // brief spends what it can — a field goes whole.
-        let narrow = fit_row(head, "create a file", "mush/2 +8−0", &activity, 34);
-        assert_eq!(narrow, "▶◐ #2 create a file  mush/2 +8−0", "{narrow}");
-
-        // Narrower: the branch is all that is left whole. Six columns of a
-        // long brief would be `creat…`, which is not a word.
         assert_eq!(
-            fit_row(head, "create a file", "mush/2 +8−0", &activity, 26),
-            "▶◐ #2  mush/2 +8−0"
+            fitted("create a file", 34),
+            "▶◐ #2 create a file  mush/2 +8−0"
         );
+
+        // Narrower: the place is all that is left whole. Six columns of a long
+        // brief would be `creat…`, which is not a word.
+        assert_eq!(fitted("create a file", 26), "▶◐ #2  mush/2 +8−0");
 
         // A brief that fits whole is placed however little room is left for
         // it: `lexer` is a handle, not a sentence.
-        assert_eq!(
-            fit_row(head, "lexer", "mush/2 +8−0", &activity, 26),
-            "▶◐ #2 lexer  mush/2 +8−0"
-        );
+        assert_eq!(fitted("lexer", 26), "▶◐ #2 lexer  mush/2 +8−0");
 
         // Narrowest: the state alone, which is never dropped.
-        assert_eq!(
-            fit_row(head, "create a file", "mush/2 +8−0", &activity, 10),
-            head
-        );
+        assert_eq!(fitted("create a file", 10), head);
 
         // And at no width does the row outgrow the columns it was given.
         for width in 8..=120usize {
-            let row = fit_row(head, "create a file", "mush/2 +8−0", &activity, width);
+            let row = fitted("create a file", width);
             assert!(
                 UnicodeWidthStr::width(row.as_str()) <= width,
                 "{row:?} is wider than {width}"
             );
         }
+    }
+
+    /// The place is spent one piece at a time, and a piece is never cut: the
+    /// pieces are ranked — the agents pane's mark, its delta, its job count —
+    /// so the ones that fit are the leading ones and the first that does not
+    /// fit ends the column.
+    ///
+    /// A delta is the case the rule exists for: `+2157−407` is one piece, and
+    /// a cut `+21…` is a count that is not the count while a lone `+2157` is a
+    /// fact with its other half missing. The row says both numbers or neither.
+    #[test]
+    fn a_place_is_spent_one_piece_at_a_time_and_never_cut() {
+        let head = "▶◐ #2";
+        let activity = ["edit_file a.rs 3s".to_string()];
+        let place = vec!["⎇".to_string(), "+2157−407".to_string(), "⚙1".to_string()];
+
+        // Roomy: the three pieces, each whole, one space between them.
+        let fit = fit_row(head, "lexer", &place, &activity, 70);
+        assert_eq!(fit.place, place);
+        assert_eq!(
+            row_text(head, &fit),
+            "▶◐ #2 lexer  ⎇ +2157−407 ⚙1  edit_file a.rs 3s"
+        );
+
+        // Narrower: the last piece does not fit and goes whole — the mark and
+        // the delta stay.
+        let fit = fit_row(head, "lexer", &place, &activity, 24);
+        assert_eq!(fit.place, ["⎇", "+2157−407"]);
+        assert_eq!(row_text(head, &fit), "▶◐ #2  ⎇ +2157−407");
+
+        // Narrower still: the delta does not fit and goes whole, so the row
+        // says only that the agent is in a checkout of its own. A `+21…` here
+        // would be the wrong number, and a `+2157` the wrong fact.
+        let fit = fit_row(head, "lexer", &place, &activity, 14);
+        assert_eq!(fit.place, ["⎇"]);
+        assert_eq!(row_text(head, &fit), "▶◐ #2  ⎇");
     }
 
     /// The one-line path carries the rule too, so a caller that formats a fact
@@ -1994,21 +2090,24 @@ mod tests {
         assert!(UnicodeWidthStr::width(cut.as_str()) <= 8, "{cut:?}");
 
         // Every field of a row, not only the brief that goes through
-        // `truncate`: the head is built by the painter and the tail cells are
-        // placed whole, with no cut to ride on.
-        let row = fit_row(
+        // `truncate`: the place pieces and the tail cells are placed whole,
+        // with no cut to ride on.
+        let fit = fit_row(
             "▶◐ #2",
             "lexer",
-            "mush/2 +1−0",
+            &["mush\r/2".to_string(), "+1−0".to_string()],
             &["boom\rREST \x1b[2J\x1b[Hwiped \x1b]0;PWNED\x07\u{2066}now".to_string()],
             60,
         );
+        let row = row_text("▶◐ #2", &fit);
         assert!(!row.contains('\x1b'), "{row:?}");
         assert!(!row.contains('\r'), "{row:?}");
+        assert!(row.starts_with("▶◐ #2 lexer  mush␍/2 +1−0  "), "{row:?}");
         assert!(row.ends_with("boom␍REST wiped now"), "{row:?}");
         // And a row whose *title* carries the bytes: the brief is measured after
         // it is made safe, so the row still fits the columns it was given.
-        let row = fit_row("▶ #1", &("x".repeat(30) + "\x1b]0;PWNED\x07"), "", &[], 20);
+        let fit = fit_row("▶ #1", &("x".repeat(30) + "\x1b]0;PWNED\x07"), &[], &[], 20);
+        let row = row_text("▶ #1", &fit);
         assert!(!row.contains('\x1b'), "{row:?}");
         assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{row:?}");
     }

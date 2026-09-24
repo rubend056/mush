@@ -35,7 +35,7 @@ const MAX_TRANSCRIPT: u16 = 110;
 /// How many columns the agent pane is given, and why it is a length rather than
 /// a share of the terminal.
 ///
-/// R1's row spends its fields left to right — `state · branch +delta · what it
+/// R1's row spends its fields left to right — `state · mark +delta · what it
 /// is doing · its title` — and that is about forty-five columns of real labels.
 /// Below thirty the chat is the better use of a narrow screen; past fifty the
 /// tree has nothing else to put there (a tool label is the widest field it has)
@@ -292,9 +292,9 @@ pub struct AgentsPane {
 }
 
 /// One tree row, with its fields already derived: the glyph from the node's own
-/// phase, the title from its brief, the branch and delta, the activity with its
-/// age. The row answers "what is happening" with the fields that answer it —
-/// and the painter only has to fit them into the columns it has.
+/// phase, the title from its brief, the isolation mark and delta, the activity
+/// with its age. The row answers "what is happening" with the fields that
+/// answer it — and the painter only has to fit them into the columns it has.
 pub struct AgentRow {
     pub id: AgentId,
     /// How many `  ` indents the row is drawn with.
@@ -325,11 +325,70 @@ pub struct AgentRow {
     /// and the one that survives a pane too short to show their rows.
     pub unread_children: usize,
     pub title: String,
-    /// The branch, its delta and any jobs: `mush/3 +12−4 ⚙1`.
-    pub place: String,
+    /// What qualifies the agent's own work, in the order it is painted: the
+    /// one-column mark of a run in a checkout of its own, the branch's line
+    /// delta, and the jobs the agent started — `⎇ +2157−407 ⚙1`.
+    ///
+    /// Pieces, and not the one string this used to be, because the delta is
+    /// one fact in two inks: the numbers are what the row has, and the painter
+    /// gives each half its colour (`ui::place_spans`) instead of finding a
+    /// `+`/`−` pair in a line a branch name could have put there. A piece is
+    /// also the unit of elision: `fit_row` keeps or drops whole pieces
+    /// ([`mush_core::text::RowFit`]), so a narrow pane can never paint `+21…`
+    /// or half a delta.
+    pub place: Vec<PlacePiece>,
     /// What it is doing, with its age: `thinking 3s`, `edit_file a.rs 12s`,
     /// `waiting on results 3s` (the `wait` tool's own noun), `compacting 2s`.
     pub activity: String,
+}
+
+/// One piece of a row's `place`.
+///
+/// The row derives the pieces; the painter paints them and the fit measures
+/// them as the words they will be, so a piece's [`text`](Self::text) is the
+/// one rule for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlacePiece {
+    /// The one column that says the agent is **working in a checkout of its
+    /// own right now**.
+    ///
+    /// The mark is not "owns a branch": a row at rest with a kept worktree
+    /// (an unmerged branch, or a failure's checkout) has a branch and is not
+    /// working, and a landed row's branch went with its checkout
+    /// ([`AgentTree::mark_reclaimed`]), so neither wears it. What the mark
+    /// claims — and all it claims — is a run in flight in a tree of its own;
+    /// the focused row's footer names the branch, its path and the `git diff`
+    /// that reads it.
+    ///
+    /// The text rides the row and not the painter because it is a *word*, and
+    /// the rung that spells it is the session's ([`Symbols::isolated`]): the
+    /// screen owns every word a frame paints (finding D9).
+    ///
+    /// [`AgentTree::mark_reclaimed`]: crate::app::AgentTree::mark_reclaimed
+    /// [`Symbols::isolated`]: crate::app::symbols::Symbols::isolated
+    Isolated(&'static str),
+    /// `+N` and `−M`, one fact in two inks: what the agent's branch has changed
+    /// against the revision it forked at. The two halves are two numbers and
+    /// never a string a painter cuts — a lone `+2157` is a fact with its other
+    /// half missing, so the pair goes on the row together or not at all.
+    Delta { added: u64, removed: u64 },
+    /// `⚙K` jobs the agent started, on its owner's row.
+    Jobs(usize),
+}
+
+impl PlacePiece {
+    /// The text this piece paints — the columns `fit_row` measures it by, and
+    /// the words the painter's spans join back into.
+    ///
+    /// The delta's spans come from its numbers and never from this string, so
+    /// no successor of this rule has to find a `+`/`−` pair in it.
+    pub fn text(&self) -> String {
+        match self {
+            PlacePiece::Isolated(mark) => mark.to_string(),
+            PlacePiece::Delta { added, removed } => format!("+{added}−{removed}"),
+            PlacePiece::Jobs(jobs) => format!("⚙{jobs}"),
+        }
+    }
 }
 
 /// The chat column: the transcript and the message box beside it.
@@ -651,26 +710,35 @@ impl App {
         // `glyph · id` is this agent's own phase alone: the old row derived the
         // glyph from "has live children", so a busy agent wore `⏸` and its own
         // work vanished from the screen (finding U1).
-        let mut place = node.branch.clone().unwrap_or_default();
+        //
+        // The place's pieces, in the order they are painted. The isolation
+        // mark is the *run*: [`Phase::is_busy`] is the tree's own rule for work
+        // in flight — the road that refuses a send reads the same one — so the
+        // row and the rest of the screen cannot disagree about what "running"
+        // means. The branch name is not painted at all any more: `#198`
+        // already names `mush/198` ([`git::branch_name`]), and the focused
+        // row's footer names the branch, its worktree and the `git diff` that
+        // reads the work.
+        let mut place = Vec::new();
+        if node.branch.is_some() && node.phase.is_busy() {
+            place.push(PlacePiece::Isolated(self.chat.symbols().isolated()));
+        }
         if let Some(stat) = self.tree.agent_stats.get(&node.id) {
             if !stat.is_empty() {
-                if !place.is_empty() {
-                    place.push(' ');
-                }
-                place.push_str(&stat.compact());
+                place.push(PlacePiece::Delta {
+                    added: stat.added,
+                    removed: stat.removed,
+                });
             }
         }
         // The jobs on this machine, on the row of whoever started them. It
-        // rides with the branch and the stat — facts that exist nowhere else on
-        // the screen — because the human should not have to ask a model what is
-        // running; the count is derived from the registry every frame, never
-        // stored, and the selected row's footer names each job.
+        // rides with the delta — facts that exist nowhere else on the screen —
+        // because the human should not have to ask a model what is running; the
+        // count is derived from the registry every frame, never stored, and the
+        // selected row's footer names each job.
         let jobs = self.live_jobs(node.id).len();
         if jobs > 0 {
-            if !place.is_empty() {
-                place.push(' ');
-            }
-            place.push_str(&format!("⚙{jobs}"));
+            place.push(PlacePiece::Jobs(jobs));
         }
         // Two more facts, both marks rather than text, because a row is a
         // glance: `✉` on a result its parent has not read, and `✉N` for how many
@@ -1427,17 +1495,36 @@ mod tests {
         });
     }
 
-    /// One painted frame's agents pane: the pane's own rect, border and title
-    /// included, one string per screen row. Reading the *cells* is the point —
-    /// a `Screen` value can say a row carries a mark while the painter never
-    /// spends the column — and the rect is what keeps the chat's copies of the
-    /// same ids out of the reading.
-    fn pane_frame(
+    /// [`insert`]'s isolated sibling: a child on a branch of its own, the shape
+    /// a spawn with `isolate` makes (`git::branch_name`).
+    fn insert_isolated(app: &mut App, id: u64, parent: u64, depth: usize, brief: &str) {
+        use crate::app::Spawn;
+        use crossbeam_channel::unbounded;
+
+        let (cmd, _rx) = unbounded();
+        app.tree.insert(Spawn {
+            id: AgentId(id),
+            parent: AgentId(parent),
+            brief: brief.to_string(),
+            depth,
+            branch: Some(git::branch_name(id)),
+            fork: None,
+            cmd,
+        });
+    }
+
+    /// One painted frame's agents pane, and the cells it was painted into: the
+    /// pane's own rect, the border and title included. Reading the *cells* is
+    /// the point — a `Screen` value can say a row carries a mark while the
+    /// painter never spends the column — and the rect is what keeps the chat's
+    /// copies of the same ids out of the reading. The buffer comes back too, for
+    /// the tests that read a cell's *ink* rather than its symbol.
+    fn pane_cells(
         app: &mut App,
         width: u16,
         height: u16,
         theme: &crate::theme::Theme,
-    ) -> Vec<String> {
+    ) -> (Rect, ratatui::buffer::Buffer) {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -1451,7 +1538,18 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::draw(frame, &screen, theme))
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        (rect, terminal.backend().buffer().clone())
+    }
+
+    /// One painted frame's agents pane: the pane's own rect, border and title
+    /// included, one string per screen row.
+    fn pane_frame(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        theme: &crate::theme::Theme,
+    ) -> Vec<String> {
+        let (rect, buffer) = pane_cells(app, width, height, theme);
         (rect.y..rect.y + rect.height)
             .map(|y| {
                 (rect.x..rect.x + rect.width)
@@ -1660,14 +1758,145 @@ mod tests {
             phase_glyph(&Phase::Failed("boom".into())),
         ];
         // The marks `ui::agent_line` adds beside the glyph, in the same head:
-        // the pane cursor, the unread counts, and the severed-link `⚮` a row
-        // whose parent the tree forgot wears (`AgentRow::parent_gone`).
-        for mark in glyphs.into_iter().chain(["▶", "✉", "⚙", "⚠", "⚮"]) {
+        // the pane cursor, the unread counts, the severed-link `⚮` a row
+        // whose parent the tree forgot wears (`AgentRow::parent_gone`), and the
+        // isolation mark both rungs spell (`PlacePiece::Isolated`).
+        let row_marks = ["▶", "✉", "⚙", "⚠", "⚮"];
+        let isolated = [
+            crate::app::symbols::Symbols::SYMBOLS.isolated(),
+            crate::app::symbols::Symbols::ASCII.isolated(),
+        ];
+        for mark in glyphs.into_iter().chain(row_marks).chain(isolated) {
             assert_eq!(
                 UnicodeWidthStr::width(mark),
                 1,
                 "{mark:?} is not one column"
             );
+        }
+        // The isolation mark stands where a branch name used to: it must not
+        // collide with any mark the row already wears.
+        for mark in isolated {
+            for worn in row_marks {
+                assert_ne!(mark, worn, "{mark:?} is already a row mark");
+            }
+        }
+    }
+
+    /// The row's `place` is the pieces it says it is, and the isolation mark is
+    /// the **run**: a busy child in a checkout of its own wears it, a row at
+    /// rest with a kept worktree (an unmerged branch, or a failure's checkout)
+    /// has the branch but not the mark — `Phase::is_busy` is the tree's own
+    /// rule for work in flight, and a mark that claimed "owns a branch" would
+    /// sit on stopped and failed rows that are not working at all — and a
+    /// landed row's branch went with its checkout (`AgentTree::mark_reclaimed`),
+    /// so its place is empty and the row says where the work went instead.
+    #[test]
+    fn the_isolation_mark_is_only_for_a_run_in_a_checkout_of_its_own() {
+        let (mut app, _rx, _root) = frame_app("isolation-mark");
+        insert_isolated(&mut app, 1, 0, 1, "rename the lexer");
+        app.tree.agent_stats.insert(
+            AgentId(1),
+            git::Stat {
+                files: 1,
+                added: 2157,
+                removed: 407,
+            },
+        );
+
+        // Busy and isolated: the mark, the delta's own numbers, no jobs.
+        let place = app.row(app.tree.node(AgentId(1)).unwrap()).place;
+        assert_eq!(place.len(), 2, "{place:?}");
+        assert!(
+            matches!(&place[0], PlacePiece::Isolated(mark) if *mark == "⎇"),
+            "{place:?}"
+        );
+        assert!(
+            matches!(
+                &place[1],
+                PlacePiece::Delta {
+                    added: 2157,
+                    removed: 407
+                }
+            ),
+            "{place:?}"
+        );
+
+        // At rest with the worktree kept: the branch is still there, but the
+        // run is not, so the mark is not either. The stat keeps riding the row.
+        app.tree.idle(AgentId(1));
+        let place = app.row(app.tree.node(AgentId(1)).unwrap()).place;
+        assert!(
+            !place
+                .iter()
+                .any(|piece| matches!(piece, PlacePiece::Isolated(_))),
+            "a row at rest is not running: {place:?}"
+        );
+        assert!(
+            place
+                .iter()
+                .any(|piece| matches!(piece, PlacePiece::Delta { .. })),
+            "the worktree's delta is still a fact: {place:?}"
+        );
+
+        // Landed: `mark_reclaimed` took the branch and the stat with the
+        // checkout, so neither the mark nor the delta is left to claim.
+        app.tree.mark_reclaimed(AgentId(1), Landed::Merged);
+        let place = app.row(app.tree.node(AgentId(1)).unwrap()).place;
+        assert!(place.is_empty(), "{place:?}");
+    }
+
+    /// The inks the row says it wears are the inks the pane paints: the id and
+    /// the isolation mark in the content's [`dim`], the delta's two halves in
+    /// the theme's own pair, in the two-column pane *and* in the compact strip
+    /// above the chat. The strip is the same `draw_agents` in a wider, shorter
+    /// rect, and "the compact layout paints the same inks" is exactly the kind
+    /// of claim that rots when only one of the two is ever looked at.
+    #[test]
+    fn the_deltas_two_inks_reach_both_layouts() {
+        let (mut app, _rx, _root) = frame_app("row-inks");
+        insert_isolated(&mut app, 1, 0, 1, "rename the lexer");
+        app.tree.agent_stats.insert(
+            AgentId(1),
+            git::Stat {
+                files: 1,
+                added: 2157,
+                removed: 407,
+            },
+        );
+        let theme = crate::theme::Theme::default();
+        // A cell offset, not a byte one: the row holds three-byte glyphs.
+        let cell_at = |text: &str, needle: &str| {
+            let at = text
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is painted: {text:?}"));
+            text[..at].chars().count() as u16
+        };
+        for (width, height) in [(120u16, 32u16), (60, 20)] {
+            let (rect, buffer) = pane_cells(&mut app, width, height, &theme);
+            let (y, text) = (rect.y..rect.bottom())
+                .find_map(|y| {
+                    let text: String = (rect.x..rect.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    text.contains("#1").then_some((y, text))
+                })
+                .unwrap_or_else(|| panic!("{width}×{height}: no row names #1"));
+            let at = rect.x + cell_at(&text, "+2157−407");
+            assert_eq!(buffer[(at, y)].symbol(), "+");
+            assert_eq!(buffer[(at, y)].style().fg, Some(theme.added()));
+            // `+2157` is five columns, so the `−` is five cells along.
+            assert_eq!(buffer[(at + 5, y)].symbol(), "−");
+            assert_eq!(buffer[(at + 5, y)].style().fg, Some(theme.removed()));
+            // The two quiet halves: the id, and the mark in the branch name's
+            // old place.
+            for (needle, what) in [("#1", "the id"), ("⎇", "the mark")] {
+                let cell = rect.x + cell_at(&text, needle);
+                assert_eq!(
+                    buffer[(cell, y)].style().fg,
+                    dim().fg,
+                    "{width}×{height}: {what} is not quiet"
+                );
+            }
         }
     }
 

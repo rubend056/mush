@@ -185,6 +185,23 @@ impl Symbols {
         }
     }
 
+    /// The mark a row wears while the agent works in a checkout of its own:
+    /// `⎇`, the branch glyph git's own prompts use (U+2387, Miscellaneous
+    /// Technical, the block `⌕` already comes from), and `b` — the word, in
+    /// seven bits — on the ascii rung.
+    ///
+    /// Pane furniture like [`Self::REMOVED`], and not a row of [`Self::mark`]'s
+    /// table: the mark is the *tree's*, not a tool's. It claims only the run in
+    /// flight, never *which* branch — the focused row's footer names that — and
+    /// one column is the whole of what it spends
+    /// ([`crate::app::screen::PlacePiece::Isolated`]).
+    pub(crate) fn isolated(self) -> &'static str {
+        match self.rung {
+            Rung::Symbols => "⎇",
+            Rung::Ascii => "b",
+        }
+    }
+
     /// The glyph alone: the mark without the space after it, for a surface that
     /// has its own spacing.
     pub(crate) fn glyph(self, name: &str) -> &'static str {
@@ -443,6 +460,12 @@ mod tests {
     /// proven.
     #[test]
     fn the_ascii_rung_is_ascii() {
+        let isolated = Symbols::ASCII.isolated();
+        assert!(
+            isolated.is_ascii(),
+            "the isolation mark is not ascii: {isolated:?}"
+        );
+        assert_eq!(isolated.chars().count(), 1, "{isolated:?}");
         for tool in ToolName::ALL {
             let glyph = Symbols::ASCII.glyph(tool.as_str());
             assert!(
@@ -450,6 +473,48 @@ mod tests {
                 "{tool}'s ascii glyph is not ascii: {glyph:?}"
             );
             assert_eq!(glyph.chars().count(), 1, "{tool}: {glyph:?}");
+        }
+    }
+
+    /// The isolation mark an agents row wears while its run is in a checkout of
+    /// its own: **one column in both rungs**, because it stands where a branch
+    /// name used to and every field behind it is measured against it. A row
+    /// mark, so it carries no space of its own — the tool marks' trailing space
+    /// is theirs — and it collides with nothing this table or the pane
+    /// furniture beside it spells.
+    #[test]
+    fn the_isolation_mark_is_one_column_in_both_rungs() {
+        for rung in [Symbols::SYMBOLS, Symbols::ASCII] {
+            let mark = rung.isolated();
+            assert_eq!(
+                UnicodeWidthStr::width(mark),
+                1,
+                "{mark:?} is not one column"
+            );
+            assert_eq!(mark.chars().count(), 1, "{mark:?} is not one character");
+            assert!(
+                !mark.ends_with(' '),
+                "a row mark carries no space of its own: {mark:?}"
+            );
+            for tool in ToolName::ALL {
+                assert_ne!(
+                    mark,
+                    rung.glyph(tool.as_str()),
+                    "{tool} already wears {mark:?} at {:?}",
+                    rung.rung()
+                );
+            }
+        }
+        // The two spellings, pinned: git's own branch wording on the symbols
+        // rung, and that word in seven bits on the ascii one.
+        assert_eq!(Symbols::SYMBOLS.isolated(), "⎇");
+        assert_eq!(Symbols::ASCII.isolated(), "b");
+        // And not the pane furniture this table spells beside its own table:
+        // the gutter, and the two signs a diff line wears.
+        for mark in [Symbols::SYMBOLS.isolated(), Symbols::ASCII.isolated()] {
+            assert_ne!(mark, Symbols::GUTTER_MARK.trim_end());
+            assert_ne!(mark, Symbols::REMOVED.to_string());
+            assert_ne!(mark, Symbols::ADDED.to_string());
         }
     }
 

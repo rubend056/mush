@@ -370,7 +370,7 @@ pub(crate) mod tests {
     use crate::app::call_grid;
     use crate::app::screen::{AgentsPane, BarPane, ChatPane, InputPane, Panes, Screen};
     use crate::app::symbols::Symbols;
-    use crate::app::{AgentId, AgentRow, Focus, Painted, Rank};
+    use crate::app::{AgentId, AgentRow, Focus, Painted, PlacePiece, Rank};
     use crate::ui::{dim, HINT};
     use mush_core::message::{FunctionCall, ToolCall};
 
@@ -821,7 +821,7 @@ pub(crate) mod tests {
         depth: usize,
         glyph: &'static str,
         title: &str,
-        place: &str,
+        place: &[PlacePiece],
         activity: &str,
     ) -> AgentRow {
         AgentRow {
@@ -833,7 +833,7 @@ pub(crate) mod tests {
             result_unread: false,
             unread_children: 0,
             title: title.to_string(),
-            place: place.to_string(),
+            place: place.to_vec(),
             activity: activity.to_string(),
         }
     }
@@ -940,7 +940,7 @@ pub(crate) mod tests {
     /// after the last message is the foot's to trim (`chat::body`) — which is
     /// why the foot's own row sits right under the reply.
     pub(crate) fn readme_sample_screen() -> Screen {
-        let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
+        let mut root = row(0, 0, "◐", "root", &[], "thinking 4s");
         root.focused = true;
         let mut transcript: Vec<Line<'static>> = Vec::new();
         transcript.extend(spoken(
@@ -991,10 +991,16 @@ pub(crate) mod tests {
                     1,
                     "◐",
                     "lexer",
-                    "mush/1 +12−3",
+                    &[
+                        PlacePiece::Isolated("⎇"),
+                        PlacePiece::Delta {
+                            added: 12,
+                            removed: 3,
+                        },
+                    ],
                     "edit_file src/lex.rs 3s",
                 ),
-                row(2, 1, "✓", "docs", "", "wrote README.md"),
+                row(2, 1, "✓", "docs", &[], "wrote README.md"),
             ],
             0,
             vec![
@@ -1031,12 +1037,12 @@ pub(crate) mod tests {
     /// is the phase the tree's `◐ #2 tests` row shows: the chat is the same
     /// moment the tree is.
     pub(crate) fn manual_sample_screen() -> Screen {
-        let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
+        let mut root = row(0, 0, "◐", "root", &[], "thinking 4s");
         root.focused = true;
         root.unread_children = 2;
-        let mut orphan = row(8, 1, "✓", "orphan", "", "wrote src/lex.rs");
+        let mut orphan = row(8, 1, "✓", "orphan", &[], "wrote src/lex.rs");
         orphan.parent_gone = true;
-        let mut unread = row(7, 1, "✓", "docs", "", "wrote README.md");
+        let mut unread = row(7, 1, "✓", "docs", &[], "wrote README.md");
         unread.result_unread = true;
         let mut transcript: Vec<Line<'static>> = Vec::new();
         transcript.extend(spoken(
@@ -1091,19 +1097,26 @@ pub(crate) mod tests {
             &["3 working", "1 waiting", "Σ +324 −40"],
             vec![
                 root,
-                row(1, 1, "⧗", "lexer", "", "waiting on results 3s"),
+                row(1, 1, "⧗", "lexer", &[], "waiting on results 3s"),
                 row(
                     2,
                     2,
                     "◐",
                     "tests",
-                    "mush/2 +324−40 ⚙1",
+                    &[
+                        PlacePiece::Isolated("⎇"),
+                        PlacePiece::Delta {
+                            added: 324,
+                            removed: 40,
+                        },
+                        PlacePiece::Jobs(1),
+                    ],
                     "edit_file tests/lex.rs 3s",
                 ),
-                row(3, 1, "✗", "probe", "", "no route to host"),
-                row(4, 1, "⊘", "run", "", "stopped · re-send to resume"),
-                row(5, 1, "⚠", "build", "", "cut off · nothing committed"),
-                row(6, 1, "≡", "fold", "", "compacting 2s"),
+                row(3, 1, "✗", "probe", &[], "no route to host"),
+                row(4, 1, "⊘", "run", &[], "stopped · re-send to resume"),
+                row(5, 1, "⚠", "build", &[], "cut off · nothing committed"),
+                row(6, 1, "≡", "fold", &[], "compacting 2s"),
                 unread,
                 orphan,
             ],

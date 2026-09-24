@@ -776,7 +776,7 @@ anything, at whatever size the terminal is.
 | Question | What answers it |
 |---|---|
 | What is each agent doing? | its `Phase` and the instant it began — the glyph and the activity text are the same fact twice read |
-| Where is its work, and on what branch? | the row's branch and line delta, kept ahead of the activity and the title when the columns run out |
+| Where is its work, and on what branch? | the row's isolation mark and line delta, the branch itself in the focused row's footer — kept ahead of the activity and the title when the columns run out |
 | How much has changed? | one cached `git diff --shortstat` per branch, measured against the parent's branch |
 
 **R0 — derive, don't store.** An agent has a `Phase`
@@ -788,13 +788,26 @@ progress is never stored at all — which is what makes `✓` on an idle agent a
 lingering `thinking…` impossible rather than merely fixed.
 
 **R1 — ranked fields, then a footer.** A row spends its columns in this order:
-state (`glyph · id`), then the marks, then `branch +add −del`, then the activity
-with its age, then the title — facts that exist nowhere else survive longest, and
-the title yields first because the footer and the transcript carry the brief in
-full. The title is derived from the brief (a given `title` first, else the
-brief's first line's first path-like word, else its first non-filler word —
-`deep.txt`, `lexer`), so two briefs that share that word paint the same title;
-give a child a `title` where the rows must read apart. The selected row's full
+state (`glyph · id`), then the marks, then the isolation mark with `+add −del`,
+then the activity with its age, then the title — facts that exist nowhere else
+survive longest, and the title yields first because the footer and the transcript
+carry the brief in full. The title is derived from the brief (a given `title`
+first, else the brief's first line's first path-like word, else its first
+non-filler word — `deep.txt`, `lexer`), so two briefs that share that word paint
+the same title; give a child a `title` where the rows must read apart.
+
+A row does not spell a branch name: `#198` already names `mush/198`
+(`git::branch_name`), so an agent **working in a checkout of its own** wears one
+column instead — `⎇`, `b` on the ascii rung — and only while its run is in
+flight (`node.branch.is_some() && node.phase.is_busy()`). A landed row's branch
+went with its checkout (`AgentTree::mark_reclaimed`), and a row at rest with a
+kept worktree is named by the focused row's footer, where the worktree path and
+the `git diff` that reads it live too. The `place` is **pieces**
+(`PlacePiece` in `crates/mush/src/app/screen.rs`): the mark, the line delta, the
+job count — and `mush_core::text::fit_row` spends them whole, so a narrow pane
+drops `+2157−407` or paints it, never `+21…`.
+
+The selected row's full
 facts get a footer under the list, up to three lines when the pane is tall and
 one when it is compact, isolated agents included (`.mush/wt/2 · git diff
 HEAD...mush/2` — git's own spellings).
@@ -845,7 +858,7 @@ row painter, and a whole frame at 100×28 with one row per mark:
  ✓ #0 done  wrote README.md
  ✗ #0 failed  no route to host
 ▶◐ #0 the focused row  thinking 3s
- ◐ #0 lexer  mush/1 +12−3 ⚙1  edit_file src/lex.rs 3s
+ ◐ #0 lexer  ⎇ +12−3 ⚙1  edit_file src/lex.rs 3s
  ✓ #0 ✉ result unread  wrote README.md
  · #0 ✉2 two reads owed
  ✓ #0 ⚮ parent gone  wrote src/lex.rs
@@ -857,7 +870,7 @@ row painter, and a whole frame at 100×28 with one row per mark:
 ┌ agents · 3 working · 1 waiting─┐┌ mush ──────────────────────────────────────────────────────────┐
 │▶◐ #0 ✉2 root  thinking 4s      ││you › make the tree show every state                            │
 │   ⧗ #1  waiting on results 3s  ││                                                                │
-│     ◐ #2 tests                 ││mush › Spawning the children.                                   │
+│     ◐ #2 tests  ⎇ +324−40 ⚙1   ││mush › Spawning the children.                                   │
 │   ✗ #3 probe  no route to host ││                                                                │
 │   ⊘ #4 run                     ││↳ tests probe                              → #2 on mush/2       │
 │   ⚠ #5 build                   │││ mush/2 · .mush/wt/2                                           │
@@ -896,10 +909,12 @@ row whose parent the history window has reaped (it is drawn under its nearest
 surviving ancestor — the root when none of its own survive — at that ancestor's
 depth plus one, dim, and the mark is what says its own parent is not the row it
 sits under; how many children a parent keeps is `CHILD_HISTORY` in
-`crates/mush/src/app/tree.rs`), `▶` the focused agent, and `⚙N` jobs on their
-owner's row. A running agent with children out wears *no* count of them: the
-children's own rows say they run, and the title's `N waiting` counts the agents
-at rest with work out. Tool calls are `mark summarized-args`: each tool's own
+`crates/mush/src/app/tree.rs`), `▶` the focused agent, `⚙N` jobs on their owner's
+row, and `⎇` (`b` on the ascii rung) a run in flight in a checkout of its own —
+the branch name it replaces is `#id`'s own `mush/<id>`. A running agent with
+children out wears *no* count of them: the children's own rows say they run, and
+the title's `N waiting` counts the agents at rest with work out. Tool calls are
+`mark summarized-args`: each tool's own
 mark, from the glyph table in §4, stands in for its name, and only a name no
 tool answers to still spells one — `⚙ name args` (never raw JSON, the tools that
 steer a run included: `⇄ #4 message "…"`). The transcript paints a call as its
@@ -925,7 +940,11 @@ the picker's frame and its selected row, the message prompt, the bar's badge, th
 selected agent row, an activity line, and the select mode's cursor band and its
 selection. The *content* colours — the alert red, the notice yellow, the dim gray
 and the body gray — stay fixed, because *what happened* reads the same in every
-window and only *whose window this is* changes. `MUSH_THEME` overrules the hash:
+window and only *whose window this is* changes; the agents pane's line delta is
+fixed too, and it is the content's one pair with bytes of its own — `+add` in
+`#446901` and `−del` in `#0d6901` (`theme.rs`'s `ADDED_RGB`/`REMOVED_RGB`),
+painted in the form the terminal announced, the same ladder the hue follows.
+`MUSH_THEME` overrules the hash:
 a hue's name, `256` to demand the indexed form on a truecolor terminal, `off` for
 the fixed palette of every version before this one, `auto` for unset; an unknown
 value is a startup error listing every spelling that works. `--print-config` says
