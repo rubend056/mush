@@ -563,13 +563,17 @@ left-aligned and in the tone's colour, and it is news only: `exit 3`, `4 hits`,
 `3 hunks`, `#198 messaged`, `#2 still running`, `no children and no jobs`. The
 **measure** — what the payload the call produced counts and weighs — is
 right-aligned at the pane's own right edge, dim: `45L 1.2KB`, `12L 812B`, `4
-hits 62B`, `47 files 2KB`, `37 defs`. A row with nothing to weigh leaves the
-measure column empty — the sentence tools (`status`, `control`, `spawn_agent`,
-`wait`) and the two writers, whose line counts stay in the verdict (`3 hunks`,
-`41L → 3L`) — and a row whose result carried only a payload and no news keeps
-the arrow and leaves the verdict's columns empty, because the arrow is the
-column's own mark — and the same row one rung down the pane paints `→ 4 hits`.
-Both columns are functions of `width` alone.
+hits 62B`, `47 files 2KB`, `37 defs`. The two writers are the one measure read
+from the **ask** and not the result, because their results are one sentence each
+and never weigh the text they wrote: an `edit_file`'s row weighs the bytes of
+the strings its `edits` carry (`2 hunks 1.2KB`), a `write_file`'s the bytes of
+its `content` (`41L → 3L 812B`), and a call whose result has not landed — or
+whose result came back a refusal, which wrote nothing — has no measure at all. A
+row with nothing to weigh leaves the measure column empty — the sentence tools
+(`status`, `control`, `spawn_agent`, `wait`) — and a row whose result carried
+only a payload and no news keeps the arrow and leaves the verdict's columns
+empty, because the arrow is the column's own mark — and the same row one rung
+down the pane paints `→ 4 hits`. Both columns are functions of `width` alone.
 
 **The units.** A line count is `123L` and a byte count is `900B`/`340KB`/`1.2MB`
 — no space inside a unit, one space between the units of a clause — while a
@@ -649,6 +653,22 @@ payload's own rule (the first three rows, `… N lines …`, the last four),
 because the body is the command's *input* and not its output. The compact log
 paints none of it: its one row is the whole design.
 
+**The text a writer's ask carries.** An `edit_file` and a `write_file` are the
+two calls whose ask *is* text — a replacement, a whole file — and the unfolded
+view paints it at the same gutter, dim: each edit's replaced lines behind `−`
+and its new lines behind `+`, in the order the tool applies them, under a lead
+row that counts them — `│ diff 2 edits · +4−3` — and a write's content whole
+behind one that says what it is — `│ write 41L · content, not output`. It is the
+ask as it was sent and **not** a diff of the file: the arguments carry no line
+numbers and no surrounding text, so no hunk header is invented and no context
+line guessed at, and whether the replacement matched is the verdict's own news
+(`3 hunks`, or the `error` a refusal wears, with its `! error: …` row below). A
+write's lines wear no `+`, because there is no old text they were measured
+against. Both blocks are folded by the payload's own rule, with the lead row's
+counts read from the whole strings, both are painted whether the call landed or
+failed, and the compact log paints neither: its one row per call is the whole
+design.
+
 The verdict is read from the result's own sentences: an exit code and the
 command's own time (`exit 1`, `5s`), a wait's delivered `#185 done`/`#c2 done`,
 the words that outranked it (`user spoke`, `parent spoke`), mush's own `nothing
@@ -667,7 +687,8 @@ In the unfolded view the facts the verdict and the measure do not carry are
 painted under the call's header, dim, at the two columns the header's mark
 stands in — a read's `of 9000L`, the files a search hit, a usages answer's
 `declaration at src/a.rs:12`, a command's `stderr
-2L`, a spawn's `mush/188 · .mush/wt/188` — and a result's payload is painted at
+2L`, a spawn's `mush/188 · .mush/wt/188`, the text a writer's ask carries
+(above) — and a result's payload is painted at
 that same `│ `, every row of it, so a call reads as one block and a wrapped line
 of output hangs visibly under the row it continues. Nothing blank stands *inside*
 a call: the header, its detail rows and its payload are one turn's own rows, and
@@ -870,7 +891,8 @@ digest row — the ask the call really made (a read's window, a search's pattern
 a command without its redundant `cd` or its output-shaping tail, a wait's one
 target) and, in the pane's own outcome column, what came back: the **verdict**
 at the arrow and the **measure** — what the payload counts and weighs, in the
-pane's units (`123L`, `2KB`, `4 hits`) — at the pane's right edge, `▤ text.rs
+pane's units (`123L`, `2KB`, `4 hits`), or, for the two writers, the bytes the
+ask itself carried — at the pane's right edge, `▤ text.rs
 1408→1530    →    123L/9000L 4KB`; the pane's width decides whether both fit
 (the rung this section's own paragraph names). It is the same row in `Ctrl-O`'s compact log, the view mush opens
 in, which hides the details and the

@@ -7604,12 +7604,27 @@ fn trimmed(count: String) -> String {
 /// the same number the message box weighs an attachment with, so a byte reads
 /// one way on every surface — and it is absent where the result carries no byte
 /// count of its own (`37 defs` is an outline's whole measure).
+///
+/// **The two writers weigh their ask.** An `edit_file`'s result counts the
+/// hunks it applied and a `write_file`'s says what the file was and became, and
+/// neither sentence weighs the text that travelled — but that text is in the
+/// call's own arguments, the whole `content` or the `old_string`/`new_string`
+/// of every edit, and the row weighs it ([`write_reading`], [`edit_reading`]).
+/// It is the one measure read from the arguments and not the result, and it is
+/// still a fact and not a guess: those bytes are what the model sent, they are
+/// what the call's own block paints ([`crate::app::call_grid`]), and a call
+/// whose result never landed — or was refused — has no measure at all, because
+/// its text was never written. The count is deliberately absent for both: the
+/// count such a row would carry is already the verdict beside it (`2 hunks`,
+/// `41L → 3L`), and a clause said twice is a column spent twice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Measure {
     /// The payload's rows counted in the pane's vocabulary, or `None` where the
-    /// payload has no countable rows: a picture is weighed, not counted.
+    /// payload has no countable rows: a picture is weighed, not counted, and a
+    /// writer is weighed too, because its count is its verdict's ([`Self`]).
     pub count: Option<String>,
-    /// The payload's bytes, or `None` where the result never says them.
+    /// The payload's bytes, or `None` where nothing says them — a result that
+    /// never names them, and the two writers, whose bytes are the ask's.
     pub size: Option<String>,
 }
 
@@ -7669,8 +7684,10 @@ pub struct CallFacts {
     pub outcome: Option<CallOutcome>,
     /// The **measure**: what the payload the call produced weighs, painted at
     /// the pane's own right edge. `None` for a call that produced no payload —
-    /// a status, a control, a spawn, a wait, an edit, a write, a refusal — and
-    /// for a call whose result has not landed.
+    /// a status, a control, a spawn, a wait, a refusal — and for a call whose
+    /// result has not landed. The two file writers are the exception: their
+    /// results are sentences and never weigh the text they wrote, so their
+    /// measure is the **ask's** own bytes ([`Measure`]).
     pub measure: Option<Measure>,
     /// The result's facts that are not its one outcome sentence — one row each,
     /// dim, painted *under* the call's header in the unfolded view only (the
@@ -7678,9 +7695,11 @@ pub struct CallFacts {
     /// left out rather than guessed: `read_file` has a total line count only
     /// where the read was a window, `spawn_agent` a worktree only where the
     /// child is isolated, and `edit_file` says nothing here because the ask
-    /// already names the file and the outcome already counts the hunks. The
-    /// painter cuts each row to the pane's gutter ([`crate::app`]'s call
-    /// grid); nothing here is cut.
+    /// already names the file and the outcome already counts the hunks — the
+    /// replacement itself is the *arguments'* own text, which the grid paints
+    /// without the digest copying it ([`crate::app::call_grid`]). The painter
+    /// cuts each row to the pane's gutter ([`crate::app`]'s call grid); nothing
+    /// here is cut.
     pub details: Vec<String>,
 }
 
@@ -7742,10 +7761,13 @@ pub enum Tone {
 /// has one (a command's lines, a search's hits, a listing's names, an outline's
 /// definitions), and a *sentence* stays the verdict (`exit 3`, `3 hunks`,
 /// `#185 done`, `2 agents · 1 job`). The tools whose results are sentences
-/// rather than payloads — `status`, `control`, `spawn_agent`, `wait`, the two
-/// file writers — have no measure at all, so the column is empty for them by
-/// content and not by chance. Each arm's own reader is named `*_reading` where
-/// it answers with the pair and `*_outcome` where the verdict is all it has.
+/// rather than payloads — `status`, `control`, `spawn_agent`, `wait` — have no
+/// measure at all, so the column is empty for them by content and not by
+/// chance; the two file writers, whose results are sentences too, weigh their
+/// *ask* instead — the bytes of the text the model sent — which is the one
+/// measure a result never carries ([`Measure`]). Each arm's own reader is named
+/// `*_reading` where it answers with the pair and `*_outcome` where the verdict
+/// is all it has.
 ///
 /// **The details.** Each arm also fills [`CallFacts::details`] from the result's
 /// other own sentences — the files a search hit, the lines a command's stderr
@@ -7762,7 +7784,10 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
     // line opens with is where it ran and not what it asked ([`command_ask`]).
     let mut cwd = None;
     let (ask, outcome, measure, details) = match name {
-        ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), None, Vec::new()),
+        ToolName::EditFile => {
+            let (outcome, measure) = edit_reading(args, ok);
+            (path_ask(args, root), outcome, measure, Vec::new())
+        }
         ToolName::ReadFile => {
             let (outcome, measure) = read_reading(ok);
             (read_ask(args, root), outcome, measure, read_details(ok))
@@ -7771,7 +7796,10 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
             let (outcome, measure) = outline_reading(ok);
             (path_ask(args, root), outcome, measure, Vec::new())
         }
-        ToolName::WriteFile => (path_ask(args, root), write_outcome(ok), None, Vec::new()),
+        ToolName::WriteFile => {
+            let (outcome, measure) = write_reading(args, ok);
+            (path_ask(args, root), outcome, measure, Vec::new())
+        }
         ToolName::ListFiles => {
             let (outcome, measure) = list_reading(ok);
             (path_ask(args, root), outcome, measure, list_details(ok))
@@ -8165,6 +8193,54 @@ fn edit_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     })
 }
 
+/// An edit's reading: the hunks the result counted ([`edit_outcome`]) and the
+/// weight of the strings the ask carried ([`edits_bytes`]) — the text the
+/// call's own block paints, in the size the result never carries.
+///
+/// The measure is read only once a result landed and only from a result that is
+/// not a refusal: `ok` is the result filtered of failures, so a failed or
+/// cancelled edit has no measure — nothing was written — and a call whose
+/// result has not landed has none either, which is what leaves the pane's
+/// in-flight row saying `… 12s` rather than weighing a call the transcript
+/// cannot yet call done.
+fn edit_reading(args: &Value, ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let outcome = edit_outcome(ok);
+    let measure = ok.and_then(|_| ask_measure(edits_bytes(args)));
+    (outcome, measure)
+}
+
+/// The bytes of every string an `edit_file`'s arguments carry — each edit's
+/// `old_string` and `new_string` together, because both are what the call's own
+/// block paints and both travelled in the request. `None` where the arguments
+/// hold no edit string at all: a shape the model can invent (an `edits` that is
+/// not a list, an entry that is not an object, a string that is missing), and a
+/// measure of nothing is not a measure.
+fn edits_bytes(args: &Value) -> Option<usize> {
+    let edits = args.get("edits").and_then(Value::as_array)?;
+    let mut bytes = 0;
+    let mut any = false;
+    for edit in edits {
+        for key in ["old_string", "new_string"] {
+            if let Some(text) = edit.get(key).and_then(Value::as_str) {
+                bytes += text.len();
+                any = true;
+            }
+        }
+    }
+    any.then_some(bytes)
+}
+
+/// An ask's own bytes as the writers' measure: the size and **no count**
+/// ([`Measure`]), the one measure read from the arguments rather than the
+/// result.
+fn ask_measure(bytes: Option<usize>) -> Option<Measure> {
+    let bytes = bytes?;
+    Some(Measure {
+        count: None,
+        size: Some(size_label(bytes)),
+    })
+}
+
 /// A read's details: the file's own size, where the result names it — the total
 /// line count a window's trailer carries ([`read_total`]). A whole read has no
 /// row: its outcome already counts every line the file has, and mush's
@@ -8348,7 +8424,8 @@ fn outline_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
 /// read off the one sentence [`write_tool`] writes for each case, with the line
 /// counts respelled as the row's own unit ([`lines_label`]). A write is a
 /// sentence and not a payload — the result never says how many bytes it wrote —
-/// so the counts stay in the verdict and the measure column is empty.
+/// so the counts stay in the verdict and the measure column carries the ask's
+/// own bytes instead ([`write_reading`]).
 fn write_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     let text = ok?.trim_end();
     let (_, tail) = text.split_once(" — ")?;
@@ -8369,6 +8446,26 @@ fn write_outcome(ok: Option<&str>) -> Option<CallOutcome> {
         text,
         tone: Tone::Ok,
     })
+}
+
+/// A write's reading: the sentence the result wrote ([`write_outcome`]) and the
+/// weight of the `content` the ask carried ([`content_bytes`]) — the bytes the
+/// call asked to put on disk, which its one-line result never names.
+///
+/// The measure is gated the way an edit's is ([`edit_reading`]): only a result
+/// that landed and is not a refusal — `ok` — earns one, because a failed write
+/// put nothing anywhere.
+fn write_reading(args: &Value, ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let outcome = write_outcome(ok);
+    let measure = ok.and_then(|_| ask_measure(content_bytes(args)));
+    (outcome, measure)
+}
+
+/// The bytes of a write's `content`, where the arguments carry one: the whole
+/// text the call asked to put on disk, which is exactly what the block under its
+/// row paints ([`crate::app::call_grid`]).
+fn content_bytes(args: &Value) -> Option<usize> {
+    args.get("content").and_then(Value::as_str).map(str::len)
 }
 
 /// `3 lines` as the row's unit: `3L`. [`write_tool`]'s result is the one
@@ -9255,14 +9352,16 @@ mod tests {
     /// One row of [`a_digest_for_every_tool`]'s table: the tool and its
     /// arguments, the result it read, and what the digest reads off the pair —
     /// the ask, the verdict and its tone where there is news, and the measure's
-    /// own count and size where the call produced a payload.
+    /// own count and size where the call produced a payload — each of the two
+    /// optional, because a measure may be a size alone (a picture, and the two
+    /// writers, whose bytes are the ask's).
     type DigestCase = (
         ToolName,
         Value,
         &'static str,
         &'static str,
         Option<(&'static str, Tone)>,
-        Option<(&'static str, Option<&'static str>)>,
+        Option<(Option<&'static str>, Option<&'static str>)>,
         &'static [&'static str],
     );
 
@@ -9280,13 +9379,18 @@ mod tests {
         let cases: Vec<DigestCase> = vec![
             (
                 ToolName::EditFile,
-                json!({"path": "src/lex.rs", "edits": [{}, {}, {}]}),
+                json!({"path": "src/lex.rs", "edits": [
+                    {"old_string": "let x = 1;", "new_string": "let x = 2;"},
+                    {"old_string": "a", "new_string": "b"},
+                    {"old_string": "c", "new_string": "d"},
+                ]}),
                 "edited src/lex.rs — 3 edits",
                 "src/lex.rs",
                 Some(("3 hunks", Tone::Ok)),
-                // The ask names the file and the verdict counts the hunks:
-                // there is no payload here to weigh.
-                None,
+                // The result counts the hunks and never weighs the text; the
+                // ask's own strings are the measure — `let x = 1;` and
+                // `let x = 2;` ten bytes each, and `a`/`b`/`c`/`d` one each.
+                Some((None, Some("24B"))),
                 &[],
             ),
             (
@@ -9297,7 +9401,7 @@ mod tests {
                 // A window is no news and is entirely a measure: the lines this
                 // call read over the file's own total, and what they weigh.
                 None,
-                Some(("3L/20L", Some("13B"))),
+                Some((Some("3L/20L"), Some("13B"))),
                 &["of 20L"],
             ),
             (
@@ -9310,20 +9414,22 @@ mod tests {
                 None,
                 // An outline's count *is* its answer and the sketch's bytes are
                 // not the file's, so the measure has no size to add.
-                Some(("37 defs", None)),
+                Some((Some("37 defs"), None)),
                 // The header's line count is already the payload's first line;
                 // a detail row would say one number twice.
                 &[],
             ),
             (
                 ToolName::WriteFile,
-                json!({"path": "src/lex.rs"}),
+                json!({"path": "src/lex.rs", "content": "one\ntwo\nthree\n"}),
                 "wrote src/lex.rs — 3 lines (new)",
                 "src/lex.rs",
                 // A write is a sentence and not a payload: its line counts stay
-                // in the verdict, respelled as the row's own unit.
+                // in the verdict, respelled as the row's own unit, and the
+                // measure weighs the `content` the ask carried instead —
+                // fourteen bytes of it.
                 Some(("new · 3L", Tone::Ok)),
-                None,
+                Some((None, Some("14B"))),
                 &[],
             ),
             (
@@ -9335,7 +9441,7 @@ mod tests {
                 None,
                 // The walk stopped at its cap: the count is a floor and wears
                 // the `+`.
-                Some(("2+ files", Some("17B"))),
+                Some((Some("2+ files"), Some("17B"))),
                 &["more than 400 files — list a narrower path"],
             ),
             (
@@ -9345,7 +9451,7 @@ mod tests {
                  crates/b.rs:9: let column_widths = 3;",
                 "\"column_widths\" in crates",
                 None,
-                Some(("3 hits", Some("103B"))),
+                Some((Some("3 hits"), Some("103B"))),
                 &["3 hits in crates/a.rs, crates/b.rs"],
             ),
             (
@@ -9359,7 +9465,7 @@ mod tests {
                 // a search row has no room for — and the measure counts the
                 // hits it spans.
                 Some(("3 hits in 2 files", Tone::None)),
-                Some(("3 hits", Some("236B"))),
+                Some((Some("3 hits"), Some("236B"))),
                 // The declaration site is the fact the folded row cannot
                 // otherwise carry: the payload's group headers hold it, one
                 // per file.
@@ -9373,7 +9479,7 @@ mod tests {
                 // The clean end is not news; the command's own time is, and the
                 // payload's lines are the measure's.
                 Some(("5s", Tone::Ok)),
-                Some(("2L", Some("11B"))),
+                Some((Some("2L"), Some("11B"))),
                 &[],
             ),
             (
@@ -9428,7 +9534,7 @@ mod tests {
                 "{name:?}'s verdict"
             );
             let expected = measure.map(|(count, size)| Measure {
-                count: Some(count.to_string()),
+                count: count.map(str::to_string),
                 size: size.map(str::to_string),
             });
             assert_eq!(facts.measure, expected, "{name:?}'s measure");
@@ -9446,7 +9552,10 @@ mod tests {
     /// A call whose result has not landed has no outcome — and therefore no
     /// arrow — while its ask is read the same as ever: the transcript cannot
     /// know whether the call is still running, and inventing `working` from it
-    /// would be a lie the tree's phase already tells the truth about.
+    /// would be a lie the tree's phase already tells the truth about. The
+    /// writers' measure is gated the same way: the bytes are already in the
+    /// arguments, but a call that has not landed may still fail, and the pane's
+    /// in-flight row is its clock ([`Measure`]).
     #[test]
     fn a_call_with_no_result_yet_has_no_outcome() {
         let facts = digest(
@@ -9461,6 +9570,122 @@ mod tests {
             facts.details.is_empty(),
             "a call with no result has no facts either"
         );
+        let write = digest(
+            ToolName::WriteFile,
+            &json!({"path": "a.rs", "content": "x\n"}),
+            None,
+            Path::new("/w"),
+        );
+        assert_eq!(write.measure, None, "an in-flight write weighs nothing yet");
+    }
+
+    /// The two writers' measure is the **ask's** own bytes — the whole
+    /// `content`, and every `old_string`/`new_string` in an `edits` list — the
+    /// one measure read from the arguments and not the result, because the
+    /// writers' results are one sentence each and never weigh the text they
+    /// wrote. It is still a fact: those bytes travelled in the call, and the
+    /// call's own block paints them ([`crate::app::call_grid`]). A refusal
+    /// wrote nothing and has no measure, a call in flight has none either, and
+    /// a shape the model invented is weighed as nothing rather than guessed at.
+    #[test]
+    fn the_writers_weigh_the_text_their_arguments_carry() {
+        let root = Path::new("/w");
+        let measure = |name: ToolName, args: Value, result: Option<&str>| {
+            digest(name, &args, result, root).measure
+        };
+        let size = |text: &str| {
+            Some(Measure {
+                count: None,
+                size: Some(text.to_string()),
+            })
+        };
+        let edit = json!({"path": "src/a.rs", "edits": [
+            {"old_string": "one", "new_string": "two"},
+            {"old_string": "three", "new_string": "four"},
+        ]});
+        // Both sides of every pair: 3 + 3 + 5 + 4. The replaced bytes are what
+        // the block paints as much as the new ones, and both travelled.
+        assert_eq!(
+            measure(
+                ToolName::EditFile,
+                edit.clone(),
+                Some("edited src/a.rs — 2 edits")
+            ),
+            size("15B")
+        );
+        // The whole content, and `0B` for an empty file — a zero-byte write is
+        // a fact (`0L` is the verdict's half of it) and not an absent measure.
+        assert_eq!(
+            measure(
+                ToolName::WriteFile,
+                json!({"path": "src/a.rs", "content": "hello\n"}),
+                Some("wrote src/a.rs — 1 line (new)")
+            ),
+            size("6B")
+        );
+        assert_eq!(
+            measure(
+                ToolName::WriteFile,
+                json!({"path": "src/a.rs", "content": ""}),
+                Some("wrote src/a.rs — 0 lines (new)")
+            ),
+            size("0B")
+        );
+        // A refusal wrote nothing: `ok` is the result filtered of failures, and
+        // the measure of a failed call is nothing whatever its arguments say.
+        assert_eq!(
+            measure(
+                ToolName::EditFile,
+                edit.clone(),
+                Some("error: `old_string` not found in src/a.rs")
+            ),
+            None
+        );
+        assert_eq!(
+            measure(
+                ToolName::WriteFile,
+                json!({"path": "src/a.rs", "content": "x"}),
+                Some("error: writing src/a.rs: no space left on device")
+            ),
+            None
+        );
+        // Nothing has landed yet.
+        assert_eq!(measure(ToolName::EditFile, edit.clone(), None), None);
+        // A shape the model invented is nothing to weigh, and does not panic on
+        // the way to saying so.
+        for arguments in [
+            json!({"path": "src/a.rs"}),
+            json!({"path": "src/a.rs", "edits": null}),
+            json!({"path": "src/a.rs", "edits": []}),
+            json!({"path": "src/a.rs", "edits": "nope"}),
+            json!({"path": "src/a.rs", "edits": [{}]}),
+            json!({"path": "src/a.rs", "edits": [{"old_string": 3, "new_string": true}]}),
+        ] {
+            assert_eq!(
+                measure(
+                    ToolName::EditFile,
+                    arguments.clone(),
+                    Some("edited src/a.rs")
+                ),
+                None,
+                "{arguments} was weighed"
+            );
+        }
+        for arguments in [
+            json!({"path": "src/a.rs"}),
+            json!({"path": "src/a.rs", "content": null}),
+            json!({"path": "src/a.rs", "content": 3}),
+        ] {
+            assert_eq!(
+                measure(
+                    ToolName::WriteFile,
+                    arguments.clone(),
+                    Some("wrote src/a.rs — 3 lines (new)")
+                ),
+                None,
+                "{arguments} was weighed"
+            );
+        }
     }
 
     /// A shell line's output-shaping tail is not what the line ran: `2>&1`,

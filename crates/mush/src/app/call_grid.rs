@@ -138,6 +138,34 @@
 //! payload costs. The compact log paints none of it: its one row is the whole
 //! design ([`details`]).
 //!
+//! **The text a writer's ask carries.** An `edit_file` and a `write_file` are
+//! the two calls whose ask **is** text — a replacement, a whole file — and whose
+//! results are one sentence each, so their rows named the file and never showed
+//! a byte of what the model sent. The unfolded view paints it, at the same
+//! gutter and in the same dim rows a script is painted in: an edit's replaced
+//! and new lines, edit by edit, behind a row that counts them (`diff 2 edits ·
+//! +4−3`), and a write's content behind a row that says what it is (`write 41L ·
+//! content, not output`).
+//!
+//! It is the **ask**, and not a diff of the file. The arguments carry no line
+//! numbers and no surrounding text, so the block invents neither: no `@@`
+//! header, no context line, and no claim about whether the replacement matched —
+//! that is the result's news alone (`3 hunks`, or the `! error: …` row a refusal
+//! earns). The `−`/`+` marks tell the arguments' own two strings apart, and a
+//! write's lines wear no mark at all: a write has no old text to have been
+//! diffed against, so a `+` on its lines would be a diff this painter never
+//! took. Both blocks are painted whether the call landed or failed, because the
+//! arguments are what the model sent and a refused edit's exact strings are what
+//! its failure row is about; the measure at the pane's edge is the half that *is*
+//! gated, because a call that failed wrote nothing
+//! ([`crate::agent::Measure`]).
+//!
+//! Both are folded by the payload's own rule
+//! ([`crate::app::chat::folded_head_tail`]) — a five-hundred-line edit costs the
+//! eight rows a payload costs, with the counts in its lead row read from the
+//! whole strings — and every row is cut to the pane's columns. The compact log
+//! paints none of it: its one row is the whole design ([`details`]).
+//!
 //! **The arguments' size marker.** A call whose arguments as sent are
 //! [`ARGUMENT_MARKER`] bytes or more wears their size after the ask, dim and
 //! parenthesised: `❯ python3 - <<'PY' (3KB)`. The parentheses are the whole
@@ -174,6 +202,13 @@ const GAP: usize = 2;
 /// character, read from the glyph table where the gutter's own spelling is
 /// authored, so the two cannot drift apart.
 const PIPE: char = crate::app::symbols::Symbols::GUTTER_PIPE;
+
+/// The sign the diff block paints before a line an `edit_file`'s `old_string`
+/// holds, and the one before a line its `new_string` holds ([`writer_rows`]):
+/// the glyph table's own two ([`crate::app::symbols::Symbols::REMOVED`]), read
+/// from it so the block, the table and the tree's `+12−3` cannot drift apart.
+const REMOVED: char = crate::app::symbols::Symbols::REMOVED;
+const ADDED: char = crate::app::symbols::Symbols::ADDED;
 
 /// The words that say what a heredoc's body is where it is painted
 /// ([`script_rows`]): the command's **input**, and not the payload below it.
@@ -1294,19 +1329,20 @@ fn painted_width(spans: &[Span<'_>]) -> usize {
         .sum()
 }
 
-/// The dim rows the unfolded view paints under a call's header: the **script**
-/// the call's own arguments carry, where it carries one ([`script_rows`]), and
-/// then the result's own fact rows — each at the block's own **gutter**
-/// ([`crate::app::symbols`]'s pipe) and cut to what the pane has left of it.
-/// The compact log paints none of them: its one row per call is the header, and
-/// these are what the human reads when the call is open.
+/// The dim rows the unfolded view paints under a call's header: the text the
+/// call's own arguments carry, where they carry it — the **script** of a
+/// heredoc ([`script_rows`]) and the replacement or content of the two file
+/// writers ([`writer_rows`]) — and then the result's own fact rows — each at the
+/// block's own **gutter** ([`crate::app::symbols`]'s pipe) and cut to what the
+/// pane has left of it. The compact log paints none of them: its one row per
+/// call is the header, and these are what the human reads when the call is open.
 ///
 /// The gutter is the same one the result's payload wears ([`crate::app::chat`]
 /// paints it through the same constant), so the header, its facts and the dump
 /// under them read as one block — which is what the human's `Ctrl-Y` walk and
-/// the pane's own columns both measure against. The script stands first
-/// because it belongs to the ask: it is what the call *asked for*, and the
-/// facts behind it are what came back.
+/// the pane's own columns both measure against. The ask's own text stands first
+/// because it belongs to the ask: it is what the call *asked for*, and the facts
+/// behind it are what came back.
 pub(crate) fn details(
     call: &ToolCall,
     facts: &CallFacts,
@@ -1326,6 +1362,7 @@ pub(crate) fn details(
     };
     let budget = width.saturating_sub(gutter);
     let mut rows = script_rows(call, &pad, budget);
+    rows.extend(writer_rows(call, &pad, budget));
     rows.extend(facts.details.iter().map(|fact| {
         Line::from(Span::styled(
             format!("{pad}{}", truncate(fact, budget)),
@@ -1387,6 +1424,154 @@ fn script_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> 
         );
     }
     rows
+}
+
+/// The text the two file writers' own arguments carry, under a lead row that
+/// says what it is — the unfolded view's answer to a call whose ask **is** text:
+/// an `edit_file`'s replacement and a `write_file`'s content.
+///
+/// **An edit is shown as it was asked for, not as a unified diff.** The
+/// arguments hold the pair the tool applies — `old_string` and `new_string` per
+/// edit — and nothing else: no line numbers, no surrounding file, so no `@@`
+/// header is invented and no context line is guessed at. The block paints the
+/// replaced lines behind [`crate::app::symbols::Symbols::REMOVED`] and the new
+/// ones behind [`crate::app::symbols::Symbols::ADDED`], edit by edit, in the
+/// order the tool would apply them, under a row that counts what is there
+/// (`diff 2 edits · +4−3`). Whether the replacement matched is the result's news
+/// and is said at the arrow (`3 hunks`, or the one word `error` with its own row
+/// below).
+///
+/// **A write is its content, with no marks.** There is no old text in a
+/// `write_file`'s arguments, so a diff against the file would be a fabrication
+/// and a `+` on every line would be a diff this painter never took: the block is
+/// the content's own lines, folded, under a row that says what they are
+/// (`write 41L · content, not output`) — the explicit saying a heredoc body
+/// wears, for the same reason: the block stands exactly where a result's
+/// payload stands.
+///
+/// **Both are painted whether the call landed or failed.** The block is the
+/// *ask* and not the result: the arguments are what the model sent, and a
+/// refused edit's exact strings are what its `! error: …` row is about. The
+/// measure at the pane's edge is the other half of that rule and *is* gated —
+/// nothing was written by a call that failed ([`crate::agent::Measure`]).
+///
+/// Both are folded by the payload's own rule
+/// ([`crate::app::chat::folded_head_tail`]) with the lead row's counts read from
+/// the whole strings — a five-hundred-line edit costs the eight rows a payload
+/// costs and still says exactly how much it hides — and every row is cut to the
+/// pane's columns ([`truncate`]). The compact log paints none of it: its one row
+/// is the whole design ([`details`]).
+///
+/// A shape the model invented paints no block at all — `edits` that is not a
+/// list, an entry that is not an object, a string that is missing — as
+/// [`script_rows`] paints nothing for a command that is not one. Nothing here
+/// panics on arguments the schema would have refused: the transcript keeps what
+/// the model sent.
+fn writer_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
+    let named = ToolName::parse(&call.function.name);
+    if named == Some(ToolName::EditFile) {
+        return edit_rows(call, pad, budget);
+    }
+    if named == Some(ToolName::WriteFile) {
+        return write_rows(call, pad, budget);
+    }
+    // Every other ask is a summary of what the call wanted, not the text itself:
+    // nothing is painted here.
+    Vec::new()
+}
+
+/// An `edit_file`'s block: the lead row and then the replacement, edit by edit —
+/// every edit's replaced lines and then its new ones, the order the strings
+/// stand in and the order the tool applies them.
+fn edit_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return Vec::new();
+    };
+    let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut removed = 0;
+    let mut added = 0;
+    for edit in edits {
+        // An entry the schema would have refused — not an object, a string that
+        // is missing or is not one — is no edit at all, and a block that painted
+        // the half it understood would be a claim about a call that never ran:
+        // the whole block says nothing instead, the way [`script_rows`] paints
+        // nothing for a command that is not one. `get` on a value that is not an
+        // object is `None`, which is the whole of the malformed-shape rule.
+        let (Some(old), Some(new)) = (
+            edit.get("old_string").and_then(serde_json::Value::as_str),
+            edit.get("new_string").and_then(serde_json::Value::as_str),
+        ) else {
+            return Vec::new();
+        };
+        for line in old.lines() {
+            removed += 1;
+            lines.push(format!("{REMOVED} {line}"));
+        }
+        for line in new.lines() {
+            added += 1;
+            lines.push(format!("{ADDED} {line}"));
+        }
+    }
+    // No string at all — an empty list, entries with no strings — is nothing to
+    // show, the way an empty heredoc body is.
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let lead = format!(
+        "diff {} · {ADDED}{added}{REMOVED}{removed}",
+        edits_label(edits.len())
+    );
+    block_rows(pad, budget, &lead, &lines)
+}
+
+/// A `write_file`'s block: the lead row and the content, line for line.
+fn write_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return Vec::new();
+    };
+    let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+    // An empty content writes an empty file: the verdict's `0L` already says so
+    // and there is no line to paint.
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let lead = format!(
+        "write {} · content, not output",
+        crate::agent::lines_label(lines.len())
+    );
+    block_rows(pad, budget, &lead, &lines)
+}
+
+/// One ask-derived block, assembled: the lead row that says what it is, then the
+/// ask's own lines folded by the payload's own rule
+/// ([`crate::app::chat::folded_head_tail`]) — and every row padded to the call's
+/// gutter and cut to the pane ([`truncate`], which sanitizes as it cuts).
+fn block_rows(pad: &str, budget: usize, lead: &str, lines: &[String]) -> Vec<Line<'static>> {
+    std::iter::once(lead.to_string())
+        .chain(crate::app::chat::folded_head_tail(lines))
+        .map(|line| {
+            Line::from(Span::styled(
+                format!("{pad}{}", truncate(&line, budget)),
+                dim(),
+            ))
+        })
+        .collect()
+}
+
+/// `2 edits`: the count the diff block's lead row names, one edit spelled
+/// without the `s` — the pane's own habit for a count of one ([`stage_tail`]).
+fn edits_label(count: usize) -> String {
+    if count == 1 {
+        "1 edit".to_string()
+    } else {
+        format!("{count} edits")
+    }
 }
 
 /// The style the ask (and the mark that leads it) is painted in: the tool-label
@@ -2273,6 +2458,257 @@ mod tests {
             "⚙ "
         ))
         .is_empty());
+    }
+
+    /// An `edit_file`'s block is the replacement the model asked for: a lead row
+    /// counting the edits and the lines, then each edit's replaced lines and its
+    /// new ones — two edits, two blocks, in the order the tool would apply them
+    /// — and nothing else under the call.
+    #[test]
+    fn an_edit_paints_each_edit_as_the_replacement_it_asked_for() {
+        let call = call_for(
+            "edit_file",
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"let x = 1;","new_string":"let x = 2;"},{"old_string":"fn a() {}\nfn b() {}","new_string":"fn ab() {}"}]}"#,
+        );
+        let rows = painted(&details(
+            &call,
+            &facts("src/lex.rs", Some("2 hunks"), Some("49B")),
+            60,
+            "± ",
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                "│ diff 2 edits · +2−3",
+                "│ − let x = 1;",
+                "│ + let x = 2;",
+                "│ − fn a() {}",
+                "│ − fn b() {}",
+                "│ + fn ab() {}",
+            ]
+        );
+    }
+
+    /// A single-line edit is one `−` and one `+`, under a lead row that counts
+    /// one edit without the `s` — the pane's own habit for a count of one.
+    #[test]
+    fn a_single_line_edit_paints_one_removed_and_one_added() {
+        let call = call_for(
+            "edit_file",
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"one","new_string":"two"}]}"#,
+        );
+        assert_eq!(
+            painted(&details(
+                &call,
+                &facts("src/lex.rs", Some("1 hunk"), Some("6B")),
+                60,
+                "± "
+            )),
+            vec!["│ diff 1 edit · +1−1", "│ − one", "│ + two"]
+        );
+    }
+
+    /// A five-hundred-line edit is folded by the payload's own rule: the first
+    /// three lines, the `… N lines …` elision and the last four — so it costs
+    /// the rows a payload costs — while the lead row's counts are read from the
+    /// whole strings, so a folded block still says exactly how much it holds.
+    #[test]
+    fn a_long_edit_is_folded_to_the_rows_a_payload_costs() {
+        let old: String = (0..500).map(|n| format!("old {n}\n")).collect();
+        let new: String = (0..500).map(|n| format!("new {n}\n")).collect();
+        let call = call_for(
+            "edit_file",
+            &serde_json::json!({
+                "path": "src/lex.rs",
+                "edits": [{"old_string": old, "new_string": new}],
+            })
+            .to_string(),
+        );
+        let rows = painted(&details(
+            &call,
+            &facts("src/lex.rs", Some("1 hunk"), Some("8KB")),
+            60,
+            "± ",
+        ));
+        assert_eq!(rows.len(), 1 + 8, "the payload's own rows: {rows:#?}");
+        assert_eq!(rows[0], "│ diff 1 edit · +500−500");
+        assert_eq!(rows[1], "│ − old 0");
+        assert_eq!(rows[4], "│ … 993 lines …", "{rows:#?}");
+        assert_eq!(rows[8], "│ + new 499", "{rows:#?}");
+    }
+
+    /// A write's block is the content itself — no `+` marks, because there is no
+    /// old text it was measured against — under the row that says what it is,
+    /// and folded like a heredoc body where the content is longer than the fold.
+    #[test]
+    fn a_write_paints_the_content_it_asked_to_make() {
+        let short = call_for(
+            "write_file",
+            r#"{"path":"src/lex.rs","content":"line 1\nline 2\nline 3\n"}"#,
+        );
+        assert_eq!(
+            painted(&details(
+                &short,
+                &facts("src/lex.rs", Some("new · 3L"), Some("21B")),
+                60,
+                "✎ "
+            )),
+            vec![
+                "│ write 3L · content, not output",
+                "│ line 1",
+                "│ line 2",
+                "│ line 3",
+            ]
+        );
+        let content: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let long = call_for(
+            "write_file",
+            &serde_json::json!({"path": "src/lex.rs", "content": content}).to_string(),
+        );
+        let rows = painted(&details(
+            &long,
+            &facts("src/lex.rs", Some("new · 40L"), Some("380B")),
+            60,
+            "✎ ",
+        ));
+        assert_eq!(rows.len(), 1 + 8, "{rows:#?}");
+        assert_eq!(rows[0], "│ write 40L · content, not output");
+        assert_eq!(rows[1], "│ line 1");
+        assert_eq!(rows[4], "│ … 33 lines …", "{rows:#?}");
+        assert_eq!(rows[8], "│ line 40", "{rows:#?}");
+    }
+
+    /// An `edits` shape the schema would have refused paints no block at all — a
+    /// list that is not a list, a `null`, an empty list, an entry that is not an
+    /// object, a string that is missing or is not a string, arguments that are
+    /// not JSON — and a write's missing or non-string `content` paints none
+    /// either. None of it panics: the transcript keeps what the model sent.
+    #[test]
+    fn a_malformed_edit_or_write_argument_paints_no_block() {
+        for arguments in [
+            r#"{"path":"src/lex.rs"}"#,
+            r#"{"path":"src/lex.rs","edits":null}"#,
+            r#"{"path":"src/lex.rs","edits":[]}"#,
+            r#"{"path":"src/lex.rs","edits":"nope"}"#,
+            r#"{"path":"src/lex.rs","edits":{}}"#,
+            r#"{"path":"src/lex.rs","edits":[{}]}"#,
+            r#"{"path":"src/lex.rs","edits":[3,null,{"old_string":null}]}"#,
+            r#"{"path":"src/lex.rs","edits":[{"old_string":3,"new_string":true}]}"#,
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"a"}]}"#,
+            r#"{"path":"src/lex.rs","edits":[{"new_string":"b"}]}"#,
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"a","new_string":"b"},{}]}"#,
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"","new_string":""}]}"#,
+            "not json at all",
+            "[]",
+        ] {
+            let rows = details(
+                &call_for("edit_file", arguments),
+                &facts("src/lex.rs", Some("1 hunk"), None),
+                60,
+                "± ",
+            );
+            assert!(
+                rows.is_empty(),
+                "{arguments} painted {}",
+                painted(&rows).join(" / ")
+            );
+        }
+        for arguments in [
+            r#"{"path":"src/lex.rs"}"#,
+            r#"{"path":"src/lex.rs","content":null}"#,
+            r#"{"path":"src/lex.rs","content":3}"#,
+            r#"{"path":"src/lex.rs","content":""}"#,
+            "nope",
+        ] {
+            let rows = details(
+                &call_for("write_file", arguments),
+                &facts("src/lex.rs", Some("new · 3L"), None),
+                60,
+                "✎ ",
+            );
+            assert!(
+                rows.is_empty(),
+                "{arguments} painted {}",
+                painted(&rows).join(" / ")
+            );
+        }
+        // A tool that is neither writer paints nothing, whatever text its
+        // arguments happen to carry.
+        assert!(painted(&details(
+            &call_for(
+                "read_file",
+                r#"{"path":"a.rs","edits":[{"old_string":"x","new_string":"y"}],"content":"z"}"#
+            ),
+            &facts("a.rs", None, None),
+            60,
+            "▤ ",
+        ))
+        .is_empty());
+    }
+
+    /// The block is the unfolded view's, and the compact log's one row per call
+    /// is the header — which now wears the writers' own measure: the compact row
+    /// carries the verdict and the size while the replacement waits under
+    /// `Ctrl-O`.
+    #[test]
+    fn a_writer_block_is_the_unfolded_views_and_the_header_is_its_own() {
+        let call = call_for(
+            "edit_file",
+            r#"{"path":"src/lex.rs","edits":[{"old_string":"one","new_string":"two"}]}"#,
+        );
+        let facts = facts("src/lex.rs", Some("1 hunk"), Some("6B"));
+        assert_eq!(
+            painted(&one(&call, &facts, 60, "± ")),
+            vec![split_row("± src/lex.rs", "1 hunk", "6B", 60)],
+            "the compact log is one row per call, and no block row is painted"
+        );
+        assert!(
+            !details(&call, &facts, 60, "± ").is_empty(),
+            "the block is what `Ctrl-O` shows"
+        );
+    }
+
+    /// The whole block — the lead row, the marks and every content line — is cut
+    /// to the pane's own columns at every width the grid's matrix sweeps, a line
+    /// wider than the pane included.
+    #[test]
+    fn a_writer_block_fits_every_pane_width() {
+        let edit = call_for(
+            "edit_file",
+            &serde_json::json!({
+                "path": "src/lex.rs",
+                "edits": [{
+                    "old_string": format!("{}\nshort", "x".repeat(400)),
+                    "new_string": "y".repeat(400),
+                }],
+            })
+            .to_string(),
+        );
+        let write = call_for(
+            "write_file",
+            &serde_json::json!({
+                "path": "src/lex.rs",
+                "content": format!("{}\nsecond line", "z".repeat(400)),
+            })
+            .to_string(),
+        );
+        for width in 0..=200 {
+            for (call, mark) in [(&edit, "± "), (&write, "✎ ")] {
+                let rows = painted(&details(
+                    call,
+                    &facts("src/lex.rs", Some("1 hunk"), Some("400B")),
+                    width,
+                    mark,
+                ));
+                assert!(!rows.is_empty(), "width {width}: the block is painted");
+                for row in &rows {
+                    assert!(
+                        UnicodeWidthStr::width(row.as_str()) <= width,
+                        "width {width}: {row:?} is wider than the pane"
+                    );
+                }
+            }
+        }
     }
 
     /// The heredocs a command opens: the delimiter's own spellings, `<<-`'s

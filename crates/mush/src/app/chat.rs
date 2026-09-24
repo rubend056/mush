@@ -9153,12 +9153,23 @@ mod tests {
                      the rest]",
                 ),
             },
-            // A long outcome that carries a `→` of its own.
+            // A long outcome that carries a `→` of its own, and an ask that is
+            // the whole file: the content is painted under the row in the
+            // unfolded view, and weighed at the pane's edge in both.
             Shape {
                 id: "m7",
                 tool: "write_file",
-                args: r#"{"path":"src/lex.rs"}"#,
+                args: r#"{"path":"src/lex.rs","content":"pub fn one() {}\npub fn two() {}\npub fn three() {}\n"}"#,
                 result: Some("wrote src/lex.rs — 41 lines → 3 lines"),
+            },
+            // An edit whose ask is the replacement: the diff block is the
+            // unfolded view's own rows, and the hunks share the pane's edge
+            // with the ask's bytes.
+            Shape {
+                id: "m7b",
+                tool: "edit_file",
+                args: r#"{"path":"src/lex.rs","edits":[{"old_string":"fn one() {}","new_string":"fn one() -> u8 {}"},{"old_string":"fn two() {}\nfn three() {}","new_string":"fn two_and_three() {}"}]}"#,
+                result: Some("edited src/lex.rs — 2 edits"),
             },
             // A spawn, then the wait that answers it, then steering: the three
             // calls a tree is steered with, in sequence.
@@ -9256,6 +9267,21 @@ mod tests {
         grid_arrow_at(row, width).is_some()
     }
 
+    /// Whether a row wears `head` as its **own** mark: at the row's first
+    /// column, or behind the cwd chip a command's row leads with. The walk below
+    /// is textual, and a block's own content can hold a mark's letters — the
+    /// ascii rung's `+ ` spawn mark stands inside a diff block's `│ + line` — so
+    /// the mark is looked for where a call's own row wears it and nowhere else:
+    /// under the gutter (`│ `) is another call's content, never its ask.
+    fn wears_mark(row: &str, head: &str) -> bool {
+        if row.starts_with(head) {
+            return true;
+        }
+        row.strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+            .is_some_and(|(_, rest)| rest.starts_with(head))
+    }
+
     /// Where the grid's own arrow stands on a row, in bytes ([`has_grid_arrow`]):
     /// the cut the two views are compared from.
     fn grid_arrow_at(row: &str, width: usize) -> Option<usize> {
@@ -9306,7 +9332,7 @@ mod tests {
             let head = symbols.mark(tool).to_string();
             let ask = rows[from..]
                 .iter()
-                .position(|row| row.contains(&head))
+                .position(|row| wears_mark(row, &head))
                 .map(|at| from + at)
                 .unwrap_or_else(|| panic!("{view} at {width}: no row for {tool}: {rows:?}"));
             if *settled {
@@ -9338,7 +9364,7 @@ mod tests {
                             "{view} at {width}: {tool}'s ask wraps under its mark: {row:?}"
                         );
                         assert!(
-                            !row.contains(&head),
+                            !wears_mark(row, &head),
                             "{view} at {width}: {tool}'s block holds another call: {row:?}"
                         );
                     }
@@ -9366,8 +9392,9 @@ mod tests {
     /// transcript that carries every call shape — a short ask with a short
     /// outcome, a long ask, a long outcome, an ask with no result yet, a
     /// failure, a refusal, calls with details, a call whose outcome cannot fit,
-    /// a `spawn_agent`/`wait`/`control` sequence, a report row between two
-    /// calls and a prose turn between two of them.
+    /// a `spawn_agent`/`wait`/`control` sequence, the two writers whose ask is
+    /// the text itself (a diff block and a whole content), a report row between
+    /// two calls and a prose turn between two of them.
     ///
     /// It asserts, at every width and in both views: no painted row is wider
     /// than the pane; every call's `→` stands at the same column — the grid's
@@ -9421,6 +9448,19 @@ mod tests {
                     shown_rows.iter().any(|row| row.contains("script")),
                     "the unfolded view paints the script at {width}: {shown_rows:#?}"
                 );
+                // The writers' own blocks are the same rule: the compact log
+                // paints the header alone, and the diff and the content stand
+                // in the unfolded view.
+                for (token, saying) in [("diff ", "the diff"), ("write ", "the content")] {
+                    assert!(
+                        compact_rows.iter().all(|row| !row.contains(token)),
+                        "the compact log paints no {saying} at {width}"
+                    );
+                    assert!(
+                        shown_rows.iter().any(|row| row.contains(token)),
+                        "the unfolded view paints {saying} at {width}: {shown_rows:#?}"
+                    );
+                }
                 let rung = symbols.rung().word();
                 printed.push_str(&format!("\n===== {width} columns · {rung} · shown =====\n"));
                 printed.push_str(&shown_rows.join("\n"));

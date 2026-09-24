@@ -210,6 +210,25 @@ impl Symbols {
     /// gutter it is the first column of, and pinned by the test below.
     pub(crate) const GUTTER_PIPE: char = '│';
 
+    /// The sign a line an `edit_file` asked to *replace* wears in the unfolded
+    /// view's diff block, and the one the line that replaced it wears — the two
+    /// marks [`crate::app::call_grid`] paints before the arguments' own lines.
+    ///
+    /// Pane furniture and not a tool's mark, which is why it is a constant here
+    /// beside the gutter and not a row of the per-tool table: the marks a rung
+    /// spells are the *tools'* (a font that cannot show `±` gets `E`), while the
+    /// gutter's `│` is painted in both rungs, and a diff's signs are furniture of
+    /// the same kind. The off sign is the one the tree already spells a change
+    /// with — `+12−3` is `mush_core::git::Stat::compact` — so a removal reads the
+    /// same sign wherever the pane weighs one. The test below pins both to the
+    /// tree's own spelling, so the two cannot drift apart.
+    pub(crate) const REMOVED: char = '−';
+
+    /// The sign a line an `edit_file` asked to *add* wears ([`Self::REMOVED`]).
+    /// `+` in every rung: it is the one byte the ascii and the symbols rows of a
+    /// diff have always shared.
+    pub(crate) const ADDED: char = '+';
+
     /// The columns [`Self::GUTTER_MARK`] and every mark take: one glyph and one
     /// space. See the module doc for why a constant is honest here.
     ///
@@ -303,7 +322,10 @@ type Sample = (
 /// The `/glyphs` sample for one tool: the ask the example row wears, the
 /// verdict at its arrow and the measure at its right edge. The tools that steer
 /// a run take no arguments, and their rows are the ones that say so; the tools
-/// that produce a payload have no verdict and their example is the measure.
+/// that produce a payload have no verdict and their example is the measure, and
+/// the two writers — whose measure is the ask's own bytes — wear a size and no
+/// count, because their count is the verdict beside it (`crate::agent`'s
+/// `Measure`).
 ///
 /// The measures are the pane's own arithmetic — `123L 4.1KB`, `37 defs` — and
 /// the two numbers behind them (a count and a size) are a fixture's, not a
@@ -320,8 +342,8 @@ fn sample(tool: ToolName) -> Sample {
             None,
             Some((Some("37 defs"), None)),
         ),
-        ToolName::WriteFile => ("src/lex.rs", Some("41L → 3L"), None),
-        ToolName::EditFile => ("src/lex.rs", Some("3 hunks"), None),
+        ToolName::WriteFile => ("src/lex.rs", Some("41L → 3L"), Some((None, Some("1.4KB")))),
+        ToolName::EditFile => ("src/lex.rs", Some("3 hunks"), Some((None, Some("1.2KB")))),
         ToolName::ListFiles => ("src", None, Some((Some("12 files"), Some("812B")))),
         ToolName::Search => (
             "\"markdown_rows\" in crates",
@@ -428,6 +450,27 @@ mod tests {
                 "{tool}'s ascii glyph is not ascii: {glyph:?}"
             );
             assert_eq!(glyph.chars().count(), 1, "{tool}: {glyph:?}");
+        }
+    }
+
+    /// The diff block's two signs are one column each, and the off sign is the
+    /// tree's own: `+12−3` is how the pane already spells a change's lines, and
+    /// a diff that spelled its removals with a hyphen would be a second sign for
+    /// one fact ([`crate::app::call_grid`]).
+    #[test]
+    fn the_diff_signs_are_one_column_and_the_trees_own() {
+        let change = mush_core::git::Stat {
+            files: 1,
+            added: 12,
+            removed: 3,
+        };
+        assert_eq!(change.compact(), "+12−3");
+        let compact = change.compact();
+        let mut signs = compact.chars();
+        assert_eq!(signs.next(), Some(Symbols::ADDED));
+        assert_eq!(signs.nth(2), Some(Symbols::REMOVED));
+        for sign in [Symbols::ADDED, Symbols::REMOVED] {
+            assert_eq!(UnicodeWidthStr::width(sign.to_string().as_str()), 1);
         }
     }
 
