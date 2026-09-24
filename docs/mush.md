@@ -303,7 +303,7 @@ and how a stored transcript sheds the bytes in place:
 (`image_dimensions`). Pictures keep their payloads newest-first while they total
 at most `IMAGE_BYTES_KEPT` (8 MiB, `crates/mush-core/src/message.rs`); an older
 picture whose bytes no longer fit gives them up and keeps everything else — its
-row, path, mime and size, so `▣ name (png · 2.0 MB)` still reads the same — and
+row, path, mime and size, so `▣ name (png · 2.0MB)` still reads the same — and
 the model sees the placeholder sentence ("bytes dropped to save room; read the
 file again if you need them") where the bytes were. The newest message's own
 pictures are never given up, and pricing is still by pixels.
@@ -550,40 +550,89 @@ nothing: an outcome column of `(width / 3).clamp(12, 28)` columns on the right,
 the `→` at `width - outcome_w`, two columns of gap before it, and the ask in
 what is left after the call's own **mark** — the tool's glyph and the space
 after it, two columns wide, measured rather than assumed so a wider glyph moves
-the ask and nothing else. The ask and the outcome are each cut with `…`
-from the right (the first clause is the one that matters, and the digest puts
-the status clause first where the result has one); where the ask's column would
-fall under
-fourteen columns the outcome moves to a row of its own, under the ask and in the
-same outcome column, and the ask takes the pane — an outcome is never dropped.
+the ask and nothing else. Where the ask's column would fall under fourteen
+columns the outcome moves to a row of its own, under the ask and in the same
+outcome column, and the ask takes the pane — an outcome is never dropped.
+
+**The outcome column is two sub-columns.** The **verdict** sits at the arrow,
+left-aligned and in the tone's colour, and it is news only: `exit 3`, `4 hits`,
+`3 hunks`, `#198 messaged`, `#2 still running`, `no children and no jobs`. The
+**measure** — what the payload the call produced counts and weighs — is
+right-aligned at the pane's own right edge, dim: `45L 1.2KB`, `12L 812B`, `4
+hits 62B`, `47 files 2KB`, `37 defs`. A row with nothing to weigh leaves the
+measure column empty — the sentence tools (`status`, `control`, `spawn_agent`,
+`wait`) and the two writers, whose line counts stay in the verdict (`3 hunks`,
+`41L → 3L`) — and a row whose result carried only a payload and no news keeps
+the arrow and leaves the verdict's columns empty, because the arrow is the
+column's own mark — and the same row one rung down the pane paints `→ 4 hits`.
+Both columns are functions of `width` alone.
+
+**The units.** A line count is `123L` and a byte count is `900B`/`340KB`/`1.2MB`
+— no space inside a unit, one space between the units of a clause — while a
+count of *things* is a number and a word, from a closed list of nouns (`4 hits`,
+`47 files`, `37 defs`, `3 hunks`; a single one drops the `s`), so no tool can
+invent a seventh spelling beside its own reader. A count is a floor and says so
+with a `+` on its own unit where the payload was cut: `62L+ 812B`, `4+ hits`,
+`400+ files`. A windowed read is honest about the whole file it was taken from
+— `60L/812L 2KB`, the window's lines over the file's own.
+
+**The rung.** Both clauses are painted only where the pane's box holds them both
+**whole** — `verdict + 2 + measure <= outcome_columns()`, the verdict's ten
+columns, the two of air, and the narrowest measure a payload produces — and the
+box reaches that eighteen at **60 columns** of pane. Under it every call paints
+one clause rather than two columns of crumbs: the verdict where the result has
+one (`→ exit 3`), the measure's own count where it has only that (`→ 4 hits`),
+and a pair that does not fit falls back whole. A verdict is never crushed to
+make room for a measure. The ask and the clauses are each cut with `…` from the
+right (the first clause is the one that matters).
+
 The ask is built from the call's own arguments — a path shown relative to the
 workspace, a read's window (`text.rs 1408→1530`), a search's pattern and where
 it looked, a command's redundant leading `cd <workspace root> &&` and its
 trailing output shaping (`2>&1`, `2>/dev/null`, `| cat`, `| head -N`, `| tail
--N`) stripped, because what the shaping cost is already in the outcome's line
-count. The outcome is read from the result's own sentences: an exit code with
-the command's own time (`exit 1 · 41 lines · 5s`), a read's line and byte
-counts, a listing's rows, a wait's delivered `#185 done`/`#c2 done`, the words
-that outranked it (`user spoke`, `parent spoke`), and mush's own `nothing to
-wait for`; the tone colours it: clean green, failure red, in-flight or unknown
-dim. **A clean end is not news**: `exit 0` is dropped and the row keeps what the
-command did (`41 lines · 5s`), while a failure keeps its whole sentence (`exit 1
-· 3 lines`), and a clean command with nothing else to say — no output, no time
-worth a clause — has no outcome at all and keeps its ask alone. A call whose
-result has not landed yet says how long it has been running instead, `→ … 12s`,
-dim, off the same clock the tree's own activity row reads.
+-N`) stripped, because what the shaping cost is already in the payload's line
+count. A `wait` names the one target it waited on (`⧗ #2`, `⧗ c3`) and a bare
+`⧗` waits on everything; a `spawn_agent` reads as the child's `title` where it
+was given one and as the brief's first line where it was not (`↳ table layout
+fixes`); a command that ran detached or exclusively says so, dim, after its
+ask (`❯ cargo test · background`). The mark is the row's one bright thing and
+the call's named target keeps the ask's colour — a path, a pattern, a command's
+program per stage — while what *qualifies* it goes dim: a read's window, a
+search's `in crates · ignore_case`, a command's arguments, those flags. A call
+whose arguments as sent are 300 bytes or more wears their size after the ask,
+dim and parenthesised — `❯ python3 - <<'PY' (3KB)` — and the marker is reserved
+**before** the ask is cut, so a long command's own size is never eaten by the
+very cut it explains.
 
-In the unfolded view the facts the outcome does not carry are painted under the
-call's header, dim, at the two columns the header's mark stands in — a read's
-`of 812 lines`, the files a search hit, a command's `stderr 12 lines`, a spawn's
-`mush/188 · .mush/wt/188` — and a result's payload is painted at that same `│ `,
-every row of it, so a call reads as one block and a wrapped line of output hangs
-visibly under the row it continues. Nothing blank stands *inside* a call: the
-header, its detail rows and its payload are one turn's own rows, and a message
-paints its closing blank only where the message after it is not the result that
-answers it — and in the compact log a turn whose only rows are its call lines
-paints no blank either, so consecutive command-only turns read as one dense
-list. A read's payload wears its file's own line numbers where the call named a
+The verdict is read from the result's own sentences: an exit code and the
+command's own time (`exit 1`, `5s`), a wait's delivered `#185 done`/`#c2 done`,
+the words that outranked it (`user spoke`, `parent spoke`), mush's own `nothing
+to wait for`, a read's `outline` where the unbounded read was answered with a
+sketch, and the one word `error` for every failure — its own `! error: …` row is
+painted under the call, so the sentence is not said twice — while a cancellation
+keeps saying what it is. The tone colours it: clean green, failure red,
+in-flight or unknown dim. **A clean end is not news**: `exit 0` is dropped and
+the measure keeps what the command did (`41L 604B`), while a failure keeps its
+verdict, and a clean command with nothing else to say — no output, no time worth
+a clause — has no outcome at all and keeps its ask alone. A call whose result
+has not landed yet says how long it has been running instead, `→ … 12s`, dim,
+off the same clock the tree's own activity row reads.
+
+In the unfolded view the facts the verdict and the measure do not carry are
+painted under the call's header, dim, at the two columns the header's mark
+stands in — a read's `of 9000L`, the files a search hit, a command's `stderr
+2L`, a spawn's `mush/188 · .mush/wt/188` — and a result's payload is painted at
+that same `│ `, every row of it, so a call reads as one block and a wrapped line
+of output hangs visibly under the row it continues. Nothing blank stands *inside*
+a call: the header, its detail rows and its payload are one turn's own rows, and
+a turn that said words closes them with the blank **before** its own calls, so
+prose is never glued to the call above it and a call's block never wears an
+empty row under it — a result paints no closing blank at all, and in the compact
+log a result's one kept row is the failure row, so consecutive call turns read
+as one dense list. mush's own report of a spawned child is not painted under its
+call at all: the row already says `#185 on mush/185` and the detail row names the
+worktree, so a spawned child is one row. A read's payload wears its file's own
+line numbers where the call named a
 window — `1408: pub const IMAGE_FILE_CAP: …`, the same `<n>: ` shape `search`
 prints — and no numbers where the payload is not the file's lines: an unbounded
 read, an outline's answer, a picture's label and a failure have no first line to
@@ -726,17 +775,17 @@ row painter, and a whole frame at 100×28 with one row per mark:
 │▶◐ #0 ✉2 root  thinking 4s      ││you › make the tree show every state                            │
 │   ⧗ #1  waiting on results 3s  ││                                                                │
 │     ◐ #2 tests                 ││mush › Spawning the children.                                   │
-│   ✗ #3 probe  no route to host ││↳ tests probe                              → #2 on mush/2       │
-│   ⊘ #4 run                     │││ mush/2 · .mush/wt/2                                           │
-│   ⚠ #5 build                   │││ spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops   │
-│   ≡ #6 fold  compacting 2s     │││ calling tools · wait returns its summary                      │
-│   ✓ #7 ✉ docs  wrote README.md ││                                                                │
-│   ✓ #8 ⚮  wrote src/lex.rs     ││⧗                                          → #2 still running   │
-│                                │││ wait timed out — #2 still running                             │
-│                                ││                                                                │
+│   ✗ #3 probe  no route to host ││                                                                │
+│   ⊘ #4 run                     ││↳ tests probe                              → #2 on mush/2       │
+│   ⚠ #5 build                   │││ mush/2 · .mush/wt/2                                           │
+│   ≡ #6 fold  compacting 2s     ││⧗                                          → #2 still running   │
+│   ✓ #7 ✉ docs  wrote README.md │││ wait timed out — #2 still running                             │
+│   ✓ #8 ⚮  wrote src/lex.rs     ││                                                                │
 │                                ││· #3 failed: no route to host                                   │
 │                                ││                                                                │
 │                                ││mush › Every mark is on a row above.                            │
+│                                ││                                                                │
+│                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
 │                                ││                                                                │
@@ -772,10 +821,13 @@ mark, from the glyph table in §4, stands in for its name, and only a name no
 tool answers to still spells one — `⚙ name args` (never raw JSON, the tools that
 steer a run included: `⇄ #4 message "…"`). The transcript paints a call as its
 digest row — the ask the call really made (a read's window, a search's pattern,
-a command without its redundant `cd` or its output-shaping tail) and, at the
-pane's own outcome column, what came back: `▤ text.rs 1408→1530    → 123 lines ·
-4 KB` — the same row in `Ctrl-O`'s compact log, the view mush opens in, which
-hides the details and the
+a command without its redundant `cd` or its output-shaping tail, a wait's one
+target) and, in the pane's own outcome column, what came back: the **verdict**
+at the arrow and the **measure** — what the payload counts and weighs, in the
+pane's units (`123L`, `2KB`, `4 hits`) — at the pane's right edge, `▤ text.rs
+1408→1530    →    123L/9000L 4KB`; the pane's width decides whether both fit
+(the rung this section's own paragraph names). It is the same row in `Ctrl-O`'s compact log, the view mush opens
+in, which hides the details and the
 payload under it. Notices are neutral `·`
 unless something actually failed (`!`).
 

@@ -32,7 +32,7 @@
 use mush_core::message::{FunctionCall, ToolCall};
 use mush_core::tools::ToolName;
 
-use crate::agent::{CallFacts, CallOutcome, Tone};
+use crate::agent::{CallFacts, CallOutcome, Measure, Tone};
 use crate::app::call_grid;
 
 /// Which mark table a pane paints through.
@@ -236,7 +236,7 @@ impl Symbols {
         let row_width = width.saturating_sub(PREVIEW_HEAD + PREVIEW_GAP);
         let mut out = String::new();
         for tool in ToolName::ALL {
-            let (ask, outcome) = sample(tool);
+            let (ask, outcome, measure) = sample(tool);
             let call = ToolCall {
                 id: "preview".to_string(),
                 kind: "function".to_string(),
@@ -247,9 +247,13 @@ impl Symbols {
             };
             let facts = CallFacts {
                 ask: ask.to_string(),
-                outcome: Some(CallOutcome {
-                    text: outcome.to_string(),
+                outcome: outcome.map(|text| CallOutcome {
+                    text: text.to_string(),
                     tone: Tone::Ok,
+                }),
+                measure: measure.map(|(count, size)| Measure {
+                    count: count.map(str::to_string),
+                    size: size.map(str::to_string),
                 }),
                 details: Vec::new(),
             };
@@ -271,25 +275,52 @@ impl Symbols {
     }
 }
 
-/// The `/glyphs` sample for one tool: the ask and the outcome the example row
-/// is painted from. The tools that steer a run take no arguments, and their
-/// rows are the ones that say so.
-fn sample(tool: ToolName) -> (&'static str, &'static str) {
+/// One tool's `/glyphs` sample: the ask the example row wears, the verdict at
+/// its arrow, and the measure at its right edge — the last two each optional,
+/// and the measure itself a count and a size, each optional.
+type Sample = (
+    &'static str,
+    Option<&'static str>,
+    Option<(Option<&'static str>, Option<&'static str>)>,
+);
+
+/// The `/glyphs` sample for one tool: the ask the example row wears, the
+/// verdict at its arrow and the measure at its right edge. The tools that steer
+/// a run take no arguments, and their rows are the ones that say so; the tools
+/// that produce a payload have no verdict and their example is the measure.
+///
+/// The measures are the pane's own arithmetic — `123L 4.1KB`, `37 defs` — and
+/// the two numbers behind them (a count and a size) are a fixture's, not a
+/// claim about the sample file.
+fn sample(tool: ToolName) -> Sample {
     match tool {
         ToolName::ReadFile => (
             "crates/mush-core/src/text.rs 1408→1530",
-            "123 lines · 4.1 kB",
+            None,
+            Some((Some("123L"), Some("4.1KB"))),
         ),
-        ToolName::Outline => ("crates/mush-core/src/outline.rs", "37 definitions"),
-        ToolName::WriteFile => ("src/lex.rs", "41 lines → 3 lines"),
-        ToolName::EditFile => ("src/lex.rs", "3 hunks"),
-        ToolName::ListFiles => ("src", "12 files"),
-        ToolName::Search => ("\"markdown_rows\" in crates", "7 hits · 3 files"),
-        ToolName::RunCommand => ("cargo test -p mush", "41 lines · 5s"),
-        ToolName::SpawnAgent => ("table layout fixes", "#188 on mush/188"),
-        ToolName::Status => ("", "3 agents · 1 job"),
-        ToolName::Control => ("#4 message \"one more line\"", "#4 messaged"),
-        ToolName::Wait => ("", "#185 done"),
+        ToolName::Outline => (
+            "crates/mush-core/src/outline.rs",
+            None,
+            Some((Some("37 defs"), None)),
+        ),
+        ToolName::WriteFile => ("src/lex.rs", Some("41L → 3L"), None),
+        ToolName::EditFile => ("src/lex.rs", Some("3 hunks"), None),
+        ToolName::ListFiles => ("src", None, Some((Some("12 files"), Some("812B")))),
+        ToolName::Search => (
+            "\"markdown_rows\" in crates",
+            None,
+            Some((Some("7 hits"), Some("2.1KB"))),
+        ),
+        ToolName::RunCommand => (
+            "cargo test -p mush",
+            Some("5s"),
+            Some((Some("41L"), Some("1.2KB"))),
+        ),
+        ToolName::SpawnAgent => ("table layout fixes", Some("#188 on mush/188"), None),
+        ToolName::Status => ("", Some("3 agents · 1 job"), None),
+        ToolName::Control => ("#4 message \"one more line\"", Some("#4 messaged"), None),
+        ToolName::Wait => ("#2", Some("#2 done"), None),
     }
 }
 

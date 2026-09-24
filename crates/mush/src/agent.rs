@@ -7165,23 +7165,153 @@ fn read_args(args: &Value) -> String {
 /// and the digest below both read it.
 pub(crate) const FAILED: &str = "error:";
 
+/// The words every spawn's own report opens with: `spawned agent #185 on
+/// mush/185 at 1a2b3c4 · …`. The id is read after them ([`spawn_outcome`]),
+/// and so is the fact that the sentence is mush's own report and not a payload
+/// a call produced — which is why the pane's own painter reads it too
+/// (`chat::spawn_report`): a spawned
+/// child's report is not painted under its call as a dump, because the call's
+/// own row already says it.
+pub(crate) const SPAWNED: &str = "spawned agent ";
+
 // ---------------------------------------------------------------------------
 // The call digest: what the compact log paints
 // ---------------------------------------------------------------------------
 
+/// The nouns a row's counts wear, **and the whole list**: the payload counts
+/// (`hits`, `files`, `defs`, `hunks`) and the two the status listing counts
+/// (`agents`, `jobs`). `lines` is deliberately absent — a line count is a unit
+/// ([`lines_label`]'s `123L`) and a byte count is [`crate::app::size_label`]'s
+/// — so a tool that wants a seventh spelling adds it *here*, where the reader
+/// sees what the pane already says, rather than inventing one beside its own
+/// reader. That is the whole point of the list: the vocabulary is closed, and
+/// closing it is a change to this enum and not a string in one tool's arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Count {
+    /// Children an agent owns — the status listing's own count.
+    Agents,
+    /// Jobs it owns — the status listing's own count.
+    Jobs,
+    /// Match lines a search printed.
+    Hits,
+    /// Names a listing printed.
+    Files,
+    /// Definitions an outline found.
+    Defs,
+    /// Edits an `edit_file` applied.
+    Hunks,
+}
+
+impl Count {
+    /// `4 hits`, `1 hit`: the number and the noun, one space between the units
+    /// of the clause, and the singular the plural without its `s` — so a single
+    /// one never reads `1 lines`.
+    fn label(self, count: usize) -> String {
+        let noun = match self {
+            Count::Agents => "agent",
+            Count::Jobs => "job",
+            Count::Hits => "hit",
+            Count::Files => "file",
+            Count::Defs => "def",
+            Count::Hunks => "hunk",
+        };
+        if count == 1 {
+            format!("1 {noun}")
+        } else {
+            format!("{count} {noun}s")
+        }
+    }
+}
+
+/// A line count the way a row spells it: `123L`, no space inside the unit and
+/// the unit in the number's own case. A row never says `lines` ([`Count`] is
+/// the whole noun list). A count of zero has no spelling at all — the readers
+/// that can count zero drop the clause instead of painting it, because `0L` is
+/// a number that says nothing.
+fn lines_label(lines: usize) -> String {
+    format!("{lines}L")
+}
+
+/// A count whose payload the cap trimmed: the `+` is the one mark that keeps a
+/// number from reading as the whole when it is the first N. It follows the
+/// count's own unit, so `62L+` says the lines are a floor and `4+ hits` says
+/// the hits are — the unit is part of the number (`62L`) and the noun is the
+/// word after it.
+fn trimmed(count: String) -> String {
+    match count.split_once(' ') {
+        Some((number, noun)) => format!("{number}+ {noun}"),
+        None => format!("{count}+"),
+    }
+}
+
+/// The payload a call produced, as the row's own right-hand column reads it:
+/// what it counts and how many bytes it is.
+///
+/// The count is the payload's own — its lines (`41L`), its hits, its names,
+/// its definitions — in the pane's closed vocabulary ([`Count`], [`lines_label`])
+/// and never cut short by a column: the call grid owns the pane's columns. The
+/// size is [`crate::app::size_label`]'s spelling (`900B`, `340KB`, `1.2MB`) —
+/// the same number the message box weighs an attachment with, so a byte reads
+/// one way on every surface — and it is absent where the result carries no byte
+/// count of its own (`37 defs` is an outline's whole measure).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Measure {
+    /// The payload's rows counted in the pane's vocabulary, or `None` where the
+    /// payload has no countable rows: a picture is weighed, not counted.
+    pub count: Option<String>,
+    /// The payload's bytes, or `None` where the result never says them.
+    pub size: Option<String>,
+}
+
+impl Measure {
+    /// The column as one string: the count and the size, one space between the
+    /// units of the clause. Whichever of the two a payload has alone stands
+    /// alone.
+    pub fn text(&self) -> String {
+        match (&self.count, &self.size) {
+            (Some(count), Some(size)) => format!("{count} {size}"),
+            (Some(count), None) => count.clone(),
+            (None, Some(size)) => size.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// The one clause a pane too narrow for two keeps: the count where the
+    /// payload has one, the size alone otherwise (`4KB` for a picture). See
+    /// the call grid's rung ([`crate::app::Chat`]'s painter drops the size).
+    pub fn brief(&self) -> String {
+        self.count
+            .clone()
+            .or_else(|| self.size.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// One tool call as the pane reads it: the ask the call made, once its result
-/// has landed what came back, and the result's own facts that are neither.
+/// has landed the news it carried and the payload it produced, and the facts
+/// that are neither.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallFacts {
     /// What the call asked for, in the tool's own shape — a read's window, a
-    /// search's pattern, the `cd` a shell line never needs, and the output
-    /// shaping a human adds to a shell line to read it ([`strip_shaping`]).
-    /// Never cut: the painter owns the pane's columns (the call grid).
+    /// search's pattern, the `cd` a shell line never needs, the output shaping
+    /// a human adds to a shell line to read it ([`strip_shaping`]), the flags a
+    /// command ran under (a detached call and an exclusive one are different
+    /// events), the title a spawn gave its child, and the one target a wait
+    /// named. Never cut: the painter owns the pane's columns (the call grid).
     pub ask: String,
-    /// What the result's own sentences say. `None` while no result has landed:
-    /// a call still in flight paints no arrow, because the transcript cannot
-    /// know the phase the tree owns.
+    /// The **verdict**: the news the result's own sentences carry, and nothing
+    /// else. A clean command's `exit 0` is not news ([`command_reading`]), a
+    /// failure is the one word `error` because its own `! error: …` row is
+    /// painted under the call and would otherwise say the sentence twice
+    /// ([`failure`]), and a payload's own count belongs to the measure. `None`
+    /// while no result has landed: a call still in flight paints no arrow,
+    /// because the transcript cannot know the phase the tree owns.
     pub outcome: Option<CallOutcome>,
+    /// The **measure**: what the payload the call produced weighs, painted at
+    /// the pane's own right edge. `None` for a call that produced no payload —
+    /// a status, a control, a spawn, a wait, an edit, a write, a refusal — and
+    /// for a call whose result has not landed.
+    pub measure: Option<Measure>,
     /// The result's facts that are not its one outcome sentence — one row each,
     /// dim, painted *under* the call's header in the unfolded view only (the
     /// compact log is one row per call). A fact the result does not carry is
@@ -7244,6 +7374,19 @@ pub enum Tone {
 /// message. A command handed to the job registry builds no report, so a
 /// detached call's digest has no exit clause at all.
 ///
+/// **The verdict and the measure.** The result's news is split in two, because
+/// the pane paints it in two places (the call grid): the
+/// [`CallFacts::outcome`] — the verdict, at the arrow, in the tone's colour —
+/// and the [`CallFacts::measure`] — the payload's count and size, dim, at the
+/// pane's own right edge. A count belongs to the measure wherever the payload
+/// has one (a command's lines, a search's hits, a listing's names, an outline's
+/// definitions), and a *sentence* stays the verdict (`exit 3`, `3 hunks`,
+/// `#185 done`, `2 agents · 1 job`). The tools whose results are sentences
+/// rather than payloads — `status`, `control`, `spawn_agent`, `wait`, the two
+/// file writers — have no measure at all, so the column is empty for them by
+/// content and not by chance. Each arm's own reader is named `*_reading` where
+/// it answers with the pair and `*_outcome` where the verdict is all it has.
+///
 /// **The details.** Each arm also fills [`CallFacts::details`] from the result's
 /// other own sentences — the files a search hit, the lines a command's stderr
 /// section holds, the total a read's trailer names. The readers live beside the
@@ -7255,26 +7398,43 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
     // is written for the results each tool really produces.
     let refused = result.and_then(failure);
     let ok = result.filter(|_| refused.is_none());
-    let (ask, outcome, details) = match name {
-        ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), Vec::new()),
-        ToolName::ReadFile => (read_ask(args, root), read_outcome(ok), read_details(ok)),
-        ToolName::Outline => (path_ask(args, root), outline_outcome(ok), Vec::new()),
-        ToolName::WriteFile => (path_ask(args, root), write_outcome(ok), Vec::new()),
-        ToolName::ListFiles => (path_ask(args, root), list_outcome(ok), list_details(ok)),
-        ToolName::Search => (
-            search_ask(args, root),
-            search_outcome(ok),
-            search_details(ok),
+    let (ask, outcome, measure, details) = match name {
+        ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), None, Vec::new()),
+        ToolName::ReadFile => {
+            let (outcome, measure) = read_reading(ok);
+            (read_ask(args, root), outcome, measure, read_details(ok))
+        }
+        ToolName::Outline => {
+            let (outcome, measure) = outline_reading(ok);
+            (path_ask(args, root), outcome, measure, Vec::new())
+        }
+        ToolName::WriteFile => (path_ask(args, root), write_outcome(ok), None, Vec::new()),
+        ToolName::ListFiles => {
+            let (outcome, measure) = list_reading(ok);
+            (path_ask(args, root), outcome, measure, list_details(ok))
+        }
+        ToolName::Search => {
+            let (outcome, measure) = search_reading(ok);
+            (search_ask(args, root), outcome, measure, search_details(ok))
+        }
+        ToolName::RunCommand => {
+            let (outcome, measure) = command_reading(ok);
+            (
+                command_ask(args, root),
+                outcome,
+                measure,
+                command_details(ok),
+            )
+        }
+        ToolName::SpawnAgent => (brief_ask(args), spawn_outcome(ok), None, spawn_details(ok)),
+        ToolName::Status => (String::new(), status_outcome(ok), None, status_details(ok)),
+        ToolName::Control => (
+            control_ask(args),
+            control_outcome(ok),
+            None,
+            control_details(ok),
         ),
-        ToolName::RunCommand => (
-            command_ask(args, root),
-            command_outcome(ok),
-            command_details(ok),
-        ),
-        ToolName::SpawnAgent => (brief_ask(args), spawn_outcome(ok), spawn_details(ok)),
-        ToolName::Status => (String::new(), status_outcome(ok), status_details(ok)),
-        ToolName::Control => (control_ask(args), control_outcome(ok), control_details(ok)),
-        ToolName::Wait => (String::new(), wait_outcome(ok), wait_details(ok)),
+        ToolName::Wait => (wait_ask(args), wait_outcome(ok), None, wait_details(ok)),
     };
     CallFacts {
         // The ask is the model's own arguments, so it is defanged exactly as the
@@ -7282,7 +7442,11 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
         // come off a result the actor sanitized on its way in, and are read the
         // same way a painted row is — the painter truncates, which sanitizes.
         ask: sanitize(&ask),
+        // A refused call produced no payload, and every reader above is handed
+        // `ok` — the result filtered of refusals — so the measure of a failure
+        // is nothing and cannot be read off the refusal's own sentence.
         outcome: refused.or(outcome),
+        measure,
         details: details.iter().map(|row| sanitize(row)).collect(),
     }
 }
@@ -7304,6 +7468,7 @@ pub(crate) fn call_digest(
         return CallFacts {
             ask: summarize_args(arguments),
             outcome: result.and_then(failure),
+            measure: None,
             details: Vec::new(),
         };
     };
@@ -7311,9 +7476,20 @@ pub(crate) fn call_digest(
     digest(name, &args, result, root)
 }
 
-/// A failed call's own sentence: `error: …`, its first line, in the alert red —
-/// except a cancellation, which is mush's doing and not the tool's failure, and
-/// wears the warning yellow ([`CANCELLED`]).
+/// A failed call's own verdict: `error`, in the alert red — except a
+/// cancellation, which is mush's doing and not the tool's failure, and wears the
+/// warning yellow ([`CANCELLED`]).
+///
+/// **The word and not the sentence.** A failing result *is* painted as its own
+/// row under the call — `! error: unknown tool `command`` — at the call grid's
+/// failure mark, and that row is the one the fold never gives up, at any number
+/// and in either view (the pane's `Fold`). The outcome used to
+/// repeat the sentence, cut to the outcome's own columns: the same words twice
+/// on one screen, the second a truncated copy of the first. So the verdict says
+/// only what the row after the arrow can say in a word — that this call failed —
+/// and the row below it says which failure. A cancellation is not a failure of
+/// the tool's and keeps its own name, because `! error: cancelled` is mush's
+/// sentence and the verdict is the reading of it.
 ///
 /// Every failed result opens with [`FAILED`]; a result that merely starts like
 /// one is not read here at all, because this is only called on results the
@@ -7327,7 +7503,7 @@ fn failure(result: &str) -> Option<CallOutcome> {
         }
     } else {
         CallOutcome {
-            text: format!("{FAILED} {why}").trim_end().to_string(),
+            text: "error".to_string(),
             tone: Tone::Alert,
         }
     })
@@ -7387,33 +7563,57 @@ fn read_ask(args: &Value, root: &Path) -> String {
 }
 
 /// A search's ask: the pattern and where it looked — `"column_widths" in
-/// crates`. The pattern is quoted because it is a pattern and not a word of the
-/// ask; the path is dropped when the call named none, which is the root.
+/// crates` — and `· ignore_case` where the call asked for it. The pattern is
+/// quoted because it is a pattern and not a word of the ask; the path is
+/// dropped when the call named none, which is the root.
+///
+/// A case-blind search is a different search: the pattern shown is not the
+/// pattern matched, and the qualifier is the only place the row says so. It
+/// rides the ask the way a command's flags do.
 fn search_ask(args: &Value, root: &Path) -> String {
     let pattern = args
         .get("pattern")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let path = workspace_path(&tools::arg_path(args, "path").unwrap_or_default(), root);
-    match (pattern.is_empty(), path.is_empty()) {
+    let mut ask = match (pattern.is_empty(), path.is_empty()) {
         (true, _) => String::new(),
         (false, true) => format!("\"{pattern}\""),
         (false, false) => format!("\"{pattern}\" in {path}"),
+    };
+    if !ask.is_empty() && args.get("ignore_case").and_then(Value::as_bool) == Some(true) {
+        ask.push_str(" · ignore_case");
     }
+    ask
 }
 
 /// A command's ask: the first line, whitespace collapsed, with the one `cd` a
-/// shell line never needs taken out and the output-shaping tail dropped.
+/// shell line never needs taken out and the output-shaping tail dropped — and
+/// the two flags that change what the call *is* appended, `· background` for a
+/// `detach`, `· exclusive` for an `exclusive`.
 ///
 /// Every command already runs with the workspace root as its cwd
 /// ([`run_shell`]), so `cd <root> && cargo test` asks for exactly what
 /// `cargo test` does and the `cd` is a lie about the line the human reads. A
 /// `cd` anywhere else stays: it is a real change of directory.
+///
+/// **The flags are the ask's own and not a detail.** A detached call returns at
+/// once and its row is all the transcript will hear of it until the job ends; an
+/// exclusive call owns the machine while it runs, which is how a sibling learns
+/// why it is refused. Both were invisible on the row, and each changes what the
+/// call *is*; they ride the ask as dim qualifiers (`call_grid`'s roles) so
+/// the line the human reads under the mark is `cargo test · exclusive`.
 fn command_ask(args: &Value, root: &Path) -> String {
     let command = command_arg(args)
         .map(|c| first_line(&c))
         .unwrap_or_default();
-    strip_shaping(&strip_cd(&command, root))
+    let mut ask = strip_shaping(&strip_cd(&command, root));
+    for (flag, word) in [("detach", "background"), ("exclusive", "exclusive")] {
+        if args.get(flag).and_then(Value::as_bool) == Some(true) {
+            ask.push_str(&format!(" · {word}"));
+        }
+    }
+    ask
 }
 
 /// [`command_ask`]'s second rule: the output-shaping tail of a shell line is
@@ -7503,13 +7703,46 @@ fn strip_cd(command: &str, root: &Path) -> String {
     tail.to_string()
 }
 
-/// A spawn's ask: the brief's first line — the task, one row, the same reading
-/// the tree's row title derives from. The title a caller chose is not the ask:
-/// it names the row, and the row already wears it.
+/// A spawn's ask: the **title** the model gave, where it gave one — it is the
+/// three-word name the tree's own row wears and the thing the human asked to
+/// see — and the brief's first line where it did not.
+///
+/// The brief's first line is usually boilerplate (`You are working in **mush**, a
+/// Rust workspace at …`), which said nothing about the child that the outcome's
+/// id does not; the title is the model's own one-line answer to "what is this
+/// child for", and the schema asks for it of every spawn that has one.
 fn brief_ask(args: &Value) -> String {
+    if let Some(title) = args.get("title").and_then(Value::as_str) {
+        let title = first_line(title);
+        if !title.trim().is_empty() {
+            return title;
+        }
+    }
     brief_arg(args)
         .map(|brief| first_line(&brief))
         .unwrap_or_default()
+}
+
+/// `wait`'s ask: the one thing the call waits on, named as `status` prints it —
+/// `#2` for a child, `c2` for a job — and nothing at all for the bare wait,
+/// which is every child and every job.
+///
+/// Without it the row was a bare `⧗` whatever the call asked, so a pane of waits
+/// said nothing about which of them was the long one; a target the model wrote
+/// as `2` is the same thing `status` prints `#2`, and the `#` is the pane's own
+/// spelling of "an agent".
+fn wait_ask(args: &Value) -> String {
+    let Some(on) = args.get("on").and_then(Value::as_str) else {
+        return String::new();
+    };
+    let on = on.trim();
+    if on.is_empty() {
+        return String::new();
+    }
+    if on.bytes().all(|byte| byte.is_ascii_digit()) {
+        return format!("#{on}");
+    }
+    on.to_string()
 }
 
 /// `control`'s ask: `#4 stop "the words"`, the same reading the label paints
@@ -7518,7 +7751,7 @@ fn control_ask(args: &Value) -> String {
     control_arg(args, None).unwrap_or_default()
 }
 
-/// `edited {path}` / `edited {path} — {3} edits`: the outcome is the count
+/// `edited {path}` / `edited {path} — {3} edits`: the verdict is the count
 /// alone — the path is already in the ask — and one edit is spelled `1 hunk`,
 /// not `1 hunks`.
 fn edit_outcome(ok: Option<&str>) -> Option<CallOutcome> {
@@ -7529,11 +7762,7 @@ fn edit_outcome(ok: Option<&str>) -> Option<CallOutcome> {
         .and_then(|count| count.parse::<usize>().ok())
         .unwrap_or(1);
     Some(CallOutcome {
-        text: if count == 1 {
-            "1 hunk".to_string()
-        } else {
-            format!("{count} hunks")
-        },
+        text: Count::Hunks.label(count),
         tone: Tone::Ok,
     })
 }
@@ -7546,7 +7775,7 @@ fn edit_outcome(ok: Option<&str>) -> Option<CallOutcome> {
 /// total is the fact the reader cannot otherwise see.
 fn read_details(ok: Option<&str>) -> Vec<String> {
     match ok.map(read_total) {
-        Some(Some(total)) => vec![format!("of {}", count_label(total, "line"))],
+        Some(Some(total)) => vec![format!("of {}", lines_label(total))],
         _ => Vec::new(),
     }
 }
@@ -7596,23 +7825,38 @@ pub(crate) fn read_picture(text: &str) -> Option<(&str, &str)> {
     Some((format, size))
 }
 
-/// A read's outcome: `{n} lines · {size}` over the window's own payload, the
-/// picture a read can hand back instead named as what it is, the empty file
-/// as `empty`, and the unbounded read's fallback as `outline · {n}
-/// definitions` — a read that came back as the file's *shape* must not be
-/// counted as though it had come back as text.
-fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
-    let text = ok?.trim_end();
+/// A read's reading: what the result says about the file it read, as a verdict
+/// and a measure.
+///
+/// A window is the measure's own honesty: the count is the lines this call
+/// read, the size is what those lines weigh, and the **file's own total** rides
+/// beside them (`60L/812L 2KB`) where the trailer names it — a number that read
+/// as the whole file would be the one lie this column may not print. A whole
+/// read has no total to name and its count is the file's own. The picture a
+/// read can hand back is named as what it is (`a png image`) and weighed by the
+/// byte count its own sentence carries; the empty file is `empty` with nothing
+/// to weigh; and the unbounded read's fallback keeps the outline's own reading,
+/// with one word of news in front of it — this read came back as the file's
+/// *shape* and must not be counted as though it had come back as text.
+fn read_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
     // The fallback's own marker is the outline header's confession, the one
     // sentence only an outline answer carries; the outcome is then read exactly
     // as the `outline` tool's own results are read, so the two cannot drift.
     if mush_core::outline::is_outline_answer(text) {
-        if let Some(outcome) = outline_outcome(Some(text)) {
-            return Some(CallOutcome {
-                text: format!("outline · {}", outcome.text),
-                tone: outcome.tone,
-            });
-        }
+        let (outcome, measure) = outline_reading(Some(text));
+        // The sketch's own count is the measure, and the read's own news is that
+        // it answered with a sketch of the file instead of the file's text —
+        // `outline` where the sketch found something to show, and the outline
+        // tool's own none-verdict (`no defs`, dim) where it found nothing, which
+        // is the whole of what came back.
+        let verdict = outcome.unwrap_or(CallOutcome {
+            text: "outline".to_string(),
+            tone: Tone::Ok,
+        });
+        return (Some(verdict), measure);
     }
     // An image: `read shots/x.png — a png image, 4198 bytes`.
     if let Some((format, size)) = read_picture(text) {
@@ -7620,72 +7864,106 @@ fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
             .trim_end_matches(" bytes")
             .parse::<usize>()
             .unwrap_or_default();
-        return Some(CallOutcome {
-            text: format!("a {format} image · {}", size_label(bytes)),
-            tone: Tone::Ok,
-        });
+        return (
+            Some(CallOutcome {
+                text: format!("a {format} image"),
+                tone: Tone::Ok,
+            }),
+            Some(Measure {
+                count: None,
+                size: Some(size_label(bytes)),
+            }),
+        );
     }
     // `{path} is empty`: nothing was read because there is nothing there.
     if text.ends_with(" is empty") {
-        return Some(CallOutcome {
-            text: "empty".to_string(),
-            tone: Tone::Ok,
-        });
+        return (
+            Some(CallOutcome {
+                text: "empty".to_string(),
+                tone: Tone::Ok,
+            }),
+            None,
+        );
     }
     let payload = payload(text);
-    Some(CallOutcome {
-        text: format!(
-            "{} · {}",
-            count_label(payload.lines().count(), "line"),
-            size_label(payload.len())
-        ),
-        tone: Tone::Ok,
-    })
+    let lines = payload.lines().count();
+    let count = match read_total(text) {
+        Some(total) => format!("{}/{}", lines_label(lines), lines_label(total)),
+        None => lines_label(lines),
+    };
+    (
+        None,
+        Some(Measure {
+            count: Some(count),
+            size: Some(size_label(payload.len())),
+        }),
+    )
 }
 
-/// An outline's outcome: `37 definitions`, read off the header's own clause —
-/// and `no definitions`, the none-verdict a miss wears, for the sentence a file
-/// with nothing to sketch answers with. That sentence is an `Ok` result and not
-/// a refusal (a markdown file is a normal file), so the digest must not paint
-/// it as one; mush's own header instead of the model's prose is what makes the
-/// reading trustworthy, and the header is written in this file.
+/// An outline's reading: `37 defs`, the header's own count, and **no size** — an
+/// outline's answer is a sketch of a file, and the sketch's bytes would weigh
+/// the answer rather than the file; the count is its own measure. `no defs` is
+/// the none-verdict a miss wears for the sentence a file with nothing to sketch
+/// answers with. That sentence is an `Ok` result and not a refusal (a markdown
+/// file is a normal file), so the digest must not paint it as one; mush's own
+/// header instead of the model's prose is what makes the reading trustworthy,
+/// and the header is written in this file.
 ///
 /// The header's line count is not repeated in the details: the unfolded view
 /// paints the payload, whose first line *is* the header, so a detail row would
 /// be the same number twice on one screen. Nothing else in the result is a fact
 /// the outcome does not already spell.
-fn outline_outcome(ok: Option<&str>) -> Option<CallOutcome> {
-    let text = ok?.trim_end();
+fn outline_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
     let first = first_line(text);
     if first.contains("no definitions") {
-        return Some(CallOutcome {
-            text: "no definitions".to_string(),
-            tone: Tone::None,
-        });
+        return (
+            Some(CallOutcome {
+                text: "no defs".to_string(),
+                tone: Tone::None,
+            }),
+            None,
+        );
     }
     // `… — 4,120 lines; 37 definitions (textual, …)`: the count is the word
     // before `definition`, with the header's thousands comma read back out.
-    let clause = first.split(';').find(|part| part.contains(" definition"))?;
-    let count = clause.split_whitespace().next()?.replace(',', "");
-    Some(CallOutcome {
-        text: count_label(count.parse().ok()?, "definition"),
-        tone: Tone::Ok,
-    })
+    let clause = first.split(';').find(|part| part.contains(" definition"));
+    let count = clause
+        .and_then(|clause| clause.split_whitespace().next())
+        .map(|count| count.replace(',', ""))
+        .and_then(|count| count.parse::<usize>().ok());
+    let Some(count) = count else {
+        return (None, None);
+    };
+    (
+        None,
+        Some(Measure {
+            count: Some(Count::Defs.label(count)),
+            size: None,
+        }),
+    )
 }
 
-/// A write's outcome: what the file was and became — `new · 3 lines`, `41 lines
-/// → 3 lines` — read off the one sentence [`write_tool`] writes for each case.
+/// A write's verdict: what the file was and became — `new · 3L`, `41L → 3L` —
+/// read off the one sentence [`write_tool`] writes for each case, with the line
+/// counts respelled as the row's own unit ([`lines_label`]). A write is a
+/// sentence and not a payload — the result never says how many bytes it wrote —
+/// so the counts stay in the verdict and the measure column is empty.
 fn write_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     let text = ok?.trim_end();
     let (_, tail) = text.split_once(" — ")?;
     let text = if let Some(after) = tail.strip_suffix(" (new)") {
-        format!("new · {after}")
-    } else if tail.contains(" → ") {
-        tail.to_string()
+        format!("new · {}", line_count(after))
+    } else if let Some((before, after)) = tail.split_once(" → ") {
+        // A rewrite says what the file was *and* became: each side is a count
+        // of its own, and each is respelled.
+        format!("{} → {}", line_count(before), line_count(after))
     } else if let Some((after, _)) = tail.split_once(" (replaced a text file past") {
-        format!("{after} · replaced past the read cap")
+        format!("{} · replaced past the read cap", line_count(after))
     } else if let Some((after, _)) = tail.split_once(" (replaced a file that is not text)") {
-        format!("{after} · replaced a file that is not text")
+        format!("{} · replaced a file that is not text", line_count(after))
     } else {
         first_line(tail)
     };
@@ -7693,6 +7971,21 @@ fn write_outcome(ok: Option<&str>) -> Option<CallOutcome> {
         text,
         tone: Tone::Ok,
     })
+}
+
+/// `3 lines` as the row's unit: `3L`. [`write_tool`]'s result is the one
+/// sentence in the transcript that spells a line count as words, and a row
+/// never says `lines` ([`Count`] is the whole noun list) — so the count is read
+/// back out and respelled, and a tail that is not a count at all is left as it
+/// was written.
+fn line_count(text: &str) -> String {
+    let text = text.trim();
+    for suffix in [" line", " lines"] {
+        if let Some(count) = text.strip_suffix(suffix) {
+            return lines_label(count.parse().unwrap_or_default());
+        }
+    }
+    text.to_string()
 }
 
 /// A listing's details: `more than 400 files — list a narrower path` where the
@@ -7727,58 +8020,89 @@ fn capped_note(text: &str, what: &str) -> Option<usize> {
     None
 }
 
-/// A listing's outcome: how many names came back — `12 files`, `1 file` — with
-/// `· more` where the walk stopped at its own cap, and the empty listing's own
-/// sentence when there was nothing to name.
-fn list_outcome(ok: Option<&str>) -> Option<CallOutcome> {
-    let text = ok?.trim_end();
+/// A listing's reading: the payload's own count and bytes — `47 files  2KB` —
+/// with the empty listing's `no files` sentence and no measure, because there
+/// are no bytes of names to weigh. A walk that stopped at its own cap earns the
+/// `+` on the count (`400+ files`): the number is the first the cap allowed and
+/// not the whole listing, and a number that read as the whole would be the one
+/// lie this column may not print.
+fn list_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
     if text.ends_with(": no files") {
-        return Some(CallOutcome {
-            text: "no files".to_string(),
-            tone: Tone::Ok,
-        });
+        return (
+            Some(CallOutcome {
+                text: "no files".to_string(),
+                tone: Tone::Ok,
+            }),
+            None,
+        );
     }
     let payload = payload(text);
     let files = payload.lines().filter(|line| !line.is_empty()).count();
-    Some(CallOutcome {
-        text: if files == 0 {
-            "no files".to_string()
-        } else {
-            let mut named = count_label(files, "file");
-            if text.contains("[mush: the first ") {
-                named.push_str(" · more");
-            }
-            named
-        },
-        tone: Tone::Ok,
-    })
+    if files == 0 {
+        return (
+            Some(CallOutcome {
+                text: "no files".to_string(),
+                tone: Tone::Ok,
+            }),
+            None,
+        );
+    }
+    let count = Count::Files.label(files);
+    let count = match capped_note(text, "files") {
+        Some(_) => trimmed(count),
+        None => count,
+    };
+    (
+        None,
+        Some(Measure {
+            count: Some(count),
+            size: Some(size_label(payload.len())),
+        }),
+    )
 }
 
-/// A search's outcome: `7 hits · 3 files` over the match lines — a hit is one
-/// match line and a file is one distinct path among them — with `· more` where
-/// the walk stopped at its cap, and a miss as `no match` rather than the whole
-/// sentence (the pattern and the path are already in the ask).
-fn search_outcome(ok: Option<&str>) -> Option<CallOutcome> {
-    let text = ok?.trim_end();
+/// A search's reading: the match lines counted (`7 hits`) over the payload's
+/// bytes, `no match` as the miss's own sentence (the pattern and the path are
+/// already in the ask), and a `+` on a count whose walk stopped at the search
+/// cap.
+///
+/// The *files* the hits landed in are not a clause here: the row's count is the
+/// payload's own and there is one of them, and the names are the details' job
+/// ([`search_details`]) — a second count beside the first read as a second
+/// payload.
+fn search_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
     if text.starts_with("no match for `") {
-        return Some(CallOutcome {
-            text: "no match".to_string(),
-            tone: Tone::None,
-        });
+        return (
+            Some(CallOutcome {
+                text: "no match".to_string(),
+                tone: Tone::None,
+            }),
+            None,
+        );
     }
-    let (hits, files) = search_hits(text);
-    let mut outcome = format!(
-        "{} · {}",
-        count_label(hits, "hit"),
-        count_label(files.len(), "file")
-    );
-    if text.contains("[mush: the first ") {
-        outcome.push_str(" · more");
+    let (hits, _) = search_hits(text);
+    if hits == 0 {
+        return (None, None);
     }
-    Some(CallOutcome {
-        text: outcome,
-        tone: Tone::Ok,
-    })
+    let count = Count::Hits.label(hits);
+    let count = if text.contains("[mush: the first ") {
+        trimmed(count)
+    } else {
+        count
+    };
+    (
+        None,
+        Some(Measure {
+            count: Some(count),
+            size: Some(size_label(payload(text).len())),
+        }),
+    )
 }
 
 /// A search's details: which files the hits landed in — the fact a counted
@@ -7798,7 +8122,7 @@ fn search_details(ok: Option<&str>) -> Vec<String> {
     }
     vec![format!(
         "{} in {}",
-        count_label(hits, "hit"),
+        Count::Hits.label(hits),
         files.join(", ")
     )]
 }
@@ -7836,38 +8160,48 @@ fn match_file(line: &str) -> Option<&str> {
     None
 }
 
-/// A command's outcome, read off the report's closing note: `41 lines · 5s`,
-/// `exit 1 · 3 lines`, `killed by signal 9`, `cancelled`, `timed out after
-/// 120s`. The line count is the payload's own — the command's output, with the
-/// end note and every `[mush: …]` trailer left out — and a command that printed
-/// nothing has no line clause, because `0 lines` is a number that says nothing.
+/// A command's reading: the verdict its end note gives — `exit 3`, `5s`,
+/// `cancelled`, `timed out after 120s`, `detached as #c1` — and the payload's
+/// own measure, `41L  1.2KB`.
+///
+/// The count belongs to the measure ([`Measure`]) and not to the sentence: the
+/// row exists to carry it and the column has a home for it, and the verdict is
+/// then only what happened. A command whose output hit the truncation cap wears
+/// the `+` (`62L+`): the lines that are there are the first N and not all of
+/// them, and a number that read as the whole would be the one lie this column
+/// may not print.
 ///
 /// **The clean end is not news.** `exit 0` is the case every successful command
-/// already is, so the clause is dropped and the line count beside it — the fact
-/// the row exists to carry — takes the column; the row used to read `exit 0 ·
-/// 41 lines`, spending its most valuable columns on the expected. A *failure* is
-/// the opposite and keeps its whole sentence, red: `exit 1 · 3 lines` says both
-/// what happened and how much of it there was. The same rule is the digest's
-/// everywhere: a clean result's outcome is the smallest true sentence and a
-/// failed one's is the whole one ([`failure`]). A clean command with nothing
-/// else to say — no output, no time worth a clause — has no outcome at all: an
-/// arrow with an empty sentence behind it is the claim the grid already refuses
-/// for a call whose result has not landed.
+/// already is, so the clause is dropped entirely and the row keeps what the
+/// command did — its time, where that is worth a clause (`5s`), and always its
+/// measure; the row used to read `exit 0 · 41 lines`, spending its most
+/// valuable columns on the expected. A *failure* is the opposite and keeps its
+/// own code, red: `exit 1` says both what happened and, beside the measure, how
+/// much of it there was. The same rule is the digest's everywhere: a clean
+/// result's verdict is the smallest true sentence and a failed one's is the
+/// whole one ([`failure`]). A clean command with nothing else to say — no
+/// output, no time worth a clause — has no verdict at all, and its row paints
+/// the measure alone rather than a bare `→`.
 ///
 /// A command handed to the job registry builds no report at all
-/// ([`detached_line`]), so its outcome is that handover and there is no exit
+/// ([`detached_line`]), so its verdict is that handover and there is no exit
 /// clause to read: the job is where the end will be said.
-fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
-    let text = ok?.trim_end();
-    let note = text
+fn command_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
+    let Some(text) = ok.map(str::trim_end) else {
+        return (None, None);
+    };
+    let Some(note) = text
         .lines()
         .rev()
-        .find_map(|line| end_note_of(line.trim_end()))?;
+        .find_map(|line| end_note_of(line.trim_end()))
+    else {
+        return (None, None);
+    };
     // The notes and the time they carry. The timeout's sentence already names
     // how long the command was *given*, so it is read whole and never grows the
     // call's own time; the arms that carry no duration of their own read the
     // ` after 5s` clause `end_note` appends.
-    let (outcome, tone, duration) = if note.starts_with("timed out after ") {
+    let (verdict, tone, duration) = if note.starts_with("timed out after ") {
         (note.to_string(), Tone::Alert, None)
     } else if let Some(job) = note.strip_prefix("still running — detached as ") {
         let job = job.split(';').next().unwrap_or("").trim();
@@ -7881,9 +8215,9 @@ fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
             Some((head, tail)) => (head, Some(tail)),
             None => (note, None),
         };
-        let (outcome, tone) = match head {
+        let (verdict, tone) = match head {
             // The clean end says nothing the human did not already expect; what
-            // follows it — the lines, the time — is the news.
+            // follows it — the time — is the news.
             "exit 0" => (String::new(), Tone::Ok),
             // Every other code is the command's own story and is told whole.
             head if head.starts_with("exit ") => (head.to_string(), Tone::Alert),
@@ -7892,38 +8226,53 @@ fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
             head if head.starts_with("killed by signal ") => (head.to_string(), Tone::Alert),
             head => (head.to_string(), Tone::None),
         };
-        (outcome, tone, duration)
+        (verdict, tone, duration)
     };
-    let payload = payload(text);
-    let lines = payload.lines().count();
     let mut clauses: Vec<String> = Vec::new();
-    if !outcome.is_empty() {
-        clauses.push(outcome);
-    }
-    if lines > 0 {
-        clauses.push(count_label(lines, "line"));
+    if !verdict.is_empty() {
+        clauses.push(verdict);
     }
     if let Some(duration) = duration {
         clauses.push(duration.to_string());
     }
-    if clauses.is_empty() {
-        // A clean command that printed nothing and took no time worth a
-        // clause: there is no sentence to paint, and the row keeps its ask
-        // alone rather than a bare `→`.
-        return None;
-    }
-    Some(CallOutcome {
+    let verdict = (!clauses.is_empty()).then(|| CallOutcome {
         text: clauses.join(" · "),
         tone,
+    });
+    let payload = payload(text);
+    let lines = payload.lines().count();
+    let measure = (lines > 0).then(|| {
+        let count = lines_label(lines);
+        Measure {
+            count: Some(if output_trimmed(text) {
+                trimmed(count)
+            } else {
+                count
+            }),
+            size: Some(size_label(payload.len())),
+        }
+    });
+    (verdict, measure)
+}
+
+/// Whether a command's payload is a prefix of what it printed: mush's own note
+/// says so where the result was cut to fit (`[mush: output truncated at …]`),
+/// and the kill note says the same where the command was stopped for writing
+/// past the cap.
+fn output_trimmed(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_end();
+        line.starts_with("[mush: output truncated at ")
+            || line.starts_with("[killed: output passed ")
     })
 }
 
-/// A command's details: the stderr a report carries, counted — `stderr 12
-/// lines`. The report's stdout is the outcome's own line count; stderr is the
-/// half those lines do not count, and a command that wrote none gets no row.
+/// A command's details: the stderr a report carries, counted — `stderr 12L`.
+/// The report's stdout is the measure's own line count; stderr is the half
+/// those lines do not count, and a command that wrote none gets no row.
 fn command_details(ok: Option<&str>) -> Vec<String> {
     match ok.map(stderr_lines) {
-        Some(Some(lines)) => vec![format!("stderr {}", count_label(lines, "line"))],
+        Some(Some(lines)) => vec![format!("stderr {}", lines_label(lines))],
         _ => Vec::new(),
     }
 }
@@ -7956,7 +8305,7 @@ fn spawn_details(ok: Option<&str>) -> Vec<String> {
     let Some(text) = ok.map(str::trim_end) else {
         return Vec::new();
     };
-    let Some(rest) = text.strip_prefix("spawned agent ") else {
+    let Some(rest) = text.strip_prefix(SPAWNED) else {
         return Vec::new();
     };
     let Some(id) = rest.split_whitespace().next() else {
@@ -7986,7 +8335,7 @@ fn spawn_details(ok: Option<&str>) -> Vec<String> {
 /// branch.
 fn spawn_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     let text = ok?.trim_end();
-    let rest = text.strip_prefix("spawned agent ")?;
+    let rest = text.strip_prefix(SPAWNED)?;
     let id = rest.split_whitespace().next()?;
     let after = rest[id.len()..].trim_start();
     let text = match after.strip_prefix("on ") {
@@ -8059,10 +8408,10 @@ fn status_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     }
     let mut outcome = Vec::new();
     if agents > 0 {
-        outcome.push(count_label(agents, "agent"));
+        outcome.push(Count::Agents.label(agents));
     }
     if jobs > 0 {
-        outcome.push(count_label(jobs, "job"));
+        outcome.push(Count::Jobs.label(jobs));
     }
     if unread > 0 {
         outcome.push(format!("{unread} unread"));
@@ -8335,7 +8684,7 @@ fn note_of(line: &str) -> Option<&str> {
     line.strip_prefix('[')?.split(']').next()
 }
 
-/// [`command_outcome`]'s half that finds the end note: the closing note of a
+/// [`command_reading`]'s half that finds the end note: the closing note of a
 /// report, if this line is one. Its grammar is [`end_note`]'s own vocabulary
 /// plus the handover line, and a `[mush: …]` trailer is deliberately *not* one —
 /// it is a sentence about the payload, and it can follow the end note.
@@ -8349,16 +8698,6 @@ fn end_note_of(line: &str) -> Option<&str> {
         || inner.starts_with("still running — detached as ")
         || inner.starts_with("ran ") && inner.contains("could not become a job"))
     .then_some(inner)
-}
-
-/// `1 line` / `3 lines`, `1 hit` / `7 hits`, `1 file` / `400 files`, `1 agent` /
-/// `2 agents`: one count, spelled so a single one never reads `1 lines`.
-fn count_label(count: usize, noun: &str) -> String {
-    if count == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{count} {noun}s")
-    }
 }
 
 #[cfg(test)]
@@ -8391,20 +8730,23 @@ mod tests {
     }
 
     /// One row of [`a_digest_for_every_tool`]'s table: the tool and its
-    /// arguments, the result it read, and what the digest reads off the pair.
+    /// arguments, the result it read, and what the digest reads off the pair —
+    /// the ask, the verdict and its tone where there is news, and the measure's
+    /// own count and size where the call produced a payload.
     type DigestCase = (
         ToolName,
         Value,
         &'static str,
         &'static str,
-        &'static str,
-        Tone,
+        Option<(&'static str, Tone)>,
+        Option<(&'static str, Option<&'static str>)>,
         &'static [&'static str],
     );
 
     /// A sample call and its result for every tool, read as the pane reads
-    /// them: the ask the call made, the outcome the result's own sentences
-    /// give, and the detail rows the unfolded view paints under it.
+    /// them: the ask the call made, the verdict the result's own sentences give,
+    /// the measure its payload earns, and the detail rows the unfolded view
+    /// paints under it.
     ///
     /// The table is [`ToolName::ALL`]'s own list, so a tool that falls out of
     /// it is caught here — and the digest itself has no wildcard arm, so a tool
@@ -8418,10 +8760,10 @@ mod tests {
                 json!({"path": "src/lex.rs", "edits": [{}, {}, {}]}),
                 "edited src/lex.rs — 3 edits",
                 "src/lex.rs",
-                "3 hunks",
-                Tone::Ok,
-                // The ask names the file and the outcome counts the hunks:
-                // there is no third fact here to carry.
+                Some(("3 hunks", Tone::Ok)),
+                // The ask names the file and the verdict counts the hunks:
+                // there is no payload here to weigh.
+                None,
                 &[],
             ),
             (
@@ -8429,9 +8771,11 @@ mod tests {
                 json!({"path": "src/text.rs", "offset": 5, "limit": 3}),
                 "one\ntwo\nthree\n[mush: lines 5–7 of 20 — read on with offset=8]",
                 "src/text.rs 5→7",
-                "3 lines · 13 B",
-                Tone::Ok,
-                &["of 20 lines"],
+                // A window is no news and is entirely a measure: the lines this
+                // call read over the file's own total, and what they weigh.
+                None,
+                Some(("3L/20L", Some("13B"))),
+                &["of 20L"],
             ),
             (
                 ToolName::Outline,
@@ -8440,8 +8784,10 @@ mod tests {
                  Rust-first — not a compiler's answer)\n\n  3  pub fn is_declaration(line: &str) -> \
                  bool {",
                 "crates/mush-core/src/outline.rs",
-                "37 definitions",
-                Tone::Ok,
+                None,
+                // An outline's count *is* its answer and the sketch's bytes are
+                // not the file's, so the measure has no size to add.
+                Some(("37 defs", None)),
                 // The header's line count is already the payload's first line;
                 // a detail row would say one number twice.
                 &[],
@@ -8451,8 +8797,10 @@ mod tests {
                 json!({"path": "src/lex.rs"}),
                 "wrote src/lex.rs — 3 lines (new)",
                 "src/lex.rs",
-                "new · 3 lines",
-                Tone::Ok,
+                // A write is a sentence and not a payload: its line counts stay
+                // in the verdict, respelled as the row's own unit.
+                Some(("new · 3L", Tone::Ok)),
+                None,
                 &[],
             ),
             (
@@ -8461,8 +8809,10 @@ mod tests {
                 "src/a.rs\nsrc/b.rs\n[mush: the first 400 files — list a narrower path to see \
                  the rest]",
                 "src",
-                "2 files · more",
-                Tone::Ok,
+                None,
+                // The walk stopped at its cap: the count is a floor and wears
+                // the `+`.
+                Some(("2+ files", Some("17B"))),
                 &["more than 400 files — list a narrower path"],
             ),
             (
@@ -8471,8 +8821,8 @@ mod tests {
                 "crates/a.rs:1: let column_widths = 1;\ncrates/a.rs:2: let it be 2;\n\
                  crates/b.rs:9: let column_widths = 3;",
                 "\"column_widths\" in crates",
-                "3 hits · 2 files",
-                Tone::Ok,
+                None,
+                Some(("3 hits", Some("103B"))),
                 &["3 hits in crates/a.rs, crates/b.rs"],
             ),
             (
@@ -8480,8 +8830,10 @@ mod tests {
                 json!({"command": "cargo test"}),
                 "ok\nstill ok\n[exit 0 after 5s]",
                 "cargo test",
-                "2 lines · 5s",
-                Tone::Ok,
+                // The clean end is not news; the command's own time is, and the
+                // payload's lines are the measure's.
+                Some(("5s", Tone::Ok)),
+                Some(("2L", Some("11B"))),
                 &[],
             ),
             (
@@ -8490,8 +8842,8 @@ mod tests {
                 "spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · \
                  wait returns its summary",
                 "table layout fixes",
-                "#185 on mush/185",
-                Tone::Running,
+                Some(("#185 on mush/185", Tone::Running)),
+                None,
                 &["mush/185 · .mush/wt/185"],
             ),
             (
@@ -8500,8 +8852,8 @@ mod tests {
                 "agents:\n#1 ◐ running on mush/1\n#2 ✉ ✓ wrote the lexer\njobs:\n#c1 running 3s \
                  · cargo test",
                 "",
-                "2 agents · 1 job · 1 unread",
-                Tone::Running,
+                Some(("2 agents · 1 job · 1 unread", Tone::Running)),
+                None,
                 &["#1 running", "#2 done", "#c1 running"],
             ),
             (
@@ -8509,8 +8861,8 @@ mod tests {
                 json!({"id": "4", "action": "message", "text": "more"}),
                 "messaged agent #4 — it is mid-run, so it reads this at its next step",
                 "#4 message \"more\"",
-                "#4 messaged",
-                Tone::Ok,
+                Some(("#4 messaged", Tone::Ok)),
+                None,
                 &["it is mid-run, so it reads this at its next step"],
             ),
             (
@@ -8518,23 +8870,35 @@ mod tests {
                 json!({}),
                 "#185 done: the table is laid out",
                 "",
-                "#185 done",
-                Tone::Ok,
+                Some(("#185 done", Tone::Ok)),
+                None,
                 &["from #185"],
             ),
         ];
         assert_eq!(cases.len(), ToolName::ALL.len(), "a row per tool");
-        for (name, args, result, ask, text, tone, details) in cases {
+        for (name, args, result, ask, verdict, measure, details) in cases {
             let facts = digest(name, &args, Some(result), root);
             assert_eq!(facts.ask, ask, "{name:?}'s ask");
             assert_eq!(
                 facts.outcome,
-                Some(CallOutcome {
+                verdict.map(|(text, tone)| CallOutcome {
                     text: text.to_string(),
                     tone,
                 }),
-                "{name:?}'s outcome"
+                "{name:?}'s verdict"
             );
+            let expected = measure.map(|(count, size)| Measure {
+                count: Some(count.to_string()),
+                size: size.map(str::to_string),
+            });
+            assert_eq!(facts.measure, expected, "{name:?}'s measure");
+            if let Some(measure) = &facts.measure {
+                assert_eq!(
+                    measure.text(),
+                    expected.as_ref().unwrap().text(),
+                    "{name:?}: the painted column"
+                );
+            }
             assert_eq!(facts.details, details, "{name:?}'s details");
         }
     }
@@ -8613,6 +8977,51 @@ mod tests {
         );
     }
 
+    /// The ask names what the call was narrowed to: a wait's one target, the
+    /// title a spawn gave its child, a search's case-blindness and a command's
+    /// two flags — the facts a bare mark would have swallowed. All four ride
+    /// the ask and nothing else, so the row is the only place they are read.
+    #[test]
+    fn the_ask_names_what_the_call_was_narrowed_to() {
+        let root = Path::new("/w");
+        let ask = |name: ToolName, args: Value| digest(name, &args, None, root).ask;
+        // A bare wait waits on everything and says nothing; one that named a
+        // target says it the way `status` prints it (`2` a child, `c2` a job).
+        assert_eq!(ask(ToolName::Wait, json!({})), "");
+        assert_eq!(ask(ToolName::Wait, json!({"on": "2"})), "#2");
+        assert_eq!(ask(ToolName::Wait, json!({"on": "c3"})), "c3");
+        // A spawn reads as the child's own title where it was given one and as
+        // the brief's first line where it was not.
+        let brief = json!({"brief": "table layout fixes\nand then some", "title": "table layout"});
+        assert_eq!(ask(ToolName::SpawnAgent, brief), "table layout");
+        let untitled = json!({"brief": "table layout fixes\nand then some"});
+        assert_eq!(ask(ToolName::SpawnAgent, untitled), "table layout fixes");
+        // A case-blind search is a different search: the pattern shown is not
+        // the pattern matched, and the qualifier is where the row says so.
+        let blind = json!({"pattern": "needle", "ignore_case": true});
+        assert_eq!(
+            ask(ToolName::Search, blind.clone()),
+            "\"needle\" · ignore_case"
+        );
+        let scoped = json!({"pattern": "needle", "path": "crates", "ignore_case": true});
+        assert_eq!(
+            ask(ToolName::Search, scoped),
+            "\"needle\" in crates · ignore_case"
+        );
+        // A detached command and an exclusive one are different events, and
+        // the flags that make them so are part of what the call is.
+        let detached = json!({"command": "cargo test", "detach": true});
+        assert_eq!(
+            ask(ToolName::RunCommand, detached),
+            "cargo test · background"
+        );
+        let exclusive = json!({"command": "cargo test", "exclusive": true});
+        assert_eq!(
+            ask(ToolName::RunCommand, exclusive),
+            "cargo test · exclusive"
+        );
+    }
+
     /// An outline with nothing to sketch is a fact, not a failure: the sentence
     /// is the reader's own, its tone is the none-verdict a search miss wears,
     /// and there is no detail row to invent.
@@ -8633,18 +9042,24 @@ mod tests {
             assert_eq!(
                 facts.outcome,
                 Some(CallOutcome {
-                    text: "no definitions".to_string(),
+                    text: "no defs".to_string(),
                     tone: Tone::None,
                 }),
                 "{result}"
+            );
+            assert_eq!(
+                facts.measure, None,
+                "{result}: nothing to sketch, nothing to weigh"
             );
             assert!(facts.details.is_empty(), "{result}");
         }
     }
 
-    /// A failed call is one sentence for every tool — the result's own first
-    /// line, red — and a cancellation, which is mush's doing and not a failure,
-    /// wears the warning yellow instead.
+    /// A failed call is one sentence for every tool — and that sentence is the
+    /// one word `error`, because the result's own `! error: …` row is painted
+    /// under the call and would otherwise say the whole thing twice. A
+    /// cancellation, which is mush's doing and not a failure, keeps its own
+    /// name and wears the warning yellow instead.
     #[test]
     fn a_failed_call_is_one_sentence_for_every_tool() {
         let root = Path::new("/w");
@@ -8659,10 +9074,14 @@ mod tests {
             assert_eq!(
                 facts.outcome,
                 Some(CallOutcome {
-                    text: "error: the call was refused".to_string(),
+                    text: "error".to_string(),
                     tone: Tone::Alert,
                 }),
                 "{name:?}'s failure"
+            );
+            assert_eq!(
+                facts.measure, None,
+                "{name:?}: a refusal produced no payload to weigh"
             );
             assert!(
                 facts.details.is_empty(),
@@ -8689,8 +9108,8 @@ mod tests {
         let details = |name: ToolName, args: Value, result: &str| {
             digest(name, &args, Some(result), root).details
         };
-        // A whole read names no total: its outcome already counts every line it
-        // read, and no sentence in the transcript weighs the whole file.
+        // A whole read names no total: its measure counts every line it read,
+        // and no sentence in the transcript weighs the whole file.
         assert!(details(ToolName::ReadFile, json!({}), "one\ntwo").is_empty());
         assert!(details(
             ToolName::ReadFile,
@@ -8699,7 +9118,10 @@ mod tests {
         )
         .is_empty());
         // A command that wrote no stderr: there is no section to count.
-        assert!(details(ToolName::RunCommand, json!({}), "ok\n[exit 0]").is_empty());
+        assert_eq!(
+            details(ToolName::RunCommand, json!({}), "out\n[exit 0]"),
+            Vec::<String>::new()
+        );
         // A search that missed names no file to hit.
         assert!(details(
             ToolName::Search,
@@ -8743,7 +9165,7 @@ mod tests {
                 json!({}),
                 "ok\n--- stderr ---\nwarning one\nwarning two\n[exit 0]"
             ),
-            vec!["stderr 2 lines"]
+            vec!["stderr 2L"]
         );
     }
 
@@ -8900,79 +9322,148 @@ mod tests {
         );
     }
 
-    /// A command's outcome is its report's closing note: the exit code and the
-    /// duration the note carries, the signal, the cancel, the timeout — and the
-    /// payload's own line count, which counts the command's output and not
-    /// mush's notes. A command that printed nothing has no line clause at all.
+    /// A command's reading: its report's closing note for the verdict — the
+    /// exit code and the duration the note carries, the signal, the cancel, the
+    /// timeout — and the payload's own lines for the measure, which counts the
+    /// command's output and not mush's notes. A command that printed nothing
+    /// has no measure at all, and a clean command with nothing else to say has
+    /// no verdict either.
     #[test]
-    fn a_command_outcome_reads_its_end_note() {
+    fn a_command_reading_reads_its_end_note() {
         let root = Path::new("/w");
-        let command =
-            |result: &str| digest(ToolName::RunCommand, &json!({}), Some(result), root).outcome;
-        let expect = |text: &str, tone: Tone| {
+        let command = |result: &str| digest(ToolName::RunCommand, &json!({}), Some(result), root);
+        let verdict = |text: &str, tone: Tone| {
             Some(CallOutcome {
                 text: text.to_string(),
                 tone,
             })
         };
+        let measure = |count: &str, size: &str| {
+            Some(Measure {
+                count: Some(count.to_string()),
+                size: Some(size.to_string()),
+            })
+        };
+        let clean = command("out\n[exit 0]");
         assert_eq!(
-            command("out\n[exit 0]"),
-            expect("1 line", Tone::Ok),
-            "the clean end is not news: the output is"
+            clean.outcome, None,
+            "the clean end is not news and the output is not a sentence"
         );
-        assert_eq!(command("[exit 101]"), expect("exit 101", Tone::Alert));
+        assert_eq!(clean.measure, measure("1L", "3B"));
+        let failed = command("[exit 101]");
+        assert_eq!(failed.outcome, verdict("exit 101", Tone::Alert));
         assert_eq!(
-            command("out\n[exit 0 after 5s]"),
-            expect("1 line · 5s", Tone::Ok),
+            failed.measure, None,
+            "the command printed nothing: there is nothing to weigh"
+        );
+        let timed = command("out\n[exit 0 after 5s]");
+        assert_eq!(
+            timed.outcome,
+            verdict("5s", Tone::Ok),
             "the command's own time travels in the note and is read back out of it"
         );
+        assert_eq!(timed.measure, measure("1L", "3B"));
         // The one command with nothing else to say: a clean end and no output
-        // and no time worth a clause paints no sentence at all, so its row
-        // keeps the ask alone.
-        assert_eq!(command("[exit 0]"), None);
-        assert_eq!(command("[exit 0 after 5s]"), expect("5s", Tone::Ok));
+        // and no time worth a clause paints no clause at all, so its row keeps
+        // the ask alone.
+        assert_eq!(command("[exit 0]").outcome, None);
+        assert_eq!(command("[exit 0]").measure, None);
         assert_eq!(
-            command("out\n[killed by signal 9]"),
-            expect("killed by signal 9 · 1 line", Tone::Alert)
+            command("[exit 0 after 5s]").outcome,
+            verdict("5s", Tone::Ok)
+        );
+        let killed = command("out\n[killed by signal 9]");
+        assert_eq!(killed.outcome, verdict("killed by signal 9", Tone::Alert));
+        assert_eq!(killed.measure, measure("1L", "3B"));
+        let cancelled = command("out\n[cancelled]");
+        assert_eq!(cancelled.outcome, verdict("cancelled", Tone::Warn));
+        assert_eq!(cancelled.measure, measure("1L", "3B"));
+        assert_eq!(
+            command("out\n[timed out after 120s]").outcome,
+            verdict("timed out after 120s", Tone::Alert)
         );
         assert_eq!(
-            command("out\n[cancelled]"),
-            expect("cancelled · 1 line", Tone::Warn)
-        );
-        assert_eq!(
-            command("out\n[timed out after 120s]"),
-            expect("timed out after 120s · 1 line", Tone::Alert)
-        );
-        assert_eq!(
-            command("out\n[no exit status: neither an exit code nor a signal]"),
-            expect(
-                "no exit status: neither an exit code nor a signal · 1 line",
+            command("out\n[no exit status: neither an exit code nor a signal]").outcome,
+            verdict(
+                "no exit status: neither an exit code nor a signal",
                 Tone::Alert
             )
         );
         // A command that ended with its group still standing: the clause is
         // mush's own note too, and it is not a line of the command's output.
         assert_eq!(
-            command("out\n[exit 0][2 processes in its group were stopped]"),
-            expect("1 line", Tone::Ok)
+            command("out\n[exit 0][2 processes in its group were stopped]").measure,
+            measure("1L", "3B")
         );
         // The handover: a command the registry took builds no report, so there
         // is no exit clause — the job is where the end will be said.
         assert_eq!(
-            command("[still running — detached as #c1; you will be told when it finishes]"),
-            expect("detached as #c1", Tone::Running)
+            command("[still running — detached as #c1; you will be told when it finishes]").outcome,
+            verdict("detached as #c1", Tone::Running)
         );
         // A `[mush: …]` line is never content either — and it can follow the
         // end note, so the note is found by its own grammar and not by being
         // the last line.
         assert_eq!(
-            command("out\n[exit 0]\n[mush: the first 4096 bytes; the rest is in the file]"),
-            expect("1 line", Tone::Ok)
+            command("out\n[exit 0]\n[mush: the lines are long]").measure,
+            measure("1L", "3B")
+        );
+    }
+
+    /// A payload the cap trimmed does not read as the whole: the count wears
+    /// the `+`, and the note mush writes where it cut is what the reader reads.
+    /// Both of the truncation notes count — the head's and the tail's — and
+    /// the count that is a floor is the line count and not a stated total.
+    #[test]
+    fn a_trimmed_payload_wears_a_plus() {
+        let root = Path::new("/w");
+        let measure =
+            |result: &str| digest(ToolName::RunCommand, &json!({}), Some(result), root).measure;
+        let cut = "three lines here\n[exit 0]\n[mush: output truncated at 4096 bytes — rerun it \
+                   narrower (rg, head, a smaller path) to see the rest]";
+        assert_eq!(
+            measure(cut),
+            Some(Measure {
+                count: Some("1L+".to_string()),
+                size: Some("16B".to_string()),
+            }),
+            "the lines that are here are the first of them and the count says so"
+        );
+        assert_eq!(
+            measure(
+                "tail only\n[exit 0]\n[mush: output truncated at 4096 bytes (the end is \
+                      shown) — rerun it narrower to see the rest]"
+            ),
+            Some(Measure {
+                count: Some("1L+".to_string()),
+                size: Some("9B".to_string()),
+            }),
+            "the tail's own note is the same reading"
+        );
+        assert_eq!(
+            measure(
+                "killed at the cap\n[killed: output passed 8388608 bytes; the first 4096 \
+                      are above]"
+            ),
+            Some(Measure {
+                count: Some("1L+".to_string()),
+                size: Some("17B".to_string()),
+            }),
+            "a command stopped for writing past the cap is the same floor"
+        );
+        // A cap the result never names: the count is the whole payload.
+        assert_eq!(
+            measure("two\nlines\n[exit 0]"),
+            Some(Measure {
+                count: Some("2L".to_string()),
+                size: Some("9B".to_string()),
+            })
         );
     }
 
     /// The two results a read can hand back that have no line count: a picture
-    /// is named as what it is, and an empty file is `empty` — not `0 lines`.
+    /// is named as what it is and weighed by the size its own sentence carries,
+    /// and an empty file is `empty` — not `0L` — with nothing to weigh.
     #[test]
     fn a_read_names_a_picture_and_an_empty_file() {
         let root = Path::new("/w");
@@ -8983,22 +9474,32 @@ mod tests {
                 Some(result),
                 root,
             )
-            .outcome
         };
+        let picture = read("read shots/a.png — a png image, 4198 bytes");
         assert_eq!(
-            read("read shots/a.png — a png image, 4198 bytes"),
+            picture.outcome,
             Some(CallOutcome {
-                text: "a png image · 4 KB".to_string(),
+                text: "a png image".to_string(),
                 tone: Tone::Ok,
             })
         );
         assert_eq!(
-            read("src/empty.rs is empty"),
+            picture.measure,
+            Some(Measure {
+                count: None,
+                size: Some("4KB".to_string()),
+            }),
+            "the payload is the picture, and its own sentence is the byte count"
+        );
+        let empty = read("src/empty.rs is empty");
+        assert_eq!(
+            empty.outcome,
             Some(CallOutcome {
                 text: "empty".to_string(),
                 tone: Tone::Ok,
             })
         );
+        assert_eq!(empty.measure, None);
     }
 
     /// The digest's text is the model's own arguments, so it is defanged
@@ -9037,7 +9538,16 @@ mod tests {
             root,
         );
         assert_eq!(facts.ask, "src/a.rs 4→5");
-        assert_eq!(facts.outcome.unwrap().text, "1 line · 1 B");
+        // A window is a measure and no news at all; the payload is the one line
+        // `x`, and the file's own total rides beside the count.
+        assert_eq!(facts.outcome, None);
+        assert_eq!(
+            facts.measure,
+            Some(Measure {
+                count: Some("1L/9L".to_string()),
+                size: Some("1B".to_string()),
+            })
+        );
         let unknown = call_digest(
             "teleport",
             r#"{"where":"home"}"#,
@@ -9048,10 +9558,12 @@ mod tests {
         assert_eq!(
             unknown.outcome,
             Some(CallOutcome {
-                text: "error: unknown tool `teleport`".to_string(),
+                text: "error".to_string(),
                 tone: Tone::Alert,
-            })
+            }),
+            "the row says a word and the failure's own row under it says the rest"
         );
+        assert_eq!(unknown.measure, None);
     }
 
     /// The label is painted raw — one span in the transcript, one activity line
@@ -12875,9 +13387,18 @@ mod tests {
         assert_eq!(
             facts.outcome,
             Some(CallOutcome {
-                text: "outline · 300 definitions".to_string(),
+                text: "outline".to_string(),
                 tone: Tone::Ok,
             })
+        );
+        assert_eq!(
+            facts.measure,
+            Some(Measure {
+                count: Some("300 defs".to_string()),
+                size: None,
+            }),
+            "the count is the sketch's own, and the sketch's bytes weigh the \
+             answer rather than the file"
         );
         assert!(facts.details.is_empty(), "{:?}", facts.details);
         let _ = fs::remove_dir_all(actor.ws.root());

@@ -291,7 +291,7 @@ pub fn tokens_label(tokens: usize) -> String {
     }
 }
 
-/// One image as a row reads it: `shots/a.png (png · 1.2 MB)`.
+/// One image as a row reads it: `shots/a.png (png · 1.2MB)`.
 ///
 /// The one spelling, used by the message box's attachment rows and by the row
 /// the transcript paints under the words: a picture the human is about to send
@@ -360,23 +360,25 @@ fn blind_model_line(model: &str) -> String {
 /// the model whole.
 const BOX_IMAGE_BYTES: usize = (mush_core::workspace::IMAGE_FILE_CAP * 8) as usize;
 
-/// A byte count the way a glance wants it: `900 B`, `340 KB`, `1.2 MB`. One
-/// decimal for the unit that needs one — a megabyte is where the rounding is
-/// visible, and `1.2` says more than `1258` or than a bare `1`.
+/// A byte count the way a glance wants it: `900B`, `340KB`, `1.2MB`. One decimal
+/// for the unit that needs one — a megabyte is where the rounding is visible,
+/// and `1.2` says more than `1258` or than a bare `1` — and **no space inside
+/// the unit**: a size is one unit of a row's clause (`45L 1.2KB`), not two words
+/// a reader has to pair up.
 ///
-/// `pub(crate)` because the agent's own digest reads it: a read's result is
-/// weighed in the compact log with the same spelling the box weighs an
-/// attachment in ([`crate::agent::digest`]), not a second one.
+/// `pub(crate)` because the agent's own digest reads it: a read's result and the
+/// payload it weighs are spelled with the same unit the box weighs an
+/// attachment in ([`crate::agent::Measure`]), not a second one.
 pub(crate) fn size_label(bytes: usize) -> String {
     const KB: usize = 1_000;
     const MB: usize = 1_000_000;
     if bytes < KB {
-        format!("{bytes} B")
+        format!("{bytes}B")
     } else if bytes < MB {
-        format!("{} KB", bytes / KB)
+        format!("{}KB", bytes / KB)
     } else {
         let text = format!("{:.1}", bytes as f64 / MB as f64);
-        format!("{} MB", text.strip_suffix(".0").unwrap_or(&text))
+        format!("{}MB", text.strip_suffix(".0").unwrap_or(&text))
     }
 }
 
@@ -12689,7 +12691,7 @@ mod tests {
 
         let text = shot(&mut app, 120, 32).text();
         assert!(text.contains("you ›"), "the speaker mark: {text}");
-        assert!(text.contains("▣ shot.png (png · 8 B)"), "{text}");
+        assert!(text.contains("▣ shot.png (png · 8B)"), "{text}");
     }
 
     /// The vision gate holds at the wire, not only at the box: a model can be
@@ -12815,7 +12817,7 @@ mod tests {
         std::fs::write(app.ws.root().join("shots/a.png"), png(340_000)).unwrap();
         app.update(Msg::Paste("shots/a.png".into()));
 
-        let label = "shots/a.png (png · 340 KB)";
+        let label = "shots/a.png (png · 340KB)";
         let Screen::Panes(panes) = app.screen(Rect::new(0, 0, 120, 32)) else {
             panic!("a terminal with room for the panes");
         };
@@ -22284,7 +22286,7 @@ mod tests {
     /// D5: the box paints the line the cursor is on, however short it is.
     ///
     /// At 40×12 with three attachments the audit's frame put the cursor on
-    /// `▣ shots/shot0.png (png · 0 B)` and painted the draft nowhere: the box
+    /// `▣ shots/shot0.png (png · 0B)` and painted the draft nowhere: the box
     /// asked for six rows, was granted five, and the attachment rows took them
     /// all. The text gets its row before the attachments, so this paints a real
     /// `TestBackend` frame at every sweep size, for 1..=8 attachments, and reads
@@ -22395,7 +22397,7 @@ mod tests {
         let boxed = shot(&mut app, 40, 12);
         boxed.assert_shape("an attachment at the floor", 40, 12);
         assert!(
-            boxed.text().contains("… (png · 1.5 MB)"),
+            boxed.text().contains("… (png · 1.5MB)"),
             "the box cuts the name and keeps the size: {}",
             boxed.text()
         );
@@ -22406,7 +22408,7 @@ mod tests {
         let wide = shot(&mut app, 80, 24);
         wide.assert_shape("a sent picture at 80×24", 80, 24);
         assert!(
-            wide.text().contains("… (png · 1.5 MB)"),
+            wide.text().contains("… (png · 1.5MB)"),
             "the transcript cuts the name and keeps the size: {}",
             wide.text()
         );

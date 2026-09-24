@@ -366,7 +366,7 @@ pub(crate) mod tests {
     use ratatui::widgets::{Block, Borders};
     use unicode_width::UnicodeWidthStr;
 
-    use crate::agent::{CallFacts, CallOutcome, Tone};
+    use crate::agent::{CallFacts, CallOutcome, Measure, Tone};
     use crate::app::call_grid;
     use crate::app::screen::{AgentsPane, BarPane, ChatPane, InputPane, Panes, Screen};
     use crate::app::symbols::Symbols;
@@ -766,15 +766,16 @@ pub(crate) mod tests {
 
     /// One tool call's rows as the pane paints them: the digest header and the
     /// result's detail rows through [`call_grid`], the one grid both views use,
-    /// with the tool's own mark ([`Symbols`]). The ask, the outcome and the
-    /// details are the fixture's words, but the mark, the columns and the
-    /// arrow's place are the pane's arithmetic — a sample cannot show a row the
-    /// grid would not paint.
+    /// with the tool's own mark ([`Symbols`]). The ask, the verdict, the measure
+    /// and the details are the fixture's words, but the mark, the columns and
+    /// the arrow's place are the pane's arithmetic — a sample cannot show a row
+    /// the grid would not paint.
     fn call_rows(
         name: &str,
         ask: &str,
         outcome: &str,
         tone: Tone,
+        measure: Option<(&str, Option<&str>)>,
         details: &[&str],
     ) -> Vec<Line<'static>> {
         let call = ToolCall {
@@ -790,6 +791,10 @@ pub(crate) mod tests {
             outcome: Some(CallOutcome {
                 text: outcome.to_string(),
                 tone,
+            }),
+            measure: measure.map(|(count, size)| Measure {
+                count: Some(count.to_string()),
+                size: size.map(str::to_string),
             }),
             details: details.iter().map(|row| row.to_string()).collect(),
         };
@@ -937,15 +942,18 @@ pub(crate) mod tests {
             Style::default().fg(Color::Green),
             "Starting with the rename.",
         ));
-        // The reply and the call are one assistant message: the call's row
-        // follows the words with no blank between them, and the blank under it
-        // closes the turn. The result below is that call's own payload — one
-        // block, so no blank stands between the header and it.
+        // The prose breathes and the calls do not: the reply's blank stands
+        // *between* its words and the call the same turn made, and the call's
+        // own block follows with no blank of its own. The result below is that
+        // call's payload — one block, so no blank stands between the header and
+        // it.
+        transcript.push(Line::from(""));
         transcript.extend(call_rows(
             "edit_file",
             "src/lex.rs",
             "3 hunks",
             Tone::Ok,
+            None,
             &[],
         ));
         transcript.extend(payload(
@@ -1002,8 +1010,10 @@ pub(crate) mod tests {
     /// §4.5's sample: one row per phase and one per row mark, so the picture
     /// says the same thing about the marks the `marks` block names. Its chat is
     /// the pane's own rows too ([`readme_sample_screen`]): a spawn and a wait,
-    /// their payloads at the grid's gutter ([`payload`]), and the report rows
-    /// the tree's phases were built from.
+    /// the wait's payload at the grid's gutter ([`payload`]), and the report
+    /// rows the tree's phases were built from. The spawn's own report is not
+    /// painted — the call's row and its detail row already say it — so a
+    /// spawned child is one row.
     ///
     /// The child is spawned and its wait times out while it still works, which
     /// is the phase the tree's `◐ #2 tests` row shows: the chat is the same
@@ -1028,28 +1038,28 @@ pub(crate) mod tests {
             Style::default().fg(Color::Green),
             "Spawning the children.",
         ));
+        transcript.push(Line::from(""));
         transcript.extend(call_rows(
             "spawn_agent",
             "tests probe",
             "#2 on mush/2",
             Tone::Running,
+            None,
             &["mush/2 · .mush/wt/2"],
         ));
-        // The result's own sentence is long enough to wrap under the call: the
-        // grid's gutter leads every row of it, and the block follows its header
-        // with no blank of its own — one call is one block.
-        transcript.extend(payload(
-            Symbols::GUTTER_MARK,
-            dim(),
-            "spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops calling tools · wait \
-             returns its summary",
-        ));
-        transcript.push(Line::from(""));
+        // The spawn's own report is *not* painted: the call's row already says
+        // `#2 on mush/2` and the detail row above names the worktree, so the
+        // sentence would say the same fact twice over ([`crate::app::chat`]'s
+        // `spawn_report` — one spawned child is one row). The wait below is a
+        // turn of its own and its call rows are a dense list, so no blank
+        // stands between the two calls; the wait's result closes its own block
+        // with the blank under its payload.
         transcript.extend(call_rows(
             "wait",
             "",
             "#2 still running",
             Tone::Running,
+            None,
             &[],
         ));
         transcript.extend(payload(

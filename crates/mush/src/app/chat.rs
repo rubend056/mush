@@ -4423,11 +4423,18 @@ fn render_message(
             // fold, whose number for it is `usize::MAX`: what the human pressed
             // `Ctrl-T` to read is shown whole, and only a setting that lowers
             // the number makes it fold like any other block.
-            let words = out.len();
+            // What the turn held when its own rows began, and what it *said*:
+            // the reasoning is a block of its own ([`Kind::Reasoning`]) and not
+            // prose, so the blank that separates words from the calls they made
+            // goes after the reply — while a turn that only thought painted a
+            // block of its own all the same, and one that called nothing closes
+            // it like any other block.
+            let painted = out.len();
             if reasoning {
                 reasoning_rows(out, message, width, fold);
                 rows.resize(out.len() - start, None);
             }
+            let words = out.len();
             let text = message.text();
             if !text.trim().is_empty() {
                 // The reply is the conversation's own text: the one block the
@@ -4444,12 +4451,23 @@ fn render_message(
                 );
             }
             image_rows(out, message, width);
-            // Rule 2 of the closing blank: in the compact log a turn whose only
-            // painted rows are its call lines paints no blank, so consecutive
-            // command-only turns read as one dense list — the calls are the log.
-            // Every other compact turn (a reply, a thought, a picture) keeps its
-            // blank, and the shown view keeps the blank either way.
+            // The prose breathes where it stands, and the calls do not: a turn
+            // that said anything — a reply, a picture — closes its own words
+            // with the blank, **before** the call rows of the same turn, and a
+            // turn whose only rows are calls paints none. The blank used to come
+            // after the calls, which is what glued the prose to the call above
+            // it and left an empty row under the last call of a speaking turn;
+            // the calls of a command-only stretch stay one dense list, so the
+            // log reads as the calls with the words around them. The reasoning
+            // block is the turn's own thinking and not prose (`words` above),
+            // so it stands against the calls it decided.
+            // The same rule in both views: what follows a turn's calls is their
+            // results' payloads, and in the shown view those close their own
+            // block ([`closing_blank`] at the result).
             let spoke = out.len() > words;
+            if spoke {
+                blank(out, &mut rows);
+            }
             // The one clock this turn's rows carry: a call still in flight
             // wears the elapsed time on its row, and the first call without a
             // result is the one running (a batch's results land in order, so
@@ -4480,7 +4498,13 @@ fn render_message(
                 // fact because the cache's own entry is shared with the other
                 // rows of the batch.
                 let aged;
-                let facts = match (age, facts.outcome.is_none()) {
+                let facts = match (
+                    age,
+                    // A call whose result landed has a verdict, a measure, or
+                    // both; one with neither is the one still running, and the
+                    // elapsed time is the only sentence there is to paint.
+                    facts.outcome.is_none() && facts.measure.is_none(),
+                ) {
                     (Some(elapsed), true) => {
                         age = None;
                         aged = CallFacts {
@@ -4506,47 +4530,46 @@ fn render_message(
                     }
                 }
             }
-            // The blank a turn closes with — and its one exception: in the
-            // shown view a turn that made calls closes with none, because the
-            // rows under it are those calls' payloads and the blank would sit
-            // *inside* the block the human reads as one thing (finding: the
-            // blank the payload used to be pushed away from its header by).
-            // The compact log is untouched: a call block paints no payload
-            // there, so there is no inside for a blank to fall into, and its
-            // own rule (`spoke`) is what keeps consecutive command-only turns
-            // one dense list.
-            let closes = if compact {
-                spoke
-            } else {
-                message.tool_calls().is_empty()
-            };
-            if closes {
-                closing_blank(out, &mut rows, start);
-            } else {
-                rows.resize(out.len() - start, None);
+            // A turn closes with no blank of its own: its calls' results are
+            // the next message's rows, and the blank a speaking turn owes is
+            // already behind its words. The one exception is a turn that
+            // painted a block of its own and called nothing at all — a thought
+            // with no call under it — because nothing follows it to be read
+            // against: that block closes the message the way a report does.
+            if !spoke && message.tool_calls().is_empty() && out.len() > painted {
+                blank(out, &mut rows);
             }
+            rows.resize(out.len() - start, None);
         }
         "tool" => {
             // A result is a file dump, so [`folded_block`] paints it through
             // [`Kind::Result`]; the failure row it may never give up is the
-            // fold's own rule ([`Fold`]).
+            // fold's own rule ([`Fold`]). A spawn's own report is *not* a dump:
+            // mush wrote it, the call's row already says its one fact (`#185 on
+            // mush/185`) and its details row names the worktree, so painting it
+            // again cost one spawned child two rows ([`spawn_report`]).
             if let Some((kind, head)) = folded_block(message, None) {
-                folded_marked(
-                    out,
-                    &mut rows,
-                    head,
-                    message.text(),
-                    width,
-                    kind,
-                    fold,
-                    numbers,
-                );
+                if !spawn_report(message.text()) {
+                    folded_marked(
+                        out,
+                        &mut rows,
+                        head,
+                        message.text(),
+                        width,
+                        kind,
+                        fold,
+                        numbers,
+                    );
+                }
             }
             image_rows(out, message, width);
             // A payload closes its block only where the next thing is not
             // another payload: two results of one turn are one call block, and
             // the blank between them was the last one the pane spent inside it.
-            if !followed_by_result {
+            // The compact log paints no payload at all, so it paints no blank
+            // here either: a result's one kept row is the failure row, and a
+            // blank under it would sit inside the call's own block.
+            if !compact && !followed_by_result {
                 closing_blank(out, &mut rows, start);
             } else {
                 rows.resize(out.len() - start, None);
@@ -4562,6 +4585,13 @@ fn render_message(
     rows
 }
 
+/// The blank that separates one message from the next, pushed where a
+/// message's own words end — see the assistant arm's own rule.
+fn blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>) {
+    out.push(Line::from(""));
+    rows.push(None);
+}
+
 /// Close a message with the blank that separates it from the next one — where
 /// the message painted a row of its own to close.
 ///
@@ -4572,9 +4602,18 @@ fn render_message(
 fn closing_blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>, start: usize) {
     rows.resize(out.len() - start, None);
     if out.len() > start {
-        out.push(Line::from(""));
-        rows.push(None);
+        blank(out, rows);
     }
+}
+
+/// Whether a result is mush's own report of a spawn rather than a payload: the
+/// sentence [`crate::agent::SPAWNED`] opens, which the call's own row already
+/// says in its outcome (`#185 on mush/185`) and, in the unfolded view, in its
+/// details row (the worktree). The transcript is where mush's own sentences are
+/// found ([`folded_block`] reads [`crate::agent::FAILED`] the same way), and
+/// the fold must know: a spawned child is one row.
+fn spawn_report(text: &str) -> bool {
+    text.trim_start().starts_with(crate::agent::SPAWNED)
 }
 
 /// Which view makes a text's rows: the reply's markdown, or the wrapper every
@@ -5743,17 +5782,31 @@ mod tests {
 
         // The arguments behind the pane change — a state no transcript road
         // writes, and the only way to tell a re-read from a stored reading.
+        // The new blob is the same size to the byte (the longer path is paid
+        // for out of the padding), so the size marker cannot come into it.
+        let other = format!(
+            r#"{{"path":"somewhere/else.rs","content":"{}"}}"#,
+            "y".repeat((1 << 20) - 12)
+        );
         if let Some(calls) = chat
             .root
             .last_mut()
             .and_then(|message| message.tool_calls.as_mut())
         {
-            calls[0].function.arguments = r#"{"path":"somewhere/else.rs"}"#.into();
+            calls[0].function.arguments = other;
         }
         let second = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 120, 4)).join("\n");
-        assert_eq!(
-            first, second,
-            "the frame paints the reading the call was recorded with"
+        assert!(
+            second.contains("a.txt") && !second.contains("somewhere"),
+            "the frame paints the reading the call was recorded with: {second:?}"
+        );
+        // The size marker moves with the arguments and not with the reading:
+        // it is a fact about the bytes as they are now, measured from the call
+        // the painter holds ([`call_grid`]'s `argument_marker`) and not carried
+        // in the digest, because the digest is what the arguments *asked*.
+        assert!(
+            second.contains("a.txt (1MB)"),
+            "the marker weighs the arguments the call carries now: {second:?}"
         );
 
         // A replacement is a new transcript, and the readings keyed by the old
@@ -5842,7 +5895,7 @@ mod tests {
     }
 
     /// The pane's row is made of the picture's own facts, and the size is one of
-    /// them: a payload given up must not turn `▣ shots/screen.png (png · 2.1 MB)`
+    /// them: a payload given up must not turn `▣ shots/screen.png (png · 2.1MB)`
     /// into a row about an empty picture. The size is read from the stored fact
     /// ([`Image::size`]), not measured off the buffer that held the bytes.
     #[test]
@@ -5854,7 +5907,7 @@ mod tests {
             None,
         );
         let before = image_label(&picture, usize::MAX);
-        assert_eq!(before, "shots/screen.png (png · 2.1 MB)");
+        assert_eq!(before, "shots/screen.png (png · 2.1MB)");
 
         picture.give_up_payload();
 
@@ -6112,7 +6165,7 @@ mod tests {
         // payload is not painted, the report keeps its one row, and the
         // reasoning — `Ctrl-T`'s block, not output — is no row at all.
         assert!(
-            fresh.iter().any(|row| row.contains("→ 1 line")),
+            fresh.iter().any(|row| row.ends_with("1L 15B")),
             "the call's row carries its outcome: {fresh:?}"
         );
         assert!(
@@ -8699,7 +8752,7 @@ mod tests {
         let rows = shown(&pane_rows(&chat, &pane, 60, 6));
         assert_eq!(
             rows[0],
-            grid_row("❯ cargo test", "1 line · 5s", 60),
+            split_row("❯ cargo test", "5s", "1L 2B", 60),
             "the result speaks for the call: {rows:?}"
         );
         assert!(
@@ -8806,8 +8859,9 @@ mod tests {
     fn a_failure_is_never_what_the_fold_gives_up() {
         let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Mush, 0);
 
-        // A failed result: the failure row stays with the blank that closes it,
-        // and the log it came with is what the fold gives up.
+        // A failed result: the failure row stays — the fold never gives it up —
+        // and in the compact log nothing follows a result's row, so no blank
+        // closes it (the block's own rule: [`render_message`]'s `"tool"` arm).
         let failed = "error: the call was refused\nthe log line one\nthe log line two";
         let rows = shown(&message_rows_under(
             &Message::tool("call_1", failed),
@@ -8816,10 +8870,7 @@ mod tests {
             true,
             zero,
         ));
-        assert_eq!(
-            rows,
-            vec!["! error: the call was refused".to_string(), String::new(),]
-        );
+        assert_eq!(rows, vec!["! error: the call was refused".to_string()]);
 
         // The same text as a *success* paints nothing at all at 0 — not even
         // the blank, because a message with no rows of its own has nothing to
@@ -8943,8 +8994,12 @@ mod tests {
             hidden,
             vec![
                 "mush › running the tests".to_string(),
-                grid_row("❯ cargo test", "3 lines", 60),
+                // The prose closed its own words with the blank, before the
+                // call of the same turn.
                 String::new(),
+                // A clean exit is not news, so the row carries the payload's
+                // own measure and no verdict.
+                split_row("❯ cargo test", "", "3L 59B", 60),
                 "· #1 done: the parser is written".to_string(),
             ],
             "the call's line carries its outcome, the report keeps its whole one \
@@ -9429,23 +9484,24 @@ mod tests {
             rows,
             vec![
                 grid_row("◐", "2 agents · 1 job · 1 unread", 88),
-                grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
-                grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
+                // A read answers with its payload's own measure and no news: the
+                // arrow is the column's mark, and the pair stands split because
+                // this pane's box holds both whole.
+                split_row("▤ text.rs 1408→1530", "", "123L/9000L 4KB", 88),
+                split_row("⌕ \"column_widths\" in crates", "", "7 hits 266B", 88),
                 grid_row("± text.rs", "3 hunks", 88),
-                grid_row("❯ cargo test -p mush-core", "41 lines · 5s", 88),
+                split_row("❯ cargo test -p mush-core", "5s", "41L 604B", 88),
                 grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
                 grid_row("↳ table layout fixes", "#185 on mush/185", 88),
                 grid_row("⧗", "#185 done", 88),
                 grid_row("⧗", "user spoke", 88),
-                grid_row(
-                    "⇄ #9 stop",
-                    "error: no such child agent #9 — status lists yours",
-                    88
-                ),
-                // The failure row the fold never gives up, and the blank that
-                // closes it: the failure said words of its own.
+                // The failure's own `! error: …` row is painted under the call,
+                // so the verdict says the one word and not the sentence twice.
+                grid_row("⇄ #9 stop", "error", 88),
+                // The failure row the fold never gives up: the result's one row,
+                // with no blank under it — a blank there would stand inside the
+                // call's own block.
                 "! error: no such child agent #9 — status lists yours".to_string(),
-                String::new(),
                 // A report and another agent's words, one row each, whole.
                 "· #185 done: the table is laid out".to_string(),
                 String::new(),
@@ -9472,12 +9528,106 @@ mod tests {
             !rows.iter().any(|row| row.contains("… +")),
             "no row stands for the rows the compact log does not paint: {rows:?}"
         );
-        // The prose keeps its blank and the call rows do not: four blanks, one
-        // per message that spoke, and none between the call lines.
+        // The prose keeps its blank and the call rows do not: three blanks, one
+        // per message that spoke, and none between the call lines or under a
+        // call's own result.
         assert_eq!(
             rows.iter().filter(|row| row.is_empty()).count(),
-            4,
+            3,
             "blanks close the blocks that said words: {rows:?}"
+        );
+    }
+
+    /// When the blank is painted, and where: a turn that said something closes
+    /// its own words with the blank **before** the calls of the same turn, a
+    /// turn of nothing but calls paints none, and a call's result paints no
+    /// blank under it — so two call turns read as one dense list, and prose is
+    /// never glued to the call above it (the human's own two findings: the
+    /// prose that hugged the call before it, and the empty row under the last
+    /// call of a speaking turn).
+    #[test]
+    fn the_blank_stands_under_the_words_and_not_under_the_calls() {
+        let turn = |text: &str, id: &str, command: &str| Message {
+            tool_calls: Some(vec![tool_call(
+                id,
+                "run_command",
+                &format!(r#"{{"command":"{command}"}}"#),
+            )]),
+            ..Message::assistant(text)
+        };
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, turn("let me look", "c1", "ls"));
+        chat.push_message(AgentId::ROOT, Message::tool("c1", "one\n[exit 0]"));
+        // A turn of nothing but a call: no blank of its own, so its row and the
+        // row above it are one list whatever the turns between them.
+        chat.push_message(AgentId::ROOT, turn("", "c2", "pwd"));
+        chat.push_message(AgentId::ROOT, Message::tool("c2", "/w\n[exit 0]"));
+        chat.push_message(AgentId::ROOT, turn("both done", "c3", "date"));
+        chat.push_message(AgentId::ROOT, Message::tool("c3", "today\n[exit 0]"));
+        let pane = pane(AgentId::ROOT);
+        let rows = shown(&pane_rows(&chat, &pane, 60, 40));
+        assert_eq!(
+            rows,
+            vec![
+                "mush › let me look".to_string(),
+                String::new(),
+                split_row("❯ ls", "", "1L 3B", 60),
+                split_row("❯ pwd", "", "1L 2B", 60),
+                "mush › both done".to_string(),
+                String::new(),
+                split_row("❯ date", "", "1L 5B", 60),
+            ],
+            "the blank closes the words, and the calls are one dense list"
+        );
+    }
+
+    /// A spawned child is **one row**: the call's own. The sentence mush writes
+    /// when a spawn lands (`spawned agent #185 …`) is mush's own report and not
+    /// a payload the call produced — the row already says `#185 on mush/185`
+    /// and the detail row names the worktree — so it is not painted under the
+    /// header in either view ([`spawn_report`]).
+    #[test]
+    fn a_spawns_report_is_not_painted_under_its_call() {
+        let mut chat = Chat::bare();
+        chat.set_output(true);
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "spawn_agent",
+                    r#"{"brief":"table layout fixes"}"#,
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c1",
+                "spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · \
+                 wait returns its summary",
+            ),
+        );
+        let pane = pane(AgentId::ROOT);
+        let rows = shown(&pane_rows(&chat, &pane, 88, 40));
+        assert_eq!(
+            rows,
+            vec![
+                grid_row("↳ table layout fixes", "#185 on mush/185", 88),
+                "│ mush/185 · .mush/wt/185".to_string(),
+            ],
+            "one spawned child is one row"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("spawned agent")),
+            "the report is not a payload: {rows:?}"
+        );
+        // The compact log paints no payload at all, and keeps the same row.
+        chat.set_output(false);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 88, 40)),
+            vec![grid_row("↳ table layout fixes", "#185 on mush/185", 88)],
         );
     }
 
@@ -9492,6 +9642,22 @@ mod tests {
             "{ask}{}→ {}",
             " ".repeat(gap),
             truncate(outcome, grid.outcome_columns())
+        )
+    }
+
+    /// One call's header row in the split grammar: the ask, the arrow at the
+    /// grid's own column, the verdict behind it and the measure at the pane's
+    /// own right edge. An empty verdict is a row whose result carried only its
+    /// payload's weight: the arrow stays, because it is the column's own mark.
+    fn split_row(ask: &str, verdict: &str, measure: &str, width: usize) -> String {
+        let grid = call_grid::Grid::of(width);
+        let gap = grid.arrow_x().saturating_sub(UnicodeWidthStr::width(ask));
+        let used = grid.arrow_x() + 2 + UnicodeWidthStr::width(verdict);
+        let fill = width.saturating_sub(used + UnicodeWidthStr::width(measure));
+        format!(
+            "{ask}{gap}→ {verdict}{fill}{measure}",
+            gap = " ".repeat(gap),
+            fill = " ".repeat(fill)
         )
     }
 
@@ -9591,7 +9757,7 @@ mod tests {
         chat.push_message(AgentId::ROOT, Message::tool("c1", "ok\n[exit 0]"));
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 6)),
-            vec![grid_row("❯ cargo test", "1 line", 60)],
+            vec![split_row("❯ cargo test", "", "1L 2B", 60)],
             "the result landed: the arrow is read from the message that carried it"
         );
     }
@@ -9625,19 +9791,19 @@ mod tests {
                 "│ #1 running".to_string(),
                 "│ #2 done".to_string(),
                 "│ #c1 running".to_string(),
-                grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
-                "│ of 9000 lines".to_string(),
-                grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
+                split_row("▤ text.rs 1408→1530", "", "123L/9000L 4KB", 88),
+                "│ of 9000L".to_string(),
+                split_row("⌕ \"column_widths\" in crates", "", "7 hits 266B", 88),
                 "│ 7 hits in crates/a.rs, crates/b.rs, crates/c.rs".to_string(),
                 grid_row("± text.rs", "3 hunks", 88),
-                grid_row("❯ cargo test -p mush-core", "41 lines · 5s", 88),
+                split_row("❯ cargo test -p mush-core", "5s", "41L 604B", 88),
                 grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
                 grid_row("↳ table layout fixes", "#185 on mush/185", 88),
                 "│ mush/185 · .mush/wt/185".to_string(),
                 grid_row("⧗", "#185 done", 88),
                 "│ from #185".to_string(),
                 grid_row("⧗", "user spoke", 88),
-                grid_row("⇄ #9 stop", "error: no such child agent #9 — status lists yours", 88),
+                grid_row("⇄ #9 stop", "error", 88),
                 // No blank between a call's header and the payload under it —
                 // the block is one thing — and the fold's own shape under each
                 // result: three head rows, the `…` counting the hidden middle,
@@ -9674,9 +9840,9 @@ mod tests {
                 "│ test 40 ... ok".to_string(),
                 "│ [exit 0 after 5s]".to_string(),
                 "│ [exit 101]".to_string(),
-                "│ spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · wait"
-                    .to_string(),
-                "│ returns its summary".to_string(),
+                // A spawn's own report is not a payload: the call's row already
+                // says `#185 on mush/185` and the detail row above names the
+                // worktree, so a spawned child is one row ([`spawn_report`]).
                 "│ #185 done: the table is laid out".to_string(),
                 "│ interrupted — the human wrote to you while you waited; it is in your transcript."
                     .to_string(),
@@ -9747,12 +9913,12 @@ mod tests {
             shown(&pane_rows(&chat, &pane, 60, 20)),
             vec![
                 "! error: the call was refused".to_string(),
-                String::new(),
                 "· #1 failed: no route to the endpoint".to_string(),
                 "  … +1 more lines".to_string(),
             ],
-            "the failures stay — with their closing blanks, because they said \
-             words of their own — and nothing else does"
+            "the failures stay and nothing else does: the result's own row \
+             carries no blank in the compact log, and the report's own blank is \
+             the foot's to trim"
         );
     }
 
