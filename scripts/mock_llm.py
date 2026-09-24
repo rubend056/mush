@@ -81,6 +81,28 @@ chat pane holds the keys; `\\e[5~` is PageUp, ten rows a press.)
         --ask "SHAPES: show me every call shape"
     kill %1
 
+8. ASKS (user message contains "ASKS"): the shapes a `run_command`'s ask
+   has to carry — a chain, a `cd` into a child's checkout (the row's cwd
+   chip), a pipeline, a heredoc script (the body that lived only in the
+   call's own arguments), and a five-stage chain long enough that the compact
+   log's one row ends at a seam and counts what it left. The workdir needs
+   nothing in it: the first turn writes the note the rest reads, and no child
+   is spawned, so a plain git repository is enough. A hand-driven
+   `scripts/screen.py` run shows both views of the same rows — the compact
+   log is the launch view, and `--keys '\x0f'` is `Ctrl-O`:
+
+    rm -rf /tmp/mush-asks && mkdir -p /tmp/mush-asks
+    git -C /tmp/mush-asks init -q
+    git -C /tmp/mush-asks -c user.email=mock@mush -c user.name=mock \
+        commit -q --allow-empty -m "asks baseline"
+    python3 scripts/mock_llm.py 8732 &
+    python3 scripts/screen.py target/debug/mush /tmp/mush-asks \
+        --url http://127.0.0.1:8732 --model mock \
+        --sizes 100x28,100x28,60x28,60x28 --settle 12 \
+        --keys-after '\x0f' \
+        --ask "ASKS: show me what a long command's row does"
+    kill %1
+
 The same scenario with a short `--settle` and a fresh workdir catches shape 5
 the way it can only be caught while it runs — the transcript ends on the
 `sleep 6` call, whose in-flight header is on the pane; the run reaches that
@@ -225,6 +247,62 @@ class Handler(BaseHTTPRequestHandler):
         ]
         return script[min(turn, len(script) - 1)]
 
+    def asks(self, messages):
+        """Scenario 8: the asks of `run_command`, one shape each.
+
+        The turn is read off the transcript, like [`shapes`], so the server
+        holds no state. Every command is a shell read of the note the first
+        turn writes, so no toolchain is needed in the workdir; the fourth
+        turn's heredoc is ten lines long, so the unfolded view's fold paints
+        it as a head, an elision row and a tail — the same eight rows a payload
+        costs.
+        """
+        turn = sum(1 for m in messages if m.get("role") == "tool")
+        script = [
+            # 1 — a three-stage chain with no `cd`: no chip, and the note the
+            #     rest of the scenario reads.
+            self.tool_call("run_command", {
+                "command": "mkdir -p .mush/wt/198 && printf 'note\\n' > note.txt "
+                           "&& cp note.txt .mush/wt/198/note.txt && echo wrote the note",
+            }),
+            # 2 — a chain behind a `cd` into a child's checkout: the prefix the
+            #     digest strips, and the chip is the only place the row says so.
+            self.tool_call("run_command", {
+                "command": "cd .mush/wt/198 && wc -l note.txt && echo in-the-checkout",
+            }),
+            # 3 — a pipeline: one thing, and it keeps its row.
+            self.tool_call("run_command", {
+                "command": "seq 1 200 | awk '{n += $1} END {print \"sum\", n}'",
+            }),
+            # 4 — a heredoc: the script *is* the work, and it lived nowhere on
+            #     the pane but in this call's own arguments.
+            self.tool_call("run_command", {
+                "command": "python3 - <<'PY'\n"
+                           "import json\n"
+                           "import math\n"
+                           "\n"
+                           "rows = [{\"n\": n, \"square\": n * n} for n in range(1, 13)]\n"
+                           "for row in rows:\n"
+                           "    row[\"root\"] = round(math.sqrt(row[\"square\"]), 3)\n"
+                           "total = sum(row[\"square\"] for row in rows)\n"
+                           "biggest = max(rows, key=lambda row: row[\"square\"])\n"
+                           "print(json.dumps({\"rows\": len(rows), \"total\": total,\n"
+                           "                  \"biggest\": biggest}))\n"
+                           "PY",
+            }),
+            # 5 — a five-stage chain behind the same `cd`: long enough that the
+            #     compact log's row ends at a seam and counts the rest.
+            self.tool_call("run_command", {
+                "command": "cd .mush/wt/198 && wc -l note.txt && wc -c note.txt "
+                           "&& wc -w note.txt && wc -m note.txt && echo counted-every-way",
+            }),
+            # The plain-text reply that ends the run.
+            {"role": "assistant",
+             "content": "every ask shape is on a row above - a chain, a checkout, a pipeline "
+                        "and a script"},
+        ]
+        return script[min(turn, len(script) - 1)]
+
     def do_POST(self):  # /v1/chat/completions
         length = int(self.headers.get("Content-Length", 0))
         request = json.loads(self.rfile.read(length))
@@ -274,6 +352,10 @@ class Handler(BaseHTTPRequestHandler):
             # Scenario 7: the call shapes, one turn each (the command is in the
             # module docstring, "Seeing the shapes").
             reply = self.shapes(messages, joined, system)
+        elif "ASKS" in joined:
+            # Scenario 8: the shapes of a command's ask, one turn each (the
+            # commands are in the module docstring, "Scenario 8").
+            reply = self.asks(messages)
         elif "TURNS" in joined:
             # The same call, unchanged, every turn: nothing counts turns any
             # more (finding H45), so what stops this hand-driven run is the
