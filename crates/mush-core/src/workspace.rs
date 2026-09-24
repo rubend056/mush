@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::git;
 use crate::message::Image;
+use crate::outline::Outline;
 use crate::session;
 use crate::text;
 
@@ -66,6 +67,18 @@ pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 /// is a match the model does not need and a walk that takes minutes; `run_command`
 /// is the road to that file.
 pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
+
+/// The sentence a read of a CRLF file appends, from its one home: the window
+/// road ([`Workspace::read_window`]) writes it under the text it shows, and
+/// [`crate::outline`] writes the same sentence under the rows it shows, because
+/// a line copied out of a CRLF file crosses the same line-ending rule whichever
+/// read handed it over (finding B7). Not a `pub` item: it is a sentence of
+/// mush's own, and the roads that write it are in this crate.
+pub(crate) const CRLF_NOTE: &str =
+    "[mush: the file's lines end with CRLF — the \\r is not shown in a line; an \
+     edit whose old_string or new_string holds a line break or a \\r is refused, a \
+     line's own text still edits exactly, and run_command (`sed -i`, `perl -pi`) or \
+     write_file is the road for anything across lines]";
 
 /// How much of one matching line `search` shows, in *bytes*, so one minified
 /// line cannot spend the whole result. A line past the cap is cut on a
@@ -1063,6 +1076,26 @@ impl Workspace {
         Ok(Some(Image::new(name, mime, bytes, pixels)))
     }
 
+    /// The declarations of one file with their line numbers, for the `outline`
+    /// tool and the unbounded read's fallback: the same lossy whole read the
+    /// window road takes (`Self::whole_read`), so a file a model may read is a
+    /// file it may sketch, and a path's refusals — not there, a directory,
+    /// binary, past [`READ_FILE_CAP`] — are the window road's own sentences
+    /// rather than a second set that could drift from them.
+    ///
+    /// The decode is lossy for the window road's reason: an outline is shown and
+    /// never written back, and a Latin-1 config still has a shape worth seeing.
+    /// What the rule reads as a declaration, and the invariant that a row never
+    /// lies about the line it names, live in [`crate::outline`] — this method
+    /// supplies the read and nothing else. A file with no definitions is not an
+    /// error: the sentence that says so is [`Outline::render`]'s.
+    pub fn outline(&self, rel: &str) -> Result<Outline, String> {
+        let text = self
+            .whole_read(rel, Decoding::Lossy)?
+            .text_or_refusal(rel)?;
+        Ok(Outline::of(rel, &text))
+    }
+
     /// A window of a text file, as the model reads it: `limit` lines from
     /// 1-based `offset`, cut to `cap` bytes, then one sentence if there is a
     /// rest — how much of the file this was and the `offset` that reads on.
@@ -1144,12 +1177,11 @@ impl Workspace {
         let last = offset + shown.len() - 1;
         let mut out = shown.join("\n");
         if text::is_crlf(&text) {
-            out.push_str(
-                "\n[mush: the file's lines end with CRLF — the \\r is not shown in a line; an \
-                 edit whose old_string or new_string holds a line break or a \\r is refused, a \
-                 line's own text still edits exactly, and run_command (`sed -i`, `perl -pi`) or \
-                 write_file is the road for anything across lines]",
-            );
+            // The sentence has one home ([`CRLF_NOTE`]) because the outline
+            // road appends the same one under the rows it shows: a line copied
+            // out of a CRLF file crosses the same ending rule either way.
+            out.push('\n');
+            out.push_str(CRLF_NOTE);
         }
         if part {
             out.push_str(&format!(
@@ -3958,6 +3990,107 @@ mod tests {
         );
         assert_eq!(ws.line_count("huge.log"), LineCount::More);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `outline` against every shape a path can have, and the file truths that
+    /// keep it honest: a path that cannot be read is refused in the *window
+    /// road's own words* (one whole read, so the two roads cannot disagree
+    /// about what a path is), and a file with nothing to sketch answers with a
+    /// sentence rather than a refusal — a markdown file, a config and an empty
+    /// file are normal files, and "no definitions" is a fact, not a failure.
+    ///
+    /// The non-Rust answers are pinned here because they are the textual rule's
+    /// declared cost. Prose with the word `fn` *inside* a sentence finds
+    /// nothing, and a TOML `type = "lib"` finds nothing (the keyword must be
+    /// followed by a name, not by `=`); but a markdown code fence whose line
+    /// *opens* with `fn sample() {}` is a row, because the rule reads lines and
+    /// the answer says on its own first line that it is not a compiler's.
+    #[test]
+    fn the_outline_road_answers_every_shape_a_path_can_have() {
+        let ws = temp_workspace("outline-shapes");
+
+        // A path that is not there, a directory and a binary file: the read
+        // refuses, and the sentences are the window road's own.
+        assert!(ws
+            .outline("no/such.rs")
+            .unwrap_err()
+            .contains("cannot read"));
+        fs::create_dir_all(ws.root().join("dir")).unwrap();
+        assert!(ws
+            .outline("dir")
+            .unwrap_err()
+            .contains("not a regular file"));
+        fs::write(ws.root().join("blob.bin"), b"text before \x00 after\n").unwrap();
+        assert!(ws.outline("blob.bin").unwrap_err().contains("binary"));
+
+        // Past the read cap, refused from the stat before any read — the
+        // sparse file the window road's own cap test uses.
+        let path = ws.root().join("huge.log");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(READ_FILE_CAP + 4096)
+            .unwrap();
+        let refused = ws.outline("huge.log").unwrap_err();
+        assert!(refused.contains("past the 32 MB cap"), "{refused}");
+        assert!(refused.contains("run_command"), "{refused}");
+
+        // An empty file has nothing to sketch, and says the file's own word.
+        fs::write(ws.root().join("empty.rs"), "").unwrap();
+        assert_eq!(
+            ws.outline("empty.rs").unwrap().render(4_000, ""),
+            "empty.rs is empty — there are no definitions to outline"
+        );
+
+        // A Rust file: the rows are the declarations' own lines.
+        fs::write(
+            ws.root().join("lib.rs"),
+            "//! docs\npub fn a() {}\n\nstruct B;\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ws.outline("lib.rs").unwrap().render(4_000, ""),
+            "lib.rs — 4 lines; 2 definitions (textual, Rust-first — not a compiler's \
+             answer)\n\n  2  pub fn a() {}\n  4  struct B;"
+        );
+
+        // A markdown file: prose finds nothing, and the answer names the road
+        // that still shows the text. A fenced line that *opens* like Rust does
+        // find something — the rule is textual, and the header says so.
+        fs::write(ws.root().join("NOTES.md"), "# Notes\nWe call fn things.\n").unwrap();
+        assert_eq!(
+            ws.outline("NOTES.md").unwrap().render(4_000, ""),
+            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
+             answer); read_file shows the text"
+        );
+        fs::write(
+            ws.root().join("SNIPPET.md"),
+            "# Sample\n\n```rust\nfn sample() {}\n```\n",
+        )
+        .unwrap();
+        let fenced = ws.outline("SNIPPET.md").unwrap().render(4_000, "");
+        assert!(fenced.contains("1 definition"), "{fenced}");
+        assert!(fenced.contains("  4  fn sample() {}"), "{fenced}");
+
+        // A config: `type = "lib"` is not a Rust declaration, because the
+        // keyword is followed by `=` and not by a name.
+        fs::write(
+            ws.root().join("Cargo.toml"),
+            "[package]\nname = \"x\"\ntype = \"lib\"\n",
+        )
+        .unwrap();
+        assert!(ws.outline("Cargo.toml").unwrap().is_empty());
+
+        // A CRLF file: the rows are the lines' own text — an ending is not a
+        // line's text — and the same sentence the window road writes says so.
+        fs::write(ws.root().join("crlf.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
+        let crlf = ws.outline("crlf.rs").unwrap().render(4_000, "");
+        assert!(crlf.contains("  1  fn a() {}"), "{crlf}");
+        assert!(crlf.contains("  2  fn b() {}"), "{crlf}");
+        assert!(
+            crlf.contains(CRLF_NOTE),
+            "the endings are said, not hidden: {crlf}"
+        );
         let _ = fs::remove_dir_all(ws.root());
     }
 

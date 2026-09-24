@@ -4755,6 +4755,7 @@ fn exec_tool(
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
+        ToolName::Outline => outline_tool(actor, state, args),
         ToolName::WriteFile => write_tool(actor, args),
         ToolName::ListFiles => list_tool(actor, state, args),
         ToolName::Search => search_tool(actor, state, args),
@@ -6095,6 +6096,25 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
         .map(ToolOutput::from)
 }
 
+/// `outline`: the definitions in one file with their line numbers.
+///
+/// The tool exists so a model can spend a screen on a file's shape instead of a
+/// window on its text. The answer says what it is on its own first line
+/// ([`mush_core::outline::Outline::header`]): a textual, Rust-first sketch and
+/// not a compiler's answer, so the model can price what it is reading. It takes
+/// no lock and runs no process, like every file tool, which is what makes it
+/// the sketch that still works while another sibling holds the machine.
+///
+/// The result is capped but never gutted: [`mush_core::outline::Outline::render`]
+/// reserves the room its own closing notes need before it spends the rest on
+/// rows, so a file with more definitions than fit says how many of them it
+/// showed (finding A11's class: a cut with no note reads as the whole answer).
+fn outline_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
+    let path = tools::arg_string(args, "path")?;
+    let outline = actor.ws.outline(&path)?;
+    Ok(outline.render(result_cap(actor, state), ""))
+}
+
 /// `write_file`: create or replace a whole file. The answer is one line naming
 /// what changed, because the model already knows what it wrote.
 ///
@@ -7101,6 +7121,7 @@ pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -
     let (ask, outcome, details) = match name {
         ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), Vec::new()),
         ToolName::ReadFile => (read_ask(args, root), read_outcome(ok), read_details(ok)),
+        ToolName::Outline => (path_ask(args, root), outline_outcome(ok), Vec::new()),
         ToolName::WriteFile => (path_ask(args, root), write_outcome(ok), Vec::new()),
         ToolName::ListFiles => (path_ask(args, root), list_outcome(ok), list_details(ok)),
         ToolName::Search => (
@@ -7447,6 +7468,36 @@ fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
             count_label(payload.lines().count(), "line"),
             size_label(payload.len())
         ),
+        tone: Tone::Ok,
+    })
+}
+
+/// An outline's outcome: `37 definitions`, read off the header's own clause —
+/// and `no definitions`, the none-verdict a miss wears, for the sentence a file
+/// with nothing to sketch answers with. That sentence is an `Ok` result and not
+/// a refusal (a markdown file is a normal file), so the digest must not paint
+/// it as one; mush's own header instead of the model's prose is what makes the
+/// reading trustworthy, and the header is written in this file.
+///
+/// The header's line count is not repeated in the details: the unfolded view
+/// paints the payload, whose first line *is* the header, so a detail row would
+/// be the same number twice on one screen. Nothing else in the result is a fact
+/// the outcome does not already spell.
+fn outline_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let first = first_line(text);
+    if first.contains("no definitions") {
+        return Some(CallOutcome {
+            text: "no definitions".to_string(),
+            tone: Tone::None,
+        });
+    }
+    // `… — 4,120 lines; 37 definitions (textual, …)`: the count is the word
+    // before `definition`, with the header's thousands comma read back out.
+    let clause = first.split(';').find(|part| part.contains(" definition"))?;
+    let count = clause.split_whitespace().next()?.replace(',', "");
+    Some(CallOutcome {
+        text: count_label(count.parse().ok()?, "definition"),
         tone: Tone::Ok,
     })
 }
@@ -8195,6 +8246,19 @@ mod tests {
                 &["of 20 lines"],
             ),
             (
+                ToolName::Outline,
+                json!({"path": "crates/mush-core/src/outline.rs"}),
+                "crates/mush-core/src/outline.rs — 812 lines; 37 definitions (textual, \
+                 Rust-first — not a compiler's answer)\n\n  3  pub fn is_declaration(line: &str) -> \
+                 bool {",
+                "crates/mush-core/src/outline.rs",
+                "37 definitions",
+                Tone::Ok,
+                // The header's line count is already the payload's first line;
+                // a detail row would say one number twice.
+                &[],
+            ),
+            (
                 ToolName::WriteFile,
                 json!({"path": "src/lex.rs"}),
                 "wrote src/lex.rs — 3 lines (new)",
@@ -8359,6 +8423,35 @@ mod tests {
             command("cargo test && echo done"),
             "cargo test && echo done"
         );
+    }
+
+    /// An outline with nothing to sketch is a fact, not a failure: the sentence
+    /// is the reader's own, its tone is the none-verdict a search miss wears,
+    /// and there is no detail row to invent.
+    #[test]
+    fn an_outline_with_nothing_to_sketch_is_not_a_failure() {
+        let root = Path::new("/w");
+        for result in [
+            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
+             answer); read_file shows the text",
+            "empty.rs is empty — there are no definitions to outline",
+        ] {
+            let facts = digest(
+                ToolName::Outline,
+                &json!({"path": "NOTES.md"}),
+                Some(result),
+                root,
+            );
+            assert_eq!(
+                facts.outcome,
+                Some(CallOutcome {
+                    text: "no definitions".to_string(),
+                    tone: Tone::None,
+                }),
+                "{result}"
+            );
+            assert!(facts.details.is_empty(), "{result}");
+        }
     }
 
     /// A failed call is one sentence for every tool — the result's own first
@@ -12364,6 +12457,11 @@ mod tests {
 
         let read = call(ToolName::ReadFile, json!({ "path": "src/lib.rs" })).unwrap();
         assert!(read.contains("fn held()"), "{read}");
+        let sketched = call(ToolName::Outline, json!({ "path": "src/lib.rs" })).unwrap();
+        assert!(
+            sketched.contains("1 definition") && sketched.contains("  1  fn held() {}"),
+            "{sketched}"
+        );
         let listed = call(ToolName::ListFiles, json!({})).unwrap();
         assert!(listed.contains("src/lib.rs"), "{listed}");
         let found = call(ToolName::Search, json!({ "pattern": "held" })).unwrap();
@@ -12464,6 +12562,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(none.text().contains("at least 1"), "{}", none.text());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `outline` through the tool's own door: the header says what the answer
+    /// is (a textual, Rust-first sketch and not a compiler's), the rows are the
+    /// declarations' lines with their numbers, and a file with nothing to
+    /// sketch answers with a sentence that still names `read_file`.
+    #[test]
+    fn the_outline_tool_names_the_definitions_and_their_lines() {
+        let (actor, _mailbox) = test_actor("outline-tool");
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut call = |path: &str| {
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::Outline,
+                &json!({ "path": path }),
+                &cancel,
+            )
+        };
+
+        fs::write(
+            actor.ws.root().join("lib.rs"),
+            "//! docs\npub fn a() {}\n\nstruct B;\n",
+        )
+        .unwrap();
+        let sketched = call("lib.rs").unwrap();
+        assert_eq!(
+            sketched,
+            "lib.rs — 4 lines; 2 definitions (textual, Rust-first — not a compiler's \
+             answer)\n\n  2  pub fn a() {}\n  4  struct B;"
+        );
+
+        fs::write(actor.ws.root().join("NOTES.md"), "# Notes\nprose.\n").unwrap();
+        let prose = call("NOTES.md").unwrap();
+        assert_eq!(
+            prose,
+            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
+             answer); read_file shows the text"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -19013,11 +19152,12 @@ mod tests {
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
         // - ctx/2) bytes. Small enough that the trim's trigger arrives after a
-        // few turns, big enough that the fold's own request fits it: below
-        // ~5.5k tokens the prompt plus the summary floor does not fit any window
-        // this size, and the fold is refused rather than attempted
+        // few turns, big enough that the fold's own request fits it: with the
+        // schemas' reserve ([`SCHEMA_TOKENS`], 2 500) and the summary's floor
+        // (1 024), a window under ~7k cannot hold the prompt this test builds,
+        // and the fold is refused rather than attempted
         // (`a_fold_the_window_cannot_hold_is_not_attempted` pins that road).
-        cfg.context_tokens = 6_000;
+        cfg.context_tokens = 8_000;
         let budget = cfg.history_budget();
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;

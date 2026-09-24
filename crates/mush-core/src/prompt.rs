@@ -207,6 +207,22 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
+            ToolName::Outline,
+            "The definitions in one file, one row per declaration — `line  <that line, cut to a \
+             width>` — so a file's shape can be read without spending the window on its text. \
+             Textual and Rust-first, best-effort: lines, not a compiler's answer, so \
+             macro-generated items are invisible; a row is the file's own line, and doubles as \
+             the anchor for read_file {offset} and edit_file {old_string}. A file with no \
+             definitions answers with a sentence, not a refusal.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative file." }
+                },
+                "required": ["path"]
+            }),
+        ),
+        tool(
             ToolName::WriteFile,
             "Create or replace a workspace file, parent directories included. Answers in one line: \
              what was written and what it replaced. For a change to an existing file: edit_file.",
@@ -370,7 +386,7 @@ mod tests {
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
         for kept in [
             "edit_file",
             "read_file",

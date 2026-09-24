@@ -8,6 +8,7 @@
 pub mod config;
 pub mod git;
 pub mod message;
+pub mod outline;
 pub mod prompt;
 pub mod provider;
 /// A test's own scratch root, removed when it drops.

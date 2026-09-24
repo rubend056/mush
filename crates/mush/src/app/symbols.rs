@@ -146,6 +146,10 @@ impl Symbols {
             // A page with text lines: `▣`, the picture's mark, already renders
             // on the human's font.
             ToolName::ReadFile => ("▤ ", "R "),
+            // Misc Symbols, the block `⚙` comes from: the trigram for earth is
+            // three stacked lines, which is what an outline is. The ascii rung
+            // takes the letter its own name starts with.
+            ToolName::Outline => ("☷ ", "O "),
             // The pencil, from the Dingbats block `✓` and `✉` come from. The
             // Latin-1 `±` is `edit_file`'s: it is in every font, and it reads as
             // "a change" — the two pencils are near-identical at a glance and
@@ -265,6 +269,7 @@ fn sample(tool: ToolName) -> (&'static str, &'static str) {
             "crates/mush-core/src/text.rs 1408→1530",
             "123 lines · 4.1 kB",
         ),
+        ToolName::Outline => ("crates/mush-core/src/outline.rs", "37 definitions"),
         ToolName::WriteFile => ("src/lex.rs", "41 lines → 3 lines"),
         ToolName::EditFile => ("src/lex.rs", "3 hunks"),
         ToolName::ListFiles => ("src", "12 files"),

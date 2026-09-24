@@ -189,13 +189,14 @@ every turn.
 
 ### Tools
 
-Ten tools, in schema order — five for the workspace's files, the shell, the
+Eleven tools, in schema order — six for the workspace's files, the shell, the
 delegation tool, and three that manage what an agent started:
 
 | Tool | Arguments | What it does |
 |---|---|---|
 | `edit_file` | `path`, `edits` | exact-and-unique replacement; `edits` is always a list (a lone edit is a list of one), `replace_all` opts into an ambiguous match, and the batch lands all-or-nothing in one call |
 | `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers, and one trailing sentence saying what the window left; a png, jpeg, gif or webp — sniffed from the file's own bytes, never its name — comes back as the image itself, if the model is documented to see; works beside a held lock |
+| `outline` | `path` | the definitions in one file, one row per declaration — `line  <that line, cut to a width>` — so a file's shape costs a screen instead of a window; textual and Rust-first, best-effort (it is not a compiler: macro-generated items are invisible), and each row is the anchor `read_file {offset}` and `edit_file {old_string}` are built from; a file with no definitions answers with a sentence, never a refusal |
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush/wt`, the isolated children's own checkout directory; capped at `LIST_LIMIT` names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
@@ -206,7 +207,7 @@ delegation tool, and three that manage what an agent started:
 | `wait` | `on?` | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early; `on` narrows it to one thing, named as `status` prints it — the rest keeps running, but any result you have not read ends the wait too |
 
 The `spawn_agent` row is omitted from a leaf agent's schema, which is what bounds
-the tree, so a root has ten tools and a leaf nine; the `status`, `control` and
+the tree, so a root has eleven tools and a leaf ten; the `status`, `control` and
 `wait` rows are not omitted, because they manage the *jobs* a leaf may run in the
 background while it edits. `mush_core::tools::TOOL_NAMES` is the single list of
 names, and a test asserts the schemas match it; the depth and fan-out bounds are

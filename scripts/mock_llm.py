@@ -10,9 +10,10 @@ in-process over a scripted client, `scripts/screen.py` needs no endpoint, and
 work without a model — `scripts/screen.py --url http://127.0.0.1:PORT --ask
 "…"` on a pty.
 
-It scripts the ten tools mush has (`edit_file`, `read_file`, `write_file`,
-`list_files`, `search`, `run_command`, `spawn_agent`, `status`, `control`,
-`wait`): a file is written by `run_command` with a shell
+It scripts ten of the eleven tools mush has (`edit_file`, `read_file`,
+`write_file`, `list_files`, `search`, `run_command`, `spawn_agent`, `status`,
+`control`, `wait` — `outline` is not scripted): a file is written by
+`run_command` with a shell
 redirect, a child is isolated with `base`, and a parent waits with `wait`, which
 takes no arguments. Scenarios, selected by the root's first user message:
 

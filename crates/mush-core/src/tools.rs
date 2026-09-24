@@ -13,7 +13,7 @@ use crate::text;
 
 /// Every tool the model may call.
 ///
-/// Ten, and the count has a history worth keeping. Six of them were a *cut*:
+/// Eleven, and the count has a history worth keeping. Six of them were a *cut*:
 /// `list_files`, `read_file` and `write_file` went, because the shell lists,
 /// reads and writes a workspace better than a bespoke tool could — `rg`, `sed
 /// -n '1,200p'`, `ls -la`, `mkdir -p && cat > f` — and `edit_file` stayed for
@@ -23,7 +23,10 @@ use crate::text;
 /// do it" is false exactly when an agent is blind; and the shell cannot carry
 /// bytes that are not text, so an image had no road at all. `list_files`,
 /// `read_file` and `write_file` work beside a lock and take an image;
-/// `search` is the same argument for finding a line.
+/// `search` is the same argument for finding a line. `outline` is the newest
+/// and the smallest: the shell has no way to sketch a file's shape in one
+/// result, and the window a model spends finding it is the window it wanted
+/// for something else.
 ///
 /// The schemas, the dispatcher and the prompt all name tools through this enum,
 /// so adding a tool is a compile error in every place that has to know about it
@@ -32,6 +35,7 @@ use crate::text;
 pub enum ToolName {
     EditFile,
     ReadFile,
+    Outline,
     WriteFile,
     ListFiles,
     Search,
@@ -46,9 +50,10 @@ impl ToolName {
     /// Every tool, in schema order: the file work first, then the shell, then
     /// what an agent manages. `prompt::tool_schemas` is tested against this
     /// list, so a schema and its executor cannot drift.
-    pub const ALL: [ToolName; 10] = [
+    pub const ALL: [ToolName; 11] = [
         ToolName::EditFile,
         ToolName::ReadFile,
+        ToolName::Outline,
         ToolName::WriteFile,
         ToolName::ListFiles,
         ToolName::Search,
@@ -70,6 +75,7 @@ impl ToolName {
         match self {
             ToolName::EditFile => "edit_file",
             ToolName::ReadFile => "read_file",
+            ToolName::Outline => "outline",
             ToolName::WriteFile => "write_file",
             ToolName::ListFiles => "list_files",
             ToolName::Search => "search",
@@ -111,7 +117,7 @@ const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
 
 /// Every tool name, in schema order. Derived from [`ToolName::ALL`], so the two
 /// cannot disagree.
-pub const TOOL_NAMES: [&str; 10] = names(ToolName::ALL);
+pub const TOOL_NAMES: [&str; 11] = names(ToolName::ALL);
 
 /// The names of the delegation-only tools.
 pub const ORCHESTRATION_TOOLS: [&str; 1] = names(ToolName::ORCHESTRATION);
@@ -518,7 +524,7 @@ mod tests {
         // The names derive from the enum, in the same order.
         let all: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
         assert_eq!(all, TOOL_NAMES.to_vec());
-        assert_eq!(TOOL_NAMES.len(), 10);
+        assert_eq!(TOOL_NAMES.len(), 11);
         let orchestration: Vec<&str> = ToolName::ORCHESTRATION.iter().map(|t| t.as_str()).collect();
         assert_eq!(orchestration, ORCHESTRATION_TOOLS.to_vec());
         // Only delegation bounds a tree. `status`, `control` and `wait` are how
