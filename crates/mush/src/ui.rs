@@ -115,9 +115,19 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
     // The row gets the pane's whole inner width. A `› ` highlight symbol used
     // to be drawn outside it, which spent two columns on a mark the highlight
     // style already made — and put a second arrow beside the row's own `▶`.
+    //
+    // The window is the pane's own (`AgentsPane::first`), not `List`'s: the
+    // pane counts the rows above and below for its title and the click road
+    // resolves a row through the same index, so painting `rows[first..]` with
+    // the cursor rebased is what makes "the row a click names" and "the row
+    // this painted" one derivation. Left to `List`'s own scroll offset it was
+    // a second derivation that happened to agree (finding V1's shape); a click
+    // is what makes the difference land somewhere a human can see.
     let row_width = inner.width as usize;
     let items: Vec<ListItem> = pane
         .rows
+        .get(pane.first..)
+        .unwrap_or_default()
         .iter()
         .map(|row| {
             let mut line = agent_line(row, row_width, theme);
@@ -159,11 +169,12 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
     };
     let list = List::new(items).highlight_style(highlight);
     let mut state = ListState::default();
-    state.select(Some(pane.cursor));
+    state.select(Some(pane.cursor.saturating_sub(pane.first)));
     // The rows go where the pane said they go. The geometry is derived once, in
     // `App::agents_pane`, because the hidden-row counts in the title are
-    // arithmetic over it: a painter that worked it out again could place the
-    // list one row off from the count that names what it hides (finding V1).
+    // arithmetic over it and a click resolves through it: a painter that worked
+    // it out again could place the list one row off from the count that names
+    // what it hides, and from the row a click names (finding V1).
     frame.render_stateful_widget(list, pane.list_area, &mut state);
 
     if !pane.footer.is_empty() {
@@ -617,6 +628,7 @@ pub(crate) mod tests {
     fn picker(area: Rect) -> PickerPane {
         PickerPane {
             area,
+            first: 0,
             title: " models ".to_string(),
             hint: "j/k or PgUp/PgDn",
             items: vec!["• test-model · 500k".to_string()],
@@ -961,6 +973,7 @@ pub(crate) mod tests {
         AgentsPane {
             area,
             list_area: Block::default().borders(Borders::ALL).inner(area),
+            first: 0,
             title: " agents ".to_string(),
             rows,
             cursor: 2,
@@ -1002,6 +1015,7 @@ pub(crate) mod tests {
         AgentsPane {
             area,
             list_area: Block::default().borders(Borders::ALL).inner(area),
+            first: 0,
             title: " agents ".to_string(),
             rows: vec![
                 row(0, 0, "root", false),

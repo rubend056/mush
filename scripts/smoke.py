@@ -7,9 +7,9 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--shift-enter|--cancel|--sigterm|--lock]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--mouse|--shift-enter|--cancel|--sigterm|--lock]
 
-The resize, shift-enter, cancel, sigterm and lock scenarios need no model
+The resize, mouse, shift-enter, cancel, sigterm and lock scenarios need no model
 endpoint; the others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
@@ -210,6 +210,69 @@ def scenario_resize(binary: str, root: pathlib.Path) -> bool:
     results = [
         check("resize alone triggered a redraw", redraw_bytes > 200, f"{redraw_bytes} bytes"),
         check("app still responds to keys", responds),
+        check("clean exit", exit_code == 0, f"exit {exit_code}"),
+    ]
+    if not all(results):
+        print(tui.tail())
+    return all(results)
+
+
+def scenario_mouse(binary: str, root: pathlib.Path) -> bool:
+    """The mouse is taken, and a click reaches the app.
+
+    This one does not need a model: the app is pointed at an unreachable
+    endpoint and never asked to chat. Both facts are read off the pty wire,
+    which is the only place either is visible end to end — the *modes* mush
+    queues (1000 and 1006, and not the library's 1002/1003/1015, whose motion
+    events nothing on this side reads) and the frame that follows a click
+    (`ESC [ < 0 ; col ; row M`, the SGR press the mode set asks a terminal
+    for). A click inside the chat pane moves the keyboard there, which the
+    bar's badge is the visible half of.
+    """
+    print(f"\n== mouse == {root}")
+    env = {"MUSH_URL": "http://127.0.0.1:1", "MUSH_PROVIDER": "custom", "MUSH_MODEL": "probe"}
+    tui = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    tui.pump(2.0)
+    started = bytes(tui.captured)
+
+    # The keyboard starts in the chat pane, and `Tab` moves it to the tree: the
+    # bar's badge is the cell that says which pane has it, and the *delta*
+    # between two captures is only the cells a repaint changed, so the badge is
+    # read where nothing else can be. That is the control half of the click's
+    # check below.
+    tui.send("\t", settle=0.5)
+    after_tab = bytes(tui.captured)
+
+    # The chat pane at 110×34: the agents strip is 34% of the width, so column
+    # 60 is the conversation's, and row 10 is in its transcript.
+    tui.send("\x1b[<0;61;11M", settle=0.6)
+    after_click = bytes(tui.captured)
+
+    exit_code = tui.close()
+    captured = bytes(tui.captured)
+
+    results = [
+        check("the mouse is taken (1000 and 1006)", b"\x1b[?1000h\x1b[?1006h" in started),
+        check(
+            "and not the modes nothing reads",
+            b"\x1b[?1002h" not in started
+            and b"\x1b[?1003h" not in started
+            and b"\x1b[?1015h" not in started,
+        ),
+        check(
+            "Tab moves the keyboard to the tree",
+            b"agents" in after_tab[len(started) :],
+            "the badge moved",
+        ),
+        check(
+            "a click in the chat pane moves it back there",
+            b"chat" in after_click[len(after_tab) :],
+            "the badge moved",
+        ),
+        check(
+            "the hand-back puts the mouse down",
+            b"\x1b[?1000l" in captured and b"\x1b[?1006l" in captured,
+        ),
         check("clean exit", exit_code == 0, f"exit {exit_code}"),
     ]
     if not all(results):
@@ -699,6 +762,7 @@ def main() -> int:
     parser.add_argument("workdir", nargs="?", default="/tmp/mush-smoke")
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
+    parser.add_argument("--mouse", action="store_true", help="run only the mouse scenario")
     parser.add_argument(
         "--shift-enter", action="store_true", help="run only the Shift-Enter scenario"
     )
@@ -712,7 +776,15 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    chosen = [args.agent, args.resize, args.shift_enter, args.cancel, args.sigterm, args.lock]
+    chosen = [
+        args.agent,
+        args.resize,
+        args.mouse,
+        args.shift_enter,
+        args.cancel,
+        args.sigterm,
+        args.lock,
+    ]
     both = not any(chosen)
     base = pathlib.Path(args.workdir)
     passed = True
@@ -720,6 +792,8 @@ def main() -> int:
         passed &= scenario_agent(binary, base / "agent")
     if both or args.resize:
         passed &= scenario_resize(binary, base / "resize")
+    if both or args.mouse:
+        passed &= scenario_mouse(binary, base / "mouse")
     if both or args.shift_enter:
         passed &= scenario_shift_enter(binary, base / "shift-enter")
     if both or args.cancel:

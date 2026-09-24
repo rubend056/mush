@@ -109,7 +109,12 @@ fn agents_columns(terminal_width: u16) -> u16 {
 /// The rect inside a pane's border — the same arithmetic `Block::inner` does in
 /// the painter, computed here because the words a pane paints (its title, its
 /// row's fields, the wrapped message box) are laid out for that width.
-fn inner(area: Rect) -> Rect {
+///
+/// `pub(super)` for the mouse road (`app::mouse`): a border is not a verb, so a
+/// click resolves against the inner rects — through this same function, so the
+/// cell a click refuses is exactly the cell the painter's `Block::inner` leaves
+/// out.
+pub(super) fn inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
@@ -275,6 +280,15 @@ pub struct AgentsPane {
     /// out again, so the hidden-row counts (which are arithmetic over it) are
     /// counts of the rows that are really on screen (finding V1).
     pub list_area: Rect,
+    /// The index in `rows` of the window's first painted row: the rows are
+    /// windowed to `list_area` around the cursor, and this is where that window
+    /// starts. Published because two readers must agree about it by
+    /// construction — the painter, which paints `rows[first..]` so the window
+    /// is this derivation's, and the click road, which resolves the pointer's
+    /// row through the same index ([`crate::app::mouse`]). The `▲`/`▼` counts
+    /// in the title are arithmetic over it too, so a frame cannot say it hides
+    /// three rows above while painting a different three.
+    pub first: usize,
     /// The pane's title, already elided to the columns this pane has: the
     /// clauses, ranked so that the ones that exist *only* here come first (the
     /// hidden-row counts `▲3`, `▼17`, then what the whole tree is doing, then
@@ -447,6 +461,13 @@ pub struct BarPane {
 pub struct PickerPane {
     /// The popup's whole rect.
     pub area: Rect,
+    /// The index in `Picker::items` of the first painted row. The list is
+    /// windowed around the cursor, so a click on a row resolves to the item it
+    /// names only through this offset — `items` below is the window, and its
+    /// own indices are not the list's. Published for the same reason the
+    /// agents pane publishes its `first`: the painter and the click read one
+    /// derivation.
+    pub first: usize,
     pub title: String,
     pub hint: &'static str,
     /// The window of items, each already marked with `• `/`  ` and defanged.
@@ -526,12 +547,13 @@ impl App {
                 .split(chat_area);
 
         // The zen view ([`App::zen`]): the focused pane takes what the two
-        // panes shared, because the terminal's own drag — mush deliberately
-        // does not capture the mouse (finding K3) — takes a rectangle of cells,
-        // and at 80 columns that rectangle starts in the agents pane. The
-        // two-pane layout above is the source of every row this hands over —
-        // the chat column's split and the message box's rows included, so the
-        // box keeps exactly the rows it had (finding D13).
+        // panes shared, because the terminal's own selection — taken with its
+        // bypass key (Shift+drag in most terminals), which the captured mouse
+        // still leaves it — is a rectangle of cells, and at 80 columns that
+        // rectangle starts in the agents pane. The two-pane layout above is the
+        // source of every row this hands over — the chat column's split and the
+        // message box's rows included, so the box keeps exactly the rows it had
+        // (finding D13).
         let (agents_area, chat) = match (self.zen, self.focus) {
             (false, _) => (
                 agents_area,
@@ -603,6 +625,7 @@ impl App {
             return AgentsPane {
                 area,
                 list_area: inner(area),
+                first: 0,
                 title: String::new(),
                 rows: Vec::new(),
                 cursor: 0,
@@ -658,7 +681,10 @@ impl App {
         // view the first visible row is the cursor's row minus the rows above
         // it. `▲`/`▼` name the side, which a bare `+17` cannot — at the bottom
         // of a 4-row pane over nineteen agents the hidden rows are all above
-        // (finding P12).
+        // (finding P12). The painter no longer leaves this to `List`'s own
+        // scroll offset: it paints `rows[first..]` with the cursor's index
+        // rebased, so the window the title counts, the window the pane paints
+        // and the window a click resolves through are one derivation.
         let visible = list_area.height as usize;
         let first = cursor.saturating_sub(visible.saturating_sub(1));
         let above = if visible == 0 {
@@ -675,6 +701,7 @@ impl App {
         AgentsPane {
             area,
             list_area,
+            first,
             // The pane's title: ` agents · 3 working · 2 jobs · 2 waiting ·
             // Σ +324 −40`, with the clauses that do not fit dropped whole from
             // the right and the pane's own name kept when none of them fit.
@@ -941,6 +968,7 @@ impl App {
         }
         Some(PickerPane {
             area: popup,
+            first: start,
             title: picker.title(),
             hint: picker.hint(),
             items,

@@ -16,6 +16,7 @@ mod call_grid;
 mod chat;
 pub mod commands;
 pub mod keys;
+mod mouse;
 mod screen;
 mod settings;
 mod symbols;
@@ -47,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
@@ -70,6 +71,17 @@ use keys::Intent;
 
 pub enum Msg {
     Key(KeyEvent),
+    /// A mouse event: a click, a release, a wheel notch — the terminal's own
+    /// cell coordinates, in the frame `main` painted. The one road the pointer
+    /// has into `App`: the modes that make a terminal send these are taken in
+    /// `main` ([`crate::screen_modes`]'s `take_mouse`), and [`App::on_mouse`]
+    /// is the one handler.
+    ///
+    /// A click is a *move* of something the keyboard also moves — a row's
+    /// cursor, the focused pane, a call's fold — so the mouse grows no verb of
+    /// its own: nothing is sent, nothing is said, and there is no answer to
+    /// carry back.
+    Mouse(MouseEvent),
     /// Pasted text, delivered whole by the terminal's bracketed paste. Inserted
     /// in one update: a paste must not cost one message per character.
     Paste(String),
@@ -837,13 +849,13 @@ pub struct App {
     /// (`Ctrl-F`).
     ///
     /// A view, so it changes what a frame paints and nothing else: no notice is
-    /// said, no session is written, no message goes out. The mouse is never
-    /// captured on purpose (finding K3), so the terminal owns selection and a
-    /// drag takes a rectangle of screen cells — at 80 columns that rectangle
-    /// starts in the agents pane, which is how a paragraph copied from the
-    /// conversation arrives with the tree's lines in front of it. `Ctrl-N`
-    /// leaves it as the human set it: the view is the human's, not the
-    /// conversation's.
+    /// said, no session is written, no message goes out. The mouse is captured
+    /// now, so the terminal's own selection is taken with its bypass key
+    /// (Shift+drag in most terminals) and only then is it a rectangle of
+    /// screen cells — at 80 columns that rectangle starts in the agents pane,
+    /// which is how a paragraph copied from the conversation arrives with the
+    /// tree's lines in front of it. `Ctrl-N` leaves the zen view as the human
+    /// set it: the view is the human's, not the conversation's.
     pub zen: bool,
     /// The conversation: the transcripts the screen shows, the notices, the
     /// message box and the context meter, in one value.
@@ -1083,6 +1095,19 @@ impl App {
         // safe reading (`Chat::forget_select_measure`).
         self.chat.forget_select_measure();
         let _coming_frame = self.screen(Rect::new(0, 0, width, height));
+    }
+
+    /// The frame's own rect: the size `main` last reported, at the origin every
+    /// `Rect` this app derives is measured from. [`Self::screen`] takes it as
+    /// its `area`, and so does every reader of a frame outside the paint — the
+    /// mouse road, which resolves a click against the frame the human clicked
+    /// on. The alternative is a second copy of the size beside the two fields
+    /// the resize event already writes, and a second copy is a second thing the
+    /// resize can leave behind; this is the same derivation the next paint is
+    /// handed (finding R28's shape: one helper for "the frame at a size", read
+    /// by both roads).
+    pub fn frame_area(&self) -> Rect {
+        Rect::new(0, 0, self.term_width, self.term_height)
     }
 
     /// Re-lay out the open popup for the terminal's new width.
@@ -2391,6 +2416,10 @@ impl App {
                 }
             }
             Msg::Key(key) => self.on_key(key),
+            // The pointer's own road: one handler, hit-tested against the
+            // frame `App::screen` derives, so a click and the paint it landed
+            // on cannot disagree about where a pane is.
+            Msg::Mouse(event) => self.on_mouse(event),
             // The write road's answer, and the mode's line said only when the
             // clipboard actually took the text: the count of lines and bytes is
             // the copy's fact, and a line that read `copied 12 lines` over a
@@ -4829,13 +4858,13 @@ impl App {
 
     /// `Ctrl-F`: the focused pane takes the whole screen, and back.
     ///
-    /// Why the view exists: mush deliberately never captures the mouse (finding
-    /// K3), so selection belongs to the terminal and a drag takes a rectangle
-    /// of screen cells — at 80 columns and up, the left column is the agents
-    /// pane, and a drag across the conversation comes back with the tree's rows
-    /// in front of the paragraph. The cheapest honest answer is a view where
-    /// one pane covers the screen, so a rectangle can hold one pane's text and
-    /// nothing else.
+    /// Why the view exists: the terminal's own selection is a rectangle of
+    /// screen cells — a drag needs its bypass key now that mush captures the
+    /// mouse, and a rectangle is a rectangle either way — so at 80 columns and
+    /// up, the left column is the agents pane, and a drag across the
+    /// conversation comes back with the tree's rows in front of the paragraph.
+    /// The cheapest honest answer is a view where one pane covers the screen,
+    /// so a rectangle can hold one pane's text and nothing else.
     ///
     /// A view like [`Self::toggle_reasoning`], so it is not said and not
     /// stored: `dirty_screen` is the whole record, and `Ctrl-N` keeps the
@@ -6524,13 +6553,15 @@ mod tests {
     use crossbeam_channel::Receiver;
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::{Position, Rect};
     use ratatui::widgets::{Block, Borders};
     use ratatui::Terminal;
 
     use crate::session_save;
     use crate::session_save::SessionSave;
+
+    use super::screen::Panes;
 
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
 
@@ -16170,8 +16201,8 @@ mod tests {
 
     /// Zen's whole promise, at the ubiquitous 80×24 and on a wide terminal:
     /// the focused pane takes the columns the two panes shared — the rectangle
-    /// a terminal drag can take without a line of the other pane in it (finding
-    /// K3) — while the bar and the message box keep the rows they had, so the
+    /// the terminal's own selection can take without a line of the other pane
+    /// in it — while the bar and the message box keep the rows they had, so the
     /// view moves the panes' frame and not the conversation in it.
     #[test]
     fn zen_gives_the_focused_pane_the_two_panes_width_at_every_size() {
@@ -18588,7 +18619,9 @@ mod tests {
     /// `/help` renders the same key table `mush --help` does, so a human who
     /// learns the keyboard from the notice can discover every binding instead
     /// of the six the old hand-written line named — and discover the keys that
-    /// really scroll (finding K3), not a wheel mush never takes.
+    /// really scroll. The wheel is a pointer and the table is the keyboard's,
+    /// so it has no row here; the manual's mouse paragraph is where it is
+    /// named.
     #[test]
     fn help_names_the_whole_key_table() {
         let (mut app, _rx) = test_app("keys-help");
@@ -18617,7 +18650,7 @@ mod tests {
         }
         assert!(
             !help.contains("wheel"),
-            "a wheel it does not scroll:\n{help}"
+            "the key table grew a pointer row:\n{help}"
         );
     }
 
@@ -23860,5 +23893,438 @@ mod tests {
             }),
             "the human is told, and told what still works: {line:?}"
         );
+    }
+
+    // ------------------------------------------------------------------ mouse
+
+    /// A left click on one cell, as the terminal delivers it: the button and
+    /// the frame coordinates, no modifier — `App::on_mouse` refuses a modified
+    /// click, because Shift is the terminal's own selection bypass.
+    fn click(column: u16, row: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// A wheel notch on one cell: `up` is the notch away from the human, which
+    /// scrolls older the way `↑` does.
+    fn wheel(up: bool, column: u16, row: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// The panes of one frame, derived the way a click derives them.
+    fn panes_at(app: &mut App, width: u16, height: u16) -> Box<Panes> {
+        app.set_term_size(width, height);
+        match app.screen(Rect::new(0, 0, width, height)) {
+            Screen::Panes(panes) => panes,
+            Screen::Floor { .. } => panic!("{width}×{height} is below the floor"),
+        }
+    }
+
+    /// The title the focused transcript pane paints on its own border, read
+    /// from the frame the mouse road would resolve against.
+    fn transcript_title(app: &mut App, width: u16, height: u16) -> String {
+        panes_at(app, width, height)
+            .chat
+            .transcript
+            .map(|painted| painted.title)
+            .unwrap_or_default()
+    }
+
+    /// The `#N` a painted row wears: the agent's number, read off the cells
+    /// rather than off the pane's own rows, so an agreement test compares the
+    /// click against what a human can see.
+    fn painted_agent(line: &str) -> Option<AgentId> {
+        let rest = &line[line.find('#')? + 1..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().map(AgentId)
+    }
+
+    /// The tree's three children, each one row, for the click tests.
+    fn three_children(app: &mut App) {
+        for id in 1..=3u64 {
+            spawn_agent(app, id, 0, 1, &format!("task {id}"), None);
+        }
+    }
+
+    /// A click on a tree row selects that conversation, through the doors
+    /// `Enter` on the row uses: the tree's cursor lands on the painted row and
+    /// the chat pane shows that agent — and the keyboard moves into the pane
+    /// the click landed in, the way clicking a window does.
+    #[test]
+    fn a_click_on_a_tree_row_focuses_that_agent() {
+        let (mut app, _rx) = test_app("mouse-tree");
+        app.focus = Focus::Chat;
+        three_children(&mut app);
+
+        let panes = panes_at(&mut app, 80, 24);
+        let at = panes
+            .agents
+            .rows
+            .iter()
+            .position(|row| row.id == AgentId(3))
+            .expect("the third child has a row");
+        assert!(at >= panes.agents.first, "the row is in the painted window");
+        let y = panes.agents.list_area.y + (at - panes.agents.first) as u16;
+        assert!(
+            panes_at(&mut app, 80, 24)
+                .agents
+                .list_area
+                .contains(Position::new(1, y)),
+            "the row is inside the list"
+        );
+
+        app.update(click(panes.agents.list_area.x + 1, y));
+
+        assert_eq!(
+            app.tree.focused,
+            AgentId(3),
+            "the chat pane now shows the row that was clicked"
+        );
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(AgentId(3)),
+            "and the cursor is the row `j`/`k` carry on from"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Agents,
+            "the keyboard is in the pane the click landed in"
+        );
+    }
+
+    /// A click in the chat pane puts the keyboard there — in the transcript
+    /// and in the message box alike, and without moving the box's own text
+    /// cursor: the pane is what a click names, the cursor is the box's keys'.
+    #[test]
+    fn a_click_on_the_chat_pane_puts_the_keyboard_in_it() {
+        let (mut app, _rx) = test_app("mouse-chat");
+        app.chat.push_message(AgentId::ROOT, Message::user("hello"));
+        app.focus = Focus::Agents;
+
+        let panes = panes_at(&mut app, 80, 24);
+        let transcript = screen::inner(panes.chat.transcript_area);
+        app.update(click(transcript.x + 1, transcript.y));
+        assert_eq!(app.focus, Focus::Chat, "the transcript moved the keyboard");
+
+        app.focus = Focus::Agents;
+        let panes = panes_at(&mut app, 80, 24);
+        let input = screen::inner(panes.chat.input_area);
+        app.update(click(input.x + 1, input.y));
+        assert_eq!(app.focus, Focus::Chat, "and so did the message box");
+    }
+
+    /// The bar and every border are nobody's: a click there does nothing at all
+    /// — not even a focus change — because there is nothing under it that the
+    /// click could be about.
+    #[test]
+    fn a_click_on_a_border_or_the_bar_changes_nothing() {
+        let (mut app, _rx) = test_app("mouse-nothing");
+        three_children(&mut app);
+        app.focus = Focus::Agents;
+
+        let panes = panes_at(&mut app, 80, 24);
+        let cells = [
+            // The tree's own border, left column and top row.
+            (panes.agents.area.x, panes.agents.area.y + 1),
+            // The footer's separator and facts, under the list.
+            (
+                panes.agents.area.x + 1,
+                panes.agents.list_area.y + panes.agents.list_area.height,
+            ),
+            // The transcript's border, and the gap between the two chat rects.
+            (panes.chat.transcript_area.x, panes.chat.transcript_area.y),
+            (panes.chat.input_area.x, panes.chat.input_area.y),
+            // The bar.
+            (panes.bar.area.x, panes.bar.area.y),
+        ];
+        for (column, row) in cells {
+            app.update(click(column, row));
+            assert_eq!(
+                app.focus,
+                Focus::Agents,
+                "{column},{row} moved the keyboard"
+            );
+            assert_eq!(
+                app.tree.focused,
+                AgentId::ROOT,
+                "{column},{row} changed the conversation"
+            );
+            assert_eq!(app.tree.cursor(), 0, "{column},{row} moved the cursor");
+        }
+    }
+
+    /// A transcript shorter than its pane leaves blank rows under it: a click on
+    /// one of them names the pane and nothing else, and never indexes a row that
+    /// was not painted. A screen below the floor has no panes at all, and a
+    /// click there is refused the way a key is (finding P11 / refactor B3).
+    #[test]
+    fn a_click_below_a_one_row_transcript_does_not_panic() {
+        let (mut app, _rx) = test_app("mouse-short");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("one row"));
+        app.focus = Focus::Agents;
+
+        let panes = panes_at(&mut app, 80, 24);
+        let transcript = screen::inner(panes.chat.transcript_area);
+        assert!(transcript.height > 3, "the pane has room it does not fill");
+        for y in transcript.y..transcript.y + transcript.height {
+            for x in transcript.x..transcript.x + transcript.width {
+                app.update(click(x, y));
+            }
+        }
+        assert_eq!(app.focus, Focus::Chat, "the transcript is what was clicked");
+
+        // One row shorter than the floor's own: no panes are derived, and the
+        // click has nothing to resolve against.
+        app.focus = Focus::Agents;
+        app.update(click(1, 1));
+        assert_eq!(
+            app.focus,
+            Focus::Agents,
+            "a floor screen has no panes to click"
+        );
+    }
+
+    /// The zen view hides one pane by giving it a zero rect: a click where that
+    /// pane's rows used to be lands on the pane that is *there* — the whole
+    /// point of deriving the hit test from the frame ([`App::screen`]) instead
+    /// of from the two-pane layout.
+    #[test]
+    fn a_click_while_zen_is_on_lands_on_the_pane_that_is_there() {
+        let (mut app, _rx) = test_app("mouse-zen");
+        app.chat.push_message(AgentId::ROOT, Message::user("hello"));
+        three_children(&mut app);
+
+        // The chat full-screen: the tree is a zero rect, so a click on a cell the
+        // tree's rows would cover is the transcript's, and only the keyboard
+        // moves.
+        app.zen = true;
+        app.focus = Focus::Chat;
+        let panes = panes_at(&mut app, 80, 24);
+        assert_eq!(
+            panes.agents.area,
+            Rect::new(0, 0, 0, 0),
+            "zen hides the tree as a zero rect"
+        );
+        let transcript = screen::inner(panes.chat.transcript_area);
+        app.update(click(transcript.x + 1, transcript.y));
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(
+            app.tree.focused,
+            AgentId::ROOT,
+            "no row was under that cell"
+        );
+
+        // The tree full-screen: the transcript is a zero rect, and a row of the
+        // tree is still a row.
+        app.focus = Focus::Agents;
+        let panes = panes_at(&mut app, 80, 24);
+        assert_eq!(panes.chat.transcript_area.height, 0, "zen hides the rows");
+        let at = panes
+            .agents
+            .rows
+            .iter()
+            .position(|row| row.id == AgentId(2))
+            .expect("the second child has a row");
+        let y = panes.agents.list_area.y + (at - panes.agents.first) as u16;
+        app.update(click(panes.agents.list_area.x + 1, y));
+        assert_eq!(
+            app.tree.focused,
+            AgentId(2),
+            "the tree was under the pointer"
+        );
+    }
+
+    /// A picker is modal: while one is up, a click outside it reaches nothing
+    /// under it — and a click on one of its own rows walks the picker's cursor,
+    /// the move `↑`/`↓` make. It never *picks*: picking a model writes the
+    /// session, and one click is not the decision `Enter` is.
+    #[test]
+    fn a_click_while_the_picker_is_up_does_not_reach_the_panes_under_it() {
+        let (mut app, _rx) = test_app("mouse-picker");
+        three_children(&mut app);
+        app.focus = Focus::Agents;
+        run(&mut app, "/help");
+
+        let panes = panes_at(&mut app, 80, 24);
+        let popup = panes.picker.as_ref().expect("the list is open").area;
+        // A tree row the popup covers, at a column the popup does not: the
+        // frame's left edge is the tree's, and the popup is centred.
+        let row = panes.agents.list_area.y;
+        assert!(
+            popup.x > panes.agents.list_area.x,
+            "the popup starts to the right"
+        );
+        assert!(popup.y <= row, "and it covers the first row");
+        app.update(click(panes.agents.list_area.x, row));
+        assert_eq!(
+            app.tree.focused,
+            AgentId::ROOT,
+            "the click reached the tree"
+        );
+        assert_eq!(app.focus, Focus::Agents, "and moved the keyboard");
+
+        // One of the popup's own rows: the cursor takes the row that was clicked.
+        let picker = panes.picker.as_ref().expect("still open");
+        let list = screen::inner(popup);
+        let want = picker.first + 1;
+        assert!(want < picker.items.len(), "the list has a second row");
+        app.update(click(popup.x + 2, list.y + 1));
+        assert_eq!(
+            app.picker.as_ref().expect("still open").cursor,
+            want,
+            "the click took the row it landed on"
+        );
+    }
+
+    /// The wheel is spent where the pointer is: the transcript scrolls through
+    /// `Chat::scroll_by` (positive is older, the arrow keys' own door), the tree
+    /// walks its cursor — the pane's window *is* the cursor, there is no second
+    /// scroll position — and a picker's list moves while one is up. The bar and
+    /// the borders are nobody's here too.
+    #[test]
+    fn a_wheel_notch_scrolls_the_pane_under_the_pointer() {
+        let (mut app, _rx) = test_app("mouse-wheel");
+        for line in 0..12 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::assistant(format!("line {line}")));
+        }
+        three_children(&mut app);
+
+        // Over the transcript: three rows older, and the pane's own title is
+        // where the reading is read back from.
+        let panes = panes_at(&mut app, 80, 24);
+        let transcript = screen::inner(panes.chat.transcript_area);
+        app.update(wheel(true, transcript.x + 1, transcript.y + 1));
+        let title = transcript_title(&mut app, 80, 24);
+        assert!(title.contains("scrolled ↑3 rows"), "{title:?}");
+
+        // Down again at the bottom, where there is nothing below: the pane is
+        // following the newest line and stays there.
+        app.update(wheel(false, transcript.x + 1, transcript.y + 1));
+        assert_eq!(transcript_title(&mut app, 80, 24), " mush ");
+
+        // Over the tree: the cursor walks the rows the window is made of.
+        let panes = panes_at(&mut app, 80, 24);
+        let before = app.tree.cursor();
+        app.update(wheel(
+            false,
+            panes.agents.list_area.x + 1,
+            panes.agents.list_area.y + 1,
+        ));
+        assert_eq!(
+            app.tree.cursor(),
+            before + 3,
+            "three rows toward the newest"
+        );
+
+        // Over the bar: nothing to spend a notch on.
+        let panes = panes_at(&mut app, 80, 24);
+        let cursor = app.tree.cursor();
+        app.update(wheel(true, panes.bar.area.x + 1, panes.bar.area.y));
+        assert_eq!(app.tree.cursor(), cursor);
+        assert_eq!(transcript_title(&mut app, 80, 24), " mush ");
+
+        // With a picker up, the notch moves the picker wherever the pointer is:
+        // the popup is the only thing on screen answering input.
+        run(&mut app, "/help");
+        panes_at(&mut app, 80, 24);
+        app.update(wheel(false, 1, 1));
+        assert_eq!(
+            app.picker.as_ref().expect("still open").cursor,
+            3,
+            "the list moved by the notch's three rows"
+        );
+    }
+
+    /// The strongest claim the mouse road can make, for the tree: every row the
+    /// pane paints is the row a click names. The test reads the agent's number
+    /// off the *painted cells* — not off the pane's own rows — and clicks each
+    /// painted row of the frame as it stands, re-deriving the frame per row
+    /// because the click moves the cursor and the cursor's own footer moves the
+    /// window with it. The window's far edge is then walked row by row, which
+    /// is the arithmetic an off-by-one in `first` would get wrong.
+    #[test]
+    fn every_painted_tree_row_is_the_row_a_click_names() {
+        let (mut app, _rx) = test_app("mouse-agreement");
+        for id in 1..=19u64 {
+            spawn_agent(&mut app, id, 0, 1, &format!("task {id}"), None);
+        }
+        let frame = shot(&mut app, 80, 24);
+        let Screen::Panes(panes) = &frame.screen else {
+            panic!("80×24 is above the floor")
+        };
+        assert!(
+            panes.agents.list_area.height < panes.agents.rows.len() as u16,
+            "the pane windows a list longer than itself"
+        );
+        let rows = panes.agents.rows.len();
+
+        for at in 0..rows {
+            let frame = shot(&mut app, 80, 24);
+            let Screen::Panes(panes) = &frame.screen else {
+                panic!("80×24 is above the floor")
+            };
+            let list = panes.agents.list_area;
+            if at < panes.agents.first || at - panes.agents.first >= list.height as usize {
+                // Scrolled out of this frame: the walk below brings the rest of
+                // the list through the window.
+                continue;
+            }
+            let y = list.y + (at - panes.agents.first) as u16;
+            let line = frame.line(y);
+            let painted = painted_agent(&line)
+                .unwrap_or_else(|| panic!("the row at {y} paints no agent: {line:?}"));
+            assert_eq!(
+                painted, panes.agents.rows[at].id,
+                "the pane painted {painted} at {y} for another row: {line:?}"
+            );
+            app.update(click(list.x + 1, y));
+            assert_eq!(
+                app.tree.focused, painted,
+                "the click on row {y} ({line:?}) named {} and not {painted}",
+                app.tree.focused
+            );
+        }
+
+        // The window's own far edge, walked to the end of the list: a click
+        // cannot name a row the pane has not painted, so the window is moved on
+        // by the wheel — the way a human reaches the rows under the fold — and
+        // the pane's last painted row is clicked on the way.
+        loop {
+            let frame = shot(&mut app, 80, 24);
+            let Screen::Panes(panes) = &frame.screen else {
+                panic!("80×24 is above the floor")
+            };
+            let list = panes.agents.list_area;
+            assert!(list.height > 0, "the pane has a row to click");
+            let y = list.y + list.height - 1;
+            let line = frame.line(y);
+            let painted = painted_agent(&line)
+                .unwrap_or_else(|| panic!("the pane's last row paints no agent: {line:?}"));
+            app.update(click(list.x + 1, y));
+            assert_eq!(
+                app.tree.focused, painted,
+                "the click on the pane's last row ({line:?}) named {} and not {painted}",
+                app.tree.focused
+            );
+            if app.tree.cursor() + 1 >= rows {
+                break;
+            }
+            app.update(wheel(false, list.x + 1, list.y));
+        }
     }
 }

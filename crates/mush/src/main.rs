@@ -1226,6 +1226,13 @@ fn event_loop(
                 }
                 // The whole paste, in one event.
                 Event::Paste(text) => app.update(Msg::Paste(text)),
+                // A click, a release, a wheel notch: the pointer's own road
+                // into `App`, taken because `screen_modes` captures the mouse.
+                // The event travels as it arrived — `App::on_mouse` reads the
+                // button and the modifier, and a terminal sends what mush
+                // asked for and nothing more (`take_mouse`: no motion, no
+                // drag).
+                Event::Mouse(event) => app.update(Msg::Mouse(event)),
                 // The terminal changed size: schedule a redraw. ratatui's
                 // `terminal.draw` re-queries the size first, so the next
                 // frame already paints at the new dimensions — and the app is
@@ -1309,6 +1316,15 @@ fn restore_terminal_modes() {
 /// leave a process that died between the two with the human's shell still
 /// reading mush's keys as `CSI u`. When it did not, the terminal is never sent
 /// a pop it never opened.
+///
+/// The mouse half is [`DisableMouseCapture`], which turns off the five modes
+/// the library's capture takes. The entry takes *two* of them by hand
+/// ([`take_mouse`]), so three of these offs name a mode mush never turned on:
+/// that is the harmless direction (a mode that was never on and is turned off
+/// is not a state anybody can be in), and it keeps the hand-back one command
+/// that leaves no mouse mode standing rather than a second list of exactly
+/// which two the entry wrote — a list that would have to be kept in step with
+/// `take_mouse` by hand.
 fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Result<()> {
     queue!(
         writer,
@@ -1322,17 +1338,29 @@ fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Re
     writer.flush()
 }
 
-/// The screen step of [`TerminalGuard::enter`]: the alternate screen and
-/// bracketed paste.
+/// The screen step of [`TerminalGuard::enter`]: the alternate screen, bracketed
+/// paste, and the mouse.
 ///
 /// Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
 /// keystrokes — one event, one repaint, and a redraw per character — into a
-/// single `Event::Paste` carrying the whole paste. Mouse capture is
-/// deliberately NOT taken: it would let mush scroll by wheel notch instead of
-/// by arrow key, but it also takes away the terminal's own drag-to-select, and
-/// reading text out of the transcript is worth more than a wheel notch. The
-/// lag that made the wheel feel broken was the per-keystroke repaint, which
-/// the event loop no longer does.
+/// single `Event::Paste` carrying the whole paste.
+///
+/// The mouse is taken now. mush used to leave it to the terminal on purpose
+/// (finding K3): the terminal's own drag-to-select was worth more than a wheel
+/// notch, and `Ctrl-F`/`Ctrl-Y` were built to scope a selection to one pane
+/// without it. The human asked for clicks — a row selects a conversation, a
+/// tool call opens on its own — so the trade is made the other way round, and
+/// what it costs is said rather than hidden: a *plain* drag is mush's input
+/// (a press, and no motion — [`take_mouse`]), so reading text out of the
+/// transcript is the terminal's bypass key (Shift+drag in most of them), and
+/// `Ctrl-F` is still the road to a rectangle of one pane; and the wheel, which
+/// the terminal can no longer spend itself, is spent by `App::on_mouse`. The
+/// lag that made the wheel feel broken was the per-keystroke repaint, which the
+/// event loop no longer does.
+///
+/// The mouse paints nothing of its own — no hover highlight, no pointer glyph:
+/// a click is a verb, and the frames the panes already paint are the whole
+/// feedback. That is what the mode is for; it is not a second cursor.
 ///
 /// The keyboard enhancement flags are *not* pushed here, and the protocol's
 /// flags query is not asked here either: `supports_keyboard_enhancement` is a
@@ -1347,8 +1375,36 @@ fn restore_mode_sequences(writer: &mut impl io::Write, enhanced: bool) -> io::Re
 fn screen_modes() -> io::Result<()> {
     let mut stdout = io::stdout();
     queue!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    take_mouse(&mut stdout)?;
     stdout.flush()
 }
+
+/// What [`take_mouse`] puts on the wire, and the reason it is not the
+/// library's own command.
+///
+/// `crossterm`'s `EnableMouseCapture` is the library's whole set — 1000, 1002,
+/// 1003, 1015 and 1006 — and two of those modes are a flood with nothing on
+/// this side to read them. 1003 is *any* motion: every pixel of every move
+/// across the frame arrives as an event and wakes the loop for a repaint that
+/// changes nothing. 1002 is the same for a drag, and mush has no drag verb: the
+/// human's drag-to-select is the terminal's own and is the bypass key's, which
+/// the mode set cannot take away. 1015 (RXVT) is a coordinate encoding older
+/// than 1006 (SGR), which every terminal mush runs in speaks. So the set is the
+/// two modes a click needs: 1000 (press and release) and 1006 (SGR
+/// coordinates, which do not run out at column 223).
+///
+/// Written as bytes rather than through a `Command` because the library's
+/// command is the wide set, and a command of our own would be a type whose only
+/// method writes these same bytes; they land in the same `stdout` buffer as the
+/// `queue!` beside them, so the entry is still modes-then-one-`flush`.
+fn take_mouse(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(MOUSE_ON)
+}
+
+/// Normal tracking and SGR coordinates, in that order: [`take_mouse`]'s own
+/// bytes, named so a test can assert both what is sent and — just as important
+/// — which of the library's modes are *not*.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
 
 /// The keyboard-protocol half of the entry: ask whether the terminal speaks
 /// the kitty protocol, and push the flags when it answers yes.
@@ -1395,8 +1451,8 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Enter the terminal: raw mode, the alternate screen, bracketed paste —
-    /// and the ratatui terminal every frame is painted through.
+    /// Enter the terminal: raw mode, the alternate screen, bracketed paste,
+    /// the mouse — and the ratatui terminal every frame is painted through.
     ///
     /// The keyboard enhancement flags are not part of this: the protocol's
     /// flags query is a bounded wait, and [`ask_keyboard_enhancement`] asks it
@@ -1404,11 +1460,13 @@ impl TerminalGuard {
     /// holds the UI up for a terminal that will not answer.
     ///
     /// Each mode is a promise to the human's shell: leaving raw mode on breaks
-    /// their typing, and leaving bracketed paste on makes their own pastes
-    /// arrive wrapped in escape codes. Everything that can end the program — a
-    /// clean quit, a signal ([`crate::signals`] turns one into the quit road),
-    /// a panic, an error on the way out — has to undo all of them, so they are
-    /// entered in one place and undone by [`restore_terminal_modes`].
+    /// their typing, leaving bracketed paste on makes their own pastes arrive
+    /// wrapped in escape codes, and leaving the mouse captured sends the clicks
+    /// and wheel notches meant for their shell into a program that has exited.
+    /// Everything that can end the program — a clean quit, a signal
+    /// ([`crate::signals`] turns one into the quit road), a panic, an error on
+    /// the way out — has to undo all of them, so they are entered in one place
+    /// and undone by [`restore_terminal_modes`].
     ///
     /// The entry is all or nothing (finding PM8): `main` exits 1 when it fails,
     /// and it must not do that from a raw shell. A failure in any step after
@@ -2461,13 +2519,16 @@ mod tests {
             "the key table is not in --help:\n{help}"
         );
         // The tree walk the human asked for is named here too, and the real
-        // scroll keys — not the wheel mush never takes (finding K3).
+        // scroll keys — the wheel is a pointer, and the key table is the
+        // keyboard's, so it has no row here (the manual's mouse paragraph names
+        // it; a wheel row belongs in the table the day the README's block is
+        // re-blessed with it).
         for want in ["←", "→", "↑ / ↓, PgUp / PgDn", "page up / down the rows"] {
             assert!(help.contains(want), "`{want}` is missing:\n{help}");
         }
         assert!(
             !help.contains("wheel"),
-            "a wheel it does not scroll:\n{help}"
+            "the key table grew a pointer row:\n{help}"
         );
 
         // And the command table, so `/compact`-style absence cannot return.
@@ -3031,6 +3092,10 @@ mod tests {
             "and turns bracketed paste off: {written:?}"
         );
         assert!(
+            written.contains("\u{1b}[?1000l") && written.contains("\u{1b}[?1006l"),
+            "and puts the mouse back before the human's shell gets it: {written:?}"
+        );
+        assert!(
             route.lower().is_empty(),
             "the owner's panic is not held: it is the terminal's own"
         );
@@ -3038,6 +3103,31 @@ mod tests {
         // The hook is the process's: put the default back, so whatever panic
         // comes next is not shaped by this test.
         let _ = std::panic::take_hook();
+    }
+
+    /// The mouse is taken by the two modes a click needs and not by the
+    /// library's whole set: 1000 (press and release) and 1006 (SGR
+    /// coordinates), and *not* 1002 (drag), 1003 (any motion) or 1015 (the
+    /// older coordinate encoding) — the mode that reports every pixel of every
+    /// move would wake the loop for repaints that change nothing, and mush has
+    /// no drag verb for 1002 to feed. The bytes are pinned because a stray mode
+    /// here is one the hand-back's offs must cover and a terminal feels at once.
+    #[test]
+    fn the_mouse_is_taken_by_the_two_modes_a_click_needs() {
+        let modes = Modes::default();
+        let mut sink = modes.clone();
+        take_mouse(&mut sink).expect("the sink answers");
+        let written = String::from_utf8_lossy(&modes.0.lock().unwrap()).into_owned();
+        assert_eq!(
+            written, "\u{1b}[?1000h\u{1b}[?1006h",
+            "the mode set a click needs: {written:?}"
+        );
+        for unwanted in ["\u{1b}[?1002h", "\u{1b}[?1003h", "\u{1b}[?1015h"] {
+            assert!(
+                !written.contains(unwanted),
+                "{unwanted:?} is a mode nothing on this side reads: {written:?}"
+            );
+        }
     }
 
     /// The keyboard enhancement flags are popped only when they were pushed: a

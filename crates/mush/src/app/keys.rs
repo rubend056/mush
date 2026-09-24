@@ -1156,9 +1156,11 @@ pub(crate) mod tests {
 
     /// The help both surfaces print comes from [`KEYS`], so this is where a
     /// binding can be lost: every row must be in the rendered table, each
-    /// context must head its rows once, and the real scroll keys — not the
-    /// wheel the terminal never sends, because mouse capture is not taken
-    /// (finding K3) — must be the ones named.
+    /// context must head its rows once, and the real scroll keys must be the
+    /// ones named. The table is the *keyboard's*: a wheel notch and a click are
+    /// pointer input, named in the manual's mouse paragraph (`docs/mush.md`
+    /// §4.5) and not here — a row for them would also have to be written into
+    /// `README.md`'s blessed block, which is the root's to re-bless.
     #[test]
     fn the_help_table_shows_every_binding_once() {
         let table = help_table();
@@ -1195,7 +1197,7 @@ pub(crate) mod tests {
         );
         assert!(
             !table.contains("wheel"),
-            "`--help` advertised a wheel it never scrolls:\n{table}"
+            "the key table grew a pointer row:\n{table}"
         );
     }
 

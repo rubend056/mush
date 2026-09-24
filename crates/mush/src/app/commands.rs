@@ -891,6 +891,7 @@ pub(crate) mod tests {
                     height: inner.height - footer_rows,
                     ..inner
                 },
+                first: 0,
                 title,
                 rows,
                 cursor,

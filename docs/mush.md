@@ -498,6 +498,36 @@ facts on screen: with the agents pane a zero rect, its `N working` / `N jobs` /
 `N waiting` counts move into the conversation pane's title; the hidden-row counts
 (`▲N`/`▼N`, `+N more lines`) stay behind.
 
+**The mouse.** mush takes the mouse — it used to leave it to the terminal on
+purpose (finding K3): the terminal's own drag-to-select was worth more than a
+wheel notch, and `Ctrl-F` / `Ctrl-Y` were built to scope a selection to one pane
+without it. The human asked for clicks, so the trade is made the other way and
+its price is said out loud: a *plain* drag is mush's own input now — the mode set
+takes press and release and no motion, so the press acts where it lands and the
+drag itself is never seen — and selecting cells is the terminal's bypass key,
+`Shift`+drag in most terminals. `Ctrl-F` is still the road to a rectangle of one
+pane, and `Ctrl-Y` still copies the transcript's *source* lines.
+
+What a left click does is move what the keyboard also moves. It puts the
+keyboard in the pane it lands on, the way clicking a window does. A tree row
+selects that conversation — the cursor goes to the clicked row, so `j`/`k`
+carry on from there — and a picker's row walks the picker's cursor (picking
+waits for `Enter`: a pick writes a session or a config, and one click is not
+that decision). A click in the message box focuses the chat pane and does not
+move the box's text cursor. The bar and every border are nobody's, and a click
+there does nothing at all. Nothing is painted for the mouse — no hover
+highlight, no pointer glyph — so the feedback a click gets is the frame the
+panes already paint.
+
+A wheel notch is three rows of whatever is under the pointer: the transcript
+(older up, three at a time), the tree's cursor — that pane's window *is* the
+cursor, so a notch walks it the way `j`/`k` do — or a picker's list, which is
+modal and takes a notch wherever the pointer is. The keys are still the exact
+road: `↑`/`↓` move one row and `PgUp`/`PgDn` a page. The wheel has no row in
+the key table below because it is not a key; the mode set it needs is taken by
+hand in `crates/mush/src/main.rs` (`take_mouse`: 1000 and 1006, not the
+library's 1002/1003/1015), and the handler is `crates/mush/src/app/mouse.rs`.
+
 The transcript is not only the human's words, and it says so. `you › ` marks a
 line the human typed — and only a line the human typed: a subagent's brief opens
 its pane as `brief › `, a parent's `control` message arrives as `parent › `, and
@@ -531,8 +561,9 @@ raw, so a `#` there is a comment and an `*` a glob. What the copy road hands
 another program is the *source* lines of a reply, never the painted screen. Both
 rules live in `crates/mush-core/src/text.rs` (`sanitize`, `markdown_rows`).
 
-`Ctrl-Y` is that copy road. mush never captures the mouse, so the terminal owns
-selection and a drag is a rectangle of screen cells; the mode is a cursor over
+`Ctrl-Y` is that copy road. The terminal's own selection is a rectangle of
+screen cells, and a drag reaches it through the terminal's bypass key now that
+mush takes the mouse (Shift+drag in most of them); the mode is a cursor over
 the transcript's **source** lines instead. `↑`/`↓` move it one line, `Shift`
 holds the selection while it moves, `PgUp`/`PgDn` ten, `Home`/`End` jump to the
 oldest or newest, `Enter` copies and leaves, `Esc` leaves without copying. While
@@ -1297,7 +1328,7 @@ wrapping) is where the tests live.
 | Crate | Why |
 |---|---|
 | `ratatui` | TUI layout and diff-based rendering |
-| `crossterm` (via ratatui) | keyboard events, raw mode, alternate screen |
+| `crossterm` (via ratatui) | keyboard and mouse events, raw mode, alternate screen |
 | `serde`, `serde_json` | messages, session file, tool arguments |
 | `crossbeam-channel` | one channel, `.select()`-ready |
 | `unicode-width` | correct wrapping and columns for wide glyphs |
