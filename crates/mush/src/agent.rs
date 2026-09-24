@@ -298,13 +298,27 @@ pub enum Outcome {
 /// It travels beside the run's outcome on [`AgentMsg::Work`], never inside it:
 /// an outcome is delivered exactly once and marks a read, while this is a
 /// *listing* fact a parent may re-read as often as it likes without re-arming
-/// anything.
+/// anything. One member is mush's own act rather than the run's: [`Work::Reaped`]
+/// says the sweep took the checkout and the branch, so a listing cannot read a
+/// removal as a branch still standing (finding H10).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Work {
     /// The run committed its work on `branch`.
     Committed { branch: String, revision: String },
     /// The run changed nothing at all: the branch stands clean where it was.
     Clean { branch: String },
+    /// The run's own end took its checkout and its branch away: the sweep found
+    /// the branch adding nothing to its base and the checkout clean — `landing`
+    /// says which of the two nothings it was ([`git::Landing`]). Its own variant
+    /// because every sentence `Clean` carries is false about it: "the branch
+    /// stands clean where it was" is a lie about a branch mush has just deleted,
+    /// and saying nothing at all is what let the human report a worktree that
+    /// never existed. `Committed` is deliberately not folded in: a run that
+    /// committed has already reported the revision it kept.
+    Reaped {
+        branch: String,
+        landing: git::Landing,
+    },
     /// The run changed only paths the repository ignores, so there was nothing
     /// to commit and nothing a commit could keep. Its own answer because
     /// "nothing changed" is false about a run that changed the filesystem —
@@ -316,19 +330,25 @@ pub enum Work {
 }
 
 impl Work {
-    /// The line the UI prints when this happened. One home for the sentence, so
-    /// the row's status line, the transcript line a failed commit leaves
-    /// ([`report_work`]) and the listing agree about the same commit. Only the
-    /// sentence is spelled here: the pane no longer reads its opening to know
-    /// who wrote it — the transcript line carries [`Message::mush`]'s mark
-    /// ([`push_mush_line`]) — so the body can be git's own error without a
-    /// reader ever mistaking it for provenance.
-    fn status_line(&self) -> Option<String> {
+    /// The line the UI prints when this happened, and — for [`Work::Reaped`] —
+    /// the sentence the parent's transcript gets ([`Work::reap_line`]). One home
+    /// for the sentence, so the row's status line, the transcript line a failed
+    /// commit leaves ([`report_work`]) and the listing agree about the same
+    /// commit. Only the sentence is spelled here: the pane no longer reads its
+    /// opening to know who wrote it — the transcript line carries
+    /// [`Message::mush`]'s mark ([`push_mush_line`]) — so the body can be git's
+    /// own error without a reader ever mistaking it for provenance.
+    ///
+    /// `id` is the child the sentence is about: a removal is told to the parent
+    /// as well as to the row ([`note_work`]), and the sentence has to name which
+    /// agent's checkout is gone.
+    fn status_line(&self, id: u64) -> Option<String> {
         match self {
             Work::Committed { branch, revision } => {
                 Some(format!("committed {revision} on {branch}"))
             }
             Work::Clean { .. } => None,
+            Work::Reaped { .. } => self.reap_line(id),
             Work::Ignored { branch, paths } => Some(format!(
                 "{branch} holds ignored work only: {} — a commit cannot keep it",
                 git::named_paths(paths)
@@ -339,12 +359,44 @@ impl Work {
         }
     }
 
+    /// The removal, said once, where the reader who cannot see the row is: the
+    /// parent's transcript ([`note_work`]). `None` for every other fact: a
+    /// commit's or ignored paths' line is the row's own — that worktree is still
+    /// there, to be looked at — while a removal's whole fact is an absence, and
+    /// the absence of the branch is what the human read as "it never existed".
+    fn reap_line(&self, id: u64) -> Option<String> {
+        match self {
+            Work::Reaped { landing, .. } => Some(format!(
+                "#{id}'s worktree was reaped — {}",
+                Self::landing_words(*landing)
+            )),
+            _ => None,
+        }
+    }
+
+    /// What [`git::Landing`] reads as in words. One home because two sentences
+    /// spell it — [`Work::reap_line`] for the parent's transcript and
+    /// [`Work::digest`] for the listing — and one removal cannot read two ways
+    /// in one tree.
+    fn landing_words(landing: git::Landing) -> &'static str {
+        match landing {
+            git::Landing::NothingCommitted => "nothing was committed, its branch was empty",
+            git::Landing::Merged => "its branch was merged",
+        }
+    }
+
     /// A bounded suffix for `status`: where the work is and whether it
-    /// is committed. Never the body of anything, and never a read.
+    /// is committed. Never the body of anything, and never a read. A removal
+    /// names the branch it took: every other arm says which branch the work is
+    /// on, and the one fact a reader needs about a reaped run is *which*
+    /// checkout is gone (finding H10).
     fn digest(&self) -> String {
         match self {
             Work::Committed { branch, revision } => format!(" · committed {revision} on {branch}"),
             Work::Clean { branch } => format!(" · {branch} clean — nothing changed"),
+            Work::Reaped { branch, landing } => {
+                format!(" · {branch} was reaped — {}", Self::landing_words(*landing))
+            }
             Work::Ignored { branch, paths } => format!(
                 " · {branch} holds ignored work only: {}",
                 truncate(&git::named_paths(paths), 60)
@@ -1190,6 +1242,11 @@ struct ActorState {
     /// it is paired with the completion's run so an old branch can never be
     /// read as the newer run's work (finding H1).
     work: HashMap<u64, (u64, Work)>,
+    /// Reap lines that arrived where the transcript cannot take a message
+    /// (`drain_signals` runs between a batch's tool calls), flushed at the next
+    /// boundary `fold_completions` owns. Only removals: a commit's or ignored
+    /// paths' line is the row's own and is never delivered (finding H1).
+    reap_lines: Vec<String>,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
@@ -2248,15 +2305,12 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // lands with git — so its work is committed here instead
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
-        let work = actor.branch.clone().map(|branch| {
-            work_from_commit(
+        let committed = actor.branch.clone().map(|branch| {
+            (
                 branch,
                 commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome),
             )
         });
-        if let Some(work) = &work {
-            report_work(&actor, &mut transcript, work);
-        }
         // …and the run's own worktree, swept now that the run is finished with
         // it: a branch that adds nothing to the base this run was forked from —
         // nothing was committed, or the human merged it while the run was still
@@ -2265,8 +2319,19 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // isolated run that changed nothing leaves a worktree behind for good.
         // Anything unmerged or dirty is left alone, and the sweep says so
         // instead of doing it. The landing travels with the event, so the UI
-        // can mark the row with what really happened to the branch.
-        if let Some(landing) = reclaim_own_worktree(&actor, &state, &outcome) {
+        // can mark the row with what really happened to the branch. It is asked
+        // *before* the work fact is built, because only the sweep knows whether
+        // a branch that committed nothing is still there: when it took the
+        // checkout, the fact is a [`Work::Reaped`] built by [`work_from_end`]
+        // and not `Clean` — a `Clean` branch stands and one that was swept
+        // does not, and that is the distinction the parent's transcript, the
+        // listing and the row all read (`note_work`).
+        let landed = reclaim_own_worktree(&actor, &state, &outcome);
+        let work = committed.map(|(branch, found)| work_from_end(branch, found, landed));
+        if let Some(work) = &work {
+            report_work(&actor, &mut transcript, work);
+        }
+        if let Some(landing) = landed {
             actor.ctx.emit(actor.id, AgentEvent::Reclaimed { landing });
         }
         // This run is over, and this is its number: a parent that hears the
@@ -2275,7 +2340,9 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         state.runs += 1;
         // The worktree fact goes before the report, so a parent draining its
         // mailbox in order has it by the time it renders the listing (finding
-        // H1). It is listed, never delivered: it marks nothing read.
+        // H1). It is listed and never *delivered* — it marks nothing read —
+        // but a removal is a sentence the parent's transcript still has to
+        // carry, and that is [`note_work`]'s `Option`.
         if let Some(work) = &work {
             actor.tell_parent(AgentMsg::Work {
                 id: actor.id,
@@ -2696,9 +2763,14 @@ fn absorb(
         }
         // How a run left its worktree: a listing fact, not a result. It starts
         // no run and marks nothing read, whichever order it arrives in
-        // (finding H1).
+        // (finding H1) — but a *removal* is also a sentence this parent has to
+        // read: the row's mark alone was what let the human read a worktree and
+        // a branch that had been taken away as "it never existed", and this is
+        // the only reader that keeps the fact.
         AgentMsg::Work { id, run, work } => {
-            note_work(state, id, run, work);
+            if let Some(line) = note_work(state, id, run, work) {
+                push_mush_line(actor, transcript, line);
+            }
             Fold::Idle
         }
         // The child's actor thread was replaced: its run numbering starts over,
@@ -2789,13 +2861,30 @@ fn absorb(
 /// empty branch are both gone, so no restore can put the checkout back either).
 /// Only a run that ended on its own terms can settle a worktree: a stop is the
 /// human's decision, not the run's.
+///
+/// A *failed* run is that same fact for the opposite reason, and it is the
+/// other half of the human's report: the endpoint (or the wire) ended the run —
+/// the run did not choose to end — and what the worktree holds is the only copy
+/// of the context the human's next `control message` resumes with. That wake
+/// runs in this directory, and [`ensure_worktree`] can put a checkout back only
+/// while the branch is there; a sweep that took both leaves the resume with
+/// nothing to run in and ten minutes of context orphaned with no record of
+/// where it went — the report that "it never existed". The UI's own sweep
+/// already behaves this way (`App::refresh_git`'s walk asks for
+/// `matches!(node.phase, Phase::Done)`: "Only a run that ended on its own terms
+/// leaves residue. A row that is stopped, cut off, failed or never asked is one
+/// a message can still wake *into its own worktree*"), so this guard was the
+/// one road that disagreed with it. The cost is named and accepted: a failed
+/// agent holds its worktree slot — and the cap counts it — until a later run's
+/// end settles it or the human takes it by hand, which is the smaller price
+/// than a resume with nowhere to write.
 fn reclaim_own_worktree(
     actor: &Actor,
     state: &ActorState,
     outcome: &Outcome,
 ) -> Option<git::Landing> {
     if actor.branch.is_none()
-        || matches!(outcome, Outcome::Stopped(_))
+        || matches!(outcome, Outcome::Stopped(_) | Outcome::Failed(_))
         || !state.running.is_empty()
         || !state.running_jobs.is_empty()
     {
@@ -4212,8 +4301,17 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
                 note_completion(state, id, run, outcome);
             }
             // A listing fact, not a signal: it starts nothing, ends nothing,
-            // and is folded nowhere (finding H1).
-            AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // and no completion line is built here (finding H1). A removal's
+            // line is the one thing this call owes the parent, and it cannot
+            // go into a transcript this call does not have: a `user` message
+            // between the assistant's tool calls and their results is the shape
+            // strict servers reject, so it is parked for the boundary
+            // [`fold_completions`] owns.
+            AgentMsg::Work { id, run, work } => {
+                if let Some(line) = note_work(state, id, run, work) {
+                    state.reap_lines.push(line);
+                }
+            }
             // The child's actor thread went away and its run numbering with it
             // (see `note_parked`). A signal about the books rather than about
             // the run in flight, so it is honoured mid-run like any other.
@@ -4309,8 +4407,18 @@ fn drain_mailbox(
                 note_completion(state, id, run, outcome);
             }
             // The worktree fact of the run just recorded. It is not a result:
-            // nothing is pushed and no boundary is moved (finding H1).
-            AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // nothing is pushed for a commit or for ignored paths, and no
+            // boundary is moved (finding H1). A removal's line *is* pushed —
+            // this is a message boundary (`drain_mailbox`'s whole job), where a
+            // `user`-shaped line is legal, unlike `drain_signals`' between-calls
+            // window — and it goes in ahead of the completions below, the order
+            // the parent heard the two facts in: `Work` is sent before
+            // `ChildDone` (`actor_body`).
+            AgentMsg::Work { id, run, work } => {
+                if let Some(line) = note_work(state, id, run, work) {
+                    push_mush_line(actor, messages, line);
+                }
+            }
             // The child's actor thread was replaced, so the books' run
             // identity for it restarts with it (see `note_parked`). It carries
             // no work to fold: the words belong to the child's own actor.
@@ -4525,22 +4633,41 @@ fn note_parked(state: &mut ActorState, id: u64) {
     state.running.remove(&id);
 }
 
-/// Record how a run left its worktree. Kept by run, and only the newest run's
-/// fact survives: a `Work` is never delivered (nothing reads it as a result),
-/// so this is a plain latest-value book (finding H1).
-fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
+/// Record how a run left its worktree — and answer the one line a *removal*
+/// owes the parent's transcript. Kept by run, and only the newest run's fact
+/// survives: a `Work` is never delivered (nothing reads it as a result), so
+/// this is a plain latest-value book (finding H1).
+///
+/// The line comes back exactly once per removal. The same `(run, work)` booked
+/// again is the same fact arriving on a second road — the parent may fold it
+/// while idle ([`absorb`]) or mid-run ([`drain_mailbox`], [`drain_signals`]) —
+/// and a checkout that is gone must not say so twice in one conversation; a
+/// *newer* run's fact supersedes an older one's, which the listing's pairing by
+/// run already decides. Every non-removal answers `None`: a commit's or ignored
+/// paths' line is the row's own, and the transcript is not a second copy of the
+/// listing (finding H1).
+fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) -> Option<String> {
     // A worktree fact for a forgotten child has no row to be listed under
     // (`AgentMsg::ForgetChild`), and the entry would sit there for the life of
     // the actor.
     if state.is_forgotten(id) {
-        return;
+        return None;
     }
-    match state.work.get(&id) {
-        Some((known, _)) if *known > run => {}
-        _ => {
-            state.work.insert(id, (run, work));
+    if let Some((known, recorded)) = state.work.get(&id) {
+        // An older run's fact is history: the listing answers with the newer
+        // one, and the removal it names has already been said or superseded.
+        if *known > run {
+            return None;
+        }
+        // The same fact again: the book already holds it, and the removal was
+        // said the first time.
+        if *known == run && recorded == &work {
+            return None;
         }
     }
+    let line = work.reap_line(id);
+    state.work.insert(id, (run, work));
+    line
 }
 
 /// How many job reports one actor's books keep — the registry's whole memory.
@@ -4660,8 +4787,20 @@ fn push_message(actor: &Actor, messages: &mut Vec<Message>, message: Message) {
 /// A completion is a legal user message exactly here, after the assistant's
 /// tool calls and their results. A *nudge* is not: the human's words between an
 /// assistant's calls and their results are the shape strict servers reject, so
-/// nudges keep parking for the tool-free boundary (`drain_mailbox`).
+/// nudges keep parking for the tool-free boundary (`drain_mailbox`). A
+/// *removal* is not a completion either, but this boundary is where a line that
+/// is not news still belongs — so the ones a run's `drain_signals` had to park
+/// ([`ActorState::reap_lines`]) are said here too, and never counted as news.
 fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
+    // First the removals a mid-batch `drain_signals` could not place. They go
+    // in *before* the completions below, which is the order the parent heard the
+    // two facts in: a run's `Work` is sent before its `ChildDone`
+    // (`actor_body`, finding H1). A removal is not a result, so none of this
+    // touches the answer — a reap is not news, and a fold that reported one
+    // would pay for a turn to say nothing.
+    for line in state.reap_lines.drain(..) {
+        push_mush_line(actor, messages, line);
+    }
     // Jobs first: they are the newest actors, and a job's line is only news if
     // the job ended on its own — one mush killed is the human's or the model's
     // own doing, and its line waits for the next run instead of paying for one.
@@ -6102,6 +6241,26 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
     }
 }
 
+/// The same fact with the sweep's own answer folded in: the run's end asked
+/// [`reclaim_own_worktree`], and a branch that committed nothing plus a
+/// checkout it took is a removal ([`Work::Reaped`]), not a clean branch.
+///
+/// The landing is the only thing the sweep can add: `Ignored` and `Uncommitted`
+/// keep their variants rather than mapping onto `Reaped` because the sweep
+/// keeps a checkout with any change — ignored paths included — so a *removed*
+/// ignored or uncommitted worktree is unreachable, and mapping one would be a
+/// sentence about a removal that did not happen (finding F1).
+fn work_from_end(
+    branch: String,
+    found: Result<git::Commit, String>,
+    landed: Option<git::Landing>,
+) -> Work {
+    match (work_from_commit(branch, found), landed) {
+        (Work::Clean { branch }, Some(landing)) => Work::Reaped { branch, landing },
+        (work, _) => work,
+    }
+}
+
 /// File what the run did to its worktree: the row's tail, and — for a commit
 /// that failed — the transcript line that outlives the run.
 ///
@@ -6118,8 +6277,14 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
 /// there would read as the parent's, which is the lie the mark exists to
 /// prevent. The other two shapes are progress reports the row and the listing
 /// already carry; only unlanded work must not be missable.
+///
+/// A [`Work::Reaped`] line is the row's tail here and the *parent's* transcript
+/// ([`Work::reap_line`], delivered by [`note_work`]), never this transcript:
+/// the reader who has to know a checkout is gone is the hand that would resume
+/// the run, and the child's own transcript is the one place the removal is not
+/// news — the run just ended, and there is nobody left reading it.
 fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
-    let Some(line) = work.status_line() else {
+    let Some(line) = work.status_line(actor.id) else {
         return;
     };
     actor.ctx.emit(actor.id, AgentEvent::Status(line.clone()));
@@ -9818,6 +9983,132 @@ mod tests {
         assert!(lines.contains("mush/1 clean — nothing changed"), "{lines}");
     }
 
+    /// A branch the sweep took is not a clean one, and the listing must not read
+    /// it as one: the branch and the checkout are gone, and the fact the parent
+    /// deciding on a merge is missing is the removal itself (finding H10). The
+    /// two landings spell their own sentence, from [`Work::landing_words`].
+    #[test]
+    fn a_reaped_branch_never_reads_as_clean() {
+        let (actor, _mailbox) = test_actor("status-reaped");
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx);
+        note_completion(&mut state, 1, 1, Outcome::Finished("nothing to do".into()));
+
+        let reaped = Work::Reaped {
+            branch: "mush/1".into(),
+            landing: git::Landing::NothingCommitted,
+        };
+        assert_eq!(
+            reaped.digest(),
+            " · mush/1 was reaped — nothing was committed, its branch was empty"
+        );
+        assert!(
+            !reaped.digest().contains("clean"),
+            "a branch that is gone never reads clean: {}",
+            reaped.digest()
+        );
+        // The same words the parent's transcript gets, with the id in front:
+        // one sentence, two readers.
+        assert_eq!(
+            reaped.status_line(1).as_deref(),
+            Some(reaped.reap_line(1).unwrap().as_str())
+        );
+        assert_eq!(
+            reaped.reap_line(1).as_deref(),
+            Some("#1's worktree was reaped — nothing was committed, its branch was empty")
+        );
+        note_work(&mut state, 1, 1, reaped);
+        let lines = status_tool(&actor, &state).unwrap();
+        assert!(
+            lines.contains(
+                "#1 ✓ nothing to do · mush/1 was reaped — nothing was committed, its branch \
+                 was empty"
+            ),
+            "the listing carries the removal: {lines}"
+        );
+        assert!(!lines.contains("clean"), "{lines}");
+
+        // The other landing: the human merged the branch while the run was
+        // still going, and the sweep took the checkout the merge left behind.
+        let merged = Work::Reaped {
+            branch: "mush/1".into(),
+            landing: git::Landing::Merged,
+        };
+        assert_eq!(
+            merged.reap_line(2).as_deref(),
+            Some("#2's worktree was reaped — its branch was merged")
+        );
+        assert!(
+            merged.digest().contains("its branch was merged"),
+            "{}",
+            merged.digest()
+        );
+    }
+
+    /// A removal is said once, to the one reader that can keep it: [`note_work`]
+    /// answers the line the first time it books a [`Work::Reaped`], and nothing
+    /// after that — the same fact again (a replayed record), a *newer* run's fact
+    /// (the listing has moved on), an older one arriving late, a non-removal, or
+    /// a child the tree has forgotten. A fact said twice in one conversation is
+    /// the failure this rule exists to prevent; a fact never said is the human's
+    /// report.
+    #[test]
+    fn a_reap_fact_is_said_once() {
+        let (_actor, _mailbox) = test_actor("reap-once");
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx);
+        note_completion(&mut state, 1, 1, Outcome::Finished("nothing to do".into()));
+        let reaped = Work::Reaped {
+            branch: "mush/1".into(),
+            landing: git::Landing::NothingCommitted,
+        };
+
+        assert_eq!(
+            note_work(&mut state, 1, 1, reaped.clone()),
+            Some("#1's worktree was reaped — nothing was committed, its branch was empty".into()),
+            "the first booking answers the sentence"
+        );
+        assert_eq!(
+            note_work(&mut state, 1, 1, reaped.clone()),
+            None,
+            "the same fact again is the same removal, not a second one"
+        );
+        assert_eq!(state.work_for(1), Some(&reaped), "and the listing holds it");
+
+        // A commit is not a removal: it has nothing to say to the transcript,
+        // and it replaces the removal in the book — a newer run's fact.
+        let committed = Work::Committed {
+            branch: "mush/1".into(),
+            revision: "abc1234".into(),
+        };
+        note_completion(&mut state, 1, 2, Outcome::Finished("again".into()));
+        assert_eq!(
+            note_work(&mut state, 1, 2, committed.clone()),
+            None,
+            "a commit's line is the row's own"
+        );
+        assert_eq!(state.work_for(1), Some(&committed));
+        // …and the older removal, replayed after it, cannot be said over it.
+        assert_eq!(
+            note_work(&mut state, 1, 1, reaped.clone()),
+            None,
+            "an older run's fact is history the listing already replaced"
+        );
+        assert_eq!(state.work_for(1), Some(&committed));
+
+        // A forgotten child has no row to list it under and no reader: the
+        // entry would sit there for the life of the actor.
+        forget_child(&mut state, 1);
+        assert_eq!(
+            note_work(&mut state, 1, 3, reaped),
+            None,
+            "a forgotten child's removal has nowhere to be said"
+        );
+        assert_eq!(state.work_for(1), None);
+    }
+
     /// A running child has no outcome to print, and `#N ◐ running` alone does
     /// not tell a parent with three children which is which. An isolated
     /// child's branch is derivable from its id — the same `mush/<id>` every
@@ -9862,7 +10153,7 @@ mod tests {
         assert!(!digest.contains("nothing changed"), "{digest}");
         assert!(digest.contains("ignored/report.txt"), "{digest}");
         let line = work
-            .status_line()
+            .status_line(1)
             .expect("a kept deliverable is news the human hears");
         assert!(line.contains("ignored/report.txt"), "{line}");
         assert!(
@@ -9930,7 +10221,7 @@ mod tests {
             "the commit must really fail: {work:?}"
         );
         let line = work
-            .status_line()
+            .status_line(1)
             .expect("an uncommitted worktree has a line");
 
         let mut state = ActorState::default();
@@ -16593,6 +16884,153 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The removal a parent learns *between its own tool calls*: the
+    /// `drain_signals` there has no transcript to put a `user` message in, so
+    /// the line is parked ([`ActorState::reap_lines`]) and said at the next
+    /// boundary — exactly once, and after the batch's last tool result, so the
+    /// transcript stays the shape a strict server accepts. The other two roads
+    /// (an idle `absorb`, a boundary `drain_mailbox`) have a transcript and push
+    /// on the spot; this is the one that could silently lose the fact, and the
+    /// loss is the human's report — a worktree and a branch gone with nothing
+    /// said about either.
+    #[test]
+    fn a_reap_learned_between_two_tool_calls_reaches_the_transcript_once() {
+        let root = init_git_repo("reap-mid-batch");
+        // The child's only reply is held, so the parent's batch can start — and
+        // its first call block — before the child's run ends.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                // The child: a plain answer, so its run commits nothing and the
+                // sweep takes its checkout and branch at the run's end.
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .held(gate.clone())
+                .says("nothing to do")
+                // The parent's second run: two calls in one batch. The first
+                // blocks until the test has let the child finish, so the fact
+                // can only be drained by a `drain_signals` — the boundary after
+                // the batch is too late.
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("two calls"))
+                .calls(vec![
+                    tool_call(
+                        "c1",
+                        "run_command",
+                        json!({ "command": "touch started; i=0; while [ ! -f go ] && \
+                            [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done" }),
+                    ),
+                    tool_call("c2", "run_command", json!({ "command": "true" })),
+                ])
+                // The turn after that boundary: the model reads what it said.
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("was reaped"))
+                .says("heard the removal")
+                // The parent's first run: delegate.
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({ "brief": "do nothing at all, and answer", "base": "main" }),
+                )])
+                .says("left it running"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.to_path_buf(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate: do nothing at all".to_string()),
+            ]))
+            .unwrap();
+
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the child's first run reached the model"
+        );
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the parent's first run must end before the nudge: {seen:?}"
+        );
+        // The parent's batch, with the child still held inside the gate.
+        root_tx.send(AgentMsg::Nudge("two calls".into())).unwrap();
+        let started = root.join("started");
+        let deadline = Instant::now() + WAIT;
+        while !started.exists() && Instant::now() < deadline {
+            let _ = events.wait(Duration::from_millis(25));
+        }
+        assert!(
+            started.exists(),
+            "the batch's first call must start: {:?}",
+            events.events_for(AgentId::ROOT)
+        );
+
+        // The child's run ends mid-batch, while the parent is blocked in its
+        // first command: its `Work` is in the parent's mailbox before the child
+        // says `Done` (`actor_body` sends the fact first), and nothing drains the
+        // mailbox until a `drain_signals` does.
+        gate.release();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the child's clean run must end: {seen:?}"
+        );
+        fs::write(root.join("go"), "go").unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
+            "the parent's batch, and the turn after it, must end: {seen:?} — root events {:?}",
+            events.events_for(AgentId::ROOT)
+        );
+
+        let line = "#1's worktree was reaped — nothing was committed, its branch was empty";
+        let root_events = events.events_for(AgentId::ROOT);
+        let said: Vec<usize> = root_events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                matches!(event, AgentEvent::Message(message) if message.text() == line)
+            })
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "the removal is said exactly once: {root_events:?}"
+        );
+        let last_tool = root_events
+            .iter()
+            .rposition(
+                |event| matches!(event, AgentEvent::Message(message) if message.role == "tool"),
+            )
+            .expect("the batch ran two calls");
+        assert!(
+            said[0] > last_tool,
+            "the line belongs at the boundary, after the batch's last tool result: {root_events:?}"
+        );
+        // And the model reads it at the next turn: the fact is in the request,
+        // not only on the row.
+        assert!(
+            scripted
+                .asked()
+                .iter()
+                .any(|asked| asked.depth().is_none() && asked.saw("was reaped")),
+            "the turn after the boundary must carry the removal: {:?}",
+            scripted
+                .asked()
+                .iter()
+                .map(|asked| format!(
+                    "depth={:?} reaped={}",
+                    asked.depth(),
+                    asked.saw("was reaped")
+                ))
+                .collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// `Stop` cancels work and is a no-op for an idle agent; only `Shutdown`
     /// ends one — which is what keeps Ctrl-N from leaving an orphan root
     /// behind that still answers to agent #0.
@@ -19222,6 +19660,13 @@ mod tests {
     /// which are gone (finding H10, U13). Without this, every isolated run that
     /// changed nothing left a worktree behind for good, and its branch was what
     /// the next `worktree add -b mush/<id>` died on.
+    ///
+    /// The removal is *said* as well as marked: the parent's transcript carries
+    /// the one sentence ([`Work::reap_line`]), because the row's mark alone — `✓
+    /// done`, no branch — is what let the human read a worktree and a branch
+    /// mush had taken away as "it never existed". A `Clean` that says nothing is
+    /// the same silence that report was made of, and this is the test that
+    /// would go green if the line were dropped again.
     #[test]
     fn a_run_that_committed_nothing_leaves_no_worktree_behind() {
         let root = init_git_repo("clean-run");
@@ -19284,6 +19729,21 @@ mod tests {
                 )),
             "the row is told what really happened — the branch never gained a commit \
              of its own — or `merged` is painted over a run only ever made of reads"
+        );
+        // …and the human's own conversation is where the fact is *read*, once.
+        // The row's mark answers "did anything land"; this answers "where did my
+        // worktree go", which is the question the absence left unanswered.
+        let reaped = "#1's worktree was reaped — nothing was committed, its branch was empty";
+        let root_events = events.events_for(AgentId::ROOT);
+        let said = root_events
+            .iter()
+            .filter(
+                |event| matches!(event, AgentEvent::Message(message) if message.text() == reaped),
+            )
+            .count();
+        assert_eq!(
+            said, 1,
+            "the root's transcript carries the removal exactly once: {root_events:?}"
         );
         // Nothing was written anywhere: the root's own checkout is untouched.
         assert_eq!(
@@ -19920,6 +20380,192 @@ mod tests {
         assert!(
             !root.join("resumed.txt").exists(),
             "and not in the parent's checkout"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other run the sweep must leave alone, and the other half of the
+    /// human's report: a failure the run did not choose. The endpoint — or the
+    /// wire — ended it, and what its worktree holds is the only copy of the
+    /// context the human's next `control message` resumes with. A sweep that
+    /// took the checkout and the branch is what makes "it never existed" true,
+    /// and the resume then lands in the parent's checkout or nowhere. The retry
+    /// in `model.rs` covers the read-side failure that never began; this is the
+    /// failure it deliberately does not repeat.
+    #[test]
+    fn a_failed_run_keeps_the_worktree_its_resume_runs_in() {
+        let root = init_git_repo("fail-keeps-worktree");
+        // The root's own second request is held so the child's failure lands
+        // while the root is still in its first run, and is folded there: the
+        // test's ordering is a fact, not a race between two fast scripted
+        // actors (the child failing first would otherwise be folded in this run
+        // or a wake, whichever the scheduler picked).
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                // The child's first request died on the wire after the request
+                // went out. `Transport` is final — nothing was retried — so the
+                // run really fails and its branch gains nothing.
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("carry on"))
+                .fails(ModelError::Transport(
+                    "Connection reset by peer (os error 104)".into(),
+                ))
+                // The resume writes in whatever workspace it is handed.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("carry on"))
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "printf 'resumed\\n' > resumed.txt" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("carry on"))
+                .says("resumed")
+                // The root delegates once, holds its next turn so the child's
+                // failure is in its mailbox when that turn ends, then answers
+                // the folded news.
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "carry a context that must survive the failure",
+                        "base": "main"
+                    }),
+                )])
+                .when(|asked: &Asked| asked.depth().is_none())
+                .held(gate.clone())
+                .says("left it running")
+                .says("noted"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.to_path_buf(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate: carry a context".to_string()),
+            ]))
+            .unwrap();
+
+        // The child is spawned before the held turn, so its failure can be
+        // waited for before the root is let go: two runs, the root's first and
+        // the child's failed one, and the failure is folded into the root's run
+        // and reported as news that needs an answer.
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the root's first run never reached its held turn"
+        );
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.errors.is_empty()),
+            "the child's failed run must end: {seen:?}"
+        );
+        gate.release();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the root, told `#1 failed`, must end its run: {seen:?} — root events {:?}",
+            events.events_for(AgentId::ROOT)
+        );
+        assert!(
+            seen.errors
+                .iter()
+                .any(|why| why.contains("Connection reset by peer")),
+            "the failure is what ended the child's run: {seen:?}"
+        );
+        let child_tx = events
+            .events()
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::Spawned { child: 1, cmd, .. } => Some(cmd),
+                _ => None,
+            })
+            .expect("the child's Spawned event carries its mailbox");
+        // The parent read the failure: the report is in its transcript, and the
+        // resume below has to carry the same conversation's work fact too.
+        assert!(
+            events
+                .events_for(AgentId::ROOT)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    AgentEvent::Message(message) if message.text().contains("#1 failed")
+                )),
+            "the root must be told the child failed: {:?}",
+            events.events_for(AgentId::ROOT)
+        );
+
+        // The failure did not settle the worktree: the branch it never
+        // committed to is still there for the resume to run on, and nothing
+        // claims a landing happened.
+        let worktree = git::worktree_path(&root, 1);
+        assert!(
+            worktree.exists(),
+            "a failed run must not reclaim the workspace its resume runs in"
+        );
+        assert!(
+            git::resolve(&root, &git::branch_name(1)).is_some(),
+            "nor delete the branch it was on"
+        );
+        assert!(
+            !events
+                .events_for(AgentId(1))
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Reclaimed { .. })),
+            "no sweep ran, so the row must not claim a landing"
+        );
+        assert!(
+            !events
+                .events_for(AgentId::ROOT)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    AgentEvent::Message(message) if message.text().contains("was reaped")
+                )),
+            "and the parent's transcript must not say a checkout was reaped"
+        );
+
+        // And the resume really runs there, carrying the context the failure
+        // left: the words are not a promise the worktree cannot keep.
+        child_tx.send(AgentMsg::Nudge("carry on".into())).unwrap();
+        let resumed = worktree.join("resumed.txt");
+        assert!(
+            seen.wait(&events, WAIT, |_| resumed.exists()),
+            "the resumed run writes in its own worktree — asks: {:?}",
+            scripted
+                .asked()
+                .iter()
+                .map(|asked| format!(
+                    "depth={:?} carry_on={}",
+                    asked.depth(),
+                    asked.saw("carry on")
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !root.join("resumed.txt").exists(),
+            "and not in the parent's checkout"
+        );
+        // "Its context intact" is a fact about the request, not a hope: the
+        // nudge's turn still carries the first run's opening brief. (The failed
+        // request never answered, so the brief is the earlier turn there is; a
+        // run that had got further would carry its tool results the same way.)
+        let resumed_request = scripted
+            .asked()
+            .into_iter()
+            .find(|asked| asked.depth() == Some(1) && asked.saw("carry on"))
+            .expect("the nudge reached the child's model");
+        assert!(
+            resumed_request.saw("carry a context that must survive the failure"),
+            "the resumed request must still hold the first run's brief: {:?}",
+            resumed_request
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
         );
         let _ = fs::remove_dir_all(&root);
     }
