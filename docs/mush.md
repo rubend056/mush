@@ -736,12 +736,13 @@ sits under; how many children a parent keeps is `CHILD_HISTORY` in
 `crates/mush/src/app/tree.rs`), `▶` the focused agent, and `⚙N` jobs on their
 owner's row. A running agent with children out wears *no* count of them: the
 children's own rows say they run, and the title's `N waiting` counts the agents
-at rest with work out. Tool calls are
-`⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
-`⚙ control #4 message "…"`). The transcript paints a call as its digest row —
-the ask the call really made (a read's window, a search's pattern, a command
-without its redundant `cd` or its output-shaping tail) and, at the pane's own
-outcome column, what came back: `⚙ read_file text.rs 1408→1530    → 123 lines ·
+at rest with work out. Tool calls are `mark summarized-args`: each tool's own
+mark, from the glyph table in §4, stands in for its name, and only a name no
+tool answers to still spells one — `⚙ name args` (never raw JSON, the tools that
+steer a run included: `⇄ #4 message "…"`). The transcript paints a call as its
+digest row — the ask the call really made (a read's window, a search's pattern,
+a command without its redundant `cd` or its output-shaping tail) and, at the
+pane's own outcome column, what came back: `▤ text.rs 1408→1530    → 123 lines ·
 4 KB` — the same row in `Ctrl-O`'s compact log, which hides the details and the
 payload under it. Notices are neutral `·`
 unless something actually failed (`!`).
