@@ -23,6 +23,22 @@
 //! `held_x` is not either, while `self.held`, `Type::held` and `&held` are:
 //! `.`, `:` and `&` are not word characters.
 //!
+//! **The alphabet is Rust's, and one reading of it is worth naming.** `$` and
+//! `#` are not word characters either, so `usages("foo")` reports `$foo` (a
+//! JavaScript identifier of its own) and `usages("include")` reports
+//! `#include` (a C directive): the character before the name is simply not a
+//! word character. The other reading is worse — making `$` a word character
+//! would make the Rust macro metavariable `$name` unmentionable, a miss for a
+//! line that plainly spells the name — and this rule is written for Rust. The
+//! tool cannot tell one language's identifier alphabet from another's, and
+//! does not pretend to.
+//!
+//! A needle that is one non-word character is walked like any other word: `-`
+//! is a hit in `a - b` and not in `a-b`, because a hit needs a non-word
+//! character on *both* sides. A needle of whitespace is no special case either
+//! — it is not the *empty* needle, which the door refuses — so `usages(" ")`
+//! walks, and a space is a hit in `a = = b` and not in `a = b`.
+//!
 //! That is the whole rule, including its most arguable reading: **`.` and `::`
 //! do not split a needle**. Asking for `method` hits `self.method()` and
 //! `Type::method` — the tool cannot tell a field from a local, and a rule that
@@ -56,7 +72,19 @@
 //! the bytes, `\r` of a CRLF ending and all — where a search's match line is
 //! shown to be copied (`search` takes the bytes for that reason). A line longer
 //! than the width is cut for the same reason an outline row is: one minified
-//! file must not spend the answer.
+//! file must not spend the answer. The cut is a *prefix*, so a mention past the
+//! width is a row whose text does not reach its own word: the row's claim is its
+//! line number, and `read_file {offset}` shows the line. The list itself is
+//! bounded the same way, and by the answer rather than by the file:
+//! [`rows_within`] is the walk's reader, and it builds one row past the room the
+//! answer has left rather than every row the file holds — a generated file can
+//! hold a row on each of a million lines, and the answer it can spend is ten.
+//!
+//! A leading BOM is not a line's text either: U+FEFF at the very start of a
+//! file is the UTF-8 signature, not the first line's first character
+//! ([`crate::text::strip_bom`]), so a Windows editor's `\u{feff}fn f() {}` is
+//! read as the declaration it spells instead of as a first word that is
+//! neither `fn` nor a name.
 
 use crate::outline::{is_declaration, row_text as outline_row_text, ROW_WIDTH};
 use crate::text;
@@ -144,6 +172,13 @@ impl Usages {
 /// second is — stopping at the first would be a false miss. The step is one
 /// *character*, never one byte: a symbol's first byte may open a multi-byte
 /// character, and a step into its middle would not be a string boundary.
+///
+/// A needle holding a line break is not a case this predicate can decide: a
+/// line never holds one, so every call answers `false`, and the tool refuses
+/// such a needle at its own door ([`crate::workspace::Workspace::usages`])
+/// rather than walking the tree for a guaranteed miss. A carriage return is
+/// different — a lone one *is* a line's text — and is walked like any other
+/// character.
 pub fn is_usage(line: &str, symbol: &str) -> bool {
     // `find("")` answers `Some(0)` forever — an empty needle is not a rule
     // this can walk. The tool layer refuses it before it gets here
@@ -179,24 +214,67 @@ fn word_char(ch: char) -> bool {
 /// order, except that the declaration-looking rows come first (and keep their
 /// order among themselves).
 ///
+/// The whole list, with no room to bound it: [`rows_within`] is the reader the
+/// walk uses, and this is that reader with `usize::MAX` room, for the callers
+/// that want the rule's own answer rather than an answer's window (the sweeps
+/// at the bottom of this file).
+///
 /// A file with no rows answers an empty `Vec`; "no rows here" is a fact the
 /// caller pools with every other file's, not an error.
 pub fn rows(symbol: &str, text: &str) -> Vec<Usage> {
+    rows_within(symbol, text, usize::MAX)
+}
+
+/// The same rows, cut to `room` with the proof that there were more: at most
+/// `room + 1` of them, and exactly `room + 1` when the file held a further
+/// row. The caller's cut is then the walk's — `Workspace::usages` stops at the
+/// row it cannot keep, and one row past the room is what proves there was one.
+///
+/// The bound is the point, and it is the answer's rather than the file's. A
+/// minified or generated file can hold a row on every one of a million lines,
+/// and building them all to show ten spends the file's own size in memory to
+/// produce an answer ten rows long — the same trade `list_files` refuses
+/// (finding IN9) and the walk's cap refuses between files. The scan still
+/// visits every line, because a declaration on the *last* line of a file leads
+/// its group and stopping early would lose the row the group exists for; what
+/// is bounded is what is built, and the rows built are exactly the first
+/// `room + 1` of the full list, definitions first and each half in line order.
+pub fn rows_within(symbol: &str, text: &str, room: usize) -> Vec<Usage> {
+    // One past the room: `room + 1` rows are the proof of "there is more",
+    // and nothing beyond them can enter the answer the caller builds.
+    let keep = room.saturating_add(1);
     let mut definitions: Vec<Usage> = Vec::new();
     let mut mentions: Vec<Usage> = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in text::strip_bom(text).lines().enumerate() {
+        // `keep` declarations have filled the window on their own, and
+        // declarations lead it: nothing later can enter, so the scan is done.
+        if definitions.len() == keep {
+            break;
+        }
         if !is_usage(line, symbol) {
             continue;
         }
-        let row = Usage {
-            line: index + 1,
-            text: row_text(line),
-            definition: is_declaration(line),
-        };
-        if row.definition {
-            definitions.push(row);
-        } else {
-            mentions.push(row);
+        if is_declaration(line) {
+            definitions.push(Usage {
+                line: index + 1,
+                text: row_text(line),
+                definition: true,
+            });
+            // A declaration takes the window's front, so the row it pushed
+            // out is the last mention — and the window is what this has to
+            // carry, not the file.
+            if definitions.len() + mentions.len() > keep {
+                mentions.pop();
+            }
+        } else if definitions.len() + mentions.len() < keep {
+            // A mention is kept only while it could still stand inside the
+            // window; a later declaration pushes the window back, and the
+            // mentions kept so far are exactly the ones it can reach.
+            mentions.push(Usage {
+                line: index + 1,
+                text: row_text(line),
+                definition: false,
+            });
         }
     }
     definitions.append(&mut mentions);
@@ -298,6 +376,202 @@ mod tests {
         assert!(!is_usage("let m = MyType::method(x);", "Type::method"));
         assert!(!is_usage("let m = Type::methodology(x);", "Type::method"));
         assert!(!is_usage("x.a_self.field = 1;", "self.field"));
+    }
+
+    /// The alphabet is Rust's, and one reading of it is worth naming: `$` and
+    /// `#` are not word characters, so a JavaScript `$foo` is reported for
+    /// `foo` — a false positive in that language — while a Rust `$name` is
+    /// reported for `name`, which is the reading that keeps a macro
+    /// metavariable findable. The tool cannot tell one language's identifier
+    /// alphabet from another's, and the rule is written for the language the
+    /// outline rule reads names in.
+    #[test]
+    fn a_dollar_prefix_is_a_boundary_because_a_metavariables_name_is_the_one_to_keep() {
+        // JavaScript: `$foo` is an identifier of its own, and this rule cannot
+        // see that. The row it reports is still honest — the line really does
+        // hold `foo` at a boundary — and the module doc says the rule cannot
+        // resolve the difference.
+        assert!(is_usage("let $foo = 1;", "foo"));
+        assert!(is_usage("$('x')", "$"));
+        assert!(is_usage("$foo", "$foo"));
+        // Rust: `$name` in a macro body spells the metavariable `name`, and a
+        // rule that counted `$` as a word character would answer a miss for a
+        // line that plainly holds it.
+        assert!(is_usage("($name:expr) => { $name }", "name"));
+        // `#` is a boundary for the same reason: a C directive's name is the
+        // name, and `#` is not an identifier character in this rule's Rust.
+        assert!(is_usage("#include <stdio.h>", "include"));
+    }
+
+    /// A needle of one non-word character is a word like any other: a hit
+    /// needs non-word characters on *both* sides, so `-` stands alone in
+    /// `a - b` and is part of `a-b`. Whitespace is no special case either —
+    /// it is not the *empty* needle, which the door refuses — so `usages(" ")`
+    /// walks, and a space is a hit only where neither neighbour is a word.
+    #[test]
+    fn a_one_character_needle_needs_boundaries_on_both_sides() {
+        assert!(is_usage("a - b", "-"));
+        assert!(!is_usage("a-b", "-"));
+        assert!(is_usage("a . b", "."));
+        assert!(!is_usage("a.b", "."));
+        assert!(is_usage("x = $ y", "$"));
+        assert!(!is_usage("x=$y", "$"));
+        assert!(is_usage("a = = b", " "));
+        assert!(!is_usage("a = b", " "));
+        assert!(is_usage("\t\t", "\t"));
+        // A letter outside ASCII is a word character like any other: `é`
+        // needs boundaries exactly as `e` does.
+        assert!(is_usage(" é ", "é"));
+        assert!(!is_usage("café", "é"));
+        // `_` is an identifier's own character, so it is not a boundary
+        // either.
+        assert!(is_usage("a _ b", "_"));
+        assert!(!is_usage("a_b", "_"));
+    }
+
+    /// A needle that holds a line break can never be a row: a row is one
+    /// line's text and no line holds a line break, so the rule answers
+    /// `false` on every line. `Workspace::usages` refuses such a needle at its
+    /// door rather than walking the tree to prove a miss it already knows. A
+    /// carriage return is the opposite case — a lone one *is* a line's text —
+    /// and is walked like any other character.
+    #[test]
+    fn a_needle_with_a_line_break_can_never_be_a_row() {
+        assert!(!is_usage("held", "held\nheld"));
+        assert!(rows("held\nheld", "held\nheld\n").is_empty());
+        // The lone carriage return of a line that ends without a line feed is
+        // a character of that line; the `\r` of a CRLF ending is not.
+        assert!(is_usage("held\r", "held\r"));
+        assert!(rows("held\r", "held\r\n").is_empty());
+        assert_eq!(rows("held\r", "held\r").len(), 1);
+    }
+
+    /// A row is the *reader's* line, and the reader's line holds neither the
+    /// BOM that signs a file nor the `\r` of a CRLF ending: the signature is
+    /// not the first line's first character, and an ending is not a line's
+    /// text. Both are still the file's bytes, and `search` and `read_file` are
+    /// the roads that hand those over.
+    #[test]
+    fn a_leading_bom_and_a_crlf_ending_are_not_a_rows_text() {
+        let found = rows("held", "\u{feff}fn held() {}\r\nlet a = held;\r\n");
+        assert_eq!(
+            found
+                .iter()
+                .map(|row| (row.line, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "fn held() {}"), (2, "let a = held;")],
+            "the declaration first, and neither row holds the signature or the `\\r`"
+        );
+        assert!(
+            found[0].definition,
+            "`fn` after the signature is a declaration"
+        );
+
+        // Only the *leading* U+FEFF is a signature: one later in the text is a
+        // zero-width no-break space, a character like any other, and the row is
+        // that line — the signature's own question is `text::strip_bom`'s, and
+        // the row keeps the character it found.
+        let later = rows("held", "let a = held;\n\u{feff}fn held() {}\n");
+        let second = later
+            .iter()
+            .find(|row| row.line == 2)
+            .expect("line 2 is a row");
+        assert_eq!(
+            second.text, "\u{feff}fn held() {}",
+            "a U+FEFF mid-file is text, not a signature"
+        );
+
+        // A lone carriage return is the line's text (`str::lines` drops only
+        // the one that ends a CRLF), and a file whose last line has no line
+        // feed still has that line.
+        let lone = rows("held", "held\r\nheld\r");
+        assert_eq!(
+            lone.iter().map(|row| row.line).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(lone[1].text, "held\r");
+    }
+
+    /// A row is the line's own characters minus the ending: an escape
+    /// sequence, a tab, a zero-width joiner and a combining mark all come back
+    /// as the file holds them — the pane sanitizes its own copy — and an
+    /// over-long line is cut on a character boundary with the cut said, so one
+    /// minified line spends one row and not its length.
+    #[test]
+    fn a_row_keeps_the_lines_own_characters_and_cuts_by_the_width() {
+        let control = "let held = \"\x1b[31m\";\t// held";
+        assert_eq!(
+            rows("held", &format!("{control}\n"))[0].text,
+            control,
+            "no sanitizing on a model road"
+        );
+
+        let zwj = "let held = \"\u{200d}\";";
+        assert_eq!(rows("held", &format!("{zwj}\n"))[0].text, zwj);
+
+        let marks = format!("held{}", "\u{0301}".repeat(1_000));
+        let cut = rows("held", &format!("{marks}\n"));
+        assert_eq!(cut.len(), 1);
+        assert!(cut[0].text.ends_with('…'), "the cut is said");
+        assert!(cut[0].text.len() <= ROW_WIDTH + '…'.len_utf8());
+        assert!(marks.starts_with(cut[0].text.trim_end_matches('…')));
+
+        let giant = format!("let held = \"{}\";", "x".repeat(200_000));
+        let found = rows("held", &format!("{giant}\n"));
+        assert_eq!(found.len(), 1, "a line is one row however long it is");
+        assert!(found[0].text.ends_with('…'));
+        assert!(found[0].text.len() <= ROW_WIDTH + '…'.len_utf8());
+    }
+
+    /// The bounded reader: `rows_within` builds one row past its room when the
+    /// file held more and every row when it held less — the first `room + 1`
+    /// rows of the full list, definitions first — so the walk can cut a
+    /// million-line file to an answer ten rows long without building the
+    /// million.
+    #[test]
+    fn a_bounded_row_list_carries_the_room_and_the_proof_of_one_more_row() {
+        let text: String = (1..=1_000)
+            .map(|n| format!("let a = held; // {n}\n"))
+            .collect();
+        let whole = rows("held", &text);
+        assert_eq!(
+            whole.len(),
+            1_000,
+            "the rule's own answer is the whole file"
+        );
+
+        assert_eq!(rows_within("held", &text, 10), whole[..11].to_vec());
+        assert_eq!(rows_within("held", &text, 1).len(), 2);
+        assert_eq!(
+            rows_within("held", &text, 0).len(),
+            1,
+            "zero room proves one row"
+        );
+        // The room's own edge: a file holding exactly the room has no proof to
+        // give, and one holding a single further row does.
+        let three = "held\nheld\nheld\n";
+        assert_eq!(rows_within("held", three, 3).len(), 3);
+        assert_eq!(rows_within("held", three, 2).len(), 3);
+        assert!(rows_within("held", "nothing here\n", 10).is_empty());
+        assert_eq!(
+            rows_within("held", &text, usize::MAX).len(),
+            1_000,
+            "no room to bound is the whole list"
+        );
+
+        // A declaration that arrives late still leads the window — the scan is
+        // the file's, not the room's — and it takes a slot an earlier mention
+        // would have held.
+        let late = format!("{}fn held() {{}}\n", "a = held;\n".repeat(50));
+        let window = rows_within("held", &late, 3);
+        assert_eq!(
+            window
+                .iter()
+                .map(|row| (row.line, row.definition))
+                .collect::<Vec<_>>(),
+            vec![(51, true), (1, false), (2, false), (3, false)],
+            "the late declaration leads, and the window is the answer's size"
+        );
     }
 
     /// The rows of one file: the declaration-looking line first (line order
@@ -502,7 +776,11 @@ mod tests {
         assert!(files.len() > 30, "the sweep found {} files", files.len());
 
         let mut lines = 0usize;
-        for symbol in ["held", "usages", "Workspace", "search", "fn"] {
+        // The last two are the needles no word rule can be assumed to handle:
+        // a single non-word character and a character no identifier opens
+        // with. Whatever the two implementations answer there, they must
+        // answer the same thing on every line of this checkout.
+        for symbol in ["held", "usages", "Workspace", "search", "fn", "-", "$"] {
             for path in &files {
                 let text =
                     fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

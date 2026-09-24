@@ -117,6 +117,29 @@ pub fn file_lines(text: &str) -> impl Iterator<Item = &str> {
         .map(|line| line.strip_suffix('\n').unwrap_or(line))
 }
 
+/// `text` without the BOM that signs it, when it opens with one: the UTF-8
+/// signature, and not a character of the file's first line.
+///
+/// A file written by a Windows editor — a `.cs`, a `.ps1`, a BOM-proud text
+/// editor — may open with U+FEFF, and Unicode's own reading of it there is a
+/// signature: it says "this is UTF-8" and is not text the file holds. The
+/// rules that read a line's *opening* would otherwise read the signature as
+/// the line's first character: `\u{FEFF}fn f() {}` gave the outline's first
+/// word `\u{FEFF}fn`, and a declaration plainly in the file was a miss. So
+/// the roads that turn bytes into *text a model reads* drop it — the lossy
+/// whole read ([`crate::workspace::Workspace`]'s window and outline) and
+/// [`crate::usages`]' reader — while the roads that keep bytes for a
+/// write-back leave it where it is: the strict edit read, and [`file_lines`]'s
+/// searching reader, whose line is the file's own bytes by contract (finding
+/// B8).
+///
+/// Only the *leading* one is a signature. A U+FEFF anywhere later in the text
+/// is a zero-width no-break space, a character like any other, and comes back
+/// untouched.
+pub fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 /// Consume one escape sequence, whole.
 ///
 /// `ESC` introduces CSI (`ESC [ parameters intermediates final`), OSC (`ESC ] …
@@ -2055,6 +2078,25 @@ mod tests {
             assert!(text.is_char_boundary(head) && head <= cut, "{cut}");
             assert!(text.is_char_boundary(tail) && tail >= cut, "{cut}");
         }
+    }
+
+    /// A signature is not a character: [`strip_bom`] takes the leading U+FEFF
+    /// and nothing else, so a rule that reads a line's opening sees the line.
+    #[test]
+    fn a_signature_is_dropped_and_a_later_zero_width_space_is_not() {
+        assert_eq!(strip_bom("\u{feff}fn f() {}"), "fn f() {}");
+        assert_eq!(
+            strip_bom("\u{feff}\u{feff}x"),
+            "\u{feff}x",
+            "one signature, not a run"
+        );
+        assert_eq!(
+            strip_bom("a\u{feff}b"),
+            "a\u{feff}b",
+            "a later U+FEFF is text"
+        );
+        assert_eq!(strip_bom("plain"), "plain");
+        assert_eq!(strip_bom(""), "");
     }
 
     /// The brief's first line, collapsed onto one row: the arithmetic the commit

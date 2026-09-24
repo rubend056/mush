@@ -695,7 +695,7 @@ impl Workspace {
         }
         match decoding {
             Decoding::Lossy => Ok(WholeRead::Text(
-                String::from_utf8_lossy(&bytes).into_owned(),
+                text::strip_bom(&String::from_utf8_lossy(&bytes)).to_string(),
             )),
             Decoding::Strict => match String::from_utf8(bytes) {
                 Ok(text) => Ok(WholeRead::Text(text)),
@@ -1136,10 +1136,14 @@ impl Workspace {
     ///
     /// The decode is lossy for the window road's reason: an outline is shown and
     /// never written back, and a Latin-1 config still has a shape worth seeing.
-    /// What the rule reads as a declaration, and the invariant that a row never
-    /// lies about the line it names, live in [`crate::outline`] — this method
-    /// supplies the read and nothing else. A file with no definitions is not an
-    /// error: the sentence that says so is [`Outline::render`]'s.
+    /// It is also where a leading BOM goes: the lossy read drops a signature
+    /// because it is not the first line's first character, so a `.cs` or `.ps1`
+    /// a Windows editor wrote is outlined from the declarations it spells
+    /// rather than missed on its first line. What the rule reads as a declaration, and the
+    /// invariant that a row never lies about the line it names, live in
+    /// [`crate::outline`] — this method supplies the read and nothing else. A
+    /// file with no definitions is not an error: the sentence that says so is
+    /// [`Outline::render`]'s.
     pub fn outline(&self, rel: &str) -> Result<Outline, String> {
         let text = self
             .whole_read(rel, Decoding::Lossy)?
@@ -1166,14 +1170,16 @@ impl Workspace {
     ///
     /// The window's lines are a *reader's* lines: [`str::lines`] drops the
     /// `\r` of a CRLF ending, so what is copied out of a CRLF file's window is
-    /// a line's text, never its bytes. That is said rather than hidden — a file
-    /// whose lines all end with CRLF gets a sentence saying so, and [`edit`]
-    /// refuses an edit whose strings hold a line break or a `\r` in such a
-    /// file: a single-line edit lands byte for byte, and the road for anything
-    /// across lines is `run_command` (`sed -i`, `perl -pi`) or `write_file`
-    /// (finding B7). The two used to be silent and disagreed — a copied
-    /// multi-line `old_string` could never match, and a one-line edit that did
-    /// match inserted LF lines into the CRLF file.
+    /// a line's text, never its bytes, and the lossy decode drops a leading BOM
+    /// for the same reason: a signature is not a line's first character. That
+    /// is said rather than hidden — a file whose lines all end with CRLF gets a
+    /// sentence saying so, and [`edit`] refuses an edit whose strings hold a
+    /// line break or a `\r` in such a file: a single-line edit lands byte for
+    /// byte, and the road for anything across lines is `run_command`
+    /// (`sed -i`, `perl -pi`) or `write_file` (finding B7). The two used to be
+    /// silent and disagreed — a copied multi-line `old_string` could never
+    /// match, and a one-line edit that did match inserted LF lines into the
+    /// CRLF file.
     ///
     /// [`edit`]: crate::tools::edit_text
     ///
@@ -1465,13 +1471,22 @@ impl Workspace {
     /// boundary, grouped by file — the `usages` tool's walk.
     ///
     /// The walk is [`Self::search`]'s, and a line's rows are
-    /// [`crate::usages::rows`]': the same `SKIP_DIRS`, [`SEARCH_FILE_CAP`],
+    /// [`crate::usages::rows_within`]': the same `SKIP_DIRS`, [`SEARCH_FILE_CAP`],
     /// bounded read, binary skip, lossy decode, `name_for_model` rule and cap
     /// semantics, because a second walker would be a second answer to "what is
     /// a workspace file, and what may a result read?" and the two would drift.
     /// What differs is the match and the shape of the answer: a word instead of
     /// a substring, and rows grouped by file with the declaration-looking ones
     /// first. [`crate::usages`] owns those two rules and argues them.
+    ///
+    /// The symbol is a *word*, and this door says so twice. The empty needle is
+    /// refused because it matches at every position of every line — a rule that
+    /// cannot walk (`is_usage` would answer `Some(0)` forever) — and a needle
+    /// holding a line break is refused because a line never holds one, so the
+    /// walk could only ever answer the miss it would spend the whole tree
+    /// proving. A `\r` is *not* refused: a lone carriage return really is a
+    /// line's text, on a file whose lines end without a line feed or in the
+    /// middle of one.
     ///
     /// The name is needed before the file is opened for `search`'s reason: a
     /// row under a name the model cannot pass back to `read_file` is a dead
@@ -1486,10 +1501,21 @@ impl Workspace {
     /// listing's: the first row the cap cannot keep sets [`Usages::more`] and
     /// ends the walk. The row that made the answer one over the cap is the
     /// whole proof that there was more, and walking on past it would be the
-    /// tree's cost rather than the answer's.
+    /// tree's cost rather than the answer's. The bound holds inside one file
+    /// too ([`crate::usages::rows_within`]): the room left in the answer is
+    /// what a file's rows are built against, so a file holding a row on every
+    /// one of a million lines costs the answer and not the file.
     pub fn usages(&self, symbol: &str, limit: usize) -> Result<Usages, String> {
         if symbol.is_empty() {
             return Err("`symbol` must not be empty".to_string());
+        }
+        if symbol.contains('\n') {
+            return Err(
+                "`symbol` must be one line's text — a line never holds a line break, so this \
+                 symbol can never be a word on one; run_command (`rg -U`) is the road for a \
+                 pattern across lines"
+                    .to_string(),
+            );
         }
         let mut found = Usages::default();
         self.walk(&self.root, &mut |path: &Path| {
@@ -1524,11 +1550,11 @@ impl Workspace {
             }
             found.scanned += 1;
             let text = String::from_utf8_lossy(&bytes);
-            let mut rows = crate::usages::rows(symbol, &text);
-            if rows.is_empty() {
-                return true;
-            }
+            // The room the answer has left is the room the file's rows are
+            // built against: `rows_within` answers one row past it when there
+            // was more, which is this walk's proof, not the file's cost.
             let room = limit.saturating_sub(found.hits());
+            let mut rows = crate::usages::rows_within(symbol, &text, room);
             if rows.len() > room {
                 // The cap's own row is the proof of "there is more": nothing
                 // of it is shown, `more` is set, and the walk ends here.
@@ -1538,6 +1564,9 @@ impl Workspace {
                     found.groups.push(FileUsages { file: name, rows });
                 }
                 return false;
+            }
+            if rows.is_empty() {
+                return true;
             }
             found.groups.push(FileUsages { file: name, rows });
             true
@@ -1721,7 +1750,14 @@ enum Decoding {
     /// Refuse bytes that are not UTF-8 ([`not_utf8`]): what is read this way
     /// may be written back.
     Strict,
-    /// Show them as U+FFFD: what is read this way is shown, never written back.
+    /// Show them as U+FFFD, and drop the leading BOM when the file opens with
+    /// one: what is read this way is shown, never written back, and a shown
+    /// text does not keep a *signature* as if it were a character. A Windows
+    /// editor's `\u{feff}fn f() {}` otherwise read as a first word that is
+    /// neither `fn` nor a name, and the outline answered a miss for a
+    /// declaration the file plainly holds ([`text::strip_bom`]). The strict
+    /// road keeps every byte because its text is the edit's source *and* its
+    /// result (finding B6).
     Lossy,
 }
 
@@ -2416,6 +2452,7 @@ fn invalid(message: String) -> io::Error {
 mod tests {
     use super::*;
     use crate::scratch::{Held, Scratch};
+    use std::time::{Duration, Instant};
 
     /// A workspace on a scratch root of its own: `mush-test-<name>-<pid>`. The
     /// returned guard travels with the workspace, so the files it makes are
@@ -4734,6 +4771,804 @@ mod tests {
         assert_eq!(whole.groups.len(), 3);
         assert_eq!(whole.scanned, 3);
         let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A UTF-8 BOM is a signature, not a character: the roads that show a file
+    /// read past it, so a `.cs` or `.ps1` a Windows editor wrote is outlined
+    /// from the declarations it spells instead of being missed on its first
+    /// line. The byte roads keep it — the edit read returns the file whole,
+    /// and a search line is the file's own bytes (finding B8).
+    #[test]
+    fn a_bom_is_a_signature_and_the_reader_roads_read_past_it() {
+        let ws = temp_workspace("bom");
+        fs::write(
+            ws.root().join("bom.rs"),
+            "\u{feff}fn held() {}\na = held;\n",
+        )
+        .unwrap();
+
+        // The outline reads the declaration the file spells, not `\u{feff}fn`,
+        // and the mention under it is not a second one.
+        let outline = ws.outline("bom.rs").unwrap().render(4_000, "");
+        assert!(outline.contains("1 definition"), "{outline}");
+        assert!(outline.contains("  1  fn held() {}"), "{outline}");
+
+        // The usage walk leads with the same line as a declaration, and the
+        // row's text is the line `fn` opens.
+        let found = ws.usages("held", 10).unwrap();
+        assert!(found.groups[0].rows[0].definition);
+        assert_eq!(found.groups[0].rows[0].line, 1);
+        assert_eq!(found.groups[0].rows[0].text, "fn held() {}");
+
+        // The window is the same reader's road: the signature is dropped there
+        // too, so a line copied out of it is the line the outline sketched.
+        let window = ws.read_window("bom.rs", 1, 1, 4_000).unwrap();
+        assert!(window.starts_with("fn held() {}"), "{window:?}");
+
+        // The byte roads keep every byte.
+        assert!(ws.read_file("bom.rs").unwrap().starts_with('\u{feff}'));
+        let searched = ws.search("held", "bom.rs", false, 10).unwrap();
+        assert!(
+            searched.matches[0].starts_with("bom.rs:1: \u{feff}fn held() {}"),
+            "{:?}",
+            searched.matches
+        );
+
+        // A file that is nothing but a signature holds no text: the readers
+        // say so, and the edit road still hands back the three bytes.
+        fs::write(ws.root().join("only_bom.txt"), "\u{feff}").unwrap();
+        assert_eq!(
+            ws.outline("only_bom.txt").unwrap().render(4_000, ""),
+            "only_bom.txt is empty — there are no definitions to outline"
+        );
+        assert_eq!(
+            ws.read_window("only_bom.txt", 1, 10, 4_000).unwrap().text,
+            "only_bom.txt is empty"
+        );
+        assert_eq!(ws.read_file("only_bom.txt").unwrap(), "\u{feff}");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The number a usage row names is the *reader's* line — `str::lines`,
+    /// counted at `\n` — so a CRLF ending is not in the row's text, a lone
+    /// carriage return is, a last line without a line feed is still a line,
+    /// and a `\n\r` pair puts the `\r` at the head of the next row. The bytes
+    /// road still reads every ending back through the road that writes them.
+    #[test]
+    fn a_usage_row_is_the_readers_line_whatever_the_endings_are() {
+        let ws = temp_workspace("usages-endings");
+        fs::write(ws.root().join("crlf.txt"), "held\r\nheld\r\n").unwrap();
+        fs::write(ws.root().join("lone.txt"), "held\r\nheld\r").unwrap();
+        fs::write(ws.root().join("pair.txt"), "held\n\rheld\n").unwrap();
+        fs::write(ws.root().join("final.txt"), "held").unwrap();
+        fs::write(ws.root().join("mixed.txt"), "held\r\nheld\n").unwrap();
+
+        let found = ws.usages("held", 100).unwrap();
+        let rows = |name: &str| -> Vec<(usize, String)> {
+            found
+                .groups
+                .iter()
+                .find(|group| group.file == name)
+                .unwrap_or_else(|| panic!("{name} has no group"))
+                .rows
+                .iter()
+                .map(|row| (row.line, row.text.clone()))
+                .collect()
+        };
+        assert_eq!(
+            rows("crlf.txt"),
+            vec![(1, "held".to_string()), (2, "held".to_string())],
+            "a CRLF ending is not a row's text"
+        );
+        assert_eq!(
+            rows("lone.txt"),
+            vec![(1, "held".to_string()), (2, "held\r".to_string())],
+            "a lone `\\r` is"
+        );
+        assert_eq!(
+            rows("pair.txt"),
+            vec![(1, "held".to_string()), (2, "\rheld".to_string())],
+            "`\\n\\r` splits at the `\\n`"
+        );
+        assert_eq!(rows("final.txt"), vec![(1, "held".to_string())]);
+        assert_eq!(
+            rows("mixed.txt"),
+            vec![(1, "held".to_string()), (2, "held".to_string())]
+        );
+        assert_eq!(
+            ws.read_file("crlf.txt").unwrap(),
+            "held\r\nheld\r\n",
+            "the edit road still holds every ending"
+        );
+
+        // A needle holding the ending is not a row in a CRLF file — the ending
+        // is not the line's text — while the file whose last line really ends
+        // with a lone `\r` answers with that line.
+        let ending = ws.usages("held\r", 100).unwrap();
+        assert_eq!(ending.groups.len(), 1);
+        assert_eq!(ending.groups[0].file, "lone.txt");
+
+        // The search road is the bytes road: it shows the lines as the file
+        // holds them, ending and all (`text::file_lines`, finding B8).
+        assert_eq!(
+            ws.search("held", "crlf.txt", false, 10).unwrap().matches,
+            vec!["crlf.txt:1: held\r", "crlf.txt:2: held\r"]
+        );
+        assert_eq!(
+            ws.search("held", "pair.txt", false, 10).unwrap().matches,
+            vec!["pair.txt:1: held", "pair.txt:2: \rheld"],
+            "a `\\n\\r` pair leaves the `\\r` at the head of the next line"
+        );
+        assert_eq!(
+            ws.search("held", "final.txt", false, 10).unwrap().matches,
+            vec!["final.txt:1: held"],
+            "a last line without a line feed is a line"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// One minified line is one row and not a result: the usage row is cut at
+    /// the outline's width with the cut said, the outline answers inside the
+    /// cap it was given, and a file past [`SEARCH_FILE_CAP`] is skipped by the
+    /// walk that has one — counted, not silently dropped.
+    #[test]
+    fn one_giant_line_is_cut_by_every_reader_and_past_the_search_cap_is_skipped() {
+        let ws = temp_workspace("giant-line");
+        let giant = format!("fn held() {{ let x = \"{}\"; }}", "x".repeat(200_000));
+        fs::write(ws.root().join("giant.rs"), format!("{giant}\n")).unwrap();
+        let too_big = format!("held \"{}\";", "x".repeat(SEARCH_FILE_CAP as usize));
+        fs::write(ws.root().join("big.txt"), format!("{too_big}\n")).unwrap();
+        assert!(
+            too_big.len() as u64 > SEARCH_FILE_CAP,
+            "the second file is past the cap"
+        );
+
+        let started = Instant::now();
+        let found = ws.usages("held", 10).unwrap();
+        assert_eq!(
+            found
+                .groups
+                .iter()
+                .map(|group| group.file.as_str())
+                .collect::<Vec<_>>(),
+            vec!["giant.rs"],
+            "the file past the cap contributes no row"
+        );
+        assert_eq!(found.hits(), 1);
+        let row = &found.groups[0].rows[0];
+        assert_eq!(row.line, 1);
+        assert!(row.definition, "a `fn` declaration with a 200 KB body");
+        assert!(row.text.ends_with('…'));
+        assert!(row.text.len() <= crate::outline::ROW_WIDTH + '…'.len_utf8());
+        assert!(giant.starts_with(row.text.trim_end_matches('…')));
+        assert_eq!(found.scanned, 1);
+        assert_eq!(found.skipped, 1, "the cap is counted, not silent");
+        // The search road has the same cap and the same count.
+        let searched = ws.search("held", ".", false, 10).unwrap();
+        assert_eq!(searched.matches.len(), 1);
+        assert_eq!(searched.skipped, 1);
+
+        let rendered = ws.outline("giant.rs").unwrap().render(1_000, "");
+        assert!(rendered.contains("1 definition"), "{rendered}");
+        assert!(
+            rendered.len() <= 1_000,
+            "{} bytes for a 1,000-byte cap",
+            rendered.len()
+        );
+        for line in rendered.lines().filter(|line| line.starts_with("  ")) {
+            assert!(
+                line.len() <= crate::outline::ROW_WIDTH + 16,
+                "a row is bounded: {} bytes",
+                line.len()
+            );
+        }
+        // The 2 MB file is still *text* to the outline, whose own cap is the
+        // 32 MB whole-read cap: it answers with no definitions and no refusal.
+        let big = ws.outline("big.txt").unwrap().render(1_000, "");
+        assert!(big.contains("no definitions"), "{big}");
+        assert!(big.len() <= 1_000);
+
+        let elapsed = started.elapsed();
+        eprintln!("giant line: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the walk of two files took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A NUL byte is a binary file whatever surrounds it: a file that is 98%
+    /// text with one stray NUL has no rows and no outline, and both walks
+    /// *count* it — `skipped` for the usage walk, a refusal naming the file for
+    /// the read roads — rather than answering the miss a model would read as
+    /// "the symbol is not there". The counter is the honest sentence, and
+    /// `run_command` (`rg`, `strings`) is the road around it.
+    #[test]
+    fn a_stray_nul_is_binary_whatever_the_rest_of_the_file_is() {
+        let ws = temp_workspace("stray-nul");
+        let mut bytes = "held\n".repeat(40).into_bytes();
+        bytes.push(0);
+        bytes.extend_from_slice(&"held\n".repeat(40).into_bytes());
+        fs::write(ws.root().join("mostly.txt"), &bytes).unwrap();
+
+        let found = ws.usages("held", 10).unwrap();
+        assert!(
+            found.groups.is_empty(),
+            "no row from a file the walk would not read: {found:?}"
+        );
+        assert_eq!(found.scanned, 0);
+        assert_eq!(found.skipped, 1);
+        assert!(!found.more);
+
+        let refused = ws.outline("mostly.txt").unwrap_err();
+        assert!(refused.contains("binary"), "{refused}");
+        let found = ws.search("held", ".", false, 10).unwrap();
+        assert!(found.matches.is_empty());
+        assert_eq!(found.skipped, 1);
+
+        // The NUL-and-nothing-else shape is the same fact.
+        fs::write(ws.root().join("fffe.bin"), b"\xff\xfe\x00").unwrap();
+        let found = ws.usages("held", 10).unwrap();
+        assert_eq!(found.skipped, 2);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The walk's decode is lossy like the window's, so a Latin-1 file still
+    /// has rows — and every row names the line the bytes hold: a replacement
+    /// character never was a `\n`, so line 2 of the decoded text is line 2 of
+    /// the bytes, and the strict edit road still refuses the same file rather
+    /// than rewriting the bytes it cannot decode (finding B6).
+    #[test]
+    fn a_lossy_row_names_the_line_the_files_bytes_hold() {
+        let ws = temp_workspace("lossy-rows");
+        let bytes = b"caf\xe9 = held;\nna\xefve = held;\n";
+        fs::write(ws.root().join("latin.txt"), bytes).unwrap();
+
+        let found = ws.usages("held", 10).unwrap();
+        assert_eq!(found.hits(), 2);
+        assert_eq!(
+            found.groups[0]
+                .rows
+                .iter()
+                .map(|row| (row.line, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "caf\u{fffd} = held;"), (2, "na\u{fffd}ve = held;")],
+            "each row names its line and shows what the lossy decode held"
+        );
+        assert_eq!(found.scanned, 1);
+        assert!(!found.groups[0].rows[0].definition);
+
+        assert_eq!(fs::read(ws.root().join("latin.txt")).unwrap(), bytes);
+        assert!(ws
+            .read_file("latin.txt")
+            .unwrap_err()
+            .contains("not valid UTF-8"));
+
+        // Not-UTF-8 *and* holding a NUL is the binary skip, not a lossy
+        // decode: a NUL is not text in any encoding this shows.
+        fs::write(ws.root().join("blob.bin"), b"\xff\xfe\x00").unwrap();
+        let found = ws.usages("held", 10).unwrap();
+        assert_eq!((found.scanned, found.skipped), (1, 1));
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The needles a human might type and a model might emit: a symbol with a
+    /// line break is refused at the door — no line holds one, so the walk
+    /// could only prove the miss it would spend the whole tree proving — while
+    /// a whitespace-only needle, a needle longer than every line, a needle
+    /// that is an identifier prefix, and a one-character non-word needle all
+    /// walk to their honest answer: rows or a miss that says what was read,
+    /// never a panic and never a false hit.
+    #[test]
+    fn hostile_needles_walk_to_an_honest_answer() {
+        let ws = temp_workspace("hostile-needles");
+        fs::write(ws.root().join("a.txt"), "held is a word\nheld_x is not\n").unwrap();
+        fs::write(ws.root().join("b.txt"), "a - b\n").unwrap();
+
+        let refused = ws.usages("held\nheld", 10).unwrap_err();
+        assert!(refused.contains("line break"), "{refused}");
+        assert!(refused.contains("rg -U"), "{refused}");
+
+        // A prefix is not the word: `held` never answers for `held_x`, and
+        // `held_x` answers for its own line.
+        let prefix = ws.usages("held_x", 10).unwrap();
+        assert_eq!(prefix.hits(), 1);
+        assert_eq!(prefix.groups[0].rows[0].line, 2);
+        for symbol in [" ", "\t", "a needle longer than any line in this workspace"] {
+            let found = ws.usages(symbol, 10).unwrap();
+            assert_eq!(found.hits(), 0, "{symbol:?}");
+            assert_eq!(found.scanned, 2, "{symbol:?}: a miss says what it read");
+            assert_eq!((found.skipped, found.unnamed), (0, 0), "{symbol:?}");
+        }
+        // The one-character non-word needle finds the `a - b` line and not the
+        // hyphen inside a word.
+        let dash = ws.usages("-", 10).unwrap();
+        assert_eq!(dash.groups.len(), 1);
+        assert_eq!(dash.groups[0].file, "b.txt");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The walk's cap is a walk's, not an answer's end: five thousand files
+    /// each holding one row, asked for a hundred, must stop at the file whose
+    /// row did not fit — `scanned` says 101 names were opened, not 5,000 — and
+    /// the counters must add up to the files it did visit.
+    #[test]
+    fn a_usage_walk_stops_at_the_cap_across_five_thousand_files() {
+        let ws = temp_workspace("usages-pool");
+        for n in 0..5_000 {
+            fs::write(ws.root().join(format!("f{n:04}.txt")), "held\n").unwrap();
+        }
+
+        let started = Instant::now();
+        let found = ws.usages("held", 100).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(found.hits(), 100, "the cap kept exactly its rows");
+        assert!(found.more, "the row it could not keep was seen");
+        assert_eq!(found.groups.len(), 100);
+        assert_eq!(
+            (found.scanned, found.skipped, found.unnamed),
+            (101, 0, 0),
+            "the walk stopped at the file whose row it could not keep"
+        );
+        eprintln!("usages pool: 100 rows over 5,000 files in {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the walk of 101 names took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The degenerate files a workspace really holds: an empty file, a file of
+    /// one blank line, a file of only comments, a file with no final line feed,
+    /// and a file of a hundred thousand very short lines. Each answers a
+    /// sentence or an honest miss — never a panic — and the walk of the
+    /// short-line file is bounded by the answer's room, not the file's lines.
+    #[test]
+    fn degenerate_files_answer_a_sentence_and_not_a_panic() {
+        let ws = temp_workspace("degenerate");
+        fs::write(ws.root().join("empty.rs"), "").unwrap();
+        fs::write(ws.root().join("blank.rs"), "\n").unwrap();
+        fs::write(
+            ws.root().join("comments.rs"),
+            "// held\n/* fn held() {} */\n",
+        )
+        .unwrap();
+        fs::write(ws.root().join("nonl.rs"), "fn held() {}").unwrap();
+        fs::write(ws.root().join("short.txt"), "held\n".repeat(100_000)).unwrap();
+
+        assert_eq!(
+            ws.outline("empty.rs").unwrap().render(4_000, ""),
+            "empty.rs is empty — there are no definitions to outline"
+        );
+        assert_eq!(
+            ws.outline("blank.rs").unwrap().render(4_000, ""),
+            "blank.rs — 1 line; no definitions (textual, Rust-first — not a compiler's \
+             answer); read_file shows the text"
+        );
+
+        // A comment holds the word, so it is a usage row; it is never a
+        // declaration, and the outline of a comments-only file has none.
+        let found = ws.usages("held", 100).unwrap();
+        let comments = found
+            .groups
+            .iter()
+            .find(|group| group.file == "comments.rs")
+            .expect("the comments file has rows");
+        assert_eq!(comments.rows.len(), 2);
+        assert!(
+            comments.rows.iter().all(|row| !row.definition),
+            "a comment line is never a declaration: {:?}",
+            comments.rows
+        );
+        let outlined = ws.outline("comments.rs").unwrap().render(4_000, "");
+        assert!(outlined.contains("no definitions"), "{outlined}");
+
+        // The last line without a line feed is a line, number and all.
+        let nonl = found
+            .groups
+            .iter()
+            .find(|group| group.file == "nonl.rs")
+            .expect("the no-final-newline file has a row");
+        assert_eq!(nonl.rows[0].line, 1);
+        assert_eq!(ws.outline("nonl.rs").unwrap().definitions().len(), 1);
+
+        // A directory holds no file: it neither answers nor counts, and asking
+        // the outline for one is the read road's refusal, not an empty answer.
+        fs::create_dir(ws.root().join("empty_dir")).unwrap();
+        assert!(ws
+            .outline("empty_dir")
+            .unwrap_err()
+            .contains("not a regular file"));
+
+        // A hundred thousand very short lines: the answer is ten rows and the
+        // proof of a further one, in bounded time.
+        let started = Instant::now();
+        let found = ws.usages("held", 10).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(found.hits(), 10);
+        assert!(found.more);
+        assert_eq!(found.scanned, 5, "all five files were read before the cap");
+        eprintln!("degenerate corpus: five files, 100,000 short lines, {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the walk took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The corpus no checkout has: a scratch root holding every shape a real
+    /// file can hand a reader — minified lines, CRLF, a lone carriage return, a
+    /// BOM, Latin-1 bytes, escape sequences, combining marks, a zero-width
+    /// joiner, a stray NUL, a file past the search cap, a hundred thousand
+    /// short lines, an empty file and a blank one. The property test over both
+    /// tools and five needles then asserts the invariants that must hold on all
+    /// of them: every row names a line that really holds the word, every row is
+    /// that line cut and never rearranged, rows ascend, no row holds a line
+    /// break, a row is bounded by its tool's width, and every answer respects
+    /// its cap and counts every file it visited.
+    #[test]
+    fn every_row_of_the_generated_corpus_is_bounded_and_names_its_line() {
+        let ws = temp_workspace("generated-corpus");
+        let files = generated_corpus(&ws);
+        let started = Instant::now();
+
+        for symbol in ["held", "fn", "-", "$", "é"] {
+            // The bounded answers, at three rooms: nothing, one row, and a
+            // handful. The walk must never hand back more than the room, and
+            // must stop exactly on its cap when it says there was more.
+            for room in [0usize, 1, 7] {
+                let found = ws.usages(symbol, room).unwrap();
+                check_usage_rows(&files, symbol, room, &found);
+            }
+            // The unbounded answer is the whole corpus: every row of every
+            // file the walk could read, and every file in exactly one counter.
+            let expected: usize = files
+                .iter()
+                .filter(|(_, bytes)| bytes.len() as u64 <= SEARCH_FILE_CAP && !bytes.contains(&0))
+                .map(|(_, bytes)| crate::usages::rows(symbol, &reader_text(bytes)).len())
+                .sum();
+            let whole = ws.usages(symbol, usize::MAX).unwrap();
+            check_usage_rows(&files, symbol, usize::MAX, &whole);
+            assert!(!whole.more, "{symbol:?}: no room to cut, so no cut");
+            assert_eq!(
+                whole.hits(),
+                expected,
+                "{symbol:?}: every row of every scanned file"
+            );
+            assert_eq!(
+                whole.scanned + whole.skipped + whole.unnamed,
+                files.len(),
+                "{symbol:?}: the counters are the walk's own file count"
+            );
+        }
+
+        for (name, _) in &files {
+            match ws.outline(name) {
+                // The one file a read road refuses: a NUL is binary.
+                Err(refusal) => {
+                    assert_eq!(name, "nul.bin", "{name}: {refusal}");
+                    assert!(refusal.contains("binary"), "{name}: {refusal}");
+                }
+                Ok(outline) => check_outline_rows(&files, name, &outline),
+            }
+        }
+
+        let elapsed = started.elapsed();
+        eprintln!("generated corpus: {} files, {elapsed:?}", files.len());
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the corpus sweep took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The corpus the property test walks, written into `ws`: the shapes a real
+    /// workspace can hand a reader, from a file with no bytes to a file past
+    /// the search cap, each one returned with its bytes so the checks can read
+    /// the same file the walk read.
+    fn generated_corpus(ws: &Workspace) -> Vec<(String, Vec<u8>)> {
+        let files: Vec<(String, Vec<u8>)> = vec![
+            ("empty.rs".into(), Vec::new()),
+            ("blank.rs".into(), b"\n".to_vec()),
+            ("nonl.rs".into(), b"fn held() {}".to_vec()),
+            (
+                "crlf.rs".into(),
+                b"fn held() {}\r\nlet a = held;\r\n".to_vec(),
+            ),
+            (
+                "lone_cr.rs".into(),
+                b"let held = 1;\rlet b = held;\r\n".to_vec(),
+            ),
+            (
+                "bom.rs".into(),
+                "\u{feff}fn held() {}\nlet a = held;\n".as_bytes().to_vec(),
+            ),
+            (
+                "bom_crlf.cs".into(),
+                "\u{feff}fn held() {}\r\nlet a = held;\r\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "latin1.rs".into(),
+                b"caf\xe9 = held;\nna\xefve = held;\n".to_vec(),
+            ),
+            ("accent.txt".into(), "é held é\n".as_bytes().to_vec()),
+            ("dollar.js".into(), b"let x = $; held\n".to_vec()),
+            ("dash.txt".into(), b"a - b\nheld\n".to_vec()),
+            (
+                "controls.rs".into(),
+                b"let held = \"\x1b[31m\";\t// held\n".to_vec(),
+            ),
+            (
+                "combining.txt".into(),
+                format!("held{}\n", "\u{0301}".repeat(1_000)).into_bytes(),
+            ),
+            (
+                "zwj.txt".into(),
+                "let held = \"\u{200d}\";\n".as_bytes().to_vec(),
+            ),
+            (
+                "giant.js".into(),
+                format!("let held = \"{}\";\n", "x".repeat(200_000)).into_bytes(),
+            ),
+            (
+                // The mention sits past the row's width: the row names the
+                // line — the number is the claim — and its text is the line's
+                // cut, which may not reach the word. `read_file {offset}` is
+                // the road that shows the whole line.
+                "late_mention.txt".into(),
+                format!("{} held\n", "x".repeat(50_000)).into_bytes(),
+            ),
+            ("comments.rs".into(), b"// held\n/* held */\n".to_vec()),
+            (
+                "short_lines.txt".into(),
+                "held\n".repeat(100_000).into_bytes(),
+            ),
+            ("nul.bin".into(), b"held before\x00held after\n".to_vec()),
+            (
+                "over_cap.txt".into(),
+                format!("held {}\n", "x".repeat(SEARCH_FILE_CAP as usize)).into_bytes(),
+            ),
+        ];
+        for (name, bytes) in &files {
+            fs::write(ws.root().join(name), bytes).unwrap();
+        }
+        files
+    }
+
+    /// The text a *reader's* road sees in these bytes: the lossy decode the
+    /// walk makes, minus the leading BOM ([`text::strip_bom`]: a signature, not
+    /// a line's text).
+    fn reader_text(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        text::strip_bom(&text).to_string()
+    }
+
+    /// [`reader_text`]'s lines, which is what both tools' rows are lines of.
+    fn reader_lines(bytes: &[u8]) -> Vec<String> {
+        reader_text(bytes).lines().map(str::to_string).collect()
+    }
+
+    /// The property, on one `usages` answer: every row names a real line of its
+    /// file, that line really holds the word at a boundary, the row's text is
+    /// that line cut and never rearranged, the declaration flag is the outline
+    /// rule's own, the two halves ascend, no row holds a line break, a row is
+    /// bounded by [`crate::outline::ROW_WIDTH`] (the outline's documented
+    /// over-long-qualifier exception aside, which is the one shape whose cut
+    /// may overrun the width to keep the word that made the row), and the
+    /// answer is inside its cap.
+    fn check_usage_rows(files: &[(String, Vec<u8>)], symbol: &str, limit: usize, found: &Usages) {
+        assert!(
+            found.hits() <= limit,
+            "{symbol:?}: {} rows over a cap of {limit}",
+            found.hits()
+        );
+        assert!(
+            !found.more || found.hits() == limit,
+            "{symbol:?}: a cut answer stops exactly on its cap"
+        );
+        assert!(
+            found.scanned + found.skipped + found.unnamed <= files.len(),
+            "{symbol:?}: more counters than files"
+        );
+        let mut seen = 0usize;
+        for group in &found.groups {
+            let (_, bytes) = files
+                .iter()
+                .find(|(name, _)| *name == group.file)
+                .unwrap_or_else(|| panic!("a group for {} and no such file", group.file));
+            let lines = reader_lines(bytes);
+            let mut last_definition = 0usize;
+            let mut last_mention = 0usize;
+            let mut mention_seen = false;
+            for row in &group.rows {
+                seen += 1;
+                assert!(
+                    row.line >= 1 && row.line <= lines.len(),
+                    "{}:{}: line {} of a file with {} lines",
+                    group.file,
+                    row.line,
+                    row.line,
+                    lines.len()
+                );
+                let line = &lines[row.line - 1];
+                assert!(
+                    crate::usages::is_usage(line, symbol),
+                    "{}:{}: the row names a line that does not hold `{symbol}` at a boundary: \
+                     {line:?}",
+                    group.file,
+                    row.line
+                );
+                assert_eq!(
+                    row.definition,
+                    crate::outline::is_declaration(line),
+                    "{}:{}: the declaration flag is the outline rule's",
+                    group.file,
+                    row.line
+                );
+                let body = row.text.strip_suffix('…').unwrap_or(&row.text);
+                assert!(
+                    line.starts_with(body),
+                    "{}:{}: the row is not that line, cut: {:?}",
+                    group.file,
+                    row.line,
+                    row.text
+                );
+                if !row.text.ends_with('…') {
+                    assert_eq!(
+                        row.text, *line,
+                        "{}:{}: an uncut row is the line itself",
+                        group.file, row.line
+                    );
+                }
+                assert!(
+                    !row.text.contains('\n'),
+                    "{}:{}: a row holds a line break",
+                    group.file,
+                    row.line
+                );
+                assert!(
+                    row.text.len() <= crate::outline::ROW_WIDTH + '…'.len_utf8() || row.definition,
+                    "{}:{}: a non-declaration row over the width: {} bytes",
+                    group.file,
+                    row.line,
+                    row.text.len()
+                );
+                if row.definition {
+                    assert!(
+                        crate::outline::is_declaration(&row.text),
+                        "{}:{}: a declaration row may never be cut through the word that made \
+                         it one: {:?}",
+                        group.file,
+                        row.line,
+                        row.text
+                    );
+                }
+                if row.definition {
+                    assert!(
+                        !mention_seen,
+                        "{}:{}: a declaration row after a plain mention",
+                        group.file, row.line
+                    );
+                    assert!(
+                        row.line > last_definition,
+                        "{}:{}: declaration rows must ascend",
+                        group.file,
+                        row.line
+                    );
+                    last_definition = row.line;
+                } else {
+                    mention_seen = true;
+                    assert!(
+                        row.line > last_mention,
+                        "{}:{}: mention rows must ascend",
+                        group.file,
+                        row.line
+                    );
+                    last_mention = row.line;
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            found.hits(),
+            "{symbol:?}: the header's count is the rows"
+        );
+    }
+
+    /// The same property on one `outline`: the answer fits the cap it was
+    /// given, every rendered row is `  line  text` for a real line of the file,
+    /// the text is that line cut, the line really is a declaration, the row
+    /// re-matches the rule it came from (the outline's hard invariant), rows
+    /// ascend, and an answer no cap cut shows every definition it counted.
+    ///
+    /// The smallest cap is comfortably longer than `CRLF_NOTE`: a cap under
+    /// that sentence's own length is the outline's header-only edge — a bare
+    /// header with no rows — which this property does not pin and does not
+    /// pretend is a row's business.
+    fn check_outline_rows(files: &[(String, Vec<u8>)], name: &str, outline: &Outline) {
+        let (_, bytes) = files
+            .iter()
+            .find(|(file, _)| file == name)
+            .unwrap_or_else(|| panic!("{name} is not a corpus file"));
+        let lines = reader_lines(bytes);
+        for cap in [4_000usize, 1_000, 700] {
+            let rendered = outline.render(cap, "");
+            assert!(
+                rendered.len() <= cap + 220,
+                "{name}: {} bytes for a cap of {cap}",
+                rendered.len()
+            );
+            if cap >= 1_000 {
+                assert!(
+                    rendered.len() <= cap,
+                    "{name}: {} bytes for a cap of {cap}",
+                    rendered.len()
+                );
+            }
+            let mut rows = 0usize;
+            let mut last = 0usize;
+            for line in rendered.lines() {
+                let Some(rest) = line.strip_prefix("  ") else {
+                    continue;
+                };
+                let (number, text) = rest
+                    .split_once("  ")
+                    .unwrap_or_else(|| panic!("{name}: a row without a line number: {line:?}"));
+                let number: usize = number
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{name}: {line:?}"));
+                rows += 1;
+                assert!(
+                    number > last,
+                    "{name}: line {number} after {last} — rows must ascend"
+                );
+                last = number;
+                assert!(
+                    number >= 1 && number <= lines.len(),
+                    "{name}:{number}: line {number} of a file with {} lines",
+                    lines.len()
+                );
+                let body = text.strip_suffix('…').unwrap_or(text);
+                assert!(
+                    lines[number - 1].starts_with(body),
+                    "{name}:{number}: the row is not that line, cut: {text:?}"
+                );
+                assert!(
+                    crate::outline::is_declaration(&lines[number - 1]),
+                    "{name}:{number}: the line is not a declaration: {:?}",
+                    lines[number - 1]
+                );
+                assert!(
+                    crate::outline::is_declaration(text),
+                    "{name}:{number}: a row may never lie — {text:?} does not re-match the rule"
+                );
+                assert!(
+                    !text.contains('\n'),
+                    "{name}:{number}: a row holds a line break"
+                );
+                assert!(
+                    text.len() <= crate::outline::ROW_WIDTH + '…'.len_utf8()
+                        || crate::outline::is_declaration(text),
+                    "{name}:{number}: {} bytes",
+                    text.len()
+                );
+            }
+            assert!(
+                rows <= outline.definitions().len(),
+                "{name}: more rows shown than the outline holds"
+            );
+            if !rendered.contains("[mush: only the first")
+                && !rendered.contains("output truncated at")
+            {
+                assert_eq!(
+                    rows,
+                    outline.definitions().len(),
+                    "{name}: an uncut answer shows every row it counted"
+                );
+            }
+        }
     }
 
     /// A reader that stats a file before it reads it still bounds the read:
