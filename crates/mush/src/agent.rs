@@ -23528,6 +23528,13 @@ mod tests {
     /// cap, a shared workspace the guard refuses to a sibling, under a row that
     /// says `✓` (§8.39).
     ///
+    /// The wait covers the last event the assertions read, not the run's end:
+    /// the ending and the completion offer both travel the UI channel, and the
+    /// ending reaches it *first* — the order
+    /// `the_runs_end_reaches_the_ui_before_the_parent_hears_the_report` pins for
+    /// the parent's fold — so a wait that stops at `Done` can read the log in
+    /// the window between the two and find only the start.
+    ///
     /// The root is the one agent that says nothing at all: it has no parent, and
     /// an event about it would be the UI filing the root's own completion back
     /// into its own mailbox — a wake-up that could never end.
@@ -23548,8 +23555,10 @@ mod tests {
         start(child, vec![Message::user("do the thing")], true);
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&events, WAIT, |seen| seen.done == 1),
-            "the run must end: {seen:?}"
+            seen.wait(&events, WAIT, |seen| {
+                seen.done == 1 && matches!(seen.asleep.last(), Some(AgentMsg::ChildDone { .. }))
+            }),
+            "the run must end and its completion must reach the UI: {seen:?}"
         );
         let told: Vec<AgentMsg> = events
             .events()
@@ -23610,6 +23619,11 @@ mod tests {
         replies: Vec<String>,
         summaries: Vec<String>,
         stopped: usize,
+        /// Every report handed to the UI because the parent's mailbox had
+        /// nobody behind it (`ParentAsleep`), in the order a parent would have
+        /// read them: the events a wait must cover when they are the last the
+        /// assertions read (§8.39).
+        asleep: Vec<AgentMsg>,
         /// Every fold state this actor reported, in order: what the row, the
         /// bar and the foot were told (finding U11). `Parked`, `Requested`,
         /// `NearlyFull`, `ended`, `landed`.
@@ -23658,6 +23672,7 @@ mod tests {
                 AgentEvent::Error(why) => self.errors.push(why),
                 AgentEvent::Notice(what) => self.notices.push(what),
                 AgentEvent::Stopped => self.stopped += 1,
+                AgentEvent::ParentAsleep { command } => self.asleep.push(command),
                 AgentEvent::Compact { summary, .. } => {
                     self.summaries.push(summary);
                     self.folds.push("landed".to_string());
