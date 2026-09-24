@@ -11191,11 +11191,12 @@ mod tests {
             vec![
                 // The calls' own headers — the same rows the compact log paints,
                 // arrow and all — and the detail rows their results hold, every
-                // one of them at the block's own `│ ` gutter.
+                // one of them at the block's own `│ ` gutter. A detail row that
+                // only restates the payload under it is not a row at all
+                // (`CallFacts::details`), which is why the status and `wait`
+                // calls carry nothing above the listing and the summary their
+                // results already paint.
                 grid_row("◐", "2 agents · 1 job · 1 unread", 88),
-                "│ #1 running".to_string(),
-                "│ #2 done".to_string(),
-                "│ #c1 running".to_string(),
                 split_row("▤ text.rs 1408→1530", "", "123L/9000L 4KB", 88),
                 "│ of 9000L".to_string(),
                 split_row("⌕ \"column_widths\" in crates", "", "7 hits 266B", 88),
@@ -11206,7 +11207,6 @@ mod tests {
                 grid_row("↳ table layout fixes", "#185 on mush/185", 88),
                 "│ mush/185 · .mush/wt/185".to_string(),
                 grid_row("⧗", "#185 done", 88),
-                "│ from #185".to_string(),
                 grid_row("⧗", "user spoke", 88),
                 grid_row("⇄ #9 stop", "error", 88),
                 // No blank between a call's header and the payload under it —
