@@ -6557,12 +6557,11 @@ fn list_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, 
     Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
-/// `search`: a literal string in the workspace's text files.
+/// `search`: a regex in the workspace's text files.
 fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let pattern = tools::arg_string(args, "pattern")?;
     let rel = tools::arg_path(args, "path")?;
-    let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
-    let found = actor.ws.search(&pattern, &rel, ignore_case, SEARCH_LIMIT)?;
+    let found = actor.ws.search(&pattern, &rel, SEARCH_LIMIT)?;
     let mut skipped = Vec::new();
     if found.skipped > 0 {
         skipped.push(skipped_note(found.skipped));
@@ -6630,8 +6629,8 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
 /// **No argument narrows the walk**, and that is a decision, not an omission.
 /// `path` would make this `search` with a different match; the question this
 /// tool exists to answer — who uses this? — is about the whole workspace, and a
-/// scoped question is `search`'s, which has the path and the case knob. There
-/// is no `ignore_case` because a symbol's spelling *is* the thing (`Write` and
+/// scoped question is `search`'s, which has the path and the pattern. There
+/// is no case knob because a symbol's spelling *is* the thing (`Write` and
 /// `write` are different names), and no `word` toggle because the word rule is
 /// the tool: turning it off is `search` by another name.
 ///
@@ -7961,27 +7960,23 @@ fn read_ask(args: &Value, root: &Path) -> String {
 }
 
 /// A search's ask: the pattern and where it looked — `"column_widths" in
-/// crates` — and `· ignore_case` where the call asked for it. The pattern is
-/// quoted because it is a pattern and not a word of the ask; the path is
-/// dropped when the call named none, which is the root.
+/// crates`. The pattern is quoted because it is a pattern and not a word of
+/// the ask; the path is dropped when the call named none, which is the root.
 ///
-/// A case-blind search is a different search: the pattern shown is not the
-/// pattern matched, and the qualifier is the only place the row says so. It
-/// rides the ask the way a command's flags do.
+/// Nothing else qualifies the ask: case-insensitivity is `(?i)` inside the
+/// pattern, so the pattern shown is always the pattern matched, and the row
+/// carries no flag the call did not run under.
 fn search_ask(args: &Value, root: &Path) -> String {
     let pattern = args
         .get("pattern")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let path = workspace_path(&tools::arg_path(args, "path").unwrap_or_default(), root);
-    let mut ask = match (pattern.is_empty(), path.is_empty()) {
+    let ask = match (pattern.is_empty(), path.is_empty()) {
         (true, _) => String::new(),
         (false, true) => format!("\"{pattern}\""),
         (false, false) => format!("\"{pattern}\" in {path}"),
     };
-    if !ask.is_empty() && args.get("ignore_case").and_then(Value::as_bool) == Some(true) {
-        ask.push_str(" · ignore_case");
-    }
     ask
 }
 
@@ -9744,9 +9739,9 @@ mod tests {
     }
 
     /// The ask names what the call was narrowed to: a wait's one target, the
-    /// title a spawn gave its child, a search's case-blindness and a command's
-    /// two flags — the facts a bare mark would have swallowed. All four ride
-    /// the ask and nothing else, so the row is the only place they are read.
+    /// title a spawn gave its child, a search's path and a command's two flags
+    /// — the facts a bare mark would have swallowed. All four ride the ask and
+    /// nothing else, so the row is the only place they are read.
     #[test]
     fn the_ask_names_what_the_call_was_narrowed_to() {
         let root = Path::new("/w");
@@ -9762,18 +9757,13 @@ mod tests {
         assert_eq!(ask(ToolName::SpawnAgent, brief), "table layout");
         let untitled = json!({"brief": "table layout fixes\nand then some"});
         assert_eq!(ask(ToolName::SpawnAgent, untitled), "table layout fixes");
-        // A case-blind search is a different search: the pattern shown is not
-        // the pattern matched, and the qualifier is where the row says so.
-        let blind = json!({"pattern": "needle", "ignore_case": true});
-        assert_eq!(
-            ask(ToolName::Search, blind.clone()),
-            "\"needle\" · ignore_case"
-        );
-        let scoped = json!({"pattern": "needle", "path": "crates", "ignore_case": true});
-        assert_eq!(
-            ask(ToolName::Search, scoped),
-            "\"needle\" in crates · ignore_case"
-        );
+        // A search's pattern is the whole match: case-insensitivity is `(?i)`
+        // inside it, so the pattern shown is always the pattern matched, and
+        // only the path qualifies the ask.
+        let folded = json!({"pattern": "(?i)needle"});
+        assert_eq!(ask(ToolName::Search, folded), "\"(?i)needle\"");
+        let scoped = json!({"pattern": "(?i)needle", "path": "crates"});
+        assert_eq!(ask(ToolName::Search, scoped), "\"(?i)needle\" in crates");
         // A usages symbol is the whole call: the walk is the workspace and the
         // match is the rule, so nothing rides the ask but the quoted word —
         // quoted even when it is one word, so a phrase reads as one piece.
@@ -14863,7 +14853,7 @@ mod tests {
 
     /// `list_files` and `search` read the same walk: build output and VCS
     /// metadata are skipped, hidden files are not, and a search says where a
-    /// line is without the model writing a regex.
+    /// line is with one `path:line: text` row per match.
     #[test]
     fn list_files_and_search_read_the_workspace() {
         let (actor, _mailbox) = test_actor("list-and-search");
@@ -14914,7 +14904,7 @@ mod tests {
             &actor,
             &mut state,
             ToolName::Search,
-            &json!({ "pattern": "needle", "ignore_case": true }),
+            &json!({ "pattern": "(?i)needle" }),
             &cancel,
         )
         .unwrap();
@@ -14925,6 +14915,22 @@ mod tests {
         assert!(
             !any_case.contains("target/"),
             "build output is not workspace text: {any_case}"
+        );
+
+        // A pattern the engine refuses is a failure the model can fix, not a
+        // miss: the engine's own words come back as the tool error.
+        let bad = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "needle(" }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(
+            bad.text().contains("found open group without closing ')'"),
+            "{}",
+            bad.text()
         );
 
         let none = exec_tool(

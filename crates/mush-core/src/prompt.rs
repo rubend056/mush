@@ -250,14 +250,16 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::Search,
-            "Find a literal string (no regex) in the workspace's text files: one `path:line: text` per \
-             match. Binary files are skipped.",
+            "Find a Rust regex in the workspace's text files: one `path:line: text` per match, \
+             each line matched on its own — so `^`/`$` anchor a line and `\\n` can never match. \
+             `(?i)` is how case-insensitive is said, and a metacharacter meant literally is \
+             escaped (`foo\\(bar\\)`). No lookaround or backreference, no `\\p{…}` classes, and \
+             `\\w`/`\\b` are ASCII-only. Binary files are skipped.",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "The literal text to find." },
-                    "path": { "type": "string", "description": "Directory or file to search. Default the root." },
-                    "ignore_case": { "type": "boolean", "description": "Case-insensitive. Default false." }
+                    "pattern": { "type": "string", "description": "The Rust regex to find; every line is matched on its own." },
+                    "path": { "type": "string", "description": "Directory or file to search. Default the root." }
                 },
                 "required": ["pattern"]
             }),
@@ -269,8 +271,8 @@ pub fn tool_schemas() -> Vec<Value> {
              Textual and best-effort — `held` in `beheld` is not a row, `self.held` is; no \
              identifier resolution, no scope, no call graph — so a comment or a string can be \
              a row and a miss is not proof the symbol is absent (the files the walk could \
-             not read are counted). No `path`, `ignore_case` or word toggle: `search` is the \
-             tool that takes those.",
+             not read are counted). No `path` or word toggle: `search` is the tool that takes \
+             those.",
             json!({
                 "type": "object",
                 "properties": {
@@ -455,6 +457,39 @@ mod tests {
         // that kills it is stated beside the detach it is the exception to.
         assert!(MACHINE.contains("killed"), "{MACHINE}");
         assert!(MACHINE.contains("output limit"), "{MACHINE}");
+    }
+
+    /// The search schema says what the pattern is: a Rust regex, matched line
+    /// by line, with the engine's two differences and the escape rule named —
+    /// the old "literal string (no regex)" left a model free to write `a(1)`
+    /// meaning it literally and read the miss as "it is not there". There is
+    /// no `ignore_case` argument: `(?i)` is inside the pattern, and a flag the
+    /// code does not read is the schema/code drift `edit_file` had (H20 item
+    /// 3).
+    #[test]
+    fn the_search_schema_names_the_regex_and_its_limits() {
+        let search = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "search")
+            .expect("search has a schema");
+        let description = search["function"]["description"].as_str().unwrap();
+        assert!(description.contains("Rust regex"), "{description}");
+        assert!(description.contains("(?i)"), "{description}");
+        assert!(
+            description.contains("lookaround") && description.contains("backreference"),
+            "{description}"
+        );
+        assert!(description.contains(r"\p{"), "{description}");
+        assert!(description.contains("ASCII"), "{description}");
+        assert!(description.contains(r"foo\(bar\)"), "{description}");
+        let properties = search["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("the properties are an object");
+        assert!(properties.contains_key("pattern"), "{properties:?}");
+        assert!(
+            !properties.contains_key("ignore_case"),
+            "the flag is gone from the schema: {properties:?}"
+        );
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`

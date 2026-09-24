@@ -1346,18 +1346,37 @@ impl Workspace {
         Ok((found, truncated, unnamed))
     }
 
-    /// Every line under `rel` containing `pattern` — a literal string, not a
-    /// regex — as `path:line: text`, capped at `limit` matches plus the fact
-    /// that there were more.
+    /// Every line under `rel` matching `pattern` — a regex, compiled once
+    /// before the walk — as `path:line: text`, capped at `limit` matches plus
+    /// the fact that there were more.
     ///
-    /// Literal on purpose: a regex engine is a dependency and a search that
-    /// runs one is the `rg` the shell already has, while this tool exists for
-    /// the one case the shell cannot serve (a held machine lock). Binary files
-    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped — the read
-    /// is bounded to the cap + 1 like `Self::whole_read`'s, so a file that
-    /// grew behind the stat is caught by its length rather than loaded whole —
-    /// and a matching line is cut to `MATCH_LINE_CAP` bytes with the cut
-    /// said, so one minified file cannot spend the result.
+    /// The pattern *is* the whole syntax (the human's decision, reversing the
+    /// literal this doc used to argue for): there is no flag argument to set,
+    /// `(?i)` is how case-insensitivity is said in the pattern itself, and a
+    /// metacharacter meant literally is escaped. The literal could not ask for
+    /// "any digit" at all, and the old argument against an engine — `rg` is
+    /// the shell's — is weakest exactly where this tool is needed: a held
+    /// machine lock refuses `run_command`. The engine is `regex-lite` rather
+    /// than the full `regex` on the same weighing — a measured +99 KB of
+    /// release binary and +0.5 s of build against +1.5 MB and +16.5 s — at
+    /// the cost of two syntax differences the schema states rather than lets a
+    /// model discover: no `\p{…}` classes, and `\w`/`\b` are ASCII-only.
+    ///
+    /// The match is per line and stays per line ([`text::file_lines`] is the
+    /// haystack, so a huge file is never held whole): a row is `path:line:
+    /// text`, `^` and `$` anchor a line, and a `\n` in the pattern can never
+    /// match. Binary files (a NUL byte) and files past [`SEARCH_FILE_CAP`] are
+    /// skipped — the read is bounded to the cap + 1 like `Self::whole_read`'s,
+    /// so a file that grew behind the stat is caught by its length rather than
+    /// loaded whole — and a matching line is cut to `MATCH_LINE_CAP` bytes with
+    /// the cut said, so one minified file cannot spend the result.
+    ///
+    /// A pattern the engine refuses is a refusal, not a "no match": the parse
+    /// error travels back and the model fixes the pattern instead of reading a
+    /// silent miss, and no file is opened to find that out. An empty pattern is
+    /// refused for [`Self::usages`]'s reason — the empty regex matches every
+    /// line, so a patternless call would be a capped listing rather than a
+    /// search.
     ///
     /// The match line is the *file's* line: no paint-time sanitizing, no
     /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
@@ -1387,26 +1406,20 @@ impl Workspace {
     /// (`Self::real_path`): a link inside the root cannot make the search
     /// read files outside it, and the files it does read are the ones under
     /// the name the model gave.
-    pub fn search(
-        &self,
-        pattern: &str,
-        rel: &str,
-        ignore_case: bool,
-        limit: usize,
-    ) -> Result<Matches, String> {
+    pub fn search(&self, pattern: &str, rel: &str, limit: usize) -> Result<Matches, String> {
         if pattern.is_empty() {
             return Err("`pattern` must not be empty".to_string());
         }
+        // Compiled once, before the walk: a bad pattern is an argument error
+        // the model can fix, not a fact about a file, and no file is opened to
+        // find it out.
+        let regex = regex_lite::Regex::new(pattern)
+            .map_err(|err| format!("`pattern` is not a valid regex: {err}"))?;
         let start = self.resolve(rel)?;
         self.real_path(&start, rel)?;
         if fs::symlink_metadata(&start).is_err() {
             return Err(format!("no such path: `{rel}`"));
         }
-        let needle = if ignore_case {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
         let mut matches = Vec::new();
         let mut more = false;
         let mut skipped = 0usize;
@@ -1443,12 +1456,7 @@ impl Workspace {
             }
             let text = String::from_utf8_lossy(&bytes);
             for (number, line) in text::file_lines(&text).enumerate() {
-                let haystack = if ignore_case {
-                    line.to_lowercase()
-                } else {
-                    line.to_string()
-                };
-                if !haystack.contains(&needle) {
+                if !regex.is_match(line) {
                     continue;
                 }
                 if matches.len() == limit {
@@ -2543,7 +2551,7 @@ mod tests {
         // The search names the file the same way, and its path opens too. The
         // three unnameable files are counted, not reported under a name that
         // opens something else (or nothing).
-        let found = ws.search("the real file", "", false, 10).unwrap();
+        let found = ws.search("the real file", "", 10).unwrap();
         assert_eq!(found.matches, vec![r"a\b.txt:1: the real file".to_string()]);
         assert_eq!(found.unnamed, 3);
         let named = found.matches[0].split(':').next().unwrap();
@@ -2551,7 +2559,7 @@ mod tests {
 
         // A search that never looked into the newline-named file is not a
         // silent miss, and a directory of only such names is not "no files".
-        let found = ws.search("the newline file", "", false, 10).unwrap();
+        let found = ws.search("the newline file", "", 10).unwrap();
         assert!(found.matches.is_empty());
         assert_eq!(found.unnamed, 3);
         let dir = ws.root().join("only");
@@ -2604,7 +2612,7 @@ mod tests {
         assert!(ws.list_files(".mush/wt", 10).is_err());
 
         // The search never reads the sibling's file.
-        let found = ws.search("fn sibling", "", false, 100).unwrap();
+        let found = ws.search("fn sibling", "", 100).unwrap();
         assert!(found.matches.is_empty(), "{:?}", found.matches);
 
         // A read of the path the old listing handed over is refused...
@@ -2667,7 +2675,7 @@ mod tests {
         );
 
         // A search is the same walk, so it cannot spend a match on a gate log.
-        let found = ws.search("held", "", false, 100).unwrap();
+        let found = ws.search("held", "", 100).unwrap();
         assert_eq!(found.matches, vec!["src.rs:1: fn held() {}".to_string()]);
 
         // Reach: the start directory is never name-checked, so a walk asked for
@@ -4060,7 +4068,7 @@ mod tests {
         ];
         // `Matches` carries no `Debug`, so the search's refusal is matched out
         // by hand rather than unwrapped.
-        refusals.push(match ws.search("DEEP", "out", false, 100) {
+        refusals.push(match ws.search("DEEP", "out", 100) {
             Err(refused) => refused,
             Ok(found) => panic!(
                 "a search through a link out of the root must be refused, not run: {:?}",
@@ -4654,7 +4662,7 @@ mod tests {
             format!("{line}\n"),
             "the strict read and the search line are the same bytes"
         );
-        let found = ws.search("needle", ".", false, 10).unwrap();
+        let found = ws.search("needle", ".", 10).unwrap();
         assert_eq!(
             found.matches,
             vec![format!("raw.txt:1: {line}")],
@@ -4663,14 +4671,14 @@ mod tests {
 
         // The `\r` of a CRLF ending is the file's byte too.
         fs::write(ws.root().join("crlf.txt"), "needle\r\nnext\r\n").unwrap();
-        let found = ws.search("needle", "crlf.txt", false, 10).unwrap();
+        let found = ws.search("needle", "crlf.txt", 10).unwrap();
         assert_eq!(found.matches, vec!["crlf.txt:1: needle\r".to_string()]);
 
         // A line past the cap is cut on a character boundary and marked, never
         // silently shortened.
         let long = format!("needle{}", "x".repeat(2 * MATCH_LINE_CAP));
         ws.write_file("long.txt", &format!("{long}\n")).unwrap();
-        let found = ws.search("needle", "long.txt", false, 10).unwrap();
+        let found = ws.search("needle", "long.txt", 10).unwrap();
         let reported = &found.matches[0];
         assert!(
             reported.starts_with(&format!("long.txt:1: {}", &long[..MATCH_LINE_CAP])),
@@ -4678,6 +4686,133 @@ mod tests {
         );
         assert!(reported.contains("line cut at"), "{reported}");
         assert!(reported.len() < long.len(), "the cut is real");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `pattern` is a regex and not a literal, and the escape rule is the cost
+    /// the schema states: `a(1)` is the group matching `a1`, so the model that
+    /// meant the file's `a(1)` literally gets a miss until it writes `a\(1\)`.
+    /// The literal this replaced could not ask for "any digit" at all.
+    #[test]
+    fn a_pattern_is_a_regex_and_a_metacharacter_is_escaped_for_it() {
+        let ws = temp_workspace("search-regex");
+        fs::write(ws.root().join("a.txt"), "a(1)\na1\n").unwrap();
+        let grouped = ws.search("a(1)", "", 10).unwrap();
+        assert_eq!(grouped.matches, vec!["a.txt:2: a1".to_string()]);
+        let escaped = ws.search(r"a\(1\)", "", 10).unwrap();
+        assert_eq!(escaped.matches, vec!["a.txt:1: a(1)".to_string()]);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// Case-insensitivity is the pattern's own `(?i)` — the flag argument the
+    /// call used to carry is gone — and the fold is the engine's, which is
+    /// ASCII-only, not the Unicode `to_lowercase` the old flag ran.
+    #[test]
+    fn case_insensitivity_is_the_patterns_own_i_flag() {
+        let ws = temp_workspace("search-ignore-case");
+        fs::write(ws.root().join("a.txt"), "NEEDLE\nneedle\n").unwrap();
+        let found = ws.search("(?i)needle", "", 10).unwrap();
+        assert_eq!(
+            found.matches,
+            vec!["a.txt:1: NEEDLE".to_string(), "a.txt:2: needle".to_string()]
+        );
+        let exact = ws.search("needle", "", 10).unwrap();
+        assert_eq!(exact.matches, vec!["a.txt:2: needle".to_string()]);
+
+        // The fold a model might expect from the old flag is not there: `(?i)é`
+        // is not `É`, because `regex-lite` folds ASCII only.
+        fs::write(ws.root().join("unicode.txt"), "É\n").unwrap();
+        let unicode = ws.search("(?i)é", "unicode.txt", 10).unwrap();
+        assert!(unicode.matches.is_empty(), "{:?}", unicode.matches);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// `\b` is a word boundary, and the engine's word characters are ASCII:
+    /// `\bheld\b` finds the word and not `beheld`, while a boundary at a `β`
+    /// is not one — the limit the schema names rather than lets a model
+    /// discover.
+    #[test]
+    fn a_word_boundary_is_ascii() {
+        let ws = temp_workspace("search-word-boundary");
+        fs::write(ws.root().join("a.txt"), "held\nbeheld\nβββ\n").unwrap();
+        let found = ws.search(r"\bheld\b", "", 10).unwrap();
+        assert_eq!(found.matches, vec!["a.txt:1: held".to_string()]);
+        let unicode = ws.search(r"\bβββ\b", "", 10).unwrap();
+        assert!(unicode.matches.is_empty(), "{:?}", unicode.matches);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The haystack is one line, not the whole file: `^`/`$` anchor a line and
+    /// a pattern holding `\n` can never match, which is what a `path:line:
+    /// text` row needs — and why the walk is per line instead of the file's
+    /// whole text.
+    #[test]
+    fn the_match_is_one_line_and_the_anchors_are_a_lines() {
+        let ws = temp_workspace("search-per-line");
+        fs::write(ws.root().join("a.txt"), "one\ntwo\n").unwrap();
+        let anchored = ws.search("^two$", "", 10).unwrap();
+        assert_eq!(anchored.matches, vec!["a.txt:2: two".to_string()]);
+        let across = ws.search("one\ntwo", "", 10).unwrap();
+        assert!(across.matches.is_empty(), "{:?}", across.matches);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The cap's contract survives a pattern that matches every line: the
+    /// first `limit` rows come back, `more` is set, and the walk stops at the
+    /// line that proved there was more rather than walking the rest.
+    #[test]
+    fn a_pattern_that_matches_every_line_still_respects_the_cap() {
+        let ws = temp_workspace("search-cap-everything");
+        fs::write(ws.root().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let found = ws.search(".*", "", 2).unwrap();
+        assert_eq!(
+            found.matches,
+            vec!["a.txt:1: one".to_string(), "a.txt:2: two".to_string()]
+        );
+        assert!(found.more, "the third line is the proof of more");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A pattern the engine refuses is the call's refusal, not a "no match":
+    /// the engine's own words travel back so the pattern can be fixed, and the
+    /// walk never runs — there are no rows to show for an argument that never
+    /// parsed.
+    #[test]
+    fn a_bad_pattern_is_refused_with_the_engines_own_words() {
+        let ws = temp_workspace("search-bad-pattern");
+        fs::write(ws.root().join("a.txt"), "needle\n").unwrap();
+        // `Matches` carries no `Debug`, so the refusal is matched out by hand
+        // rather than unwrapped.
+        let refused = match ws.search("needle(", "", 10) {
+            Err(refused) => refused,
+            Ok(found) => panic!(
+                "a bad pattern must be refused, not run: {:?}",
+                found.matches
+            ),
+        };
+        assert!(refused.contains("`pattern`"), "{refused}");
+        assert!(
+            refused.contains("found open group without closing ')'"),
+            "the engine's own words: {refused}"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// An empty pattern is refused, like [`Workspace::usages`]'s empty symbol:
+    /// the empty regex matches every line, so a patternless call would answer
+    /// with the cap's worth of the workspace instead of a search.
+    #[test]
+    fn an_empty_pattern_is_refused() {
+        let ws = temp_workspace("search-empty-pattern");
+        fs::write(ws.root().join("a.txt"), "one\ntwo\n").unwrap();
+        let refused = match ws.search("", "", 10) {
+            Err(refused) => refused,
+            Ok(found) => panic!(
+                "an empty pattern must be refused, not run: {:?}",
+                found.matches
+            ),
+        };
+        assert_eq!(refused, "`pattern` must not be empty");
         let _ = fs::remove_dir_all(ws.root());
     }
 
@@ -5653,7 +5788,7 @@ mod tests {
             shown.starts_with("caf\u{fffd} = 1\nna\u{fffd}ve = 2"),
             "the window still shows the file, lossily: {shown}"
         );
-        let found = ws.search("caf", "", false, 10).unwrap();
+        let found = ws.search("caf", "", 10).unwrap();
         assert!(
             found
                 .matches

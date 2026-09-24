@@ -86,8 +86,8 @@
 //! **The ask is spans by role, and the shell's own line.** The mark is the
 //! row's one bright thing and the call's named target keeps the ask's own
 //! colour — a path, a pattern, a command's program *per stage* — while what
-//! *qualifies* the target goes dim: a read's window, a search's `in crates ·
-//! ignore_case`, a command's arguments and its `· background`, a control's
+//! *qualifies* the target goes dim: a read's window, a search's `in crates`, a
+//! command's arguments and its `· background`, a control's
 //! quoted words. A command is read at its own operators: the program of every
 //! `|`, `;`, `&&` and `||` stage is a target and the rest of the stage is a
 //! qualifier, and a `;`/`&&`/`||` operator is a [`Role::Seam`] — dim, and the
@@ -727,8 +727,8 @@ fn ask_pieces(call: &ToolCall, facts: &CallFacts, mark: &str) -> Ask {
 ///
 /// A target is what the call is *about*: a path, a pattern, a program, the id a
 /// spawn was given. Everything the call reads the target *through* — a window,
-/// where a search looked, the case it ran under, a command's arguments, the
-/// flags it ran under, the words a control carries — is a qualifier and dim.
+/// where a search looked, a command's arguments, the flags it ran under, the
+/// words a control carries — is a qualifier and dim.
 fn ask_roles(tool: ToolName, ask: &str) -> Vec<Piece> {
     if ask.is_empty() {
         return Vec::new();
@@ -738,8 +738,8 @@ fn ask_roles(tool: ToolName, ask: &str) -> Vec<Piece> {
         // is a target it ran, that program's arguments qualify it, and the
         // operator that ends a stage is the [`Role::Seam`] a row may end at.
         ToolName::RunCommand => stages(ask),
-        // A search's pattern is what was looked for; where and how it looked
-        // (`in crates · ignore_case`) are the qualifiers.
+        // A search's pattern is what was looked for; where it looked
+        // (`in crates`) is the qualifier.
         ToolName::Search => match ask.find("\" in ") {
             Some(at) => vec![
                 (ask[..at + 1].to_string(), Role::Named),
@@ -2840,12 +2840,12 @@ mod tests {
             "the mark is the read's own, whatever glyph the caller hands in"
         );
         assert_eq!(
-            roles("search", "⌕ ", "\"column_widths\" in crates · ignore_case"),
+            roles("search", "⌕ ", "\"column_widths\" in crates"),
             (
                 vec![("⌕ ".to_string(), Role::Named)],
                 vec![
                     ("\"column_widths\"".to_string(), Role::Named),
-                    (" in crates · ignore_case".to_string(), Role::Qualifier),
+                    (" in crates".to_string(), Role::Qualifier),
                 ]
             )
         );
@@ -2881,7 +2881,7 @@ mod tests {
         for ask in [
             "seq 1 20 | tail -3",
             "src/a.rs 1408→1530",
-            "\"x\" in crates · ignore_case",
+            "\"(?i)x\" in crates",
             "#4 message \"one more line\"",
             "cargo test · background",
             "",

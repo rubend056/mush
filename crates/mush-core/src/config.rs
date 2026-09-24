@@ -577,7 +577,7 @@ fn host_of(url: &str) -> &str {
 }
 
 /// Tokens every request reserves for the tool schemas. Twelve schemas measure
-/// ~7.6 KB (~2.5 K tokens at the 3 bytes/token heuristic), so the reserve
+/// ~7.8 KB (~2.6 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
@@ -600,11 +600,14 @@ fn host_of(url: &str) -> &str {
 /// defaulted. The fourth is `outline`: a file's shape otherwise costs the model
 /// the window it wanted for the work, and one schema is what that road adds to
 /// every request. The fifth is `usages`: who mentions a symbol is the question
-/// before a rename, and it is the one word rule no schema can spell with
-/// `search`'s substring pattern — the twelfth schema took the payload past
-/// 2 500 tokens' worth of bytes, so the reserve moved rather than the call.
-/// The `schemas_fit_the_budget_reserve` test is what makes growth a decision
-/// rather than a silent drift.
+/// before a rename, and its grouped, declaration-first answer — with a word
+/// rule that is Unicode where the engine's `\b` is ASCII — is a shape no other
+/// call produces; the twelfth schema took the payload past 2 500 tokens' worth
+/// of bytes, so the reserve moved rather than the call. The sixth change,
+/// `search`'s pattern becoming a regex with its limits and escape rule spelled,
+/// cost ~200 bytes and did not move the number: the measurement above is after
+/// it and still rounds up. The `schemas_fit_the_budget_reserve` test is what
+/// makes growth a decision rather than a silent drift.
 pub const SCHEMA_TOKENS: usize = 3_000;
 
 impl Config {

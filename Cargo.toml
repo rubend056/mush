@@ -20,6 +20,11 @@ dirs = "6"
 # what the renderer actually paints.
 unicode-segmentation = "1"
 unicode-truncate = "1.1"
+# The search tool's engine, and deliberately the `regex` crate's
+# zero-dependency sibling: a measured +99 KB of release binary and +0.5 s of
+# build against +1.5 MB and +16.5 s, at the cost of the two syntax differences
+# the schema states (no `\p{…}`, ASCII `\w`/`\b`).
+regex-lite = "0.1"
 
 # mush is a terminal application that talks to the network and shells out. It
 # has never needed `unsafe`, and it should stay that way.

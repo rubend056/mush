@@ -18,7 +18,7 @@
 //! lines is only ever its first line. The header [`Outline::render`] opens with
 //! carries that sentence on every answer, because a model that trusts an
 //! outline further than the rule reaches is a model mush misled — the same
-//! reason `search` says "no regex" and `read_file` names the lines a window
+//! reason `usages` says "textual" and `read_file` names the lines a window
 //! left.
 //!
 //! **One rule, and no path.** [`is_declaration`] takes the line and nothing
