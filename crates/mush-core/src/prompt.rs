@@ -193,9 +193,11 @@ pub fn tool_schemas() -> Vec<Value> {
         tool(
             ToolName::ReadFile,
             "Read a workspace file, or look at an image. Text is a window — `offset`/`limit` are \
-             lines (default: from line 1, as many as fit) and the cut says what it left; a png, \
-             jpeg, gif or webp comes back as the image. Works while another agent holds \
-             the machine.",
+             lines (default: from line 1, as many as fit) and the cut says what it left. An \
+             unbounded read (`offset` and `limit` both absent) of a file whose text does not fit \
+             the result cap answers with the file's outline instead of a cut head, and names the \
+             `offset`/`limit` range that reads on; a png, jpeg, gif or webp comes back as the \
+             image. Works while another agent holds the machine.",
             json!({
                 "type": "object",
                 "properties": {

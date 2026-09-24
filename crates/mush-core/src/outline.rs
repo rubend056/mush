@@ -236,6 +236,18 @@ pub fn definitions(text: &str) -> Vec<Definition> {
         .collect()
 }
 
+/// Whether a tool result is one of this module's answers: a first line carrying
+/// the header's own confession. The app's digest reads it to tell a `read_file`
+/// that came back as an outline — the unbounded read's fallback — from one that
+/// came back as text, and then reads it exactly as the `outline` tool's own
+/// results are read, so the two readings cannot drift apart.
+pub fn is_outline_answer(result: &str) -> bool {
+    result
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(RULE_NOTE))
+}
+
 /// Whether a line is a declaration by this module's textual rule — the whole
 /// rule in one predicate, with the reasoning in `declaration_prefix`.
 pub fn is_declaration(line: &str) -> bool {
@@ -714,7 +726,10 @@ mod tests {
         // The number, not only the bound: a sweep whose cost moves is worth
         // seeing in a `--nocapture` run, the same reading `prompt`'s schema
         // size gets.
-        eprintln!("outline sweep: {} files, {rows} rows, {elapsed:?}", files.len());
+        eprintln!(
+            "outline sweep: {} files, {rows} rows, {elapsed:?}",
+            files.len()
+        );
         assert!(rows > 500, "the sweep found only {rows} rows");
         assert!(
             elapsed < Duration::from_secs(2),

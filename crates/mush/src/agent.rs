@@ -6090,10 +6090,70 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
     }
     let offset = tools::arg_usize(args, "offset", 1)?;
     let limit = tools::arg_usize(args, "limit", usize::MAX)?;
-    actor
+    let window = actor
         .ws
-        .read_window(&path, offset, limit, result_cap(actor, state))
-        .map(ToolOutput::from)
+        .read_window(&path, offset, limit, result_cap(actor, state))?;
+    // The unbounded read: `offset` and `limit` both absent — a model asking for
+    // "the file" rather than for a window of it. When the cap cut that window,
+    // the head it would have read is a poor answer (forty lines of nine hundred,
+    // and no idea what the other eight hundred and sixty hold), so the file's
+    // *outline* is the answer instead: the same header the `outline` tool
+    // prints, the rows, and a line naming the `offset`/`limit` range that reads
+    // on. Never instead of nothing, though — a file the rule finds no
+    // declarations in (a markdown note, a config, a data file) keeps the
+    // head-plus-trailer behaviour, because losing the ability to see a prose
+    // file at all would be the worse trade. And a *bounded* read — `offset` or
+    // `limit` sent, however wide — is untouched: the model stated the window it
+    // wanted, and the window road answers it exactly as it always has.
+    //
+    // The road line is part of the answer for the loop guard's sake: `count_round`
+    // counts *identical* calls, so a model that repeats this exact call is
+    // stopped after `LOOP_ROUNDS` whatever the result says — what the result
+    // can do, and does, is make the next call a *different* one (offset/limit,
+    // named with a concrete window), which resets the count. The schema's
+    // description says the same thing where the call is chosen.
+    if unbounded_read(args) && window.truncated {
+        // The outline is a second read of the same file — the window road had
+        // the bytes but not the shape — and a file that moved between the two
+        // reads is the same race every read-then-act road has (B16): the
+        // outline is self-consistent and nothing in the answer claims the two
+        // reads saw the same bytes. A second read that *fails* (the file went
+        // away, or became a binary) must not throw away the window the first
+        // read already paid for: this fallback is a courtesy, and a courtesy
+        // does not turn a successful read into an error.
+        if let Ok(outline) = actor.ws.outline(&path) {
+            if !outline.is_empty() {
+                return Ok(ToolOutput::from(
+                    outline.render(result_cap(actor, state), &unbounded_read_lead(&path)),
+                ));
+            }
+        }
+    }
+    Ok(ToolOutput::from(window.text))
+}
+
+/// Whether a `read_file` call asked for the whole file: `offset` and `limit`
+/// both absent. A `null` is the JSON way of saying nothing at all — and
+/// [`tools::arg_usize`] reads it as absent — so this reads it the same way, or
+/// "unbounded" would mean one thing to the schema's reader and another to the
+/// fallback that acts on it.
+fn unbounded_read(args: &Value) -> bool {
+    ["offset", "limit"]
+        .into_iter()
+        .all(|key| matches!(args.get(key), None | Some(Value::Null)))
+}
+
+/// The line the unbounded read's fallback puts under the outline's header: what
+/// was not shown, and the move that shows it. It names `offset` and `limit` and
+/// a concrete window because the guard counts identical calls — the result is
+/// what makes the model's next call a different one, and "read a range" without
+/// a range is not a move a model can take.
+fn unbounded_read_lead(path: &str) -> String {
+    format!(
+        "[mush: the unbounded read of `{path}` was cut at the result cap, so the file's text was \
+         not shown — this is its outline; read a range with `offset` and `limit`, for example \
+         read_file {{path: \"{path}\", offset: 1, limit: 200}}]"
+    )
 }
 
 /// `outline`: the definitions in one file with their line numbers.
@@ -7418,9 +7478,20 @@ fn read_details(ok: Option<&str>) -> Vec<String> {
 /// 4–5 of 9 — read on with offset=6]` for a window, and `[mush: line 1 of 20 is
 /// longer than the cap …]` for a line the cap cut. The window's own count is
 /// the outcome's, so only the `of N` clause is read here.
+///
+/// The note has to *open* with `line`/`lines`, not merely be a `[mush: …]` note
+/// that holds ` of ` somewhere. An outline answer can reach this reader through
+/// a `read_file` call (the unbounded-read fallback), and its cut note — `[mush:
+/// only the first 12 of 37 definitions are shown …]` — would otherwise put a
+/// count of *definitions* on the row as a count of lines: a false number, which
+/// is the one thing these readers exist not to print.
 fn read_total(text: &str) -> Option<usize> {
     for line in text.lines() {
-        let Some(rest) = line.trim_end().strip_prefix("[mush: ") else {
+        let line = line.trim_end();
+        let Some(rest) = line
+            .strip_prefix("[mush: lines ")
+            .or_else(|| line.strip_prefix("[mush: line "))
+        else {
             continue;
         };
         let Some((_, tail)) = rest.split_once(" of ") else {
@@ -7435,10 +7506,23 @@ fn read_total(text: &str) -> Option<usize> {
 }
 
 /// A read's outcome: `{n} lines · {size}` over the window's own payload, the
-/// picture a read can hand back instead named as what it is, and the empty file
-/// as `empty`.
+/// picture a read can hand back instead named as what it is, the empty file
+/// as `empty`, and the unbounded read's fallback as `outline · {n}
+/// definitions` — a read that came back as the file's *shape* must not be
+/// counted as though it had come back as text.
 fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
     let text = ok?.trim_end();
+    // The fallback's own marker is the outline header's confession, the one
+    // sentence only an outline answer carries; the outcome is then read exactly
+    // as the `outline` tool's own results are read, so the two cannot drift.
+    if mush_core::outline::is_outline_answer(text) {
+        if let Some(outcome) = outline_outcome(Some(text)) {
+            return Some(CallOutcome {
+                text: format!("outline · {}", outcome.text),
+                tone: outcome.tone,
+            });
+        }
+    }
     // An image: `read shots/x.png — a png image, 4198 bytes`.
     if let Some(rest) = text.strip_prefix("read ") {
         if let Some((_, facts)) = rest.split_once(" — a ") {
@@ -12603,6 +12687,129 @@ mod tests {
             "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
              answer); read_file shows the text"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The unbounded read's fallback: a model that asked for "the file" and is
+    /// about to be shown forty lines of six hundred is answered with the file's
+    /// *outline* instead — the `outline` tool's own header and rows, under a
+    /// line that says the text was not shown and names the `offset`/`limit`
+    /// range that reads on. The road line is not decoration: the loop guard
+    /// counts identical calls, so the result itself has to make the model's
+    /// next call a different one.
+    #[test]
+    fn an_unbounded_read_of_a_cut_file_answers_with_the_outline() {
+        let (actor, _mailbox) = test_actor("read-outline-fallback");
+        let body: String = (1..=300)
+            .map(|n| format!("fn item_{n}() {{}}\n// filler {n}\n"))
+            .collect();
+        fs::write(actor.ws.root().join("big.rs"), &body).unwrap();
+        // Small enough that the whole file cannot fit one result: the same cut
+        // a real `result_cap` makes on a big file.
+        let mut state = ActorState {
+            turn_room: Some(2_000),
+            ..ActorState::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let answered = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({"path": "big.rs"}),
+            &cancel,
+        )
+        .unwrap();
+        let text: &str = &answered;
+        assert!(
+            text.starts_with(
+                "big.rs — 600 lines; 300 definitions (textual, Rust-first — not a compiler's \
+                 answer)"
+            ),
+            "the same header the outline tool prints: {text}"
+        );
+        assert!(
+            text.contains(
+                "the unbounded read of `big.rs` was cut at the result cap, so the file's text \
+                 was not shown"
+            ),
+            "the answer says what it is not: {text}"
+        );
+        assert!(
+            text.contains(
+                "read a range with `offset` and `limit`, for example read_file {path: \"big.rs\", \
+                 offset: 1, limit: 200}"
+            ),
+            "the next move is named and concrete: {text}"
+        );
+        assert!(text.contains("  1  fn item_1() {}"), "{text}");
+        assert!(
+            !text.contains("filler"),
+            "the file's text was not shown: {text}"
+        );
+        assert!(
+            text.contains("[mush: only the first "),
+            "the cut is said: {text}"
+        );
+
+        // The pane reads the call as what it was: an outline, not a text
+        // window — the cut note's `of 300 definitions` must never be read as a
+        // count of the file's lines.
+        let facts = digest(
+            ToolName::ReadFile,
+            &json!({"path": "big.rs"}),
+            Some(text),
+            actor.ws.root(),
+        );
+        assert_eq!(
+            facts.outcome,
+            Some(CallOutcome {
+                text: "outline · 300 definitions".to_string(),
+                tone: Tone::Ok,
+            })
+        );
+        assert!(facts.details.is_empty(), "{:?}", facts.details);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The controls the fallback must not touch: an unbounded read that fits is
+    /// the file's own text with no outline around it, and a *bounded* read —
+    /// `offset` or `limit` sent, however wide — is today's window and trailer,
+    /// because the model stated the window it wanted.
+    #[test]
+    fn a_read_that_fits_or_states_a_window_is_unchanged() {
+        let (actor, _mailbox) = test_actor("read-no-fallback");
+        let mut state = ActorState {
+            turn_room: Some(2_000),
+            ..ActorState::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut read =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::ReadFile, &args, &cancel);
+
+        // Unbounded, and the whole file fits: the text, and nothing around it.
+        fs::write(actor.ws.root().join("small.rs"), "fn one() {}\n").unwrap();
+        let whole = read(json!({"path": "small.rs"})).unwrap();
+        assert_eq!(&*whole, "fn one() {}", "the text, and nothing around it");
+        assert!(!whole.contains("mush:"), "{whole}");
+
+        // The long file, bounded: the window and its trailer, exactly as
+        // before.
+        let body: String = (1..=300)
+            .map(|n| format!("fn item_{n}() {{}}\n// filler {n}\n"))
+            .collect();
+        fs::write(actor.ws.root().join("big.rs"), &body).unwrap();
+        let window = read(json!({"path": "big.rs", "limit": 3})).unwrap();
+        assert_eq!(
+            &*window,
+            "fn item_1() {}\n// filler 1\nfn item_2() {}\n[mush: lines 1–3 of 600 — read on with \
+             offset=4]"
+        );
+        // An `offset` alone is bounded too: the model named where to start.
+        let from = read(json!({"path": "big.rs", "offset": 5})).unwrap();
+        assert!(from.starts_with("fn item_3() {}"), "{from}");
+        assert!(from.contains("[mush: lines 5–"), "{from}");
+        assert!(!from.contains("not a compiler's answer"), "{from}");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

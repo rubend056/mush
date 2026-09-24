@@ -349,6 +349,42 @@ pub struct Matches {
     pub unnamed: usize,
 }
 
+/// What a window read found: the text the model reads, and whether the window
+/// stopped short of the file's own end.
+///
+/// The text already *says* when it was cut, in its own trailing sentence
+/// (`[mush: lines 1–40 of 900 — read on with offset=41]`). The flag exists so a
+/// caller that has to *act* on the fact does not have to parse mush's own prose
+/// back out of the text it just wrote — the digest is the one reader that reads
+/// sentences, and it is a painter. The unbounded-read fallback in the app is
+/// the caller: a model that asked for "the file" and would be shown forty lines
+/// of nine hundred is better served by the file's outline (`outline::Outline`),
+/// and this flag is how it knows the window was cut without trusting a string.
+///
+/// `false` covers every window that reached the end, the empty-file sentence,
+/// and a single line shown whole; a refusal (`Err`) is not a `Window` at all.
+#[derive(Clone, Debug)]
+pub struct Window {
+    pub text: String,
+    /// The window stopped short of the file: its trailer says `read on with
+    /// offset=…` or `shown in part`.
+    pub truncated: bool,
+}
+
+impl std::fmt::Display for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for Window {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
 /// What a bounded line count of a whole file can say, from
 /// [`Workspace::line_count`]: the number of lines a file had when that number
 /// is knowable without spending more than [`READ_FILE_CAP`] of memory, and the
@@ -1100,6 +1136,14 @@ impl Workspace {
     /// 1-based `offset`, cut to `cap` bytes, then one sentence if there is a
     /// rest — how much of the file this was and the `offset` that reads on.
     ///
+    /// The answer is a [`Window`], whose text is that window and whose flag is
+    /// the same fact for a caller that has to act on it: whether the window
+    /// stopped short of the file's end. The trailer is written for the model;
+    /// the flag is how the app's read tool knows a cut happened without parsing
+    /// mush's own sentence back out of the text (the unbounded-read fallback:
+    /// a request for the whole file that the cap cut answers with the file's
+    /// outline instead of its head).
+    ///
     /// No line numbers are printed beside the text, on purpose: a model copies
     /// what it reads into `edit_file`'s `old_string`, and a numbered line is a
     /// string that cannot match. The range is named once, in the trailing
@@ -1135,7 +1179,7 @@ impl Workspace {
         offset: usize,
         limit: usize,
         cap: usize,
-    ) -> Result<String, String> {
+    ) -> Result<Window, String> {
         let text = self
             .whole_read(rel, Decoding::Lossy)?
             .text_or_refusal(rel)?;
@@ -1147,7 +1191,10 @@ impl Workspace {
             ));
         }
         if total == 0 {
-            return Ok(format!("{rel} is empty"));
+            return Ok(Window {
+                text: format!("{rel} is empty"),
+                truncated: false,
+            });
         }
         if offset > total {
             return Err(format!(
@@ -1198,7 +1245,13 @@ impl Workspace {
                 "\n[mush: lines {offset}–{last} of {total} — end of file]"
             ));
         }
-        Ok(out)
+        Ok(Window {
+            text: out,
+            // The two trailers that mean "there is more": a window that stopped
+            // before the file's end, and a single line the cap showed in part.
+            // The CRLF note and the end-of-file line are *not* cuts.
+            truncated: part || last < total,
+        })
     }
 
     /// Every file under `rel` (default the workspace root), workspace-relative,
