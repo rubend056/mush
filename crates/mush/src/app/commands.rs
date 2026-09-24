@@ -910,6 +910,7 @@ pub(crate) mod tests {
                     // of them for a fold to keep (`Chat::re_anchor`).
                     anchor: None,
                     select: None,
+                    calls: Vec::new(),
                 }),
                 input: Some(InputPane {
                     prompt: "› ".to_string(),

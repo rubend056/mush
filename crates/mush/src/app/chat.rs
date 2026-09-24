@@ -58,7 +58,9 @@
 //! terminal: width and height are arguments, the blank separator that closes a
 //! message is trimmed before the window is cut, every block that is not the
 //! human's own words or the model's reply is folded to its kind's number of rows
-//! ([`Fold`], with the `…` row that says what is hidden), and the `Ctrl-O` view is
+//! ([`Fold`], with the `…` row that says what is hidden — and one call the human
+//! opened or closed by hand at its own fold, [`Chat::toggle_call`]), and the
+//! `Ctrl-O` view is
 //! the compact log: a tool's result at no rows at all — the call's own line,
 //! `▤ src/a.rs → 3 lines`, is the event ([`crate::agent::digest`]) —
 //! and mush's reports and another agent's words at one row each, with a blank
@@ -337,6 +339,23 @@ impl Notice {
     }
 }
 
+/// One tool call's own address: the assistant message that made it, and its
+/// place in that message's `tool_calls()` batch.
+///
+/// A call's *rows* are painted from two messages — the header and the details
+/// from the message that made the call, the payload from the `"tool"` message
+/// that answered it — so a row that belongs to a call has to name the message
+/// the click must address, and that is the assistant message, never the result
+/// the payload was painted from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallRef {
+    /// The index in the agent's transcript of the assistant message whose
+    /// `tool_calls()` the call is in.
+    pub message: usize,
+    /// The call's place in that message's batch.
+    pub call: usize,
+}
+
 /// One transcript pane as it is painted: the rows, top first, and the title it
 /// wears.
 ///
@@ -364,6 +383,24 @@ pub struct Painted {
     /// rows: a key that re-derived it, or mixed a row from one frame with a
     /// width from another, would land the row on a pane the frame never painted.
     pub anchor: Option<Anchor>,
+    /// Where each painted transcript row came from: `Some(call)` for a row of a
+    /// tool call's block — its header, its details, or the payload of the
+    /// result it answers — and `None` for every other row.
+    ///
+    /// Parallel to the *transcript* rows of [`Self::lines`]; the foot's rows
+    /// (`lines` carries them at the end) have no entry, so this is the same
+    /// length as the body and never longer than `lines`. Published rather than
+    /// asked for at click time because it is the frame's own account of what it
+    /// painted: the click resolves through the frame it landed on, and there is
+    /// no second derivation of the call grid for it to drift from.
+    pub calls: Vec<Option<CallRef>>,
+}
+
+impl Painted {
+    /// The tool call a painted row is part of, if it is part of one.
+    pub fn call_at(&self, row: usize) -> Option<CallRef> {
+        self.calls.get(row).copied().flatten()
+    }
 }
 
 /// The rows of a painted pane the select mode marks: indices into
@@ -658,6 +695,56 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
     Some(format!("cleared {what} · Ctrl-Z puts it back"))
 }
 
+/// One message's rows as the painter built them: the stop of the message's own
+/// text each row is the reading of, and the call the row belongs to where it
+/// belongs to one.
+#[derive(Default)]
+struct Rows {
+    stops: Vec<Option<Stop>>,
+    /// Parallel to `stops`: the call's place in **this** message's batch, for
+    /// the rows of a call's own block (its header and its details). A `"tool"`
+    /// message marks its payload rows with `Payload`, because the call they
+    /// answer is a fact only the caller can walk to (`Message::tool_call_id`);
+    /// the caller turns both into [`CallRef`]s.
+    calls: Vec<Option<RenderCall>>,
+}
+
+impl Rows {
+    /// One painted row with the stop it is the reading of and no call of its
+    /// own.
+    fn push(&mut self, stop: Option<Stop>) {
+        self.stops.push(stop);
+        self.calls.push(None);
+    }
+
+    /// One painted row of this message's own call `at`: the grid's rows are
+    /// the call's *header* and *details*, and they are the rows a click may
+    /// open or close the call through.
+    fn push_call(&mut self, at: usize) {
+        self.stops.push(None);
+        self.calls.push(Some(RenderCall::Own(at)));
+    }
+
+    /// Raise both maps to `rows` painted rows — the rows this message has
+    /// pushed into the pane, counted from its own start — with `None`s: a row
+    /// that is not the message's own words and belongs to no call (the
+    /// reasoning, a picture's label, the blank that closes the message).
+    fn grow(&mut self, rows: usize) {
+        self.stops.resize(rows, None);
+        self.calls.resize(rows, None);
+    }
+}
+
+/// The call a painted row belongs to, as far as the painter of one message can
+/// know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderCall {
+    /// A row of this message's own call `usize` (the header, the details).
+    Own(usize),
+    /// A row of the payload this `"tool"` message answers with.
+    Payload,
+}
+
 /// The rows one message paints, and the stop each row is the reading of.
 ///
 /// The map is what lets a *stop* be found among painted rows at all: a wrapped
@@ -670,6 +757,9 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
 struct Chunk {
     lines: Vec<Line<'static>>,
     rows: Vec<Option<(usize, Stop)>>,
+    /// The call each row belongs to, where one does ([`Rows::calls`] resolved):
+    /// parallel to `lines`, and the map the pane publishes.
+    calls: Vec<Option<CallRef>>,
 }
 
 impl Chunk {
@@ -678,14 +768,18 @@ impl Chunk {
     fn cut(mut self, rows: usize) -> Self {
         self.lines.truncate(rows);
         self.rows.truncate(rows);
+        self.calls.truncate(rows);
         self
     }
 
     /// Append the rows from `skip` on, at most `room` of them.
     fn take_into(self, body: &mut Body, skip: usize, room: usize) {
-        for (line, row) in self.lines.into_iter().zip(self.rows).skip(skip).take(room) {
+        let Chunk { lines, rows, calls } = self;
+        let rows = lines.into_iter().zip(rows).zip(calls).skip(skip).take(room);
+        for ((line, row), call) in rows {
             body.lines.push(line);
             body.rows.push(row);
+            body.calls.push(call);
         }
     }
 }
@@ -697,6 +791,10 @@ struct Body {
     /// Parallel to `lines`: `(message index, stop)`, the provenance a [`Chunk`]
     /// carries once the message is known.
     rows: Vec<Option<(usize, Stop)>>,
+    /// Parallel to `lines`: the call a row belongs to, where one does — what
+    /// [`Painted::calls`] publishes, so a click resolves against the frame
+    /// rather than a second walk of the call grid.
+    calls: Vec<Option<CallRef>>,
 }
 
 impl Body {
@@ -709,6 +807,7 @@ impl Body {
         }
         self.lines.truncate(kept);
         self.rows.truncate(kept);
+        self.calls.truncate(kept);
     }
 
     /// The row the body's bottom edge is reading from, and the rows the pane
@@ -1220,6 +1319,23 @@ pub struct Chat {
     /// tree already holds — nothing is stored, and an agent whose phase is not
     /// an activity has no clock here at all.
     call_at: HashMap<AgentId, Instant>,
+    /// The tool calls the human has opened or closed by hand, keyed by the
+    /// call's own address: the agent, the assistant message's index, and the
+    /// call's place in that message's `tool_calls()`.
+    ///
+    /// `true` is *open* — the call's block paints the conversation's own
+    /// numbers even where the conversation is the compact log — and `false` is
+    /// *closed*, the same fold one call at a time. An absent entry follows the
+    /// conversation, which is why the map opens empty and why `Ctrl-O` still
+    /// moves every call the human has not touched.
+    ///
+    /// Plain `HashMap` and not a `RefCell` like [`Self::facts`]: the cache is
+    /// written *during a paint* (from `&self`, which is why it needs the cell),
+    /// and this is written by a click, which has `&mut Chat`. The state is the
+    /// human's, so it is never derived-and-dropped the way the cache is — the
+    /// roads that move or lose a transcript move or drop it, like
+    /// [`Self::spoken`].
+    open_calls: HashMap<AgentId, HashMap<(usize, usize), bool>>,
 }
 
 /// One line the human sent to a busy agent, and the turn it is waiting for.
@@ -1271,6 +1387,7 @@ impl Chat {
             symbols: Symbols::from_env(),
             fold: Fold::DEFAULT,
             call_at: HashMap::new(),
+            open_calls: HashMap::new(),
         }
     }
 
@@ -1325,15 +1442,118 @@ impl Chat {
     /// conversation's own numbers ([`Self::set_output`]), which is what
     /// `Ctrl-O`'s first press at launch does.
     ///
-    /// The one read for both roads that measure a block — the painter
-    /// ([`Self::chunk`]) and the select mode's stop walk ([`Self::stops_at`]) —
-    /// so a cursor cannot step over a row the pane did not paint.
+    /// The reading a message with no per-call choice of its own takes: a call
+    /// the human has not touched ([`Self::call_fold`]), and every message that is
+    /// not a result ([`Self::message_fold`]). The painter ([`Self::chunk`]) and
+    /// the select mode's stop walk ([`Self::stops_at`]) both end here, so a
+    /// cursor cannot step over a row the pane did not paint.
     fn painted_fold(&self) -> Fold {
         if self.output {
             self.fold
         } else {
             self.fold.compact()
         }
+    }
+
+    /// The fold the call `at` of message `index` paints through: the human's own
+    /// choice for that call where they made one ([`Self::toggle_call`]), and the
+    /// conversation's fold otherwise.
+    ///
+    /// The choice is stored as the two states `Ctrl-O` moves between, so a call
+    /// opened by a click keeps the conversation's own numbers and a call closed
+    /// by one keeps the compact log's, whatever the view around them does.
+    fn call_fold(&self, on: AgentId, index: usize, at: usize) -> Fold {
+        match self
+            .open_calls
+            .get(&on)
+            .and_then(|calls| calls.get(&(index, at)))
+        {
+            Some(true) => self.fold,
+            Some(false) => self.fold.compact(),
+            None => self.painted_fold(),
+        }
+    }
+
+    /// The fold a whole message paints through: a result message's payload
+    /// belongs to the call it answers, so its fold is that call's (`Some`); a
+    /// message whose call this transcript no longer holds (a restored session
+    /// that kept the answer and lost the turn), and every non-`"tool"` message,
+    /// take the conversation's fold.
+    fn message_fold(&self, on: AgentId, index: usize, message: &Message) -> Fold {
+        if message.role != "tool" {
+            return self.painted_fold();
+        }
+        match self.call_for_result(on, index, message) {
+            Some(call) => self.call_fold(on, call.message, call.call),
+            None => self.painted_fold(),
+        }
+    }
+
+    /// The call a result message answers, where the transcript still holds it:
+    /// the assistant message that made the call, and the call's place in that
+    /// message's batch — **not** the result's own index.
+    ///
+    /// One walk, read by every road that pairs the two: the payload's own line
+    /// numbering ([`Self::payload_numbers`]), the fold a result message paints
+    /// through ([`Self::message_fold`]) and the call a payload row names for a
+    /// click ([`Self::chunk`]'s `RenderCall::Payload`), so the three cannot
+    /// disagree about which call a result answers. The walk goes *backwards*,
+    /// so a call id two turns share (a model that repeats `call_1`) reads as
+    /// the nearest message that made a call of this id — the reading the
+    /// pairing has always had.
+    fn call_for_result(&self, on: AgentId, index: usize, message: &Message) -> Option<CallRef> {
+        let id = message.tool_call_id.as_deref()?;
+        self.transcript(on)[..index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(at, message)| {
+                message
+                    .tool_calls()
+                    .iter()
+                    .position(|call| call.id == id)
+                    .map(|call| CallRef { message: at, call })
+            })
+    }
+
+    /// A click on a tool call's own row: open or close that one call, leaving
+    /// every other call in the fold the conversation has it in.
+    ///
+    /// The call named is the one the frame's own provenance resolved
+    /// ([`Painted::calls`]), so this opens the call the pane painted under the
+    /// pointer. The choice flips what the call's block shows: one painting the
+    /// compact log's single row opens to the shown view's rows, and one already
+    /// open closes back to the compact log's — the same two states
+    /// [`Self::set_output`] flips for a whole conversation, one call at a time.
+    /// The conversation's own fold is not touched: `Ctrl-O` still moves every
+    /// call the human has not clicked.
+    ///
+    /// **Why there is no key for this.** The keyboard's only cursor over a
+    /// transcript is `Ctrl-Y`'s select mode, and it walks [`Stop`]s: the
+    /// *source lines* of a message, which is what it can copy. A call's header
+    /// is not a source line — it is a row the call grid paints from
+    /// `Message::tool_calls()` — so `Enter` on it would need either a second
+    /// derivation of the grid for the key road (exactly the drift a click
+    /// resolves against the frame to avoid) or a redesign of [`Stops`] that
+    /// stops walking text. `Ctrl-O` remains the keyboard's whole-conversation
+    /// road; this verb is the finer target the human asked for, and it is a
+    /// *scope*, not a new state: both folds are the two `Ctrl-O` already has.
+    pub fn toggle_call(&mut self, on: AgentId, message: usize, call: usize) {
+        // The state the call paints in *now* is the state the click flips it
+        // out of: a call the compact log already gave one row opens, and one
+        // already open (in the shown view, or by an earlier click) closes.
+        let next = match self
+            .open_calls
+            .get(&on)
+            .and_then(|calls| calls.get(&(message, call)))
+        {
+            Some(open) => !open,
+            None => self.call_fold(on, message, call).hides(Kind::Result),
+        };
+        self.open_calls
+            .entry(on)
+            .or_default()
+            .insert((message, call), next);
     }
 
     /// The revision of the UI's copy of `agent`'s transcript. A conversation
@@ -1681,11 +1901,15 @@ impl Chat {
     /// passed keep their text and their voices and only their indices change.
     ///
     /// Everything keyed by index moves with them — the voices recorded for the
-    /// lines the note jumped over, and the select cursor — while a held
-    /// reading's `up_to` is a count of messages and moves only when the window
-    /// reaches past the insertion point. The summary cache is dropped rather
-    /// than shifted: it is derived from the messages themselves (finding A13's
-    /// parse), so the next paint reads each call from the index it now sits at.
+    /// lines the note jumped over, the select cursor, and the calls the human
+    /// opened by hand — while a held reading's `up_to` is a count of messages
+    /// and moves only when the window reaches past the insertion point. The
+    /// summary cache is dropped rather than shifted: it is derived from the
+    /// messages themselves (finding A13's parse), so the next paint reads each
+    /// call from the index it now sits at. The per-call choices move for the
+    /// opposite reason — they are the human's, not a reading of the messages,
+    /// and a dropped choice would fold a call out from under the pointer that
+    /// opened it.
     fn shift_indices(&mut self, agent: AgentId, from: usize, arrived: usize) {
         if let Some(voices) = self.spoken.get_mut(&agent) {
             let moved: Vec<(usize, Voice)> = voices
@@ -1696,6 +1920,19 @@ impl Chat {
             for (index, voice) in moved {
                 voices.remove(&index);
                 voices.insert(index + 1, voice);
+            }
+        }
+        if let Some(calls) = self.open_calls.get_mut(&agent) {
+            // The call's place *within* its message's batch is untouched — the
+            // whole message moved — so only the message's own index changes.
+            let moved: Vec<((usize, usize), bool)> = calls
+                .iter()
+                .filter(|((message, _), _)| (from..arrived).contains(message))
+                .map(|(index, open)| (*index, *open))
+                .collect();
+            for ((message, call), open) in moved {
+                calls.remove(&(message, call));
+                calls.insert((message + 1, call), open);
             }
         }
         self.drop_facts(agent);
@@ -1762,6 +1999,11 @@ impl Chat {
         // went, exactly as the voices are: a stale one would label a message
         // with another call's arguments (see the field).
         self.drop_facts(agent);
+        // The per-call choices are keyed by the same indices, and they describe
+        // the transcript that just went too: a click that opened the call at
+        // (3, 0) names a call of the *old* copy, and a replacement is a new
+        // conversation.
+        self.open_calls.remove(&agent);
         // A hold is a position in the transcript that just went, and a fold is
         // a new transcript: the pane reads it from the bottom (finding D15).
         self.reading.remove(&agent);
@@ -1939,6 +2181,10 @@ impl Chat {
         // must not read a request typed at the one before it.
         self.queued.clear();
         self.facts.borrow_mut().clear();
+        // The per-call choices describe calls of the conversation that just
+        // went — `Ctrl-N` is a new chat, and a map left behind would open a
+        // call in it that the human never clicked.
+        self.open_calls.clear();
         self.pending = None;
         // The road back goes with the conversation the loss was in: a Ctrl-N
         // that handed a keystroke a draft from the chat that just went would be
@@ -1984,6 +2230,11 @@ impl Chat {
     /// and only failures are written to the session, so leaving them behind
     /// would keep the file growing with `!` lines about an agent nothing can
     /// open (`Chat::stored_notices`).
+    /// revision an attach client edits against, the calls the human had opened
+    /// by hand, and the pane's reading position. The notices go too — they are tagged with the agent they were
+    /// written about, and only failures are written to the session, so leaving
+    /// them behind would keep the file growing with `!` lines about an agent
+    /// nothing can open (`Chat::stored_notices`).
     ///
     /// The revision is *dropped* rather than stepped forward the way
     /// [`Self::clear`] steps it, and that is safe only because the id is spent:
@@ -1999,6 +2250,7 @@ impl Chat {
         self.spoken.remove(&agent);
         self.queued.remove(&agent);
         self.drop_facts(agent);
+        self.open_calls.remove(&agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
         self.notices.retain(|notice| notice.agent != agent);
@@ -2474,11 +2726,22 @@ impl Chat {
     /// under: the fold a block wears is the message's own kind ([`folded_block`]),
     /// and the block's boundary is the painter's walk ([`folded_rows`]), so the
     /// key road measures the rows the paint road painted — one road, not two.
+    ///
+    /// The fold is the *same* derivation [`Self::chunk`] paints through
+    /// ([`Self::message_fold`]): a call a click opened has more rows than the
+    /// compact log gave it, and the cursor must be able to stand on — and copy
+    /// — every one of them, and never on a row the pane did not paint.
     fn stops_at(&self, on: AgentId, index: usize, measure: Option<usize>) -> Option<Stops> {
         let message = self.transcript(on).get(index)?;
         let voice = self.voice_at(on, index, message);
         let numbers = self.payload_numbers(on, index, message);
-        Stops::of(message, voice, measure, self.painted_fold(), numbers)
+        Stops::of(
+            message,
+            voice,
+            measure,
+            self.message_fold(on, index, message),
+            numbers,
+        )
     }
 
     /// The cursor as the transcript *and the pane's last paint* are now: a
@@ -2896,6 +3159,10 @@ impl Chat {
             _ => None,
         };
         body.lines.extend(queued);
+        // The transcript's own provenance, published before the foot is
+        // appended: a click on a foot row names no call, and the map stops at
+        // the last transcript row (`Painted::calls`).
+        let calls = body.calls;
         body.lines.extend(foot.lines);
         let lines = body.lines;
 
@@ -2954,6 +3221,7 @@ impl Chat {
             title,
             select: select_rows,
             anchor,
+            calls,
         }
     }
 
@@ -3219,18 +3487,17 @@ impl Chat {
     /// payload's lines are the result's ([`payload_numbers`]) — or `None` for
     /// every message that is not a read's window.
     ///
-    /// The walk is short by construction: the messages between a result and its
-    /// call are the other results of the same batch, and none of them carries a
-    /// call. A call id two turns share (a model that repeats `call_1`) cannot
-    /// be read wrong either, because this walks backwards: the nearest message
-    /// that made a call of this id is the one it belongs to.
+    /// The pairing is [`Self::call_for_result`]'s, not a second walk: a click
+    /// resolves a payload row through the same pairing that decides the row's
+    /// own line numbers, so the numbers a row wears and the call a click on it
+    /// names cannot come from two different readings. The `get` is the guard
+    /// for a state a test could build — an address past the batch it names —
+    /// and not for a road the transcript writes.
     fn payload_numbers(&self, on: AgentId, index: usize, message: &Message) -> Option<Numbering> {
-        let id = message.tool_call_id.as_deref()?;
-        let call = self.transcript(on)[..index]
-            .iter()
-            .rev()
-            .flat_map(Message::tool_calls)
-            .find(|call| call.id == id)?;
+        let call = self.call_for_result(on, index, message)?;
+        let call = self.transcript(on)[call.message]
+            .tool_calls()
+            .get(call.call)?;
         payload_numbers(call, message.text())
     }
 
@@ -3295,7 +3562,7 @@ impl Chat {
     fn chunk(&self, on: AgentId, index: usize, width: usize) -> Chunk {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
-        let fold = self.painted_fold();
+        let fold = self.message_fold(on, index, message);
         // The calls' own reading: one digest per call, which is the header of
         // both views — the unfolded one paints the ask's own rows, the script
         // it carries, each result's details and its payload under it, and the
@@ -3306,6 +3573,18 @@ impl Chat {
         // the agent's running call. Both are read at the frame the pane is
         // painting, which is what lets them move without the transcript moving.
         let numbers = self.payload_numbers(on, index, message);
+        // The fold each of this message's own calls paints through: one entry
+        // per entry of `tool_calls()`, the human's click where they made one
+        // ([`Self::call_fold`]). The reply and the reasoning above the calls
+        // keep the message's own `fold`.
+        let folds: Vec<Fold> = (0..message.tool_calls().len())
+            .map(|at| self.call_fold(on, index, at))
+            .collect();
+        // The call a payload this message paints answers, where the transcript
+        // still holds it: the pairing the `Payload` rows are resolved through,
+        // so a click on a payload row names the *assistant* message
+        // ([`Self::call_for_result`]).
+        let paired = self.call_for_result(on, index, message);
         // Whether the next message is another result: the blank rule's one
         // fact from outside this message ([`render_message`]).
         let followed_by_result = self
@@ -3313,26 +3592,50 @@ impl Chat {
             .get(index + 1)
             .is_some_and(|next| next.role == "tool");
         let mut lines = Vec::new();
-        let rows = render_message(
+        let painted = render_message(
             &mut lines,
             message,
             voice,
             width,
             self.reasoning,
             fold,
+            &folds,
             self.symbols,
             &facts,
             self.call_age(on, index),
             numbers,
             followed_by_result,
         );
-        debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
+        debug_assert_eq!(
+            lines.len(),
+            painted.stops.len(),
+            "one map entry per painted row"
+        );
+        let calls = painted
+            .calls
+            .into_iter()
+            .map(|call| match call {
+                // The grid's rows are the call's own, and the message they sit
+                // in is this one.
+                Some(RenderCall::Own(at)) => Some(CallRef {
+                    message: index,
+                    call: at,
+                }),
+                // A payload row belongs to the call its result answers, in
+                // whichever message made it; `None` where the transcript no
+                // longer holds that message, so the row is nobody's to click.
+                Some(RenderCall::Payload) => paired,
+                None => None,
+            })
+            .collect();
         Chunk {
             lines,
-            rows: rows
+            rows: painted
+                .stops
                 .into_iter()
                 .map(|stop| stop.map(|stop| (index, stop)))
                 .collect(),
+            calls,
         }
     }
 
@@ -3479,8 +3782,10 @@ impl Chat {
         let start = body.lines.len().saturating_sub(height + scroll);
         body.lines.drain(..start);
         body.rows.drain(..start);
+        body.calls.drain(..start);
         body.lines.truncate(height);
         body.rows.truncate(height);
+        body.calls.truncate(height);
         body
     }
 
@@ -3837,6 +4142,7 @@ fn waiting(pane: &Pane<'_>, width: usize, height: usize) -> Body {
         .collect();
     Body {
         rows: vec![None; lines.len()],
+        calls: vec![None; lines.len()],
         lines,
     }
 }
@@ -3890,7 +4196,7 @@ fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize,
     if reasoning.trim().is_empty() {
         return;
     }
-    let mut map = Vec::new();
+    let mut map = Rows::default();
     folded_marked(
         out,
         &mut map,
@@ -4213,7 +4519,10 @@ impl Kind {
 /// the call's own line is the event — and a setting will later read the numbers
 /// from configuration, which is why they are here and not spelled at a paint
 /// site. `Chat` holds the one a conversation paints through
-/// ([`Chat::painted_fold`]).
+/// ([`Chat::painted_fold`]), and one call the human opened by hand paints
+/// through the call's own ([`Chat::call_fold`]) — a *scope* of these same two
+/// values and not a third, which is why a click can only land on the two states
+/// `Ctrl-O` already moves between.
 ///
 /// The numbers are **per kind** because the kinds are read differently. A tool
 /// result, a report and a brief are dumps: the human reads their head and
@@ -4853,7 +5162,7 @@ fn payload_numbers(call: &ToolCall, result: &str) -> Option<Numbering> {
 #[allow(clippy::too_many_arguments)]
 fn folded_marked(
     out: &mut Vec<Line<'static>>,
-    rows: &mut Vec<Option<Stop>>,
+    rows: &mut Rows,
     head: Head<'_>,
     text: &str,
     width: usize,
@@ -4862,7 +5171,7 @@ fn folded_marked(
     numbers: Option<Numbering>,
 ) {
     let start = out.len();
-    let base = rows.len();
+    let base = rows.stops.len();
     let (head, folded) = folded_rows(head, text, width, kind, fold, numbers);
     let lead = head.mark.width();
     // What every row under the first wears in the mark's place: the block's own
@@ -4892,24 +5201,36 @@ fn folded_marked(
         out.push(row);
         rows.push(Some(stop));
     }
-    debug_assert_eq!(out.len() - start, rows.len() - base, "one entry per row");
+    debug_assert_eq!(
+        out.len() - start,
+        rows.stops.len() - base,
+        "one entry per row"
+    );
 }
 
 /// One message's rows: who said it, wrapped at the pane's width — and, beside
-/// them, the [`Stop`] of the message's own text each row is the reading of.
+/// them, the [`Stop`] of the message's own text each row is the reading of and
+/// the call each row belongs to where one does.
 ///
 /// The map is *returned* rather than kept by the painter because a stop is one
 /// or more painted rows, and only the pass that paints a row knows whether the
 /// row is a soft wrap of the line above it, a markdown view of it, or the `…`
 /// that stands for the tail the fold hid. A second pass that counted them could
 /// disagree with the rows on screen, and the cursor would then sit on the wrong
-/// one. The caller adds the message's index.
+/// one. The caller adds the message's index. The call map is built the same way
+/// and for the same reason: a call's row is the grid's (finding A13's shape
+/// once more — the paint site is the only place that knows which row belongs to
+/// which call).
 ///
 /// `reasoning` is the pane's `Ctrl-T` choice and `fold` the pane's [`Fold`] —
 /// how much of each kind of block it paints. Both are threaded in rather than
-/// read off a `Chat` this free function has no handle on. `symbols` is the same
-/// kind of threading for the glyph rung every call's mark is painted through
-/// ([`Symbols`]), and `facts` for the calls themselves: one [`CallFacts`] per
+/// read off a `Chat` this free function has no handle on. `call_folds` is the
+/// per-call half of the same threading: one [`Fold`] per entry of
+/// `message.tool_calls()`, the human's click where they made one
+/// ([`Chat::call_fold`]), and empty — or short of the call — for a caller that
+/// has none, when the call paints through the message's fold. `symbols` is the
+/// same kind of threading for the glyph rung every call's mark is painted
+/// through ([`Symbols`]), and `facts` for the calls themselves: one [`CallFacts`] per
 /// entry of `message.tool_calls()`, the reading [`Chat::call_facts`] cached, and
 /// empty — or short of the call — for a caller that has none, when the header
 /// falls back to the call's own arguments read with no result and no workspace
@@ -4943,14 +5264,15 @@ fn render_message(
     width: usize,
     reasoning: bool,
     fold: Fold,
+    call_folds: &[Fold],
     symbols: Symbols,
     facts: &[CallFacts],
     age: Option<Duration>,
     numbers: Option<Numbering>,
     followed_by_result: bool,
-) -> Vec<Option<Stop>> {
+) -> Rows {
     let start = out.len();
-    let mut rows: Vec<Option<Stop>> = Vec::new();
+    let mut rows = Rows::default();
     // The compact log is the fold that gives the result kind no rows; it is also
     // the view whose tool-call rows are the events, and the two facts are one
     // (`Ctrl-O` is the whole of both).
@@ -4993,6 +5315,7 @@ fn render_message(
                 ),
             }
             image_rows(out, message, width);
+            rows.grow(out.len() - start);
             closing_blank(out, &mut rows, start);
         }
         "assistant" => {
@@ -5012,7 +5335,7 @@ fn render_message(
             let painted = out.len();
             if reasoning {
                 reasoning_rows(out, message, width, fold);
-                rows.resize(out.len() - start, None);
+                rows.grow(out.len() - start);
             }
             let words = out.len();
             let text = message.text();
@@ -5031,6 +5354,11 @@ fn render_message(
                 );
             }
             image_rows(out, message, width);
+            // The rows a helper painted without a stop of the message's own are
+            // padded here, before anything else is pushed: the two maps are
+            // *parallel* to `out`, and a row that carried no entry would shift
+            // every entry after it onto the wrong row.
+            rows.grow(out.len() - start);
             // The prose breathes where it stands, and the calls do not: a turn
             // that said anything — a reply, a picture — closes its own words
             // with the blank, **before** the call rows of the same turn, and a
@@ -5099,22 +5427,34 @@ fn render_message(
                     _ => facts,
                 };
                 let mark = symbols.mark(&call.function.name);
+                // The view this call's own block paints through: the human's
+                // click where they made one ([`Chat::call_fold`]), and the
+                // message's own fold — the conversation's, for a call nobody
+                // touched — otherwise. The header's `AskRows` and the details
+                // both read *this* fold, so a click-opened call opens whole,
+                // while the reply and the reasoning above stay the message's.
+                let call_fold = call_folds.get(at).copied().unwrap_or(fold);
+                let call_compact = call_fold.hides(Kind::Result);
                 // The ask's own view: the compact log gives every call one row,
                 // and the unfolded view gives the ask the rows it needs
                 // ([`call_grid::AskRows`]).
-                let ask_rows = if compact {
+                let ask_rows = if call_compact {
                     call_grid::AskRows::One
                 } else {
                     call_grid::AskRows::Many
                 };
+                // The grid's rows are this call's own block, marked where they
+                // are painted: a click resolves through this map, so it can
+                // never name a row the grid did not paint (finding A13's shape:
+                // one derivation, two readers).
                 for row in call_grid::header(call, facts, width, mark, ask_rows) {
                     out.push(row);
-                    rows.push(None);
+                    rows.push_call(at);
                 }
-                if !compact {
+                if !call_compact {
                     for row in call_grid::details(call, facts, width, mark) {
                         out.push(row);
-                        rows.push(None);
+                        rows.push_call(at);
                     }
                 }
             }
@@ -5127,7 +5467,7 @@ fn render_message(
             if !spoke && message.tool_calls().is_empty() && out.len() > painted {
                 blank(out, &mut rows);
             }
-            rows.resize(out.len() - start, None);
+            rows.grow(out.len() - start);
         }
         "tool" => {
             // A result is a file dump, so [`folded_block`] paints it through
@@ -5138,6 +5478,7 @@ fn render_message(
             // again cost one spawned child two rows ([`spawn_report`]).
             if let Some((kind, head)) = folded_block(message, None) {
                 if !spawn_report(message.text()) {
+                    let payload = rows.stops.len();
                     folded_marked(
                         out,
                         &mut rows,
@@ -5148,9 +5489,19 @@ fn render_message(
                         fold,
                         numbers,
                     );
+                    // Every row the payload painted is the result's own — and
+                    // the call it answers is a fact only the caller can walk to
+                    // (`Message::tool_call_id`), so the rows say `Payload` and
+                    // the caller resolves them ([`Chat::call_for_result`]). The
+                    // picture's label and the closing blank below are the
+                    // *message's* rows and stay nobody's call.
+                    for call in &mut rows.calls[payload..] {
+                        *call = Some(RenderCall::Payload);
+                    }
                 }
             }
             image_rows(out, message, width);
+            rows.grow(out.len() - start);
             // A payload closes its block only where the next thing is not
             // another payload: two results of one turn are one call block, and
             // the blank between them was the last one the pane spent inside it.
@@ -5159,23 +5510,26 @@ fn render_message(
             // blank under it would sit inside the call's own block.
             if !compact && !followed_by_result {
                 closing_blank(out, &mut rows, start);
-            } else {
-                rows.resize(out.len() - start, None);
             }
         }
         _ => {}
     }
     debug_assert_eq!(
         out.len() - start,
-        rows.len(),
+        rows.stops.len(),
         "one map entry per painted row"
+    );
+    debug_assert_eq!(
+        rows.stops.len(),
+        rows.calls.len(),
+        "the call map is one entry per painted row"
     );
     rows
 }
 
 /// The blank that separates one message from the next, pushed where a
 /// message's own words end — see the assistant arm's own rule.
-fn blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>) {
+fn blank(out: &mut Vec<Line<'static>>, rows: &mut Rows) {
     out.push(Line::from(""));
     rows.push(None);
 }
@@ -5187,8 +5541,8 @@ fn blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>) {
 /// either, because a blank over a block nothing painted is exactly the clutter
 /// the compact log exists to remove. Everything else keeps its blank as it
 /// always had it, the failure rows included.
-fn closing_blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>, start: usize) {
-    rows.resize(out.len() - start, None);
+fn closing_blank(out: &mut Vec<Line<'static>>, rows: &mut Rows, start: usize) {
+    rows.grow(out.len() - start);
     if out.len() > start {
         blank(out, rows);
     }
@@ -5236,7 +5590,7 @@ enum View {
 /// keeps the two row counts from drifting.
 fn mark_rows(
     out: &mut Vec<Line<'static>>,
-    rows: &mut Vec<Option<Stop>>,
+    rows: &mut Rows,
     mark: &str,
     style: Style,
     text: &str,
@@ -5244,8 +5598,8 @@ fn mark_rows(
     view: View,
 ) {
     let start = out.len();
-    let base = rows.len();
-    debug_assert_eq!(out.len(), rows.len(), "the map is one entry per row");
+    let base = rows.stops.len();
+    debug_assert_eq!(out.len(), rows.stops.len(), "the map is one entry per row");
     marked(out, mark, style, text, width);
     let lead = out
         .get(start)
@@ -5264,12 +5618,18 @@ fn mark_rows(
             View::Plain => wrap_text(raw, wrap).len(),
             View::Markdown => counts.as_ref().expect("the map above")[line],
         };
-        rows.extend(std::iter::repeat(Some(Stop::Line(line))).take(count));
+        for _ in 0..count {
+            rows.push(Some(Stop::Line(line)));
+        }
     }
     // The buffers are parallel, not merely both filled: `marked` pushed the
     // rows and this pushed one entry for each of them, and it is that pairing —
     // the map's index into `out` — that the whole selection reads.
-    debug_assert_eq!(out.len() - start, rows.len() - base, "one entry per row");
+    debug_assert_eq!(
+        out.len() - start,
+        rows.stops.len() - base,
+        "one entry per row"
+    );
 }
 
 #[cfg(test)]
@@ -5418,6 +5778,7 @@ mod tests {
             width,
             reasoning,
             fold,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -6222,6 +6583,55 @@ mod tests {
         );
     }
 
+    /// The select cursor and the click name the same rows: a click opens a
+    /// call's payload onto the pane ([`Chat::toggle_call`]), and the cursor
+    /// steps onto exactly the rows the pane painted — while the payload the
+    /// compact log hides is no stop at all, so `↑` cannot land on a line that
+    /// was never on screen.
+    #[test]
+    fn the_select_cursor_walks_the_rows_a_click_opened() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)]),
+                ..Message::assistant("checking")
+            },
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("c1", "alpha\nbeta"));
+        say(&mut chat, AgentId::ROOT, "thanks");
+
+        // The launch view gives the result kind no rows, so the block is no
+        // stop: from the human's own line, `↑` lands on the reply — the payload
+        // it stepped over is one the pane never painted.
+        assert!(chat.start_select(AgentId::ROOT).is_none(), "the mode is on");
+        let at = |chat: &Chat| chat.select.as_ref().expect("the mode is on").cursor;
+        assert_eq!(at(&chat), (2, Stop::Line(0)), "the newest line");
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        assert_eq!(
+            at(&chat),
+            (0, Stop::Line(0)),
+            "the hidden payload is not a stop"
+        );
+
+        // The click opens the call, and the payload becomes a row the pane
+        // paints: the same step reaches it, and `Enter` copies its own line.
+        chat.toggle_call(AgentId::ROOT, 0, 0);
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 80, 10));
+        assert!(
+            rows.iter().any(|row| row.contains("alpha")),
+            "the opened payload is painted: {rows:?}"
+        );
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        assert_eq!(at(&chat), (1, Stop::Line(0)), "the payload's own line");
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "alpha");
+        assert_eq!(copied.line, "copied 1 line from #0's tool result — 5 bytes");
+        assert!(!chat.selecting(), "Enter leaves the mode");
+    }
+
     /// The human's own message is the text they typed, newlines and all.
     #[test]
     fn the_humans_own_message_is_copied_as_it_was_typed() {
@@ -6869,6 +7279,94 @@ mod tests {
                 .title
                 .contains("scrolled ↑2 rows"),
             "and the child's reading is not the root's fold's to drop"
+        );
+    }
+
+    /// The per-call choices are the human's state, not a cache: the road that
+    /// moves a transcript's indices moves them with the lines, and the roads
+    /// that replace or lose a transcript drop them. A choice left at the old
+    /// index would open a call nobody clicked — the note that jumped over the
+    /// message, or a line of the replacement that happens to sit there.
+    #[test]
+    fn an_open_call_travels_with_the_lines_and_dies_with_the_transcript() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user("the task"));
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)]),
+                ..Message::assistant("")
+            },
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("c1", "alpha"));
+        chat.toggle_call(AgentId::ROOT, 1, 0);
+        assert_eq!(
+            chat.call_fold(AgentId::ROOT, 1, 0),
+            chat.fold,
+            "the click opened the call"
+        );
+
+        // A dropped-turns note lands at the front (finding A18) and the turn it
+        // jumped over is one line down: the choice moves with it, or it would
+        // name the note.
+        chat.push_message(AgentId::ROOT, Message::note(transcript::DROPPED_TURNS_NOTE));
+        assert_eq!(
+            chat.transcript(AgentId::ROOT)[2].tool_calls().len(),
+            1,
+            "the call's message moved down one line"
+        );
+        assert_eq!(
+            chat.call_fold(AgentId::ROOT, 2, 0),
+            chat.fold,
+            "and the call is still open"
+        );
+        assert!(
+            !chat.open_calls[&AgentId::ROOT].contains_key(&(1, 0)),
+            "the old address names a line the call is no longer at"
+        );
+
+        // A replacement is a new copy of the conversation: its indices describe
+        // the transcript that went, exactly as the voices' do.
+        chat.replace_transcript(AgentId::ROOT, vec![Message::user("another task")]);
+        assert!(
+            !chat.open_calls.contains_key(&AgentId::ROOT),
+            "a replacement takes the calls with it"
+        );
+
+        // A new chat folds every call back, and a reaped child's choices go
+        // with the node and its transcript.
+        let mut cleared = Chat::bare();
+        cleared.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)]),
+                ..Message::assistant("")
+            },
+        );
+        cleared.push_message(AgentId::ROOT, Message::tool("c1", "alpha"));
+        cleared.toggle_call(AgentId::ROOT, 0, 0);
+        assert!(cleared.open_calls.contains_key(&AgentId::ROOT));
+        cleared.clear();
+        assert!(
+            cleared.open_calls.is_empty(),
+            "a new chat has no clicks in it"
+        );
+
+        let mut reaped = Chat::bare();
+        reaped.push_message(
+            AgentId(1),
+            Message {
+                tool_calls: Some(vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)]),
+                ..Message::assistant("")
+            },
+        );
+        reaped.push_message(AgentId(1), Message::tool("c1", "alpha"));
+        reaped.toggle_call(AgentId(1), 0, 0);
+        assert!(reaped.open_calls.contains_key(&AgentId(1)));
+        reaped.forget(AgentId(1));
+        assert!(
+            !reaped.open_calls.contains_key(&AgentId(1)),
+            "a reaped agent's calls go with its transcript"
         );
     }
 
@@ -9353,6 +9851,7 @@ mod tests {
             60,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9416,6 +9915,7 @@ mod tests {
             40,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9456,6 +9956,7 @@ mod tests {
             40,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9495,6 +9996,7 @@ mod tests {
             40,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9536,6 +10038,7 @@ mod tests {
             40,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9583,6 +10086,7 @@ mod tests {
             20,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9647,6 +10151,7 @@ mod tests {
             126,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9679,6 +10184,7 @@ mod tests {
             60,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9714,6 +10220,7 @@ mod tests {
             80,
             false,
             Fold::DEFAULT,
+            &[],
             Symbols::SYMBOLS,
             &[],
             None,
@@ -9757,6 +10264,7 @@ mod tests {
                 width,
                 false,
                 Fold::DEFAULT,
+                &[],
                 Symbols::SYMBOLS,
                 &[],
                 None,

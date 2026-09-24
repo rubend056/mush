@@ -508,16 +508,25 @@ drag itself is never seen — and selecting cells is the terminal's bypass key,
 `Shift`+drag in most terminals. `Ctrl-F` is still the road to a rectangle of one
 pane, and `Ctrl-Y` still copies the transcript's *source* lines.
 
-What a left click does is move what the keyboard also moves. It puts the
-keyboard in the pane it lands on, the way clicking a window does. A tree row
-selects that conversation — the cursor goes to the clicked row, so `j`/`k`
-carry on from there — and a picker's row walks the picker's cursor (picking
-waits for `Enter`: a pick writes a session or a config, and one click is not
-that decision). A click in the message box focuses the chat pane and does not
-move the box's text cursor. The bar and every border are nobody's, and a click
-there does nothing at all. Nothing is painted for the mouse — no hover
-highlight, no pointer glyph — so the feedback a click gets is the frame the
-panes already paint.
+What a left click does is move what the keyboard also moves — with one verb the
+keys have no target for. It puts the keyboard in the pane it lands on, the way
+clicking a window does. A tree row selects that conversation — the cursor goes
+to the clicked row, so `j`/`k` carry on from there — and a picker's row walks
+the picker's cursor (picking waits for `Enter`: a pick writes a session or a
+config, and one click is not that decision). A click on a tool call's own row —
+its header or its details, or the payload of the result it answers — opens or
+closes *that* call: the rows the compact log hid appear, the call's own block
+and nothing else, and a second click closes it back. Every other call stays in
+the fold the conversation has it in, and `Ctrl-O` still folds and unfolds all of
+them at once. There is no key for one call because the keyboard's only cursor
+over a transcript is `Ctrl-Y`'s, which walks source lines: a call's header is a
+row the call grid paints and not a line of the transcript, so `Enter` on it
+would need a second derivation of the grid — the drift the click avoids by
+resolving against the frame. A click in the message box focuses the chat pane
+and does not move the box's text cursor. The bar and every border are nobody's,
+and a click there does nothing at all. Nothing is painted for the mouse — no
+hover highlight, no pointer glyph — so the feedback a click gets is the frame
+the panes already paint.
 
 A wheel notch is three rows of whatever is under the pointer: the transcript
 (older up, three at a time), the tree's cursor — that pane's window *is* the
@@ -595,8 +604,12 @@ tool call; the key brings the rows back, and a second press folds them away.
 Either key leaves a pane scrolled away from the bottom where the human was
 reading: the row at its bottom edge is the same source row afterwards, because
 a held window is a count of rows and a fold is exactly what changes them.
-The call's row is the *same row in both views* — the pane's call grid — and the
-compact log differs only in what follows it: a header, no details, no payload.
+The key is the *conversation's* scope of the fold, and not the only one a call
+has: a click on one call's own row opens or closes that one call and leaves
+every other call where `Ctrl-O` put it, so a conversation can hold one block
+open while it is otherwise folded (the mouse's own verb, above). The call's row
+is the *same row in both views* — the pane's call grid — and the compact log
+differs only in what follows it: a header, no details, no payload.
 
 The grid is a function of the pane's width alone, because a turn is often a
 single call and a column that lines up only inside one message lines up with

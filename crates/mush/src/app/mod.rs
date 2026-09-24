@@ -24327,4 +24327,402 @@ mod tests {
             app.update(wheel(false, list.x + 1, list.y));
         }
     }
+
+    // ------------------------------------------------- clicks on a call
+
+    /// One turn with two windowed reads and the two results that answer them:
+    /// the first call's block is a header, a details row (`of 9L`, the file's own
+    /// total) and a payload with its trailer, the second's the same with `17L`.
+    /// Two calls of **one** assistant message, because that is the batch a click
+    /// must tell apart — the call's place in it is half of the address — and the
+    /// two results are painted from two *other* messages.
+    fn calls_turn(app: &mut App) {
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![
+                    tool_call(
+                        "c1",
+                        "read_file",
+                        serde_json::json!({ "path": "alpha.rs", "offset": 1, "limit": 1 }),
+                    ),
+                    tool_call(
+                        "c2",
+                        "read_file",
+                        serde_json::json!({ "path": "beta.rs", "offset": 1, "limit": 1 }),
+                    ),
+                ]),
+                ..Message::assistant("")
+            },
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c1",
+                "alpha payload\n[mush: lines 1–1 of 9 — read on with offset=2]",
+            ),
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c2",
+                "beta payload\n[mush: lines 1–1 of 17 — read on with offset=2]",
+            ),
+        );
+    }
+
+    /// The transcript pane's rows as the frame painted them, cell by cell: what
+    /// the human reads. The click tests resolve against these rather than
+    /// against the pane's own lines, so a click is compared with what is on
+    /// screen.
+    fn transcript_cells(app: &mut App) -> Vec<String> {
+        let frame = shot(app, 80, 24);
+        let Screen::Panes(panes) = &frame.screen else {
+            panic!("80×24 is above the floor")
+        };
+        let inner = screen::inner(panes.chat.transcript_area);
+        (inner.y..inner.y + inner.height)
+            .map(|y| frame.line(y))
+            .collect()
+    }
+
+    /// A left click on the row the pane paints `needle` on: the row is found on
+    /// the frame's own cells, the way the human's eye finds it, and clicked
+    /// inside the transcript's inner rect.
+    fn click_painted(app: &mut App, needle: &str) {
+        let frame = shot(app, 80, 24);
+        let Screen::Panes(panes) = &frame.screen else {
+            panic!("80×24 is above the floor")
+        };
+        let inner = screen::inner(panes.chat.transcript_area);
+        let y = (inner.y..inner.y + inner.height)
+            .find(|y| frame.line(*y).contains(needle))
+            .unwrap_or_else(|| panic!("no row paints {needle:?}:\n{}", frame.rows().join("\n")));
+        app.update(click(inner.x, y));
+    }
+
+    /// A left click on a tool call's own row opens that one call, and a second
+    /// closes it: its details and its result's payload appear under it, and the
+    /// call beside it — one nobody clicked — stays in the fold the conversation
+    /// has it in (the compact log at launch).
+    #[test]
+    fn a_click_on_a_call_header_opens_that_call_and_a_second_closes_it() {
+        let (mut app, _rx) = test_app("mouse-call");
+        calls_turn(&mut app);
+
+        // The launch view: one row per call, no details, no payload.
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("alpha.rs")),
+            "the ask is painted: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("of 9L")),
+            "the details are folded away: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("alpha payload")),
+            "and so is the payload: {rows:?}"
+        );
+
+        click_painted(&mut app, "alpha.rs");
+
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("of 9L")),
+            "the clicked call's details: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("alpha payload")),
+            "and its result's payload: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("of 17L")),
+            "the neighbour's details stay folded: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("beta payload")),
+            "and its payload stays folded too: {rows:?}"
+        );
+
+        // The pane is anchored at the bottom, so the header moved when the call
+        // opened: the row is found again on the cells the click is about.
+        click_painted(&mut app, "alpha.rs");
+
+        let rows = transcript_cells(&mut app);
+        assert!(
+            !rows.iter().any(|row| row.contains("of 9L")),
+            "the second click closed it: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("alpha payload")),
+            "payload and all: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("beta.rs")),
+            "and the neighbour is still there: {rows:?}"
+        );
+    }
+
+    /// A result's payload is painted from the *tool* message that answered the
+    /// call, and a click on it names the call the transcript pairs it with
+    /// ([`Chat::call_for_result`]) — the assistant message, never the result's
+    /// own index. The failure row is the payload a call keeps at any fold (the
+    /// fold never gives it up), so a click on it opens the call it answers, and
+    /// the next click closes it: the pairing is the same both ways, and the
+    /// neighbour's payload is left whole.
+    #[test]
+    fn a_click_on_a_result_payload_opens_the_call_it_answers() {
+        let (mut app, _rx) = test_app("mouse-call-payload");
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![
+                    tool_call("c1", "read_file", serde_json::json!({ "path": "alpha.rs" })),
+                    tool_call("c2", "read_file", serde_json::json!({ "path": "beta.rs" })),
+                ]),
+                ..Message::assistant("")
+            },
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c1",
+                "error: alpha.rs is outside the workspace\nnot a line to read",
+            ),
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c2",
+                "error: beta.rs is outside the workspace\nnot a line either",
+            ),
+        );
+        ctrl(&mut app, 'o'); // the shown view: both payloads are painted whole
+
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("error: alpha.rs")),
+            "the payload's own first row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("not a line to read")),
+            "and the log under it, in the shown view: {rows:?}"
+        );
+
+        // One click on the payload's first row closes the call it answers —
+        // `call_for_result` walks back to the *assistant* message, and no
+        // second derivation of the pairing exists for the click to disagree
+        // with the fold.
+        click_painted(&mut app, "error: alpha.rs");
+
+        let rows = transcript_cells(&mut app);
+        assert!(
+            !rows.iter().any(|row| row.contains("not a line to read")),
+            "the call it answers closed: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("not a line either")),
+            "and the neighbour's payload is untouched: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("error: alpha.rs")),
+            "and the failure row the fold never gives up stays: {rows:?}"
+        );
+
+        // The same row again: the payload row names the call it answers on
+        // every click, in either direction.
+        click_painted(&mut app, "error: alpha.rs");
+
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("not a line to read")),
+            "opened again: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("not a line either")),
+            "with the neighbour it never touched still open: {rows:?}"
+        );
+    }
+
+    /// A call a click opened keeps its own rows when the conversation folds:
+    /// `Ctrl-O` moves every call nobody clicked, and the one the human chose
+    /// stays where they put it — the two scopes are independent.
+    #[test]
+    fn the_open_call_keeps_its_rows_when_the_conversation_folds() {
+        let (mut app, _rx) = test_app("mouse-call-fold");
+        calls_turn(&mut app);
+
+        click_painted(&mut app, "alpha.rs");
+        assert!(
+            transcript_cells(&mut app)
+                .iter()
+                .any(|row| row.contains("alpha payload")),
+            "the click opened the first call"
+        );
+
+        // The whole conversation unfolds: both payloads paint.
+        ctrl(&mut app, 'o');
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("alpha payload")),
+            "the clicked call is open: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("beta payload")),
+            "and the neighbour follows Ctrl-O: {rows:?}"
+        );
+
+        // And folds again: the neighbour's payload goes with the conversation,
+        // the clicked call's stays.
+        ctrl(&mut app, 'o');
+        let rows = transcript_cells(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("alpha payload")),
+            "the clicked call keeps its rows: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("beta payload")),
+            "and the rest folds: {rows:?}"
+        );
+    }
+
+    /// The agreement walk's own turn: two `run_command` calls of one assistant
+    /// message, each carrying a heredoc — the first's script one line, the
+    /// second's two. Every block is a header, its script's detail rows (painted
+    /// from the *ask's* own arguments) and a two-row payload, and every one of
+    /// those rows carries a word only its own call wrote — so the walk below can
+    /// read which call a row is off the cells alone, without asking any map.
+    fn scripted_calls_turn(app: &mut App) {
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![
+                    tool_call(
+                        "c1",
+                        "run_command",
+                        serde_json::json!({
+                            "command": "python3 - <<'PYA'\nprint(\"alpha\")\nPYA"
+                        }),
+                    ),
+                    tool_call(
+                        "c2",
+                        "run_command",
+                        serde_json::json!({
+                            "command": "python3 - <<'PYB'\nprint(\"beta\")\nprint(\"beta two\")\nPYB"
+                        }),
+                    ),
+                ]),
+                ..Message::assistant("")
+            },
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool("c1", "alpha out\nalpha second"),
+        );
+        app.chat
+            .push_message(AgentId::ROOT, Message::tool("c2", "beta out\nbeta second"));
+    }
+
+    /// The strongest claim the click on a call can make: every row of a call's
+    /// painted block is the row a click names. The walk reads each row's call
+    /// off the frame's own account ([`Painted::calls`]) and checks the *cells*
+    /// carry that call's own words — the ask, its details, its payload — then
+    /// clicks the row: the call named closes, the one beside it does not, and
+    /// the block is opened again before the next row. The frame is re-derived
+    /// before every click because a closed block is a different frame: the pane
+    /// is anchored at the bottom, so a block that shrinks moves everything under
+    /// it. A row that is nobody's call toggles nothing.
+    #[test]
+    fn every_painted_call_row_is_the_row_a_click_names() {
+        let (mut app, _rx) = test_app("mouse-call-agreement");
+        scripted_calls_turn(&mut app);
+        app.chat.set_output(true); // the shown view: every block's rows are painted
+
+        // The whole turn is on screen from the pane's first row, or the walk
+        // below would read rows that are not there.
+        assert!(
+            transcript_cells(&mut app)[0].contains("PYA"),
+            "the transcript starts at the pane's first row"
+        );
+
+        // Which call a row is, per the block's own text: the ask's heredoc word,
+        // the script's own count and printed words, the payload's own lines.
+        let needles = [
+            ("PYA", 0usize),
+            ("script 1L", 0),
+            ("print(\"alpha", 0),
+            ("alpha", 0),
+            ("PYB", 1),
+            ("script 2L", 1),
+            ("print(\"beta", 1),
+            ("beta", 1),
+        ];
+        let painted_rows = transcript_cells(&mut app).len();
+        let mut visited = 0usize;
+        for row in 0..painted_rows {
+            let frame = shot(&mut app, 80, 24);
+            let Screen::Panes(panes) = &frame.screen else {
+                panic!("80×24 is above the floor")
+            };
+            let inner = screen::inner(panes.chat.transcript_area);
+            let text = frame.line(inner.y + row as u16);
+            let named = panes
+                .chat
+                .transcript
+                .as_ref()
+                .expect("the pane paints a transcript")
+                .call_at(row);
+            let Some((_, at)) = needles.iter().find(|(needle, _)| text.contains(needle)) else {
+                assert!(
+                    named.is_none(),
+                    "the pane names a call for a row that is not one: {text:?}"
+                );
+                let before = transcript_cells(&mut app);
+                app.update(click(inner.x, inner.y + row as u16));
+                assert_eq!(
+                    transcript_cells(&mut app),
+                    before,
+                    "a row that is nobody's call toggles nothing: {text:?}"
+                );
+                continue;
+            };
+            let call = named.unwrap_or_else(|| {
+                panic!("the pane paints call {at}'s words at row {row} and names no call: {text:?}")
+            });
+            assert_eq!(
+                call.message, 0,
+                "a call's row names the message that made the call, never the result's: {text:?}"
+            );
+            assert_eq!(call.call, *at, "the row's own call: {text:?}");
+            visited += 1;
+
+            // The click closes the call named, and only it: its payload goes,
+            // the neighbour's stays.
+            app.update(click(inner.x, inner.y + row as u16));
+            let after = transcript_cells(&mut app).join("\n");
+            let (gone, kept) = if *at == 0 {
+                ("alpha", "beta")
+            } else {
+                ("beta", "alpha")
+            };
+            assert!(
+                !after.contains(gone) && after.contains(kept),
+                "the click on {text:?} closed call {at} and no other:\n{after}"
+            );
+
+            // Open the block again, so the next row is read on the frame this
+            // walk started from.
+            click_painted(&mut app, if *at == 0 { "PYA" } else { "PYB" });
+            let back = transcript_cells(&mut app).join("\n");
+            assert!(
+                back.contains("alpha second") && back.contains("beta second"),
+                "the block is back:\n{back}"
+            );
+        }
+        assert_eq!(
+            visited, 11,
+            "both blocks were walked: two headers, five detail rows, four payload rows"
+        );
+    }
 }

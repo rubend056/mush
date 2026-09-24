@@ -9,10 +9,13 @@
 //! `Ctrl-F` is still the road to a rectangle of one pane, and the wheel — which
 //! the terminal can no longer spend itself — is spent here.
 //!
-//! Nothing here has a verb of its own. Every arm moves what the keyboard also
-//! moves — a row's cursor, the focused pane, a picker's row — so a mouse that
-//! is never touched costs this program nothing but the modes, and a mouse that
-//! is used cannot reach a state the keys could not.
+//! Nothing here has a verb of its own but one: a click on a tool call's own row
+//! opens or closes *that* call ([`App::click`] → [`Chat::toggle_call`]), which
+//! no key can name because the keyboard's only cursor over a transcript walks
+//! source lines and a call's header is not one. Every other arm moves what the
+//! keyboard also moves — a row's cursor, the focused pane, a picker's row — so a
+//! mouse that is never touched costs this program nothing but the modes, and a
+//! mouse that is used cannot reach a state the keys could not.
 
 use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
@@ -84,10 +87,11 @@ impl App {
     ///
     /// A click in a pane puts the keyboard in it, the way clicking a window
     /// does, and then moves what was under the pointer: an agent's row selects
-    /// that conversation, a picker's row walks the picker's cursor. The bar, a
-    /// border, a pane's footer and the popup's own blank cells carry no verb,
-    /// so a click there does nothing at all — not even a focus change, because
-    /// there is nothing under it the click could be about.
+    /// that conversation, a picker's row walks the picker's cursor, and a
+    /// tool call's own row opens or closes that one call. The bar, a border, a
+    /// pane's footer and the popup's own blank cells carry no verb, so a click
+    /// there does nothing at all — not even a focus change, because there is
+    /// nothing under it the click could be about.
     fn click(&mut self, column: u16, row: u16) {
         let Some(panes) = self.panes() else {
             return;
@@ -105,12 +109,31 @@ impl App {
                 self.tree.point_cursor_at(id);
                 self.focus_cursor_row();
             }
-            // The pane under the keyboard, as `Tab` moves it. The box's own
-            // text cursor is not moved: a click would have to name a *column*
-            // the box's grapheme walk agrees with, which is an editor's job and
-            // not a click's, and the pane's own keys already put the cursor
-            // where the human wants it.
-            Hit::Transcript | Hit::Input => self.focus = Focus::Chat,
+            // The pane under the keyboard, as `Tab` moves it — and, where the
+            // row is part of a tool call's block, that one call opens or closes
+            // under the pointer. The call named is the one the frame's own
+            // provenance resolved ([`Painted::call_at`]), so the click acts on
+            // the call the pane painted on that row and never on a call a
+            // second derivation of the grid would have put there. A row that
+            // belongs to no call — the reply, a blank, the foot's own lines —
+            // only moves the keyboard.
+            Hit::Transcript { row } => {
+                self.focus = Focus::Chat;
+                let call = panes
+                    .chat
+                    .transcript
+                    .as_ref()
+                    .and_then(|transcript| transcript.call_at(row));
+                if let Some(call) = call {
+                    self.chat
+                        .toggle_call(self.tree.focused, call.message, call.call);
+                }
+            }
+            // The box's own text cursor is not moved: a click would have to
+            // name a *column* the box's grapheme walk agrees with, which is an
+            // editor's job and not a click's, and the pane's own keys already
+            // put the cursor where the human wants it.
+            Hit::Input => self.focus = Focus::Chat,
             // A picker's row: the cursor moves to the row that was clicked, the
             // move `↑`/`↓` make. It does not *pick*: picking a model writes the
             // session and picking a provider writes the home config, and a
@@ -146,7 +169,7 @@ impl App {
             // The transcript the pane shows, by the door the arrow keys use.
             // The message box is the same pane — it has no scrollback of its
             // own, so a notch over it moves the conversation it sits under.
-            Hit::Transcript | Hit::Input => self.chat.scroll_by(self.tree.focused, -rows),
+            Hit::Transcript { .. } | Hit::Input => self.chat.scroll_by(self.tree.focused, -rows),
             // The tree's window *is* its cursor: the rows above and below are
             // what `first` counts and `j`/`k` walk. There is no separate scroll
             // position to move, so a notch over the tree walks the cursor the
@@ -186,8 +209,11 @@ impl App {
 enum Hit {
     /// A painted row of the agents pane: the agent that row names.
     Agent(AgentId),
-    /// The chat pane's transcript.
-    Transcript,
+    /// The chat pane's transcript: the row under the pointer, an index into
+    /// the pane's own lines from the transcript's first painted row — the
+    /// index [`Painted::call_at`] and the select mode's maps are both numbered
+    /// by. A click on a call is resolved through it and a notch ignores it.
+    Transcript { row: usize },
     /// The chat pane's message box.
     Input,
     /// A painted row of an open picker: the item's index in `Picker::items`.
@@ -238,9 +264,15 @@ fn hit(panes: &Panes, column: u16, row: u16) -> Hit {
         };
     }
     // The chat's two halves, through the same `inner` the painter's
-    // `Block::inner` is: the border between them belongs to neither pane.
-    if inner(panes.chat.transcript_area).contains(point) {
-        return Hit::Transcript;
+    // `Block::inner` is: the border between them belongs to neither pane. The
+    // transcript's row is counted from its first painted row, so the index a
+    // click names is the one the pane's own maps are written in — a second
+    // derivation from the frame's origin is how a click lands one row off.
+    let transcript = inner(panes.chat.transcript_area);
+    if transcript.contains(point) {
+        return Hit::Transcript {
+            row: (row - transcript.y) as usize,
+        };
     }
     if inner(panes.chat.input_area).contains(point) {
         return Hit::Input;

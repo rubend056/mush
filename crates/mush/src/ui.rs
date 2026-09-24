@@ -738,6 +738,7 @@ pub(crate) mod tests {
                 // The rows are the test's own words, not a conversation's: no
                 // reading of them for a fold to keep (`Chat::re_anchor`).
                 anchor: None,
+                calls: Vec::new(),
             }),
             input: None,
         }
