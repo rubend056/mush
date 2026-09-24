@@ -1144,11 +1144,35 @@ impl Workspace {
     /// [`crate::outline`] — this method supplies the read and nothing else. A
     /// file with no definitions is not an error: the sentence that says so is
     /// [`Outline::render`]'s.
+    ///
+    /// The rows the answer may hold are bounded by [`crate::outline::DEFAULT_ROOM`]
+    /// — this crate's ceiling for a result the model reads ([`crate::CMD_CAP`]),
+    /// because this road serves tool results and the app renders one at or below
+    /// that ceiling. The file is *counted* whatever the room is, so a file with
+    /// more declarations than the room answers with the exact count and a
+    /// sentence naming the rows it did not keep rather than with a refusal or a
+    /// silent cut. A caller that knows the cap it will render at — the app's
+    /// tool roads know the exact `result_cap` their turn has left — passes its
+    /// own room to [`Self::outline_within`] and spends proportionally less.
     pub fn outline(&self, rel: &str) -> Result<Outline, String> {
+        self.outline_within(rel, crate::outline::DEFAULT_ROOM)
+    }
+
+    /// The same read and the same rule as [`Self::outline`], bounded by the
+    /// caller's own room: the rows the answer it is building can show, at most.
+    ///
+    /// The room is the caller's because the cap is: the answer is rendered by
+    /// whoever asked for it, and [`crate::outline::room_for_cap`] is the one
+    /// conversion from a cap in bytes to a room in rows. A room too small for
+    /// the file is not a lie and not a failure — the count is still the file's
+    /// own, and `Outline::render`'s closing note names every row it left — and a
+    /// room past what the cap can paint costs one row of memory and loses
+    /// nothing.
+    pub fn outline_within(&self, rel: &str, room: usize) -> Result<Outline, String> {
         let text = self
             .whole_read(rel, Decoding::Lossy)?
             .text_or_refusal(rel)?;
-        Ok(Outline::of(rel, &text))
+        Ok(Outline::within(rel, &text, room))
     }
 
     /// A window of a text file, as the model reads it: `limit` lines from
@@ -4347,6 +4371,61 @@ mod tests {
             crlf.contains(CRLF_NOTE),
             "the endings are said, not hidden: {crlf}"
         );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The room is the caller's and the count is the file's: the road that knows
+    /// the cap it will render at keeps that room's rows and one more — the proof
+    /// — and answers with the file's own count plus a sentence naming what it
+    /// left. The read and the refusals are the same road's, room or no room.
+    #[test]
+    fn the_outline_road_keeps_the_room_its_caller_gives_it() {
+        let ws = temp_workspace("outline-room");
+        let body: String = (1..=500).map(|n| format!("fn item_{n}() {{}}\n")).collect();
+        fs::write(ws.root().join("many.rs"), &body).unwrap();
+
+        // No room named: this crate's ceiling for a result the model reads,
+        // which is past every row this file has — so the answer is whole and
+        // owes no note at all.
+        let roomy = ws.outline("many.rs").unwrap();
+        assert_eq!(roomy.total(), 500);
+        assert_eq!(roomy.definitions().len(), 500);
+        let whole = roomy.render(1_000_000, "");
+        assert!(whole.contains("  500  fn item_500() {}"), "{whole}");
+        assert!(!whole.contains("[mush: only the first"), "{whole}");
+
+        // The caller's own room: three rows and the proof, the count of the
+        // file in the header, and the note naming the rows the answer is not.
+        let narrow = ws.outline_within("many.rs", 3).unwrap();
+        assert_eq!(narrow.total(), 500);
+        assert_eq!(narrow.definitions().len(), 4, "the room and the proof row");
+        assert!(
+            narrow.header().contains("500 definitions"),
+            "{}",
+            narrow.header()
+        );
+        let answer = narrow.render(4_000, "");
+        assert!(answer.contains("  3  fn item_3() {}"), "{answer}");
+        assert!(
+            !answer.contains("fn item_4()"),
+            "the proof is not a row: {answer}"
+        );
+        assert!(
+            answer.contains("only the first 3 of 500 definitions are shown"),
+            "{answer}"
+        );
+
+        // Nothing about the read changed with the room: the same refusals, in
+        // the window road's own words.
+        assert!(ws
+            .outline_within("no/such.rs", 3)
+            .unwrap_err()
+            .contains("cannot read"));
+        fs::write(ws.root().join("blob.bin"), b"text before \x00 after\n").unwrap();
+        assert!(ws
+            .outline_within("blob.bin", 3)
+            .unwrap_err()
+            .contains("binary"));
         let _ = fs::remove_dir_all(ws.root());
     }
 

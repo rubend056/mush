@@ -146,8 +146,23 @@
 //! the lie the invariant below forbids, and the methods inside are the anchors
 //! a reader wants most. What keeps a block from drowning the outline is that a
 //! row *is* the line — nothing is summarized, nothing is grouped — so the
-//! header's count and the result cap are the only bounds, and a file whose
-//! bulk is one `impl` is a file whose shape is its methods.
+//! header's count, the room the answer was built with ([`Outline::within`]) and
+//! the result cap are the only bounds, and a file whose bulk is one `impl` is a
+//! file whose shape is its methods.
+//!
+//! **The row list is bounded by the answer, not by the file.** A file can hold
+//! a declaration on every one of a million lines — generated code, a
+//! minified-ish header, a giant table — and building them all to paint one
+//! screen spends the file's own size in memory on an answer a few hundred rows
+//! long: the same trade [`crate::usages::rows_within`] refuses inside a file and
+//! the whole-read cap refuses between files. [`Outline::within`] is the reader
+//! an answer uses, and it is the counting design: the walk visits every line and
+//! *counts* every declaration — materialising is what costs, and counting is one
+//! `usize` on a scan that was going to visit the line anyway — while keeping at
+//! most the rows the answer can show, plus the one past them that proves there
+//! were more. What was not kept is still named: [`Outline::render`] says how
+//! many of the counted rows it did not show, exactly as it does when the result
+//! cap is what cut them, and the header's count is the file's own either way.
 //!
 //! **The invariant: a row may never lie about a line.** Whatever the rule
 //! matched on the file's line, the row's own text still matches it — a cut row
@@ -177,9 +192,50 @@ pub const ROW_WIDTH: usize = 100;
 const RULE_NOTE: &str = "textual, many languages, best-effort — not a compiler's answer";
 
 /// The bytes [`Outline::render`] keeps free for the closing note that says how
-/// many rows the result cap cut: two counts, spelled with at most twenty digits
-/// each. The note itself is written once the loop knows `shown`.
+/// many rows the answer did not show: two counts, spelled with at most twenty
+/// digits each. The note itself is written once the loop knows `shown`. The
+/// reserve holds for either cut — the result cap's and the room's — because the
+/// sentence is the same one.
 const CUT_RESERVE: usize = 160;
+
+/// The fewest bytes a rendered row can take, counting the gutter, the line
+/// number, the two spaces, the row's text and the newline (`Outline::render`'s
+/// own format is `"  {line}  {text}\n"`).
+///
+/// The text under it is at least four bytes: the shortest word that opens a
+/// declaration is two (`fn`), the name the rule insists on is one more, and a
+/// word character beside the keyword would make the keyword part of a longer
+/// word and no declaration at all ([`declaration_prefix`]). So ten is a floor
+/// rather than an estimate of a row's length, and a floor is what
+/// [`room_for_cap`] needs: a cap can never pay for more rows than it allows.
+const MIN_ROW_BYTES: usize = 10;
+
+/// The rows a result capped at `cap` bytes can show, at most — the room to hand
+/// [`Outline::within`] when the cap is known, and the one place the answer's two
+/// rulers meet (a cap counts bytes, a room counts rows, and the caller owns
+/// both).
+///
+/// It rounds down, because a cap pays for a whole row or not at all, and it is
+/// deliberately the *floor* of a row's length: a conversion that guessed high
+/// would keep rows no answer could ever paint, which is the waste the room
+/// exists to stop. A room past what the cap pays for costs one row of memory and
+/// loses nothing; a room under it costs the rows the cap could have paid for,
+/// and the answer says so either way.
+pub const fn room_for_cap(cap: usize) -> usize {
+    cap / MIN_ROW_BYTES
+}
+
+/// The room [`Outline::of`] and the workspace road keep when their caller does
+/// not name one: what this crate's ceiling for a result the model reads
+/// ([`crate::CMD_CAP`]) can pay for — an outline *is* such a result, and no
+/// answer built in this crate is rendered past that ceiling.
+///
+/// It is *a cap and a high one* — the house rule's own shape — but the room is
+/// still the answer's: a caller that knows the exact cap its turn has left
+/// passes its own room to [`Outline::within`] and keeps proportionally less,
+/// and a file with more rows than the room is not refused — it is counted, and
+/// the count is what the header and the closing note say.
+pub const DEFAULT_ROOM: usize = room_for_cap(crate::CMD_CAP);
 
 /// One declaration: the file's 1-based line number and the row's own text.
 ///
@@ -194,15 +250,28 @@ pub struct Definition {
     pub text: String,
 }
 
-/// The outline of one file: the rows the rule found, the file's own line count,
-/// and whether its lines end with CRLF (the fact a window read reports too, so
-/// one road's rows and the other's text tell one story about the endings).
+/// The outline of one file: the rows the answer kept, how many rows the file
+/// holds, the file's own line count, and whether its lines end with CRLF (the
+/// fact a window read reports too, so one road's rows and the other's text tell
+/// one story about the endings).
 #[derive(Clone, Debug)]
 pub struct Outline {
     path: String,
     lines: usize,
     crlf: bool,
+    /// At most `room + 1` rows ([`Outline::within`]): the one past the room is
+    /// the proof that the file held more, and [`Outline::render`] never shows
+    /// it. Every row here is a row the answer may claim — the count above it is
+    /// the file's, not this list's.
     definitions: Vec<Definition>,
+    /// Every declaration the file spells, counted by the walk that visited every
+    /// line. Equal to `definitions.len()` exactly when the list is the whole
+    /// file's, so the two together are the answer's honesty.
+    total: usize,
+    /// The rows the answer may show — the room the caller named. It is kept
+    /// because the proof row is not showable: `min(room, definitions.len())` is
+    /// the most the cap can reach, and `render` says what it left of the rest.
+    room: usize,
 }
 
 impl Outline {
@@ -210,40 +279,85 @@ impl Outline {
     /// road is [`Workspace::outline`](crate::workspace::Workspace::outline),
     /// which owns the read caps and the lossy decode). `path` is the name the
     /// model used, shown back in the header exactly as it was asked about.
-    pub fn of(path: &str, text: &str) -> Self {
+    ///
+    /// `room` is the rows the answer can show, and it is the caller's: how many
+    /// rows fit is a fact about the answer, not about the file, so the door that
+    /// knows the cap it will render at converts it ([`room_for_cap`]). The walk
+    /// visits every line whatever the room is, so the file's count is exact and
+    /// the room decides only what is *built*: a room past the file's own rows
+    /// keeps them all, and a room under them keeps the first `room + 1` — the
+    /// last of those the proof that there was more ([`Self::definitions`]) —
+    /// while the answer names the rest rather than pretending to hold it.
+    pub fn within(path: &str, text: &str, room: usize) -> Self {
+        let found = scan(text, room);
         Self {
             path: path.trim().to_string(),
-            lines: text.lines().count(),
+            lines: found.lines,
             crlf: text::is_crlf(text),
-            definitions: definitions(text),
+            definitions: found.rows,
+            total: found.total,
+            room,
         }
     }
 
-    /// Nothing to sketch: the answer is a sentence, not a header with no rows.
-    pub fn is_empty(&self) -> bool {
-        self.definitions.is_empty()
+    /// The outline of `text` for a caller with no cap of its own: the room this
+    /// crate's ceiling for a result the model reads can pay for ([`DEFAULT_ROOM`]).
+    /// A caller that *does* know its cap — the app renders a tool result at the
+    /// `result_cap` its turn has left — passes [`room_for_cap`] of it to
+    /// [`Self::within`] and keeps proportionally fewer rows for the same answer,
+    /// which is the point of the room being the caller's.
+    pub fn of(path: &str, text: &str) -> Self {
+        Self::within(path, text, DEFAULT_ROOM)
     }
 
-    /// The rows, in the file's own order.
+    /// Nothing to sketch: the answer is a sentence, not a header with no rows.
+    /// The count is the file's own, so a room too small to keep a row still
+    /// reads as "nothing declares anything here" only when that is true.
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// The rows this answer kept, in the file's own order — at most `room + 1`
+    /// of them, the last being the proof row when the file held more than the
+    /// room ([`Self::within`]), which [`Self::render`] never shows. The list is
+    /// the whole file's exactly when it is as long as [`Self::total`]; a caller
+    /// that needs every row asks for a room that pays for them rather than
+    /// reading this list as the file.
     pub fn definitions(&self) -> &[Definition] {
         &self.definitions
     }
 
+    /// How many declarations the walk found in the whole file: the header's
+    /// count, exact even when [`Self::definitions`] kept only the room's rows,
+    /// because counting is what the walk that visits every line does anyway.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
     /// The line the header opens with: the file, its length, how many
-    /// definitions the rule found, and the rule's own confession.
+    /// definitions the rule found, and the rule's own confession. The count is
+    /// [`Self::total`] — the file's, not the kept list's — so a bounded row list
+    /// makes the header no less exact.
     pub fn header(&self) -> String {
         format!(
             "{} — {}; {} ({RULE_NOTE})",
             self.path,
             count(self.lines, "line"),
-            count(self.definitions.len(), "definition"),
+            count(self.total, "definition"),
         )
     }
 
     /// The whole answer, within `cap` bytes: the header, `lead` under it when
     /// the caller has a sentence of its own (the unbounded-read fallback says
     /// there what the model is not being shown), a blank, then the rows — as
-    /// many as the cap pays for — and the closing notes.
+    /// many as the cap pays for and the room kept, which is every row the answer
+    /// holds when the two are generous — and the closing notes.
+    ///
+    /// A row left out is always said, whichever of the two bounds left it: the
+    /// note under the rows names the file's own count and the rows it showed,
+    /// and an answer that shows every row it counted has nothing to say and says
+    /// nothing (which is what makes a small file's answer the bytes it always
+    /// was).
     ///
     /// The notes are why the row loop reserves room before it starts: a result
     /// whose last line is a half-written row and whose "the rest was cut" note
@@ -286,11 +400,11 @@ impl Outline {
             return truncate_for_model(out, cap);
         }
         let mut shown = 0usize;
-        let mut cut = false;
-        for definition in &self.definitions {
+        // The rows the room allows: the one kept past it is the proof, never a
+        // row of the answer.
+        for definition in self.definitions.iter().take(self.room) {
             let row = format!("  {}  {}\n", definition.line, definition.text);
             if out.len() + row.len() > budget {
-                cut = true;
                 break;
             }
             out.push_str(&row);
@@ -299,25 +413,35 @@ impl Outline {
         if out.ends_with('\n') {
             out.pop();
         }
-        if cut {
+        // Two different cuts leave a row out — the cap could not pay for it, or
+        // the room never kept it — and both need the same sentence, because the
+        // reader's question is only what it was not shown. `shown == self.total`
+        // is the whole sketch and then there is nothing to say; anything less is
+        // a count the answer owes the model.
+        if shown < self.total {
             out.push_str(&self.cut_note(shown));
         }
         out.push_str(&crlf);
         truncate_for_model(out, cap)
     }
 
-    /// The sentence under a capped answer that says what the cap left: one home
-    /// for the counts, so the row loop that stopped early and the cap too small
-    /// for a single row say it the same way (the second with `shown` zero).
+    /// The sentence under a bounded answer that says what it left: one home for
+    /// the counts, so the row loop that stopped early, the room that kept fewer
+    /// rows than the file holds, and the cap too small for a single row all say
+    /// it the same way (the last with `shown` zero).
     ///
-    /// It is bounded by [`CUT_RESERVE`], which is why `render` can reserve its
-    /// room before it starts: two counts, spelled with at most twenty digits
-    /// each, and one fixed clause naming the road that still shows any row.
+    /// It is the count of the *file* that the sentence names as the whole —
+    /// [`Self::total`], which the walk verified line by line — and the count of
+    /// what the reader can see beside it, so no reading of it can claim a row
+    /// the answer did not keep. It is bounded by [`CUT_RESERVE`], which is why
+    /// `render` can reserve its room before it starts: two counts, spelled with
+    /// at most twenty digits each, and one fixed clause naming the road that
+    /// still shows any row.
     fn cut_note(&self, shown: usize) -> String {
         format!(
             "\n[mush: only the first {shown} of {} definitions are shown — read_file \
              {{offset, limit}} shows a range around any row's line]",
-            self.definitions.len()
+            self.total
         )
     }
 
@@ -350,16 +474,78 @@ impl Outline {
 /// duplicates (the walk is the file's own order and the rule is one answer per
 /// line, so neither can happen — the sweep test asserts both anyway, because
 /// a later rule that looks back or forward could break them silently).
+///
+/// The whole list, with no room to bound it: [`Outline::within`] is the reader
+/// an answer uses, and this is that walk with room for all of it, for the
+/// callers that want the rule's own answer rather than an answer's window (the
+/// sweeps at the bottom of this file). A generated file holds a row on every
+/// line it has, so a caller that builds this list has already decided to spend
+/// the file's size in memory — which is exactly what the tool road must not do,
+/// and does not: the shape is here for the rule's own reader, and the answer's
+/// door is bounded.
 pub fn definitions(text: &str) -> Vec<Definition> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            row_text(line).map(|text| Definition {
-                line: index + 1,
-                text,
-            })
-        })
-        .collect()
+    scan(text, usize::MAX).rows
+}
+
+/// What one walk of a file's text found: the rows the answer keeps, how many
+/// rows the file holds, and how many lines it has.
+struct Scan {
+    /// At most `room + 1` rows, in the file's own order. The one row past the
+    /// room is the proof that the file held more than the room: the list is
+    /// longer than the room exactly when it is not the whole file
+    /// (`total > room`), which is the property [`crate::usages::rows_within`]
+    /// carries into its caller as one more row than the room.
+    rows: Vec<Definition>,
+    /// Every declaration the file spells, counted while the walk visited every
+    /// line. This is the number the header and the closing note name, so the
+    /// count stays exact where a list cannot be.
+    total: usize,
+    /// The file's own line count, from the same walk ([`str::lines`], the
+    /// reader both this and the header's count use).
+    lines: usize,
+}
+
+/// The walk behind [`Outline::within`] and [`definitions`]: one pass over the
+/// text that counts what the file holds, counts its lines, and keeps what the
+/// answer can show.
+///
+/// Counting every row while building only the room's is the whole shape. The
+/// scan cannot stop early the way `usages`' does: a row's text is a reader's
+/// line, so the file's count is only exact if every line was read, and the count
+/// is what the header claims. What the walk does not build is what it does not
+/// keep, and the room bounds the built rows — the file's own size never enters
+/// the answer's memory (finding IN9's trade, the same one `list_files` and the
+/// search walk refuse between files).
+///
+/// `row_text` is the rule's own reader for a row's own text, and it allocates;
+/// it is asked only for the rows the answer keeps, so the allocations the walk
+/// makes are the room's rather than the file's while `is_declaration` — the
+/// non-allocating half of the same rule — answers for every line.
+fn scan(text: &str, room: usize) -> Scan {
+    // One past the room: `room + 1` rows are the proof that the file held more
+    // than the room, and nothing past them can enter the answer.
+    let keep = room.saturating_add(1);
+    let mut found = Scan {
+        rows: Vec::new(),
+        total: 0,
+        lines: 0,
+    };
+    for (index, line) in text.lines().enumerate() {
+        found.lines = index + 1;
+        if !is_declaration(line) {
+            continue;
+        }
+        found.total += 1;
+        if found.rows.len() < keep {
+            if let Some(text) = row_text(line) {
+                found.rows.push(Definition {
+                    line: index + 1,
+                    text,
+                });
+            }
+        }
+    }
+    found
 }
 
 /// Whether a tool result is one of this module's answers: a first line carrying
@@ -2759,6 +2945,236 @@ command! Tiny call s:helper(\"world\")
         let tiny = outline.render(header.len() - 20, "");
         assert!(tiny.starts_with("two.rs — 2 lines"), "{tiny:?}");
         assert!(tiny.contains("truncated at"), "the cut is marked: {tiny:?}");
+    }
+
+    /// A million declarations in one file — the generated file, the
+    /// minified-ish header, the giant table — and the answer it gets. The walk
+    /// counts every line's declaration, so the header's count is the file's own
+    /// and not an estimate; the rows it keeps are the room's and the proof row,
+    /// so the file's size never reaches the answer's memory; and the painted
+    /// answer says what it left, which is the only thing that makes a bounded
+    /// row list honest.
+    ///
+    /// The string is built by repeating one line, so what this test spends is
+    /// the walk — a million lines under the rule — and not the fixture.
+    #[test]
+    fn a_million_declarations_are_counted_and_not_kept() {
+        let text = "fn a() {}\n".repeat(1_000_000);
+        let started = Instant::now();
+        let outline = Outline::within("huge.rs", &text, DEFAULT_ROOM);
+        let walked = started.elapsed();
+
+        // The count is the file's own, verified line by line rather than
+        // extrapolated from what was built.
+        assert_eq!(outline.total(), 1_000_000);
+        assert_eq!(
+            outline.definitions().len(),
+            DEFAULT_ROOM + 1,
+            "the room's rows and the one that proves there were more"
+        );
+        assert!(outline
+            .header()
+            .starts_with("huge.rs — 1,000,000 lines; 1,000,000 definitions"));
+
+        // The painted answer: the cap's rows, all of them kept ones, and the
+        // sentence that names the file the answer is not.
+        let answer = outline.render(crate::CMD_CAP, "");
+        let shown = answer.lines().filter(|line| line.starts_with("  ")).count();
+        assert!(shown > 0 && shown <= DEFAULT_ROOM, "{shown} rows shown");
+        assert!(answer.len() <= crate::CMD_CAP);
+        assert!(
+            answer.contains(&format!(
+                "only the first {shown} of 1000000 definitions are shown"
+            )),
+            "a bounded answer says what it left: {answer}"
+        );
+        assert!(answer.contains("  1  fn a() {}"), "{answer}");
+        assert!(answer.ends_with("any row's line]"), "{answer}");
+
+        // The memory the rows hold: each row's own text plus the row itself,
+        // which is the shape of the cost the room exists to bound. The file is
+        // ten megabytes and the rows are tens of kilobytes — two orders of
+        // magnitude — and the bound is asserted so a walk that ever goes back
+        // to building every row is caught here rather than in a report.
+        let held: usize = outline
+            .definitions()
+            .iter()
+            .map(|row| row.text.len() + std::mem::size_of::<Definition>())
+            .sum();
+        assert!(
+            text.len() > held * 100,
+            "the rows hold {held} bytes of a {} byte file",
+            text.len()
+        );
+        // The walk's own cost is one pass: a rule that goes quadratic shows up
+        // here, and the number is worth seeing in a `--nocapture` run.
+        eprintln!("million-line outline: {walked:?}, {held} bytes of rows kept");
+        assert!(walked < Duration::from_secs(10), "the walk took {walked:?}");
+    }
+
+    /// The answer a small file always gave, byte for byte: the header, the
+    /// blank line, the rows, and nothing else — no room, no note, nothing
+    /// between the caller and the sketch it asked for. A bound has to be
+    /// invisible until it bites, and this is the test that says it is.
+    #[test]
+    fn a_small_file_answers_the_bytes_it_always_did() {
+        let text = "// a heading\nfn first() {\n}\n\npub struct Second;\n";
+        let outline = Outline::of("src/small.rs", text);
+        assert_eq!(
+            outline.render(4_000, ""),
+            "src/small.rs — 5 lines; 2 definitions (textual, many languages, best-effort — not a \
+             compiler's answer)\n\n  2  fn first() {\n  5  pub struct Second;"
+        );
+        assert_eq!(
+            outline.definitions().len(),
+            outline.total(),
+            "nothing was left out of a file the room covers"
+        );
+    }
+
+    /// The row past the room is the proof, and only the proof. A file holding
+    /// exactly the room is whole and the list says so (`len == total`); a file
+    /// holding more keeps one more than the room, and the list being longer than
+    /// the room *is* the evidence that the file was; and the answer shows the
+    /// room and never the proof row, whatever cap it is given.
+    #[test]
+    fn the_row_past_the_room_is_the_proof_the_file_held_more() {
+        let exactly: String = (1..=10).map(|n| format!("fn item_{n}() {{}}\n")).collect();
+        let more: String = (1..=1_000)
+            .map(|n| format!("fn item_{n}() {{}}\n"))
+            .collect();
+
+        let whole = Outline::within("ten.rs", &exactly, 10);
+        assert_eq!(whole.definitions().len(), 10, "the file, and no proof row");
+        assert_eq!(whole.definitions().len(), whole.total());
+
+        let bounded = Outline::within("many.rs", &more, 10);
+        assert_eq!(bounded.definitions().len(), 11, "the room, and the proof");
+        assert_eq!(bounded.total(), 1_000);
+        assert!(
+            bounded.definitions().len() > 10,
+            "a list longer than the room is the proof the room was not the file"
+        );
+
+        // A cap that would pay for every row kept still shows the room: the
+        // proof row is not a row of any answer.
+        let answer = bounded.render(1_000_000, "");
+        let shown = answer.lines().filter(|line| line.starts_with("  ")).count();
+        assert_eq!(shown, 10, "{answer}");
+        assert!(answer.contains("  10  fn item_10() {}"), "{answer}");
+        assert!(
+            !answer.contains("fn item_11()"),
+            "the proof is not shown: {answer}"
+        );
+        assert!(
+            answer.contains("only the first 10 of 1000 definitions are shown"),
+            "{answer}"
+        );
+
+        // Zero room still proves: one row is built, none is shown, and the
+        // sentence carries the count of both sides.
+        let none = Outline::within("none.rs", &more, 0);
+        assert_eq!(none.definitions().len(), 1);
+        assert_eq!(none.total(), 1_000);
+        let answer = none.render(1_000_000, "");
+        assert!(
+            answer.contains("only the first 0 of 1000 definitions are shown"),
+            "{answer}"
+        );
+        assert!(!answer.contains("  fn item_1"), "{answer}");
+
+        // A room past the file is the whole file, and no note is owed.
+        let roomy = Outline::within("roomy.rs", &more, usize::MAX);
+        assert_eq!(roomy.definitions().len(), 1_000);
+        assert_eq!(roomy.total(), 1_000);
+        let answer = roomy.render(1_000_000, "");
+        assert!(!answer.contains("[mush: only the first"), "{answer}");
+    }
+
+    /// The property a bounded row list must keep, over a table of shapes rather
+    /// than one file: for every room and every cap, every row an answer paints
+    /// is a row it kept, that row is its file's own line and re-matches the rule
+    /// it came from, rows ascend, the header's count is the file's count, and an
+    /// answer with no closing note is the whole sketch — no row left out and
+    /// none claimed.
+    #[test]
+    fn a_bounded_answer_claims_no_row_it_did_not_keep() {
+        let texts = [
+            String::from("fn one() {}\nlet a = 1;\nfn two() {}\n"),
+            String::new(),
+            String::from("no declarations here\njust prose\n"),
+            (1..=50)
+                .map(|n| format!("fn item_{n}() {{ let body = \"{}\"; }}\n", "x".repeat(120)))
+                .collect(),
+            (1..=500).map(|n| format!("fn item_{n}() {{}}\n")).collect(),
+        ];
+        let rooms = [0usize, 1, 3, 40, DEFAULT_ROOM, usize::MAX];
+        let caps = [700usize, 2_000, 4_000, 20_000];
+        for text in &texts {
+            let lines: Vec<&str> = text.lines().collect();
+            let counted = definitions(text).len();
+            for room in rooms {
+                let outline = Outline::within("shape.rs", text, room);
+                assert_eq!(outline.total(), counted, "the count is the file's own");
+                assert_eq!(
+                    outline.definitions().len(),
+                    counted.min(room.saturating_add(1)),
+                    "the kept rows are the room's and the proof"
+                );
+                assert!(outline.header().contains(&count(counted, "definition")));
+                for cap in caps {
+                    let answer = outline.render(cap, "");
+                    let mut shown = 0usize;
+                    let mut last = 0usize;
+                    for line in answer.lines() {
+                        let Some(rest) = line.strip_prefix("  ") else {
+                            continue;
+                        };
+                        let (number, text) = rest.split_once("  ").expect("a row holds two spaces");
+                        let number: usize = number.parse().expect("a row names a line");
+                        shown += 1;
+                        assert!(
+                            number > last && number <= lines.len(),
+                            "{number} after {last} in a file of {} lines",
+                            lines.len()
+                        );
+                        last = number;
+                        let body = text.strip_suffix('…').unwrap_or(text);
+                        assert!(
+                            lines[number - 1].starts_with(body),
+                            "{number}: the row is not that line, cut: {text:?}"
+                        );
+                        assert!(
+                            is_declaration(text),
+                            "{number}: a row may never lie — {text:?} does not re-match the rule"
+                        );
+                    }
+                    assert!(
+                        shown <= outline.definitions().len(),
+                        "an answer claims no row it did not keep: {shown} of {}",
+                        outline.definitions().len()
+                    );
+                    assert!(shown <= room, "the room is what an answer may show");
+                    assert!(
+                        answer.len() <= cap + CUT_RESERVE,
+                        "{} bytes for a cap of {cap}",
+                        answer.len()
+                    );
+                    if answer.contains("[mush: only the first") {
+                        assert!(
+                            shown < counted,
+                            "a cut answer is not the whole file's rows: {answer}"
+                        );
+                    } else {
+                        assert_eq!(
+                            shown, counted,
+                            "an answer with no note is the whole sketch: {answer}"
+                        );
+                        assert_eq!(outline.definitions().len(), counted);
+                    }
+                }
+            }
+        }
     }
 
     /// The property the brief calls the hard invariant, over this checkout:
