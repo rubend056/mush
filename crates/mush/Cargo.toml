@@ -31,8 +31,15 @@ rustix = { version = "1", features = ["fs", "process"] }
 # documented as unusable beside libc, and this workspace forbids `unsafe`.
 signal-hook = "0.3"
 # TLS so hosted https endpoints (e.g. DeepSeek) work; the HTTP client itself
-# stays hand-rolled and blocking.
-rustls = "0.23"
+# stays hand-rolled and blocking. ring, not rustls's default aws-lc-rs: that
+# provider is a C library built through cmake into every target dir, which no
+# Rust cache can reuse — ~22 s of a 36.5 s cold `cargo build -p mush` in the
+# probe, and a re-measure today put cold `cargo test --workspace --no-run` at
+# 69.3 s with it against 39.2 s with ring (−43 % wall, −30 % CPU).
+# No `prefer-post-quantum`: on rustls 0.23 it turns aws_lc_rs back on, so the
+# handshake offers X25519/secp256r1/secp384r1 and not the X25519MLKEM768
+# hybrid — the cost, named in the commit body.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 
 # The same crate, with the test-support feature on, for this binary's tests
