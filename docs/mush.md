@@ -1352,6 +1352,7 @@ wrapping) is where the tests live.
 | `rustls`, `webpki-roots` | TLS for hosted https endpoints (DeepSeek); the client stays hand-rolled |
 | `rustix` | `flock(2)` for the one-mush-per-workspace lock, and the process-group kill that ends a command's group; the workspace forbids `unsafe`, so the syscalls come through its safe wrappers rather than a hand-written `extern "C"` (already in the tree under tempfile and rustls) |
 | `signal-hook` | one handler per ending signal that only sets a flag the event loop reads, so a killed mush takes the same clean-quit road `Ctrl-Q` does (already linked by crossterm) |
+| `regex-lite` | `search`'s Rust-flavoured regex; the zero-dependency sibling of `regex`, measured at +99 KB of release binary and +0.5 s of build against +1.5 MB and +16.5 s |
 | `mush-core` | the workspace's own core crate — pure domain, no UI (this repository, a path dependency) |
 
 Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,

@@ -28,9 +28,15 @@ use crate::text;
 /// and the window a model spends finding it is the window it wanted for
 /// something else. `usages` is the newest and the narrowest: "who uses this?"
 /// is the question a model asks before a rename or a signature change, and
-/// `search` answers it only if the model already knows every spelling of the
-/// boundary — a substring hit on `held` inside `beheld` is exactly the false
-/// lead the word rule refuses ([`crate::usages`], which argues the rule).
+/// `search` answers it only if the model remembers to write the boundary —
+/// `\b` is spellable now, but it is ASCII and `regex-lite` has no `\p{…}`, so
+/// the rule's own word — Rust's identifier, `café` and all — cannot be bounded
+/// (`café` is a row the rule keeps and `\bcafé\b` misses), `\b` cannot write
+/// the boundary of a needle that is not a word (a `-`, a hit between spaces),
+/// and the readings the rule settled once (`_` in the word, `$` and `#` out of
+/// it) are the model's to write per query. The answer a model reaches for is
+/// the substring, whose `held` inside `beheld` is exactly the false lead the
+/// word rule refuses ([`crate::usages`], which argues the rule).
 ///
 /// The schemas, the dispatcher and the prompt all name tools through this enum,
 /// so adding a tool is a compile error in every place that has to know about it

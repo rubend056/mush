@@ -7634,7 +7634,7 @@ fn trimmed(count: String) -> String {
 /// of every edit, and the row weighs it ([`write_reading`], [`edit_reading`]).
 /// It is the one measure read from the arguments and not the result, and it is
 /// still a fact and not a guess: those bytes are what the model sent, they are
-/// what the call's own block paints ([`crate::app::call_grid`]), and a call
+/// what the call's own block paints ([`crate::app`]'s call grid), and a call
 /// whose result never landed — or was refused — has no measure at all, because
 /// its text was never written. The count is deliberately absent for both: the
 /// count such a row would carry is already the verdict beside it (`2 hunks`,
@@ -7719,7 +7719,7 @@ pub struct CallFacts {
     /// child is isolated, and `edit_file` says nothing here because the ask
     /// already names the file and the outcome already counts the hunks — the
     /// replacement itself is the *arguments'* own text, which the grid paints
-    /// without the digest copying it ([`crate::app::call_grid`]). The painter
+    /// without the digest copying it ([`crate::app`]'s call grid). The painter
     /// cuts each row to the pane's gutter ([`crate::app`]'s call grid); nothing
     /// here is cut.
     ///
@@ -8528,7 +8528,7 @@ fn write_reading(args: &Value, ok: Option<&str>) -> (Option<CallOutcome>, Option
 
 /// The bytes of a write's `content`, where the arguments carry one: the whole
 /// text the call asked to put on disk, which is exactly what the block under its
-/// row paints ([`crate::app::call_grid`]).
+/// row paints ([`crate::app`]'s call grid).
 fn content_bytes(args: &Value) -> Option<usize> {
     args.get("content").and_then(Value::as_str).map(str::len)
 }
