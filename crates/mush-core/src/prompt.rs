@@ -257,7 +257,8 @@ pub fn tool_schemas() -> Vec<Value> {
              separator, and overlapping windows merge; a bigger ask is clamped to the 10, not \
              refused. `(?i)` is how case-insensitive is said, and a metacharacter meant literally \
              is escaped (`foo\\(bar\\)`). No lookaround or backreference, no `\\p{…}` classes, \
-             and `\\w`/`\\b` are ASCII-only. Binary files are skipped.",
+             and `\\w`/`\\b` are ASCII-only; `(?i)`'s fold is too (`é` does not match `É`). \
+             Binary files are skipped.",
             json!({
                 "type": "object",
                 "properties": {
@@ -275,8 +276,10 @@ pub fn tool_schemas() -> Vec<Value> {
              Textual and best-effort — `held` in `beheld` is not a row, `self.held` is; no \
              identifier resolution, no scope, no call graph — so a comment or a string can be \
              a row and a miss is not proof the symbol is absent (the files the walk could \
-             not read are counted). No `path` or word toggle: `search` is the tool that takes \
-             those.",
+             not read are counted). No `path`: `search { pattern, path }` is the tool that \
+             narrows a file. And no word flag: the word is this call's own rule — \
+             alphanumerics and `_` — so `\\b` semantics are written `\\b`, ASCII-only as the \
+             search schema states.",
             json!({
                 "type": "object",
                 "properties": {
@@ -486,6 +489,10 @@ mod tests {
         assert!(description.contains(r"\p{"), "{description}");
         assert!(description.contains("ASCII"), "{description}");
         assert!(description.contains(r"foo\(bar\)"), "{description}");
+        assert!(
+            description.contains("fold is too"),
+            "the case fold's ASCII limit is stated where `\\w`/`\\b`'s is: {description}"
+        );
         let properties = search["function"]["parameters"]["properties"]
             .as_object()
             .expect("the properties are an object");
@@ -494,6 +501,43 @@ mod tests {
             !properties.contains_key("ignore_case"),
             "the flag is gone from the schema: {properties:?}"
         );
+    }
+
+    /// `usages` takes the symbol and nothing else: no `path` — `search
+    /// { pattern, path }` is the call that narrows a file — and no word flag
+    /// anywhere, which the schema used to promise ("a word toggle") while none
+    /// existed. The word is the rule's own, alphanumerics and `_`; a caller who
+    /// wants a boundary writes `\b` into a `search` pattern and gets the
+    /// engine's ASCII rule, not this one — a letter outside ASCII is a word
+    /// character here, which `\bcafé\b` misses (`crate::tools`' argument).
+    #[test]
+    fn the_usages_schema_takes_one_argument_and_promises_no_word_toggle() {
+        let usages = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "usages")
+            .expect("usages has a schema");
+        let parameters = &usages["function"]["parameters"];
+        let properties = parameters["properties"]
+            .as_object()
+            .expect("the properties are an object");
+        assert_eq!(
+            properties.keys().collect::<Vec<_>>(),
+            vec!["symbol"],
+            "the one argument is the symbol: {properties:?}"
+        );
+        assert_eq!(parameters["required"], json!(["symbol"]));
+        let description = usages["function"]["description"].as_str().unwrap();
+        assert!(!description.contains("word toggle"), "{description}");
+        assert!(
+            description.contains("search { pattern, path }"),
+            "the call that narrows a file is named: {description}"
+        );
+        assert!(
+            description.contains("alphanumerics and `_`"),
+            "{description}"
+        );
+        // The code half: the rule keeps a word `\b` would miss.
+        assert!(crate::usages::is_usage("café", "café"));
     }
 
     /// A search's `context` is how many lines either side of a match the answer

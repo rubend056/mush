@@ -64,15 +64,17 @@ box and press `Enter`. The agent works the workspace through twelve tools: seven
 touch the files (`edit_file` replaces exact text, because an exact-and-unique
 match is a safety property `sed -i` does not have; `read_file` reads a line
 window and works even while another agent holds the machine; `outline` sketches
-a file's declarations without spending the window on its text; `search`
-(`pattern`, `path?`, `context?`) matches a Rust-flavoured regex, not a
-literal — a metacharacter meant literally is escaped (`foo\(bar\)`), `(?i)` is
-how case-insensitive is said, `\w`/`\b` are ASCII-only, and there is no
-lookaround, backreference or `\p{…}` class — a match row is `path:line: text`,
-a context row `path-line- text`, grep's own shape; `usages` answers who mentions
-a symbol as a word, grouped by file), `run_command` is the shell for everything
-else (git, tests, builds), `spawn_agent` delegates, and `status`, `control` and
-`wait` manage the agents and jobs it starts. The schemas are
+a file's declarations without spending the window on its text; `write_file`
+creates or replaces a whole file; `list_files` lists the files under a path, one
+per line; `search` (`pattern`, `path?`, `context?`) matches a Rust-flavoured
+regex, not a literal — a metacharacter meant literally is escaped
+(`foo\(bar\)`), `(?i)` is how case-insensitive is said, `\w`/`\b` and `(?i)`'s
+fold are ASCII-only (`é` does not match `É`), and there is no lookaround,
+backreference or `\p{…}` class — a match row is `path:line: text`, a context row
+`path-line- text`, grep's own shape; `usages` answers who mentions a symbol as a
+word, grouped by file), `run_command` is the shell for everything else (git,
+tests, builds), `spawn_agent` delegates, and `status`, `control` and `wait`
+manage the agents and jobs it starts. The schemas are
 `crates/mush-core/src/prompt.rs`; the manual's §3 lists them.
 
 It talks to any OpenAI-compatible endpoint with function calling:
