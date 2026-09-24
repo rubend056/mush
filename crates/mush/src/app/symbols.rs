@@ -17,12 +17,18 @@
 //! future home. `/glyphs` alone opens [`Symbols::preview`]: the table itself, one
 //! row per tool, so the human can check what their font does with it.
 //!
-//! **Every glyph is one column.** That is what lets a result message — which
-//! the transcript does not let know which call produced it — stand its whole
-//! block at the same two-column gutter ([`Symbols::GUTTER_MARK`], the pipe
-//! every payload row wears), so a call still reads as one block. The tests
-//! below are the pin: a glyph two columns wide would be caught there rather
-//! than as a ragged gutter.
+//! **Every glyph is one column** — as the grid measures it *and* as the
+//! terminal paints it. `unicode-width` is the measure the grid lays a row out
+//! with; a terminal has width tables of its own, and where the two disagree
+//! (the East-Asian-Wide `W`/`F` rows `unicode-width` answers one for, an
+//! `A`mbiguous row a terminal resolves wide) every cell of the row after such a
+//! glyph is written a column off where the grid put it. One column is what lets
+//! a result message — which the transcript does not let know which call
+//! produced it — stand its whole block at the same two-column gutter
+//! ([`Symbols::GUTTER_MARK`], the pipe every payload row wears), so a call still
+//! reads as one block. The tests below are the pin: a glyph two columns wide by
+//! either measure is caught there rather than on the pane, as a ragged gutter or
+//! a stray cell on its border.
 //!
 //! **The table has no wildcard arm.** A new [`ToolName`] cannot compile until
 //! it has been given a mark in both rungs, the same house rule the digest
@@ -147,18 +153,28 @@ impl Symbols {
             // A page with text lines: `▣`, the picture's mark, already renders
             // on the human's font.
             ToolName::ReadFile => ("▤ ", "R "),
-            // Misc Symbols, the block `⚙` comes from: the trigram for earth is
-            // three stacked lines, which is what an outline is. The ascii rung
+            // Math Operators: three stacked lines, which is what an outline is
+            // — the shape the trigram had, in its narrow spelling. `☷` (U+2637,
+            // the trigram for earth) is East-Asian-Wide: a terminal that
+            // follows the standard paints it in two columns while `unicode-width`
+            // counts it one, so every cell of the row after the mark was written
+            // a column right of where the grid put it — a long ask's measure
+            // landing on the pane's border, where it stayed, as the diff never
+            // repaints a cell whose model content did not change. The test below
+            // is the pin that keeps the table out of that class. The ascii rung
             // takes the letter its own name starts with.
-            ToolName::Outline => ("☷ ", "O "),
+            ToolName::Outline => ("≣ ", "O "),
             // The pencil, from the Dingbats block `✓` and `✉` come from. The
             // Latin-1 `±` is `edit_file`'s: it is in every font, and it reads as
             // "a change" — the two pencils are near-identical at a glance and
             // must not be told apart by shape.
             ToolName::WriteFile => ("✎ ", "W "),
             ToolName::EditFile => ("± ", "E "),
-            // The Misc-Symbols block `⚙` comes from.
-            ToolName::ListFiles => ("☰ ", "L "),
+            // Geometric Shapes, the block `▤` and `▣` come from: a square of
+            // cells, which is what a directory of names is. `☰` (U+2630, the
+            // trigram for heaven) it wore first and is East-Asian-Wide like
+            // `outline`'s `☷` — the same test is the pin.
+            ToolName::ListFiles => ("▦ ", "L "),
             // Misc Technical: the one to eyeball, which is what `/glyphs` is for.
             ToolName::Search => ("⌕ ", "? "),
             // Arrows: the same block `↳` comes from, and the shape the answer
@@ -384,6 +400,75 @@ fn sample(tool: ToolName) -> Sample {
     }
 }
 
+/// The East-Asian-Wide codepoints `unicode-width` counts **one** column — in
+/// both versions this tree carries (0.2, mush's own measure, and 0.1 through
+/// ratatui) — and the mark table's own pin: no glyph a row is spelled with may
+/// be one of them.
+///
+/// A terminal has width tables of its own, and for these a standards-following
+/// one answers two columns (the trigrams, the hexagrams) or none at all (a
+/// combining mark, a filler) where `unicode-width` answers one. Either way the
+/// row is not where the grid put it: the crossterm backend skips the `MoveTo`
+/// for a cell that follows the one it last wrote, so after such a glyph the rest
+/// of the row is written a column off, and ratatui's diff repaints nothing — the
+/// pane's own border cell did not change in the model — so the stray ink stays
+/// until something repaints the whole screen (a resize is the one thing that
+/// does). That is how the tail of a long `outline` ask's measure stayed on the
+/// conversation pane's border. The other half of the standard's `W`/`F` rows is
+/// already refused by `every_mark_is_the_gutter`: any glyph the crate itself
+/// measures two fails that pin, and this one holds the codepoints where the
+/// crate answers one and the terminal answers differently.
+///
+/// `EastAsianWidth.txt`'s `W` and `F` rows, Unicode 16.0.0, minus the ones the
+/// crate answers two for. The `A` (Ambiguous) rows are deliberately not here:
+/// whether a terminal widens one is its own locale policy rather than the
+/// standard's, and the pane's `│`, `▤`, `▣`, `◐` and `±` are all of that class.
+#[cfg(test)]
+pub(crate) const EAST_ASIAN_WIDE_ONE_COLUMN: &[(u32, u32)] = &[
+    // The trigrams: `outline`'s `☷` and `list_files`' `☰` are both here.
+    (0x2630, 0x2637),
+    // The monograms, their single-line siblings.
+    (0x268A, 0x268F),
+    // CJK tone marks and the two Japanese voicing marks: a terminal combines
+    // these onto the cell they follow rather than widening them.
+    (0x302A, 0x302F),
+    (0x3099, 0x309A),
+    // The Hangul filler.
+    (0x3164, 0x3164),
+    // Two CJK strokes.
+    (0x31E4, 0x31E5),
+    // The Yijing hexagrams.
+    (0x4DC0, 0x4DFF),
+    // Khitan small script's filler, and one of its characters.
+    (0x16FE4, 0x16FE4),
+    (0x18CFF, 0x18CFF),
+    // The Tai Xuan Jing symbols and the counting-rod numerals, the hexagrams'
+    // neighbours in the standard's wide rows.
+    (0x1D300, 0x1D356),
+    (0x1D360, 0x1D376),
+    // The seven emoji Unicode 16.0 added, which the crate's tables predate.
+    (0x1FA89, 0x1FA89),
+    (0x1FA8F, 0x1FA8F),
+    (0x1FABE, 0x1FABE),
+    (0x1FAC6, 0x1FAC6),
+    (0x1FADC, 0x1FADC),
+    (0x1FADF, 0x1FADF),
+    (0x1FAE9, 0x1FAE9),
+];
+
+/// Whether `ch` is one of [`EAST_ASIAN_WIDE_ONE_COLUMN`]: a glyph the grid
+/// counts one column and a terminal paints as two — or as none, where the
+/// standard's wide codepoint is a mark that combines onto the cell before it.
+///
+/// `#[cfg(test)]`, like [`Symbols::GUTTER`] beside it: the tests' pin on what a
+/// terminal will make of the table, not a number production reads.
+#[cfg(test)]
+pub(crate) fn the_terminal_disagrees(ch: char) -> bool {
+    EAST_ASIAN_WIDE_ONE_COLUMN
+        .iter()
+        .any(|&(start, end)| (start..=end).contains(&u32::from(ch)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +558,53 @@ mod tests {
                 "{tool}'s ascii glyph is not ascii: {glyph:?}"
             );
             assert_eq!(glyph.chars().count(), 1, "{tool}: {glyph:?}");
+        }
+    }
+
+    /// No glyph the table spells is one the width tables disagree on: a mark
+    /// must be one column to the terminal as well as to `unicode-width`, or the
+    /// row holding it lands a column off the grid.
+    ///
+    /// `every_mark_is_the_gutter` is the crate's half of the pin; this is the
+    /// terminal's, and the only glyphs that can pass the first and fail this one
+    /// are [`EAST_ASIAN_WIDE_ONE_COLUMN`]'s — an East-Asian-Wide codepoint the
+    /// crate answers one for. `☷` (the trigram `outline` wore, three stacked
+    /// lines) and `☰` (`list_files`') were both in it: a standards-following
+    /// terminal paints them in two columns, so every cell of the row after the
+    /// mark is written a column right of where the grid put it, and the tail of
+    /// a long ask's measure landed on the conversation pane's own border, where
+    /// it stayed — ratatui's diff never repaints a cell whose model content did
+    /// not change — until a resize repainted everything.
+    ///
+    /// The gutter, the isolation mark and the diff's two signs are pinned here
+    /// beside the per-tool marks: a row paints them between the same cells.
+    #[test]
+    fn no_glyph_is_east_asian_wide() {
+        let mut glyphs: Vec<String> = vec![
+            Symbols::GUTTER_MARK.to_string(),
+            Symbols::GUTTER_PIPE.to_string(),
+            Symbols::SYMBOLS.isolated().to_string(),
+            Symbols::ASCII.isolated().to_string(),
+            Symbols::REMOVED.to_string(),
+            Symbols::ADDED.to_string(),
+        ];
+        for rung in [Symbols::SYMBOLS, Symbols::ASCII] {
+            glyphs.push(rung.mark("no_such_tool").to_string());
+            for tool in ToolName::ALL {
+                glyphs.push(rung.mark(tool.as_str()).to_string());
+            }
+        }
+        for glyph in glyphs {
+            for ch in glyph.chars() {
+                assert!(
+                    !the_terminal_disagrees(ch),
+                    "{ch:?} (U+{:04X}) in {glyph:?}: an East-Asian-Wide codepoint `unicode-width` \
+                     counts one column, so a terminal paints it two wide (or, a combining mark, \
+                     none) and every cell of the row after it is written a column off the grid — \
+                     a long ask's measure landing on the pane's border",
+                    u32::from(ch)
+                );
+            }
         }
     }
 

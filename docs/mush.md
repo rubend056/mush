@@ -788,12 +788,16 @@ cargo test`, `⌕ "held" crates`, `⤴ "held"`, `↳ #2 on mush/2`, `⧗` — so
 mark and the ask it made, and a result's payload
 stands at that mark's own width, so a call and its output read as one block.
 The table is the tool's: `read_file ▤`, `write_file ✎`, `edit_file ±`,
-`list_files ☰`, `search ⌕`, `usages ↥`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
-`control ⇄`, `wait ⧗`, `outline ☷`, and `⚙` for a name no tool answers to (the
+`list_files ▦`, `search ⌕`, `usages ↥`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
+`control ⇄`, `wait ⧗`, `outline ≣`, and `⚙` for a name no tool answers to (the
 model can invent one); each mark is one glyph and one space, and every glyph is
-one
-column, which is what lets a result — carrying a call's id and not its tool's
-name — paint its payload under a blank of the same width. A name no tool
+one column to the terminal as well as to the layout. No mark is an
+East-Asian-Wide codepoint, which a terminal paints two columns wide while the
+row measured one — the trigrams `☷` and `☰`, `outline`'s and `list_files`'
+first marks, did exactly that, and the tail of a long ask's measure sat on the
+conversation pane's border until a resize repainted the screen. That one column
+is what lets a result — carrying a call's id and not its tool's name — paint
+its payload under a blank of the same width. A name no tool
 answers to keeps the generic mark *and* its own name — `⚙ frobnicate x` —
 because `⚙` alone would say nothing about a call mush has never heard of. A
 terminal whose

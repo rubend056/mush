@@ -8475,6 +8475,144 @@ mod tests {
         Shot { screen, cells }
     }
 
+    /// The cells a terminal would show somewhere other than the cell the frame
+    /// gave them: ratatui's diff, walked the way the crossterm backend writes
+    /// it, with the terminal's own width for each glyph.
+    ///
+    /// The backend skips the `MoveTo` for a cell that follows the one it last
+    /// wrote, so its idea of where the cursor is *is* the cell coordinates —
+    /// right only while a terminal takes as many columns for a glyph as
+    /// `unicode-width` gave it. Where it takes more (an East-Asian-Wide
+    /// codepoint `unicode-width` answers one for, `symbols`' own
+    /// `EAST_ASIAN_WIDE_ONE_COLUMN`), every cell written after that glyph in the
+    /// row lands off the column the frame gave it — and ratatui's diff never
+    /// repairs it, because the frame's own cell there did not change. That is
+    /// the stray the human saw: the tail of an `outline` row's measure standing
+    /// on the conversation pane's border until a resize repainted the screen.
+    ///
+    /// One string per drifted cell, `(x, y) symbol shows at (x, y)` — the cell
+    /// that lands first, and the first few after it.
+    fn terminal_drift(frame: &Buffer) -> Vec<String> {
+        let previous = Buffer::empty(frame.area);
+        let mut last: Option<(u16, u16)> = None;
+        let mut at = (0u16, 0u16);
+        let mut drift: Vec<String> = Vec::new();
+        for (x, y, cell) in previous.diff(frame) {
+            if !matches!(last, Some((lx, ly)) if x == lx + 1 && y == ly) {
+                at = (x, y);
+            }
+            last = Some((x, y));
+            if at != (x, y) && drift.len() < 8 {
+                drift.push(format!(
+                    "({x}, {y}) {symbol:?} shows at {at:?}",
+                    symbol = cell.symbol()
+                ));
+            }
+            let glyphs = cell.symbol();
+            let width = if glyphs.chars().any(symbols::the_terminal_disagrees) {
+                2
+            } else {
+                unicode_width::UnicodeWidthStr::width(glyphs)
+            };
+            at.0 = at.0.saturating_add(width as u16);
+        }
+        drift
+    }
+
+    /// Every cell of a painted frame lands in its own column on a terminal too,
+    /// not only in the model.
+    ///
+    /// `outline`'s mark used to be `☷` — East-Asian-Wide, so a terminal paints
+    /// it two columns wide where the grid measured one — and that is the whole
+    /// of the report: the row after the mark was written a column right, the
+    /// tail of the ask's measure standing on the pane's own border, where no
+    /// later frame repainted it (the model's cell there never changed) until a
+    /// resize. `terminal_drift` is the walk that sees it; the rows below carry
+    /// the calls the report named, in both of the layouts it saw them in — the
+    /// split every size paints to start with, and zen (`Ctrl-F`), where the
+    /// focused pane takes the whole screen.
+    #[test]
+    fn a_terminals_width_leaves_every_painted_cell_where_the_grid_put_it() {
+        let (mut app, _rx) = test_app("painted-columns");
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::user("look at scripts/loc_history.py"),
+        );
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![
+                    tool_call(
+                        "c1",
+                        "outline",
+                        serde_json::json!({"path": "scripts/loc_history.py"}),
+                    ),
+                    tool_call("c2", "list_files", serde_json::json!({"path": "scripts"})),
+                    tool_call(
+                        "c3",
+                        "read_file",
+                        serde_json::json!({
+                            "path": "scripts/loc_history.py",
+                            "offset": 1,
+                            "limit": 130
+                        }),
+                    ),
+                    tool_call(
+                        "c4",
+                        "run_command",
+                        serde_json::json!({
+                            "command": "time python3 scripts/loc_history.py 2>&1 | tail -6"
+                        }),
+                    ),
+                ]),
+                ..Message::assistant("")
+            },
+        );
+        let window: String = (1..=130)
+            .map(|n| format!("line {n:03} in the history's own column\n"))
+            .collect();
+        for (id, text) in [
+            (
+                "c1",
+                "scripts/loc_history.py — 456 lines; 15 definitions (textual, many languages, \
+                 best-effort — not a compiler's answer)"
+                    .to_string(),
+            ),
+            (
+                "c2",
+                "a.py\nb.py\nc.py\nd.py\ne.py\nf.py\ng.py\nh.py\ni.py\nj.py\nk.py\nl.py"
+                    .to_string(),
+            ),
+            (
+                "c3",
+                format!(
+                    "{}\n[mush: lines 1–130 of 456 — read on with offset=131]",
+                    window.trim_end()
+                ),
+            ),
+            ("c4", "[exit 0 after 4s]".to_string()),
+        ] {
+            app.chat
+                .push_message(AgentId::ROOT, Message::tool(id, text));
+        }
+        // The sizes the report named, split and zen: both layouts carry the same
+        // rows, and neither may put a cell where the terminal would not.
+        for zen in [false, true] {
+            if zen {
+                ctrl(&mut app, 'f');
+            }
+            for &(width, height) in &[(133u16, 45u16), (100u16, 28u16), (80u16, 24u16)] {
+                let (_, frame) = painted(&mut app, width, height);
+                let drift = terminal_drift(&frame);
+                assert!(
+                    drift.is_empty(),
+                    "{width}×{height} zen={zen}: a terminal would write cells off their columns:\n{}",
+                    drift.join("\n")
+                );
+            }
+        }
+    }
+
     /// The pane rects one frame derives, and whether the chat pane has a
     /// transcript at all. The zen view's claims are claims about these — "the
     /// focused pane took the width", "the box kept its rows" — so these tests
