@@ -20500,14 +20500,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The other run the sweep must leave alone, and the other half of the
-    /// human's report: a failure the run did not choose. The endpoint — or the
-    /// wire — ended it, and what its worktree holds is the only copy of the
-    /// context the human's next `control message` resumes with. A sweep that
-    /// took the checkout and the branch is what makes "it never existed" true,
-    /// and the resume then lands in the parent's checkout or nowhere. The retry
-    /// in `model.rs` covers the read-side failure that never began; this is the
-    /// failure it deliberately does not repeat.
+    /// The whole event, end to end, in the human's own words: *a child that
+    /// ran, failed on a transport error, and is then woken by a message resumes
+    /// in a worktree of its own with its context intact*. All three rungs are
+    /// here. The read-side failure that never began is asked again (`model.rs`,
+    /// the retry and its money line); the retry's own attempt dies mid-reply,
+    /// where A2 makes a failure final; the run fails, and the sweep must leave
+    /// its checkout alone — the endpoint, or the wire, ended it, and what the
+    /// worktree holds is the only copy of the context the resume carries. A
+    /// sweep that took the checkout and the branch is what makes "it never
+    /// existed" true, and the resume then lands in the parent's checkout or
+    /// nowhere.
     #[test]
     fn a_failed_run_keeps_the_worktree_its_resume_runs_in() {
         let root = init_git_repo("fail-keeps-worktree");
@@ -20519,9 +20522,15 @@ mod tests {
         let gate = Arc::new(Gate::new());
         let scripted = Arc::new(
             Scripted::new()
-                // The child's first request died on the wire after the request
-                // went out. `Transport` is final — nothing was retried — so the
-                // run really fails and its branch gains nothing.
+                // The child's first request died before the endpoint wrote a
+                // byte of a reply — the one read-side failure the retry asks
+                // again — and its retry died mid-reply, where A2 keeps the
+                // failure final. Two attempts, one logical call, and the run
+                // really fails: its branch gains nothing.
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("carry on"))
+                .fails(ModelError::Unanswered(
+                    "the endpoint dropped the connection before the reply began".into(),
+                ))
                 .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("carry on"))
                 .fails(ModelError::Transport(
                     "Connection reset by peer (os error 104)".into(),
@@ -20612,6 +20621,26 @@ mod tests {
                 )),
             "the root must be told the child failed: {:?}",
             events.events_for(AgentId::ROOT)
+        );
+
+        // The retry rung really ran: the first attempt was asked again — the
+        // line admits it may have been billed — and only the second, mid-reply,
+        // was final. One logical call, two attempts on the wire.
+        assert_eq!(
+            scripted
+                .asked()
+                .iter()
+                .filter(|asked| asked.depth() == Some(1) && !asked.saw("carry on"))
+                .count(),
+            2,
+            "the reply that never began is retried, and the one that died mid-reply is not"
+        );
+        assert!(
+            seen.notices.iter().any(|line| line
+                == "the endpoint dropped the connection before the reply began — \
+                    asking again (2/3); that attempt may have been billed"),
+            "the child is told what the lost attempt may have cost: {:?}",
+            seen.notices
         );
 
         // The failure did not settle the worktree: the branch it never
