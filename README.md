@@ -411,6 +411,7 @@ crates/mush-core/   pure domain: workspace, sessions, prompt, messages, config, 
 crates/mush/        the binary: TUI, agent actors, HTTP client
 scripts/smoke.py    end-to-end test that drives the real TUI over a pty
 scripts/screen.py   prints the painted screen as text at six terminal sizes
+scripts/loc_history.py draws the census's four LOC series by day, out of git history
 scripts/mock_llm.py scripted model server, kept for hand-driven runs (nothing in the repo calls it)
 docs/mush.md        the manual
 ```

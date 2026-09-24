@@ -1423,7 +1423,8 @@ them should ask rather than build.
   whole gate; they run on any POSIX machine with rust and python3 (the pty
   scenarios and several fixtures use a pty, `setsid` and `/proc`), so any POSIX
   CI can call them. `scripts/census.py` prints the production/test/comment
-  split.
+  split, and `scripts/loc_history.py` draws those four series by day out of git
+  history, one point per day's last commit (matplotlib, and only for the PNG).
 - **Screen review.** `scripts/screen.py` drives the real binary over a pty and
   prints the painted screen as text at 200×50 down to 30×8, which is how the ten
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
