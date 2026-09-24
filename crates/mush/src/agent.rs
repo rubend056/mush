@@ -8017,6 +8017,13 @@ fn read_ask(args: &Value, root: &Path) -> String {
 /// Nothing else qualifies the ask: case-insensitivity is `(?i)` inside the
 /// pattern, so the pattern shown is always the pattern matched, and the row
 /// carries no flag the call did not run under.
+///
+/// **The context is named, where the call asked for one** (`· context 2`): a
+/// windowed answer's payload holds a neighbour either side of every hit, and
+/// the row's own count is matches, so without the clause the ask of a windowed
+/// search and the ask of a bare one read alike. It is read from the call's own
+/// argument — the window the walk really ran under — and a call that asked for
+/// none (`context` absent, or zero) says nothing.
 fn search_ask(args: &Value, root: &Path) -> String {
     let pattern = args
         .get("pattern")
@@ -8028,7 +8035,12 @@ fn search_ask(args: &Value, root: &Path) -> String {
         (false, true) => format!("\"{pattern}\""),
         (false, false) => format!("\"{pattern}\" in {path}"),
     };
-    ask
+    let context = tools::arg_usize(args, "context", 0).unwrap_or(0);
+    if ask.is_empty() || context == 0 {
+        ask
+    } else {
+        format!("{ask} · context {context}")
+    }
 }
 
 /// A usages ask: the symbol alone, quoted — `"held"`, `"Type::method"`. There
@@ -8620,6 +8632,10 @@ fn list_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
 /// already in the ask), and a `+` on a count whose walk stopped at the search
 /// cap.
 ///
+/// The count is the payload's **match rows**, not its lines: with a `context`
+/// the payload carries a neighbour either side of a hit as `path-line- text`,
+/// and a window of two hits reads `2 hits` ([`search_hits`] owns the parse).
+///
 /// The *files* the hits landed in are not a clause here: the row's count is the
 /// payload's own and there is one of them, and the names are the details' job
 /// ([`search_details`]) — a second count beside the first read as a second
@@ -8642,11 +8658,14 @@ fn search_reading(ok: Option<&str>) -> (Option<CallOutcome>, Option<Measure>) {
         return (None, None);
     }
     let count = Count::Hits.label(hits);
-    let count = if text.contains("[mush: the first ") {
-        trimmed(count)
-    } else {
-        count
-    };
+    // The answer is the first N rows whichever cap said so: the walk's own note
+    // (`[mush: the first 200 rows …]`) or the result cap's marker, which is the
+    // note a cut payload loses — it closes the answer the cut shortened, and
+    // the marker `truncate_for_model` appends is what is left of it. Both are
+    // read here for `command_reading`'s reason ([`output_trimmed`]): the number
+    // that read as the whole would be the one lie this column may not print.
+    let capped = text.contains("[mush: the first ") || text.contains("[mush: output truncated at ");
+    let count = if capped { trimmed(count) } else { count };
     (
         None,
         Some(Measure {
@@ -8736,6 +8755,10 @@ fn usages_counts(text: &str) -> Option<(usize, usize)> {
 /// A miss has no names to give, and a hit line the reader cannot name a file
 /// from (a line the cap cut mid-match) is not a file to invent.
 ///
+/// The names come off the payload's **match rows**, one reading with the count
+/// above ([`search_hits`]): a context neighbour names no file of its own, and a
+/// neighbour whose text holds a `:12:` cannot be mistaken for a match row.
+///
 /// **A hoist**: the payload spells no total at all — the counts are derived
 /// from the match rows — and many rows collapse into the one row a reader wants
 /// before opening a file.
@@ -8812,34 +8835,84 @@ fn usages_details(ok: Option<&str>) -> Vec<String> {
 }
 
 /// The hits and the distinct files of a search's payload, in one walk: a hit is
-/// one non-empty match line, and a file is one distinct path among them, in
-/// sorted order so two readings of the same result read the same.
+/// one **match row**, and a file is one distinct path among them, in sorted
+/// order so two readings of the same result read the same.
+///
+/// A payload holds two row shapes ([`mush_core::workspace::Workspace::search`]):
+/// a match is `path:line: text` and a context neighbour is `path-line- text`.
+/// A row's own kind is the kind of its separator, and its separator is the
+/// leftmost one of either shape — so a neighbour is never counted as a hit, and
+/// a neighbour whose own text holds a `:12:` (a timestamp, a YAML `key: 12:`,
+/// a nested row) never names a file. The count is the matches the payload
+/// *shows*: the walk cap can cut a window, and then the `+` [`search_reading`]
+/// adds is the mark that says so, the same one a capped answer wears for the
+/// same reason.
 fn search_hits(text: &str) -> (usize, Vec<String>) {
-    let payload = payload(text);
-    let hits = payload.lines().filter(|line| !line.is_empty()).count();
-    let mut files: Vec<String> = payload
-        .lines()
-        .filter_map(match_file)
-        .map(str::to_string)
-        .collect();
+    let mut hits = 0;
+    let mut files: Vec<String> = Vec::new();
+    for row in payload(text).lines() {
+        if let Some((RowKind::Match, file)) = search_row(row) {
+            hits += 1;
+            files.push(file.to_string());
+        }
+    }
     files.sort_unstable();
     files.dedup();
     (hits, files)
 }
 
-/// The file a search match line names: `path:line: text`. The separator is the
-/// first `:` a line number follows — not the last one — because a path may hold
-/// a colon and a match line's own text may hold many.
-fn match_file(line: &str) -> Option<&str> {
+/// Which of a search row's two shapes the separator that ends its name is
+/// ([`search_row`]).
+enum RowKind {
+    Match,
+    Context,
+}
+
+/// A search row's kind and the file it names: `path:line: text` is
+/// `(Match, "path")` and `path-line- text` is `(Context, "path")`.
+///
+/// The separator is the **leftmost** one of either shape — not the last, and
+/// not the first of one shape — because a path may hold a colon and a row's own
+/// text may hold every shape there is: `covid-19-data.csv:3: x` is a match
+/// whose name holds `-19-`, `a.rs:1: b.rs:2: c` is a match whose own text looks
+/// like a row, and `notes.md-4- notes-2- see log:12: boom` is a neighbour whose
+/// text holds both an `-2- ` and a `:12:`. What precedes the row's separator is
+/// the name and nothing else; what follows it is text, and no text is ever read
+/// as either.
+///
+/// A candidate separator is only one when it is *closed* the way the walk
+/// closes it: a line number between the two separator bytes, and then a space
+/// — `:12: `, `-12- ` — or the payload's end, where [`payload`] trimmed an
+/// empty row's tail. The closing byte is a fact the walk always writes, and
+/// requiring it is what keeps a *name* that holds a `:12:` from reading as a
+/// row: without it the reader would take a position the walk never wrote a
+/// separator at.
+///
+/// The cost is a **name** that itself holds a whole *closed* separator before
+/// the walk's own: a file named `a-2- b.rs` reads as a neighbour of `a`, and
+/// one named `a:12: b.rs` as a match of `a`. A name holding the old reader's
+/// `:12:` is read correctly now — the closing space is a fact the walk writes,
+/// and requiring it narrows the guess to names that hold the shape *and* the
+/// space. The corpus in `a_windowed_search_is_read_by_its_match_rows` pins the
+/// boundary from both sides.
+fn search_row(line: &str) -> Option<(RowKind, &str)> {
     for (at, byte) in line.bytes().enumerate() {
-        if byte != b':' {
-            continue;
-        }
+        let (kind, closes) = match byte {
+            b':' => (RowKind::Match, b':'),
+            b'-' => (RowKind::Context, b'-'),
+            _ => continue,
+        };
         let rest = &line[at + 1..];
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && rest.as_bytes().get(digits) == Some(&b':') {
-            return Some(&line[..at]);
+        if digits == 0 || rest.as_bytes().get(digits) != Some(&closes) {
+            continue;
         }
+        // The byte the walk writes behind the closing separator: a space, or
+        // nothing at all where `payload` trimmed an empty row's own tail.
+        if !matches!(rest.as_bytes().get(digits + 1), None | Some(b' ')) {
+            continue;
+        }
+        return Some((kind, &line[..at]));
     }
     None
 }
@@ -15112,6 +15185,192 @@ mod tests {
             refused.text()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The digest reads a windowed search by its **match rows**: a `context`
+    /// neighbour is neither a hit nor a file, however its own text is spelled,
+    /// and neither reading — the measure or the details row — may be fooled by
+    /// one. The corpus is every row shape that has fooled a reader, through the
+    /// real walk and the real tool: each payload is asserted whole, and the
+    /// digest's ask, count and details follow it ([`search_hits`] is the one
+    /// reader both readings use).
+    ///
+    /// The last case is the other half of the rule: `context = 0` is still the
+    /// one-row answer this tool has always given, byte for byte, and its ask
+    /// names no window.
+    #[test]
+    fn a_windowed_search_is_read_by_its_match_rows() {
+        let (actor, _mailbox) = test_actor("search-rows");
+        let root = actor.ws.root().to_path_buf();
+        let write = |rel: &str, text: &str| fs::write(root.join(rel), text).unwrap();
+        // A path holding `-digits-`: `-19-` is not a neighbour's separator,
+        // because the walk's own closes with a space.
+        write("covid-19-data.csv", "a\nb\nx\n");
+        // A path holding `-digits-` and a dot: `-4.` is not one either.
+        write("webpack-4.config.js", "a\nb\nc\nd\ne\nf\ng\nh\ny\n");
+        // A neighbour whose own text holds an `-2- ` and a `:12:` (a log line),
+        // and a last neighbour that is empty after its separator — the row the
+        // payload's own trim leaves without its trailing space.
+        write("notes.md", "alpha\nnotes-2- see log:12: boom\nNEEDLE\n\n");
+        // The same empty neighbour *mid-payload*, where its separator keeps the
+        // space the walk writes.
+        write("gap.rs", "NEEDLE\n\nNEEDLE\n");
+        // A match whose own text looks like a row: its `b.rs:2:` is text, not a
+        // second separator.
+        write("a.rs", "b.rs:2: c\nnothing\n");
+        // A path that holds a colon.
+        write("weird:name.rs", "a\nb\nc\nx\n");
+        fs::create_dir_all(root.join("src")).unwrap();
+        // The root search's rows carry a path with a slash.
+        write("src/a.rs", "one\ntwo\nthree\n");
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // (the call, the payload the model reads, its ask, the hits, the files)
+        let cases: Vec<(Value, &str, &str, &str, &[&str])> = vec![
+            (
+                json!({ "pattern": "x", "path": "covid-19-data.csv", "context": 1 }),
+                "covid-19-data.csv-2- b\ncovid-19-data.csv:3: x",
+                "\"x\" in covid-19-data.csv · context 1",
+                "1 hit",
+                &["covid-19-data.csv"],
+            ),
+            (
+                json!({ "pattern": "y", "path": "webpack-4.config.js", "context": 1 }),
+                "webpack-4.config.js-8- h\nwebpack-4.config.js:9: y",
+                "\"y\" in webpack-4.config.js · context 1",
+                "1 hit",
+                &["webpack-4.config.js"],
+            ),
+            (
+                json!({ "pattern": "NEEDLE", "path": "notes.md", "context": 2 }),
+                "notes.md-1- alpha\nnotes.md-2- notes-2- see log:12: boom\nnotes.md:3: NEEDLE\n\
+                 notes.md-4- ",
+                "\"NEEDLE\" in notes.md · context 2",
+                "1 hit",
+                &["notes.md"],
+            ),
+            (
+                json!({ "pattern": "NEEDLE", "path": "gap.rs", "context": 1 }),
+                "gap.rs:1: NEEDLE\ngap.rs-2- \ngap.rs:3: NEEDLE",
+                "\"NEEDLE\" in gap.rs · context 1",
+                "2 hits",
+                &["gap.rs"],
+            ),
+            (
+                json!({ "pattern": "c", "path": "a.rs", "context": 1 }),
+                "a.rs:1: b.rs:2: c\na.rs-2- nothing",
+                "\"c\" in a.rs · context 1",
+                "1 hit",
+                &["a.rs"],
+            ),
+            (
+                json!({ "pattern": "x", "path": "weird:name.rs", "context": 1 }),
+                "weird:name.rs-3- c\nweird:name.rs:4: x",
+                "\"x\" in weird:name.rs · context 1",
+                "1 hit",
+                &["weird:name.rs"],
+            ),
+            (
+                json!({ "pattern": "three", "context": 1 }),
+                "src/a.rs-2- two\nsrc/a.rs:3: three",
+                "\"three\" · context 1",
+                "1 hit",
+                &["src/a.rs"],
+            ),
+            (
+                json!({ "pattern": "x", "path": "covid-19-data.csv", "context": 0 }),
+                "covid-19-data.csv:3: x",
+                "\"x\" in covid-19-data.csv",
+                "1 hit",
+                &["covid-19-data.csv"],
+            ),
+        ];
+        for (args, payload, ask, count, files) in cases {
+            let found = exec_tool(&actor, &mut state, ToolName::Search, &args, &cancel).unwrap();
+            assert_eq!(found, payload, "the payload of {args}");
+            let facts = digest(ToolName::Search, &args, Some(&found), &root);
+            assert_eq!(facts.ask, ask, "the ask of {args}");
+            assert_eq!(
+                facts.outcome, None,
+                "a hit's count is the measure's, not a verdict: {args}"
+            );
+            assert_eq!(
+                facts.measure.and_then(|measure| measure.count),
+                Some(count.to_string()),
+                "the measure of {args}"
+            );
+            assert_eq!(
+                facts.details,
+                vec![format!("{count} in {}", files.join(", "))],
+                "the details of {args}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A payload's own notes and a cut tail are not rows: the walk cap's note
+    /// is mush talking, and a row the result cap left without its separator is
+    /// not a match row the reader can back. Either cap makes the shown matches
+    /// a floor, and the `+` says so — the walk's own note, or the marker
+    /// `truncate_for_model` appends where the cut took that note away.
+    #[test]
+    fn a_search_count_is_its_match_rows_and_a_floor_when_a_cap_cut_them() {
+        // Two matches around three neighbours, the last an empty row the
+        // payload's own trim left without its space.
+        assert_eq!(
+            search_hits("a.rs:1: one\na.rs-2- two\na.rs:3: three\na.rs-4- "),
+            (2, vec!["a.rs".to_string()])
+        );
+        // A neighbour whose text holds a `-2- ` and a `:12:` is a neighbour.
+        assert_eq!(
+            search_hits("notes.md-2- notes-2- see log:12: boom\nnotes.md:3: NEEDLE"),
+            (1, vec!["notes.md".to_string()])
+        );
+        // The walk's note is not a row, and a row the cut left mid-name names
+        // no file and counts no hit.
+        assert_eq!(
+            search_hits(
+                "a.rs:1: one\nb.rs-2- two\n[mush: the first 200 rows — narrow the pattern, the \
+                 path, or the context]"
+            ),
+            (1, vec!["a.rs".to_string()])
+        );
+        assert_eq!(
+            search_hits("a.rs:1: one\nc.rs:2"),
+            (1, vec!["a.rs".to_string()])
+        );
+        let count = |result: &str| {
+            digest(
+                ToolName::Search,
+                &json!({ "pattern": "x" }),
+                Some(result),
+                Path::new("/w"),
+            )
+            .measure
+            .and_then(|measure| measure.count)
+        };
+        assert_eq!(
+            count("a.rs:1: one\nb.rs-2- two"),
+            Some("1 hit".to_string()),
+            "an uncapped answer's count is the whole"
+        );
+        assert_eq!(
+            count(
+                "a.rs:1: one\nb.rs-2- two\n[mush: the first 200 rows — narrow the pattern, the \
+                 path, or the context]"
+            ),
+            Some("1+ hit".to_string()),
+            "the walk's note says the count is a floor"
+        );
+        assert_eq!(
+            count(
+                "a.rs:1: one\nb.rs-2- two\n[mush: output truncated at 16000 bytes — rerun it \
+                 narrower (rg, head, a smaller path) to see the rest]"
+            ),
+            Some("1+ hit".to_string()),
+            "a cut answer's own marker is the witness the note left behind"
+        );
     }
 
     /// A tool call whose arguments the model sent as something other than JSON
