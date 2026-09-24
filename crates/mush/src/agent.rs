@@ -3451,13 +3451,17 @@ fn run_turns(
             Err(ModelError::Framing(error)) => {
                 return Err(reply_broke(&cfg.base_url, &error));
             }
-            // Unreachable, Unsent and Transport reach the human the same way;
-            // the difference is what happened before this point. An Unsent
-            // failure was retried — nothing of the request ever left mush, so
-            // repeating it was honest — while a Transport one was not, because
-            // the endpoint may already have received the request (finding A2).
+            // Unreachable, Unsent, Unanswered and Transport reach the human the
+            // same way; the difference is what happened before this point. An
+            // Unsent failure was retried — nothing of the request ever left
+            // mush, so repeating it was honest — and so was an Unanswered one,
+            // whose failing attempt may still have been billed and whose retry
+            // line said so. A Transport failure was not: the reply had begun,
+            // so the endpoint may already have received and answered the
+            // request (finding A2).
             Err(ModelError::Unreachable(error))
             | Err(ModelError::Unsent(error))
+            | Err(ModelError::Unanswered(error))
             | Err(ModelError::Transport(error)) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
@@ -4014,10 +4018,12 @@ fn compact_history(
         // A cancelled run is already ending; do not report a network failure.
         Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
         // The run will fail on its real request anyway; surface it. An
-        // `Unsent` failure got its retries here, the same as the run's own ask:
-        // compaction is a model call like any other (finding A2).
+        // `Unsent` or `Unanswered` failure got its retries here, the same as
+        // the run's own ask: compaction is a model call like any other
+        // (finding A2).
         Err(ModelError::Unreachable(error))
         | Err(ModelError::Unsent(error))
+        | Err(ModelError::Unanswered(error))
         | Err(ModelError::Transport(error)) => {
             return Err(format!("cannot reach {}: {error}", cfg.base_url));
         }
@@ -16146,6 +16152,38 @@ mod tests {
             usage[0],
             "the endpoint counted 9k prompt + 105 completion tokens this run (9.1k total)",
             "the fold's call is the run's largest, and its counts are the run's"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A failed attempt adds no tokens: the count is only ever reported from a
+    /// reply that arrived (`report_usage`'s one caller), so a run whose first
+    /// attempt died before the reply began — retried, and announced as possibly
+    /// billed — reports exactly the answering attempt's numbers, not a sum the
+    /// failure never earned.
+    #[test]
+    fn a_retried_unanswered_attempt_adds_no_tokens() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .fails_unanswered("the endpoint dropped the connection before the reply began")
+                .says("all done")
+                .with_usage(7, 5, 12),
+        );
+        let (actor, events, mailbox) =
+            scripted_actor_on_clock("usage-unanswered", &scripted, Arc::new(Advanceable::new()));
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("say hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("all done"), "the run carried on");
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0], "the endpoint counted 7 prompt + 5 completion tokens this run (12 total)",
+            "one attempt's numbers: the dead attempt reported nothing"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;

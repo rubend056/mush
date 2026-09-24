@@ -16,10 +16,13 @@
 //!
 //! A model call is also where the retry lives: [`retrying`] repeats a request
 //! that never left mush — the endpoint could not be dialled, or the write
-//! failed before the request was whole — and never one that may already have
-//! been received. The loop is driven by the caller, because the caller is the
-//! layer that holds the clock the backoff waits on, the cancel flag the human's
-//! Stop sets, and the agent whose transcript the retry is announced in.
+//! failed before the request was whole — and one that left whole but whose
+//! connection died before the reply began ([`ModelError::Unanswered`], whose
+//! line admits the attempt may have been billed), never one whose reply had
+//! already started: those bytes are paid for. The loop is driven by the caller,
+//! because the caller is the layer that holds the clock the backoff waits on,
+//! the cancel flag the human's Stop sets, and the agent whose transcript the
+//! retry is announced in.
 
 use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,17 +58,28 @@ pub enum ModelError {
     /// not resolve, a connect that is refused or times out, a TLS handshake
     /// that fails), or the write failed before the request was whole. No
     /// complete request ever arrived, so the endpoint has nothing to read, run
-    /// or charge for — the one failure [`retrying`] asks again, and the only
-    /// one it may (finding A2).
+    /// or charge for — one of the two failures [`retrying`] asks again, and the
+    /// only one a repeat cannot bill (finding A2).
     Unsent(String),
-    /// The wire failed under a request the endpoint may already have received:
-    /// a connection reset or dropped before the reply framed itself, an
-    /// unexpected end of stream, a read that timed out, a chunked body whose
-    /// stream ended inside it. Final, never retried: once the last byte of the
-    /// request has left mush, the endpoint may have read it, run it and charged
-    /// for it, and a second send is a question the human pays for twice
-    /// (finding A2). The call ends naming the endpoint, and the human can ask
-    /// again deliberately.
+    /// The request went out whole, but the connection died before the reply
+    /// began: not one byte of a reply arrived, so the endpoint handed mush
+    /// nothing of an answer — the *other* class [`retrying`] asks again, and
+    /// the reason is the measurement (zero reply bytes), not the error kind,
+    /// which a reset that lands mid-reply shares. The attempt may still have
+    /// been billed: the endpoint can have read, run and charged for the request
+    /// before the connection died, which is what the retry line says
+    /// (finding A2).
+    Unanswered(String),
+    /// The wire failed after the reply began, under a request the endpoint may
+    /// already have received: a connection reset or dropped before the reply
+    /// framed itself, an unexpected end of stream, a read that timed out, a
+    /// chunked body whose stream ended inside it. Final, never retried: reply
+    /// bytes arrived, so the endpoint answered something, those bytes may
+    /// already have been paid for, and a second send is a question the human
+    /// pays for twice (finding A2). The call ends naming the endpoint, and the
+    /// human can ask again deliberately. A connection that died *before* the
+    /// reply began is [`ModelError::Unanswered`] instead: no byte of an answer
+    /// was used, and that one is asked again.
     Transport(String),
     /// The reply's framing broke before its body could be read: a status line
     /// or `Content-Length` that is not one, a chunk size that is not hex or
@@ -101,14 +115,18 @@ pub enum ModelError {
 /// lets a scripted client serve a whole tree.
 ///
 /// The one contract beyond the signature: a call that returns `Err` has handed
-/// the caller *nothing of a reply*. [`retrying`] reads that rule and
-/// [`ModelError::Unsent`] when it decides what may be asked again — a repeat can
-/// only duplicate work if part of the first reply was already used, or if the
-/// request may already have been received — so a client that ever streams a
-/// partial body must report a later failure as something that is never retried.
+/// the caller *nothing of a reply*. [`retrying`] reads that rule and the two
+/// markers when it decides what may be asked again: [`ModelError::Unsent`], a
+/// request that never left mush, and [`ModelError::Unanswered`], a connection
+/// that died before the reply began — neither hands the caller a reply byte, so
+/// a repeat can only duplicate or bill work if the request may already have
+/// been received, which is why the second's line says so. A client that ever
+/// streams a partial body must report a later failure as something that is
+/// never retried.
 /// `HttpModel` satisfies it by construction: it makes a `Response` only from a
-/// body that framed itself (finding B27), and it marks a request that never went
-/// out with [`http::is_unsent`].
+/// body that framed itself (finding B27), it marks a request that never went out
+/// with [`http::is_unsent`], and a connection that died before the reply began
+/// with [`http::is_unanswered`].
 pub trait ModelClient: Send + Sync {
     /// `cancel` is the flag the human's Stop sets; the call must notice it
     /// while it waits, not only once the endpoint has answered.
@@ -171,6 +189,17 @@ impl ModelClient for HttpModel {
             Err(error) if http::is_unsent(&error) => {
                 return Err(ModelError::Unsent(error.to_string()))
             }
+            // The request went out whole and the connection died before the
+            // reply began: not one byte of an answer arrived, so there is no
+            // partial reply for a repeat to duplicate — the one read-side
+            // failure that may be asked again. Asked by the marker, not the
+            // kind: the same `ConnectionAborted`/`ConnectionReset` that arrives
+            // here also arrives *mid-reply*, where the bytes are already on
+            // their way to being billed and the failure is final. The retry
+            // line says the attempt may still have been billed (finding A2).
+            Err(error) if http::is_unanswered(&error) => {
+                return Err(ModelError::Unanswered(error.to_string()))
+            }
             // The reply's framing broke before its body was read: nothing of
             // the reply exists for this caller to have used — a `Response` is
             // only ever made from a body that framed itself — and `http`
@@ -211,25 +240,31 @@ impl ModelClient for HttpModel {
 
 /// Whether `error` is the wire failing rather than the endpoint answering: a
 /// connection reset or aborted, an end of stream where a reply should have
-/// been, a read that timed out — the failures of a request that had already
-/// been written, which is why every one of them is final.
+/// been, a read that timed out — the failures of a request whose reply may
+/// already have begun, which is why every one of them is final.
 ///
 /// What is *not* here is as deliberate: `InvalidData` is a refusal `http.rs`
-/// already classified, and `Interrupted` is how the cancel flag is reported. A
-/// request that never left mush has its own class too ([`ModelError::Unsent`])
-/// and is the one asked again, through the marker `http.rs` raises for it rather
-/// than through this kind — the kind alone cannot tell a reset while writing
-/// (nothing was handed over) from one while reading (the request may already be
-/// on its way to being answered). A reply whose *framing* broke is its own class
-/// as well ([`ModelError::Framing`]). A signal that interrupted a read or a
-/// write — the human resizing the terminal — was already made again inside
+/// already classified, and `Interrupted` is how the cancel flag is reported. The
+/// two classes that *are* asked again have their own markers too:
+/// [`ModelError::Unsent`] (a request that never left mush) and
+/// [`ModelError::Unanswered`] (a request that left whole but whose connection
+/// died before one byte of the reply arrived) — the kind alone cannot tell a
+/// reset while writing (nothing was handed over) from one before the reply
+/// began (nothing came back) from one that landed mid-reply (an answer is
+/// already on its way, and is final). A reply whose *framing* broke is its own
+/// class as well ([`ModelError::Framing`]). A signal that interrupted a read or
+/// a write — the human resizing the terminal — was already made again inside
 /// `http.rs`, so the interrupt itself never reaches this classifier (finding
 /// B25); the only `Interrupted` that arrives here is a decision, and a
 /// cancellation is never retried. The remaining kinds — `InvalidInput` from a
 /// URL mush cannot parse, whatever a config cell would not say — are the
 /// request mush cannot even ask, and are final for the same reason a repeat
 /// would ask the same broken question.
-fn transport(error: &io::Error) -> bool {
+///
+/// `pub(crate)` so `http.rs`'s own tests can pin that a mid-reply death is
+/// classified here and a pre-reply one is not ([`ModelError::Unanswered`]):
+/// the two say opposite things and share their kinds.
+pub(crate) fn transport(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         ErrorKind::ConnectionReset
@@ -280,20 +315,26 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 /// `announce`, so the human reads `Connection refused (os error 111) — retrying
 /// (2/3)` in the transcript instead of watching a spinner that looks stuck.
 ///
-/// One failure is repeated: a [`ModelError::Unsent`] one. It means the request
-/// never left mush — the endpoint could not be dialled, or the write failed
-/// before the request was whole — so nothing complete was ever handed to the
-/// endpoint and a repeat cannot duplicate or bill anything. Everything else is
-/// final, and deliberately: once the last byte of the request has left mush,
-/// the endpoint may already have read it, run it and charged for it, and a
-/// second send is a question the human pays for twice (finding A2). A
-/// [`ModelError::Transport`] failure (a connection that dropped, a read that
-/// timed out, a body cut in half), a [`ModelError::Framing`] one, a
-/// cancellation, a status the endpoint chose (4xx *and* 5xx: an answer is not a
-/// hiccup, and the 400 that teaches mush a smaller window already has exactly
-/// one retry of its own in the run loop), a refusal (a reply past one of
-/// `http.rs`'s caps) and a body that arrived and did not parse are all returned
-/// at once, unchanged, with the endpoint named by the caller.
+/// Two failures are repeated, and each is announced in its own words. A
+/// [`ModelError::Unsent`] one means the request never left mush — the endpoint
+/// could not be dialled, or the write failed before the request was whole — so
+/// nothing complete was ever handed to the endpoint and a repeat cannot
+/// duplicate or bill anything. A [`ModelError::Unanswered`] one means the
+/// request went out whole and the connection died before the reply began: not
+/// one byte of an answer arrived, so there is no partial reply a repeat could
+/// duplicate — but the attempt *may already have been billed*, because the
+/// endpoint can have read, run and charged for the request before its
+/// connection died, and the line says so rather than letting a human believe a
+/// retry was free. A [`ModelError::Transport`] failure that arrived *mid-reply*
+/// — a connection that dropped, a read that timed out, a body cut in half —
+/// stays final: those bytes were already paid for, and a second send is a
+/// question the human pays for twice (finding A2). Everything else is final
+/// too, and deliberately: a [`ModelError::Framing`] one, a cancellation, a
+/// status the endpoint chose (4xx *and* 5xx: an answer is not a hiccup, and the
+/// 400 that teaches mush a smaller window already has exactly one retry of its
+/// own in the run loop), a refusal (a reply past one of `http.rs`'s caps) and a
+/// body that arrived and did not parse are all returned at once, unchanged,
+/// with the endpoint named by the caller.
 ///
 /// Worst case: [`RETRY_ATTEMPTS`] attempts, all inside the one `timeout` (each
 /// is given only what is left of it), plus a backoff spent from the same
@@ -325,13 +366,21 @@ pub fn retrying<T>(
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        // A failure before the request was handed over, and only that one: no
-        // complete request ever reached the endpoint, so asking again cannot
-        // duplicate or bill anything. Anything else — a failure after the
-        // write, a cancellation, the endpoint's own verdict, a refusal, a body
-        // that did not parse — is final (finding A2).
-        let message = match &error {
-            ModelError::Unsent(message) => message.clone(),
+        // Two failures are handed another attempt: a request that never left
+        // mush, whose repeat cannot duplicate or bill anything, and a request
+        // that left whole but whose connection died before the reply began,
+        // whose repeat may still be billed — which its line says. Anything
+        // else — a failure after a reply byte arrived, a cancellation, the
+        // endpoint's own verdict, a refusal, a body that did not parse — is
+        // final (finding A2).
+        let line = match &error {
+            ModelError::Unsent(message) => {
+                format!("{message} — retrying ({}/{RETRY_ATTEMPTS})", tries + 1)
+            }
+            ModelError::Unanswered(message) => format!(
+                "{message} — asking again ({}/{RETRY_ATTEMPTS}); that attempt may have been billed",
+                tries + 1
+            ),
             _ => return Err(error),
         };
         if tries == RETRY_ATTEMPTS {
@@ -347,10 +396,7 @@ pub fn retrying<T>(
         if left.is_zero() {
             return Err(error);
         }
-        announce(&format!(
-            "{message} — retrying ({}/{RETRY_ATTEMPTS})",
-            tries + 1
-        ));
+        announce(&line);
         wait(clock, cancel, tries, left)?;
         tries += 1;
     }
@@ -386,13 +432,14 @@ fn wait(
 }
 
 impl ModelError {
-    /// The same failure, saying how many times it was asked. Only the one
-    /// retryable class carries a count; every other error is returned from
+    /// The same failure, saying how many times it was asked. Only the
+    /// retryable classes carry a count; every other error is returned from
     /// [`retrying`] before this is reached.
     fn after_attempts(self) -> Self {
         let say = |message: String| format!("{message} — {RETRY_ATTEMPTS} attempts failed");
         match self {
             ModelError::Unsent(message) => ModelError::Unsent(say(message)),
+            ModelError::Unanswered(message) => ModelError::Unanswered(say(message)),
             other => other,
         }
     }
@@ -638,16 +685,28 @@ pub(crate) mod fake {
         }
 
         /// The next call fails before the request can go out — the endpoint
-        /// could not be dialled, or the write broke — the one class the retry
-        /// policy asks again (finding A2).
+        /// could not be dialled, or the write broke — one of the two classes
+        /// the retry policy asks again (finding A2).
         pub fn fails_unsent(mut self, message: &str) -> Self {
             self.script(Err(ModelError::Unsent(message.to_string())));
             self
         }
 
-        /// The next call fails the way the wire does *after* the request went
-        /// out: the endpoint may already have received it, so this class is
-        /// final and never asked again (finding A2).
+        /// The next call fails after the request went out whole but before the
+        /// reply began: the other class the retry policy asks again, and the
+        /// one whose line admits the attempt may still have been billed
+        /// (finding A2).
+        pub fn fails_unanswered(mut self, message: &str) -> Self {
+            self.script(Err(ModelError::Unanswered(message.to_string())));
+            self
+        }
+
+        /// The next call fails the way the wire does *after* the reply began:
+        /// the endpoint may already have received the request and answered
+        /// part of it, so this class is final and never asked again (finding
+        /// A2). A connection that dies before the reply begins is
+        /// [`ModelError::Unanswered`], the one read-side shape a repeat may
+        /// make.
         pub fn fails_transport(mut self, message: &str) -> Self {
             self.script(Err(ModelError::Transport(message.to_string())));
             self
@@ -1093,6 +1152,25 @@ mod tests {
         }
     }
 
+    /// End a test server's connection the way a peer going away does: the FIN
+    /// first, then read until the client hangs up. The drain matters, because a
+    /// bare close with request bytes unread is answered with an RST — and the
+    /// wire would then say `Connection reset by peer` where the test is about a
+    /// reply that never began. The timeout is the backstop for a client that
+    /// never hangs up at all.
+    fn fin_then_drain(connection: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+
+        let _ = connection.shutdown(std::net::Shutdown::Write);
+        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut drain = [0u8; 1024];
+        while let Ok(read) = connection.read(&mut drain) {
+            if read == 0 {
+                break;
+            }
+        }
+    }
+
     /// The human's line, on the whole road: an endpoint that closes the
     /// connection it had answered on — a keep-alive timeout, the ordinary way —
     /// must not cost a retry when the next call runs. `http.rs` sees the close
@@ -1372,6 +1450,73 @@ mod tests {
         );
     }
 
+    /// The other class the retry policy asks again, in its own words: a request
+    /// that left whole but whose connection died before the reply began is
+    /// asked again, and the line admits the attempt may already have been
+    /// billed — the risk the measurement cannot rule out (finding A2).
+    #[test]
+    fn an_unanswered_connection_is_retried_until_the_model_answers() {
+        let hiccup = "the endpoint dropped the connection before the reply began: \
+                      Connection reset by peer (os error 104)";
+        let model = Arc::new(Scripted::new().fails_unanswered(hiccup).says("done"));
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let reply = called(&model, &clock, &AtomicBool::new(false), &log).unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "done");
+        assert_eq!(model.asked().len(), 2, "the request was really made twice");
+        assert_eq!(
+            retry_lines(&log),
+            vec![format!(
+                "{hiccup} — asking again (2/3); that attempt may have been billed"
+            )],
+            "the exact line: the shape, and the money it may have cost"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            RETRY_BACKOFF,
+            "and the backoff came through the clock seam"
+        );
+    }
+
+    /// Every attempt dies before the reply begins: the caller gets the class
+    /// back with its attempts named — never a `Transport` that would claim the
+    /// reply had begun when none did.
+    #[test]
+    fn unanswered_failures_on_every_attempt_name_the_attempts() {
+        let reason = "the endpoint dropped the connection before the reply began";
+        let model = Arc::new(
+            Scripted::new()
+                .fails_unanswered(reason)
+                .fails_unanswered(reason)
+                .fails_unanswered(reason),
+        );
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let error = called(&model, &clock, &AtomicBool::new(false), &log).unwrap_err();
+
+        assert_eq!(
+            model.asked().len(),
+            RETRY_ATTEMPTS,
+            "three attempts, no more"
+        );
+        match error {
+            ModelError::Unanswered(message) => assert_eq!(
+                message,
+                format!("{reason} — {RETRY_ATTEMPTS} attempts failed"),
+                "the original reason plus the count"
+            ),
+            other => panic!("an unanswered connection, not {other:?}"),
+        }
+        assert_eq!(
+            retry_lines(&log).len(),
+            RETRY_ATTEMPTS - 1,
+            "both retries were announced before giving up"
+        );
+    }
+
     /// A clock whose `sleep` is the human pressing Ctrl-C: the flag is set at
     /// the instant the pause begins, so the retry must not be made at all.
     struct CancelledDuringBackoff {
@@ -1533,6 +1678,190 @@ mod tests {
             server.join().unwrap(),
             1,
             "one logical call, one connection: the request went out whole"
+        );
+        assert!(retry_lines(&log).is_empty(), "and no retry was announced");
+    }
+
+    /// A connection that dies before the reply begins is the one read-side
+    /// failure a repeat may make: not one byte of the reply arrived, so there
+    /// is no partial answer a repeat could duplicate — only the chance the
+    /// endpoint already ran and billed the attempt, which the line says. The
+    /// first connection reads a whole request and then closes with nothing
+    /// written; the second answers it. A death *mid-reply* is the test below,
+    /// and stays final.
+    #[test]
+    fn a_connection_that_dies_before_the_reply_begins_is_asked_again() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        std::thread::spawn(move || {
+            // The first attempt: the whole request is read, then the endpoint
+            // closes without writing one byte. `fin_then_drain` makes that a
+            // clean FIN; a bare `drop` on unread request bytes would be an RST,
+            // and the wire would say `Connection reset by peer` where this test
+            // is about the peer that simply went away.
+            let Ok((mut connection, _)) = listener.accept() else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            read_whole_request(&mut connection);
+            fin_then_drain(&mut connection);
+
+            // The second attempt, the one the retry made: answered whole. The
+            // close after it is a bare `drop` like the keep-alive fixture's:
+            // the whole request was read, so it is a FIN and cannot discard the
+            // reply that was written and flushed first.
+            let Ok((mut connection, _)) = listener.accept() else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            read_whole_request(&mut connection);
+            let answer = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                answer.len()
+            );
+            let _ = connection.write_all(head.as_bytes());
+            let _ = connection.write_all(answer.as_bytes());
+            let _ = connection.flush();
+            drop(connection);
+        });
+
+        let cfg = ConfigHandle::own(mush_core::Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "test",
+            None,
+        ));
+        let model = HttpModel::new(cfg);
+        let cancel = AtomicBool::new(false);
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        let log = Recorder::new();
+
+        let reply = retrying(
+            crate::clock::system(),
+            CHAT_DEADLINE,
+            &cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |left| model.chat(&request, &cancel, left),
+        )
+        .unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "done");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "the retry dialled a second connection"
+        );
+        assert_eq!(
+            retry_lines(&log),
+            vec![
+                "the endpoint dropped the connection before the reply began — \
+                 asking again (2/3); that attempt may have been billed"
+                    .to_string()
+            ],
+            "the line names the shape and admits the bill"
+        );
+    }
+
+    /// The retry's boundary, from the other side: a connection that dies after
+    /// the reply began is final. Those bytes were already handed to mush's
+    /// parser — so the endpoint may already have billed them — and a repeat
+    /// would be a second question the human pays for. The peer answers a head
+    /// and part of its `Content-Length` body, then goes; a retry would dial at
+    /// once, and the accept loop counts every connection that ever arrived.
+    #[test]
+    fn a_connection_that_dies_mid_reply_is_final_and_asked_once() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            // Long enough that a retry would have connected at once.
+            let until = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        accepted += 1;
+                        read_whole_request(&mut connection);
+                        // A head that promised 40 bytes, then eight of them:
+                        // the reply began, and ended mid-body.
+                        let _ = connection.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                              Content-Length: 40\r\n\r\n{\"choices\"",
+                        );
+                        let _ = connection.flush();
+                        fin_then_drain(&mut connection);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            accepted
+        });
+
+        let cfg = ConfigHandle::own(mush_core::Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "test",
+            None,
+        ));
+        let model = HttpModel::new(cfg);
+        let cancel = AtomicBool::new(false);
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        let log = Recorder::new();
+
+        let error = retrying(
+            crate::clock::system(),
+            CHAT_DEADLINE,
+            &cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |left| model.chat(&request, &cancel, left),
+        )
+        .unwrap_err();
+
+        match error {
+            ModelError::Transport(reason) => assert_eq!(
+                reason, "the body ended before its Content-Length",
+                "the wire failing after the reply began"
+            ),
+            other => panic!("a mid-reply death is the wire failing, not {other:?}"),
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "one logical call, one connection: the reply began, so nothing is sent twice"
         );
         assert!(retry_lines(&log).is_empty(), "and no retry was announced");
     }
