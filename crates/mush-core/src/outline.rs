@@ -39,7 +39,7 @@
 //! **The rule, exactly.** A line is a declaration when, after its leading
 //! whitespace, it opens with
 //!
-//! - a declaration keyword followed by a *name*: the union in [`KEYWORDS`] —
+//! - a declaration keyword followed by a *name*: the union in `KEYWORDS` —
 //!   Rust's `fn`, `struct`, `enum`, `trait`, `impl`, `const`, `static`, `type`,
 //!   `mod`, `union` and `macro`; Go's `func`, `type` and `var`; Python's,
 //!   Ruby's, Scala's and Groovy's `def`; JavaScript's, PHP's, Lua's and shell's
@@ -58,7 +58,7 @@
 //!   `async`, `unsafe`, `export`, `declare`, `public`, `private`, `protected`,
 //!   `internal`, `abstract`, `sealed`, `final`, `virtual`, `override`,
 //!   `partial`, `readonly`, `synchronized`, `native`, `inline`, `local`,
-//!   `mutable`, `extend`, `auto`, `default` — bounded by [`MAX_QUALIFIERS`],
+//!   `mutable`, `extend`, `auto`, `default` — bounded by `MAX_QUALIFIERS`,
 //!   because a line is not an invitation to loop. `const` is the delicate one:
 //!   before `fn` (or a further qualifier of one) it qualifies the function, and
 //!   anywhere else it *is* the declaration — that is what tells `const fn f`
