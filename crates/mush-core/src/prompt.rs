@@ -212,7 +212,7 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::Outline,
             "The definitions in one file, one row per declaration — `line  <that line, cut to a \
              width>` — so a file's shape can be read without spending the window on its text. \
-             Textual and Rust-first, best-effort: lines, not a compiler's answer, so \
+             Textual across many languages, best-effort: lines, not a compiler's answer, so \
              macro-generated items are invisible; a row is the file's own line, and doubles as \
              the anchor for read_file {offset} and edit_file {old_string}. A file with no \
              definitions answers with a sentence, not a refusal.",

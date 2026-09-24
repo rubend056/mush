@@ -8709,7 +8709,8 @@ mod tests {
         // reader has to trust most — the outline answer *is* lines of text, and
         // only the call's own arguments say it is not the file's window.
         let outline = format!(
-            "text.rs — 12 definitions; textual, Rust-first — not a compiler's answer ({})",
+            "text.rs — 12 definitions; textual, many languages, best-effort — not a compiler's \
+             answer ({})",
             "1 of 12 rows shown"
         );
         for (id, arguments, text) in [

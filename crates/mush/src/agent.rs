@@ -6450,10 +6450,11 @@ fn unbounded_read_lead(path: &str) -> String {
 ///
 /// The tool exists so a model can spend a screen on a file's shape instead of a
 /// window on its text. The answer says what it is on its own first line
-/// ([`mush_core::outline::Outline::header`]): a textual, Rust-first sketch and
-/// not a compiler's answer, so the model can price what it is reading. It takes
-/// no lock and runs no process, like every file tool, which is what makes it
-/// the sketch that still works while another sibling holds the machine.
+/// ([`mush_core::outline::Outline::header`]): a textual sketch across many
+/// languages and not a compiler's answer, so the model can price what it is
+/// reading. It takes no lock and runs no process, like every file tool, which
+/// is what makes it the sketch that still works while another sibling holds
+/// the machine.
 ///
 /// The result is capped but never gutted: [`mush_core::outline::Outline::render`]
 /// reserves the room its own closing notes need before it spends the rest on
@@ -9408,8 +9409,8 @@ mod tests {
                 ToolName::Outline,
                 json!({"path": "crates/mush-core/src/outline.rs"}),
                 "crates/mush-core/src/outline.rs — 812 lines; 37 definitions (textual, \
-                 Rust-first — not a compiler's answer)\n\n  3  pub fn is_declaration(line: &str) -> \
-                 bool {",
+                 many languages, best-effort — not a compiler's answer)\n\n  3  pub fn \
+                 is_declaration(line: &str) -> bool {",
                 "crates/mush-core/src/outline.rs",
                 None,
                 // An outline's count *is* its answer and the sketch's bytes are
@@ -9803,8 +9804,8 @@ mod tests {
     fn an_outline_with_nothing_to_sketch_is_not_a_failure() {
         let root = Path::new("/w");
         for result in [
-            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
-             answer); read_file shows the text",
+            "NOTES.md — 2 lines; no definitions (textual, many languages, best-effort — not a \
+             compiler's answer); read_file shows the text",
             "empty.rs is empty — there are no definitions to outline",
         ] {
             let facts = digest(
@@ -14285,7 +14286,7 @@ mod tests {
     }
 
     /// `outline` through the tool's own door: the header says what the answer
-    /// is (a textual, Rust-first sketch and not a compiler's), the rows are the
+    /// is (a textual sketch across many languages and not a compiler's), the rows are the
     /// declarations' lines with their numbers, and a file with nothing to
     /// sketch answers with a sentence that still names `read_file`.
     #[test]
@@ -14311,16 +14312,16 @@ mod tests {
         let sketched = call("lib.rs").unwrap();
         assert_eq!(
             sketched,
-            "lib.rs — 4 lines; 2 definitions (textual, Rust-first — not a compiler's \
-             answer)\n\n  2  pub fn a() {}\n  4  struct B;"
+            "lib.rs — 4 lines; 2 definitions (textual, many languages, best-effort — not a \
+             compiler's answer)\n\n  2  pub fn a() {}\n  4  struct B;"
         );
 
         fs::write(actor.ws.root().join("NOTES.md"), "# Notes\nprose.\n").unwrap();
         let prose = call("NOTES.md").unwrap();
         assert_eq!(
             prose,
-            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
-             answer); read_file shows the text"
+            "NOTES.md — 2 lines; no definitions (textual, many languages, best-effort — not a \
+             compiler's answer); read_file shows the text"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -14358,8 +14359,8 @@ mod tests {
         let text: &str = &answered;
         assert!(
             text.starts_with(
-                "big.rs — 600 lines; 300 definitions (textual, Rust-first — not a compiler's \
-                 answer)"
+                "big.rs — 600 lines; 300 definitions (textual, many languages, best-effort — \
+                 not a compiler's answer)"
             ),
             "the same header the outline tool prints: {text}"
         );

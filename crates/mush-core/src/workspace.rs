@@ -4232,7 +4232,10 @@ mod tests {
     /// nothing, and a TOML `type = "lib"` finds nothing (the keyword must be
     /// followed by a name, not by `=`); but a markdown code fence whose line
     /// *opens* with `fn sample() {}` is a row, because the rule reads lines and
-    /// the answer says on its own first line that it is not a compiler's.
+    /// the answer says on its own first line that it is not a compiler's. A
+    /// Python file is the other half of that reading: the predicate takes a line
+    /// and no path, so its keywords are a union over the world's languages, and
+    /// a `def` is a row where a `fn` is one.
     #[test]
     fn the_outline_road_answers_every_shape_a_path_can_have() {
         let ws = temp_workspace("outline-shapes");
@@ -4277,8 +4280,26 @@ mod tests {
         .unwrap();
         assert_eq!(
             ws.outline("lib.rs").unwrap().render(4_000, ""),
-            "lib.rs — 4 lines; 2 definitions (textual, Rust-first — not a compiler's \
-             answer)\n\n  2  pub fn a() {}\n  4  struct B;"
+            "lib.rs — 4 lines; 2 definitions (textual, many languages, best-effort — not a \
+             compiler's answer)\n\n  2  pub fn a() {}\n  4  struct B;"
+        );
+
+        // A Python file: the rule reads a line and no path, and its keywords
+        // are a union over languages — `class` and `def` are this file's
+        // declarations exactly as `struct` and `fn` are Rust's.
+        fs::write(
+            ws.root().join("handlers.py"),
+            "import json\n\n\nclass Handler:\n    def handle(self, event):\n        return event\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ws.outline("handlers.py")
+                .unwrap()
+                .definitions()
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["class Handler:", "    def handle(self, event):"]
         );
 
         // A markdown file: prose finds nothing, and the answer names the road
@@ -4287,8 +4308,8 @@ mod tests {
         fs::write(ws.root().join("NOTES.md"), "# Notes\nWe call fn things.\n").unwrap();
         assert_eq!(
             ws.outline("NOTES.md").unwrap().render(4_000, ""),
-            "NOTES.md — 2 lines; no definitions (textual, Rust-first — not a compiler's \
-             answer); read_file shows the text"
+            "NOTES.md — 2 lines; no definitions (textual, many languages, best-effort — not a \
+             compiler's answer); read_file shows the text"
         );
         fs::write(
             ws.root().join("SNIPPET.md"),
