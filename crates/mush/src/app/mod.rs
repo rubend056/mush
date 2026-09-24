@@ -1394,8 +1394,14 @@ impl App {
     /// ([`Self::vet_stored_agents`], called from `App::new` before the sweep),
     /// so the rows arrive parents first and whole.
     ///
-    /// A restored agent whose worktree is gone continues in the main checkout,
-    /// which is where its work ended up once it was merged.
+    /// A restored agent comes back where it worked. An isolated one gets its
+    /// checkout back — on its branch while git still has it, and *rebuilt* at
+    /// the root's `HEAD` when git no longer does, which is exactly what a
+    /// failure's own end reaps and what used to leave the wake with nowhere to
+    /// run; only a repository git cannot branch from leaves the actor refusing,
+    /// and never with the parent's checkout as a fallback. A settled agent has
+    /// no branch in the stored file, so its row continues in the main checkout,
+    /// where its work ended up once it was merged.
     ///
     /// The rows arrive parents first and whole ([`Self::vet_stored_agents`]): a
     /// child's completion reaches the parent's books because the parent's actor
@@ -1499,45 +1505,65 @@ impl App {
                     .note_cut_off_for(AgentId(agent.id), cut_off_notice(None));
                 cut_off.push((AgentId(agent.id), parent));
             }
-            let tx = agent::revive(
-                handles.clone(),
-                cfg.clone(),
-                ui_tx.clone(),
-                conversation,
-                root.clone(),
-                agent::ReviveSpec {
-                    id: agent.id,
-                    depth: agent.depth.max(1),
-                    brief: agent.brief.clone(),
-                    branch: branch.clone(),
-                    messages: agent.messages.clone(),
-                    // A restored child reports to the parent the tree names: its
-                    // row is on screen, the parent's books were seeded with it
-                    // (`seed_children`, below), and the human's own nudge
-                    // already tells that parent it is running
-                    // (`tell_parent_running`) — so the completion is the only
-                    // thing that can ever settle those books, and a child that
-                    // reported into a dead channel left a `wait` burning its
-                    // whole cap under a row that said `✓` (§8.39).
-                    //
-                    // The mailbox is read here, before the revive, because
-                    // `vet_stored_agents` hands the rows back parents first: a
-                    // parent is registered the moment its own actor is built,
-                    // so a nested child's parent is in the tree by the time
-                    // this runs, whether or not the file happened to write it
-                    // first. A parent with no actor of its own — a leftover
-                    // worktree found on disk — has none to give, and neither
-                    // has a parent the tree does not hold at all: an orphan
-                    // reports to an id, and the mailbox it finds missing is the
-                    // same absence, whose failed sends the UI delivers instead.
-                    //
-                    // What does *not* change is that no run starts: `revive`
-                    // ends in `start(_, _, false)`, and a restart is not a
-                    // request. This wires where a run would report, not that
-                    // one happens.
-                    parent: parent.and_then(|parent| self.tree.agent_tx.get(&parent).cloned()),
-                },
-            );
+            // A leftover row is work *found on disk*, and the branch is the
+            // only thing that can put a checkout back on it. [`agent::revive`]
+            // rebuilds a branch git no longer has at the root's `HEAD` — the
+            // rescue a stored child needs — but for a leftover that would
+            // fabricate a worktree the startup walk (`discover_worktrees`) then
+            // reads as work and keeps, so the row would outlive the work it
+            // claims (finding R16). A ghost leftover is therefore given no
+            // actor, exactly as a leftover the discover walk finds without one,
+            // and that walk reaps it with its chat record; a leftover git still
+            // has something of — the checkout itself, or the branch a checkout
+            // goes back on — is revived as any row is.
+            let work_on_disk = git::is_checkout(&git::worktree_path(&root, agent.id))
+                || branch
+                    .as_deref()
+                    .is_some_and(|branch| git::resolve(&root, branch).is_some());
+            let tx = if agent.leftover && !work_on_disk {
+                None
+            } else {
+                Some(agent::revive(
+                    handles.clone(),
+                    cfg.clone(),
+                    ui_tx.clone(),
+                    conversation,
+                    root.clone(),
+                    agent::ReviveSpec {
+                        id: agent.id,
+                        depth: agent.depth.max(1),
+                        brief: agent.brief.clone(),
+                        branch: branch.clone(),
+                        messages: agent.messages.clone(),
+                        // A restored child reports to the parent the tree names:
+                        // its row is on screen, the parent's books were seeded
+                        // with it (`seed_children`, below), and the human's own
+                        // nudge already tells that parent it is running
+                        // (`tell_parent_running`) — so the completion is the only
+                        // thing that can ever settle those books, and a child
+                        // that reported into a dead channel left a `wait` burning
+                        // its whole cap under a row that said `✓` (§8.39).
+                        //
+                        // The mailbox is read here, before the revive, because
+                        // `vet_stored_agents` hands the rows back parents first: a
+                        // parent is registered the moment its own actor is built,
+                        // so a nested child's parent is in the tree by the time
+                        // this runs, whether or not the file happened to write it
+                        // first. A parent with no actor of its own — a leftover
+                        // worktree found on disk — has none to give, and neither
+                        // has a parent the tree does not hold at all: an orphan
+                        // reports to an id, and the mailbox it finds missing is
+                        // the same absence, whose failed sends the UI delivers
+                        // instead.
+                        //
+                        // What does *not* change is that no run starts: `revive`
+                        // ends in `start(_, _, false)`, and a restart is not a
+                        // request. This wires where a run would report, not that
+                        // one happens.
+                        parent: parent.and_then(|parent| self.tree.agent_tx.get(&parent).cloned()),
+                    },
+                ))
+            };
             self.tree.register(Existing {
                 id: AgentId(agent.id),
                 parent,
@@ -1554,7 +1580,7 @@ impl App {
                 leftover: agent.leftover,
                 landed,
                 result_unread: agent.result_unread,
-                tx: Some(tx),
+                tx,
             });
             // What it said in the previous conversation is where it resumes.
             self.chat
@@ -3206,16 +3232,19 @@ impl App {
     }
 
     /// Why a message to `id` cannot run, if it cannot: its worktree is gone and
-    /// its branch went with it.
+    /// its branch went with it, and even a branch cannot be made.
     ///
     /// An isolated agent's directory can be taken away under a branch that
     /// stays — a hand-run `git worktree remove`, or the reclaim of a nested
     /// child whose branch `git branch -d` would not delete — and that is no
     /// longer a refusal: `agent::revive` (and the actor's own run start) puts
-    /// the checkout back on the branch (`git::worktree_restore`). What is still
-    /// refused is a branch git no longer has: there is nothing to run in, and
-    /// the words must not be allowed to land the child in the parent's checkout
-    /// instead.
+    /// the checkout back on the branch (`git::worktree_restore`). A branch git
+    /// no longer has is not one either: it is *rebuilt* at the root's `HEAD`,
+    /// with the checkout on it, which is the wake a failure's own end used to
+    /// orphan. What is still refused is a repository git cannot branch from at
+    /// all (`git::can_branch_from`) — there is nowhere to run and nothing to
+    /// make — and the words must not be allowed to land the child in the
+    /// parent's checkout instead.
     ///
     /// A landed agent is the other refusal, and it is the deliberate one: a
     /// merge, a discard, or a run that committed nothing is a settled worktree,
@@ -3243,9 +3272,12 @@ impl App {
         }
         if let Some(branch) = node.branch.as_deref() {
             if !git::checkout_restorable(self.ws.root(), id.0, branch) {
-                // The branch is gone with the worktree: the one state the gates
-                // still refuse (`agent::worktree_gone_line`). A branch git still
-                // has is a checkout the wake puts back, so it is not this.
+                // A repository git cannot branch from: no checkout on disk, no
+                // branch to put one back on, no branch to rebuild — the one
+                // state the gates still refuse (`agent::worktree_gone_line`). A
+                // branch git still has is a checkout the wake puts back, and a
+                // branch git no longer has is one *rebuilt* at the root's
+                // `HEAD`, so neither is this.
                 return Some(agent::worktree_gone_line(id.0));
             }
         }
@@ -3702,23 +3734,29 @@ impl App {
     /// so there is no worktree of its own; a hand-run `git worktree remove`
     /// leaves a branch that still names one, and the wake that puts the
     /// checkout back runs there (`git::worktree_restore`) — so the wire says
-    /// that path rather than the root the agent will not run in. Only a branch
-    /// git no longer has answers with the main checkout, the way the gates
-    /// refuse it (finding A8). The same question `worktree_gone` asks, answered
-    /// for the wire.
+    /// that path rather than the root the agent will not run in. A branch git no
+    /// longer has answers with `.mush/wt/<id>` too: the wake *rebuilds* the
+    /// branch and the checkout at the root's `HEAD` and runs there, so that is
+    /// where the agent will really work. Only a repository git cannot branch
+    /// from answers with the main checkout, the way the gates refuse it
+    /// (finding A8). The same question `worktree_gone` asks, answered for the
+    /// wire.
     fn attach_worktree(&self, id: AgentId) -> String {
         self.agent_root(id).display().to_string()
     }
 
     /// The root of the workspace an agent's own tools resolve paths in: its
-    /// worktree while git can still put one back, else the shared checkout.
+    /// worktree while git can still give it one, else the shared checkout.
     ///
     /// The same answer `agent::revive` gives the actor — a branch git still has
-    /// is a checkout away, and the workspace is built on it — so the UI and the
-    /// actor cannot disagree about what a workspace-relative path means to this
-    /// agent (finding S1's census). Two surfaces ask it: the roster's `worktree`
-    /// string, through [`Self::attach_worktree`], and the attach gate's copy of
-    /// a picture for an agent that works elsewhere ([`Self::carry_images`]).
+    /// is a checkout away, a branch git no longer has is *rebuilt* at the root's
+    /// `HEAD`, and the workspace is built on the checkout that comes back — so
+    /// the UI and the actor cannot disagree about what a workspace-relative path
+    /// means to this agent (finding S1's census). The one case that answers the
+    /// shared checkout is a repository git cannot branch from, which is the
+    /// wake's own refusal. Two surfaces ask it: the roster's `worktree` string,
+    /// through [`Self::attach_worktree`], and the attach gate's copy of a picture
+    /// for an agent that works elsewhere ([`Self::carry_images`]).
     fn agent_root(&self, id: AgentId) -> std::path::PathBuf {
         let path = git::worktree_path(self.ws.root(), id.0);
         let branch = self.tree.node(id).and_then(|node| node.branch.clone());
@@ -5185,10 +5223,32 @@ impl App {
     /// written from bytes the request will carry entire — never a prefix of
     /// one — and [`Workspace::save_pasted_image`] is handed `false` for its
     /// `cut_at_the_cap`.
+    ///
+    /// One root may not be openable at all: `.mush/wt/<id>` for a branch git no
+    /// longer has — the checkout a wake *builds*, which does not exist until
+    /// that wake runs ([`Self::agent_root`], `agent::revive`). That is a
+    /// directory about to be made, not a failure, so the copy goes through the
+    /// main checkout's workspace instead of refusing the paste. It is sound
+    /// because the picture's bytes ride inside the message
+    /// (`Message::content_parts`), not in the file: the receiving agent sees the
+    /// picture whatever workspace it runs in. A path the human named outside the
+    /// root is absolute, and that agent's own reader resolves it wherever it
+    /// runs; a relative copy under `.mush/paste/` is the placeholder's best
+    /// effort for a checkout that cannot hold a file written before it existed —
+    /// and a path that resolves nowhere is a smaller loss than a wake refused
+    /// over a directory that is about to exist.
     fn carry_images(&self, id: AgentId, images: Vec<Image>) -> Result<Vec<Image>, String> {
         let root = self.agent_root(id);
-        let ws =
-            Workspace::new(&root).map_err(|e| format!("cannot open {}: {e}", root.display()))?;
+        let opened = Workspace::new(&root);
+        let ws = match &opened {
+            Ok(ws) => ws,
+            // The checkout the wake builds: the copy goes through the main
+            // checkout's workspace, whose `.mush/paste/` is a directory that is
+            // really there. Every other failure is still the paste's own
+            // refusal, named with the root that would not open.
+            Err(_) if !root.exists() => &self.ws,
+            Err(error) => return Err(format!("cannot open {}: {error}", root.display())),
+        };
         images
             .into_iter()
             .map(|image| {
@@ -10364,16 +10424,19 @@ mod tests {
         }
     }
 
-    /// A stored branch whose branch is gone with its worktree is where the wake
-    /// must stop: an isolated agent never runs in the parent's checkout.
+    /// A stored branch whose branch is gone with its worktree is the human's
+    /// report, and the answer is now a rebuild: the wake re-creates `mush/2` at
+    /// the root's `HEAD`, makes the checkout on it, and runs there — never in
+    /// the parent's checkout.
     ///
-    /// The row keeps the branch it was spawned on — dropping it is what made
-    /// the child a writer in the root — and the refusal is the branch's absence,
-    /// not the directory's (`agent::worktree_gone_line`). The human's own words
-    /// are refused before they are sent, the root is untouched, and no request
-    /// is made at all.
+    /// The row keeps the branch it was spawned on (dropping it is what made the
+    /// child a writer in the root). The old answer refused the human's words
+    /// because a run would have recreated `.mush/wt/2` as a plain directory no
+    /// surface could see (finding S1); that premise is superseded — the checkout
+    /// is a real one git knows, on a branch git knows — and the refusal orphaned
+    /// exactly the context the wake carries.
     #[test]
-    fn a_restored_branch_whose_branch_is_gone_is_refused_not_run_in_the_root() {
+    fn a_restored_branch_whose_branch_is_gone_is_rebuilt_at_head_and_runs_there() {
         let root = repo("restore-dead-branch");
         ignore_worktrees(&root);
         let mut stored = stored_with_agent(
@@ -10382,7 +10445,7 @@ mod tests {
         );
         stored.agents[0].branch = Some("mush/2".to_string());
         let (port, asked) = recording_endpoint();
-        let (mut app, _rx) = app_root_at(
+        let (mut app, rx) = app_root_at(
             &root,
             Some(stored),
             session_save::fake::Recorder::new(),
@@ -10396,22 +10459,49 @@ mod tests {
             "the branch stays as the mark of where this agent worked"
         );
         assert!(
-            app.worktree_gone(AgentId(2))
-                .is_some_and(|line| line.contains("worktree is gone")),
-            "and the wake is refused in the branch's own words"
+            app.worktree_gone(AgentId(2)).is_none(),
+            "and the wake is not refused: a repository git can branch from has a checkout to build"
+        );
+
+        // The revive did the door work at startup, and its line — a message like
+        // any other — is what the pane reads.
+        while let Ok(msg) = rx.try_recv() {
+            app.update(msg);
+        }
+        let worktree = git::worktree_path(&root, 2);
+        assert!(
+            git::is_checkout(&worktree),
+            "the restore made a real checkout git knows"
+        );
+        assert_eq!(git::branch(&worktree).as_deref(), Some("mush/2"));
+        assert_eq!(
+            git_of(&worktree, &["rev-parse", "HEAD"]),
+            git_of(&root, &["rev-parse", "HEAD"]),
+            "the branch starts at the root's HEAD — the only base a revive has"
+        );
+        assert!(
+            app.chat
+                .transcript(AgentId(2))
+                .iter()
+                .any(|message| message.text() == "mush/2 re-created at HEAD"),
+            "the pane carries where the branch now stands: {:?}",
+            app.chat.transcript(AgentId(2))
         );
 
         app.tree.focus(AgentId(2));
         app.chat.insert("carry on");
         app.send_message();
+        let body = asked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the restored child runs");
         assert!(
-            asked.recv_timeout(Duration::from_millis(300)).is_err(),
-            "nothing runs — least of all in the parent's checkout"
+            body.contains(".mush/wt/2"),
+            "and it is told it works in the rebuilt checkout: {body}"
         );
         assert_eq!(
             git_of(&root, &["status", "--porcelain"]).unwrap_or_default(),
             "",
-            "and the parent's tree is untouched"
+            "the parent's tree is untouched"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -11267,6 +11357,72 @@ mod tests {
             .unwrap_or_else(|e| panic!("after the send, {}: {e}", sent.images[0].path))
             .expect("the sent path names an image in the child's workspace");
         assert_eq!(seen.bytes, sent.images[0].bytes);
+    }
+
+    /// A picture pasted for an agent whose checkout is *about to be built* is
+    /// still carried. `agent_root` answers `.mush/wt/<id>` for a branch git no
+    /// longer has — the checkout the wake rebuilds — and that directory does not
+    /// exist until the wake runs, so opening it would fail the paste over a
+    /// directory that is about to exist. The copy goes through the main
+    /// checkout's workspace instead, and the picture rides inside the message
+    /// whatever workspace the agent's own run ends up in.
+    #[test]
+    fn a_picture_carried_to_an_agent_whose_checkout_is_about_to_be_built_is_attached() {
+        let root = repo("carry-rebuild");
+        ignore_worktrees(&root);
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        let_the_model_see(&mut app);
+        // A child whose row names a branch and whose checkout is gone: what a
+        // hand-removal of a reaped branch's worktree leaves, before the wake
+        // that rebuilds it.
+        let (cmd, _mailbox) = crossbeam_channel::unbounded();
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "task 1".into(),
+                depth: 1,
+                branch: Some("mush/1".into()),
+                fork: None,
+                title: None,
+                cmd,
+            },
+        });
+        let worktree = git::worktree_path(&root, 1);
+        assert!(!worktree.exists(), "the checkout is not there yet");
+        assert!(
+            git::checkout_restorable(&root, 1, "mush/1"),
+            "but the wake will build it, so the paste must not be refused"
+        );
+        let outside = Scratch::new("carry-rebuild-outside");
+        let shot = outside.join("shot.png");
+        std::fs::write(&shot, png(64)).unwrap();
+
+        app.tree.focus(AgentId(1));
+        app.update(Msg::Paste(shot.display().to_string()));
+
+        let attached = app.chat.attachments();
+        assert_eq!(
+            attached.len(),
+            1,
+            "the picture attaches instead of failing on a directory about to exist: {:?}",
+            app.status_line()
+        );
+        assert_eq!(attached[0].bytes, png(64), "the human's own bytes ride");
+        // The copy is the main checkout's: the only workspace whose paste
+        // directory is really there. The bytes travel inside the message, which
+        // is what reaches the agent the wake is about to run.
+        assert!(
+            attached[0].path.starts_with(".mush/paste/"),
+            "the copy landed in the workspace that is there: {}",
+            attached[0].path
+        );
+        let (line, kind) = app.status_line().expect("a line about the attach");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(line.contains("Enter sends"), "and how to send it: {line}");
     }
 
     /// A FIFO named like the picture must not freeze the pane. The carry asks
@@ -20868,6 +21024,11 @@ mod tests {
     /// notices together, and this road dropped only the node — so an agent that
     /// no longer exists kept an id-keyed entry in every `Chat` map for the life
     /// of the session (finding R16).
+    ///
+    /// The reap must not be defeated by the revive `restore_agents` runs first:
+    /// a leftover is work *found on disk*, not a stored session, so its ghost is
+    /// given no actor and no branch is fabricated for it at the root's `HEAD` —
+    /// the walk below reads the repository as it is and takes the row with it.
     #[test]
     fn a_reaped_leftover_drops_its_chat_record() {
         use std::fs;
@@ -20895,6 +21056,10 @@ mod tests {
         assert!(
             !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
             "the pass reaped the leftover"
+        );
+        assert!(
+            git::resolve(&root, &git::branch_name(7)).is_none(),
+            "and no branch was fabricated at the root's HEAD for a row whose work git lost"
         );
         assert!(
             app.chat.transcript(AgentId(7)).is_empty(),
