@@ -12,7 +12,7 @@
 //! **The grid.** One reading of a pane's width, `width`:
 //!
 //! ```text
-//!   ⚙ status                                      → 3 agents · 1 job
+//!   ❯ cargo test                              → exit 0 · 41 lines
 //!   │←mark→│←  ask_w  →│←gap→│←  outcome_w    →│
 //!   0      2            arrow_x-2    arrow_x   width
 //! ```
@@ -120,9 +120,9 @@ impl Grid {
     }
 }
 
-/// One call's header: the mark and the name, the ask, and, where the result
-/// has landed, its outcome in the fixed grid above — one row where they share
-/// the pane, two where they do not ([`Grid::stacked`]).
+/// One call's header: the mark — which *is* the tool's name — the ask, and,
+/// where the result has landed, its outcome in the fixed grid above — one row
+/// where they share the pane, two where they do not ([`Grid::stacked`]).
 ///
 /// `mark` is the call's own — the tool's glyph and the space after it
 /// ([`crate::app::symbols`]) — and it is **measured**, not assumed: the ask's
@@ -212,14 +212,29 @@ fn outcome_row(grid: Grid, outcome: &CallOutcome) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The ask under its head: `▤ read_file src/a.rs 5→7`, and `◐ status` alone
-/// for the tools that take no arguments (`status`, `wait`).
+/// The ask under its head: `▤ src/a.rs 5→7`. The mark *is* the tool's name
+/// ([`crate::app::symbols`]), so a tool the table knows is not named again;
+/// the tools that take no arguments (`status`, `wait`) are their bare mark,
+/// `◐` or `⧗`. A name no tool answers to keeps the generic mark *and* its own
+/// name — `⚙ frobnicate x` — because `⚙` alone would say nothing about a call
+/// mush has never heard of.
 fn ask_text(call: &ToolCall, facts: &CallFacts, mark: &str) -> String {
-    if facts.ask.is_empty() {
-        format!("{mark}{}", call.function.name)
-    } else {
-        format!("{mark}{} {}", call.function.name, facts.ask)
+    let name = match mush_core::tools::ToolName::parse(&call.function.name) {
+        Some(_) => "",
+        None => call.function.name.as_str(),
+    };
+    // The mark carries its own trailing space, so a known tool's row joins the
+    // ask to it directly; only an invented name needs a space of its own before
+    // the ask.
+    let mut head = String::from(mark);
+    if !name.is_empty() {
+        head.push_str(name);
+        if !facts.ask.is_empty() {
+            head.push(' ');
+        }
     }
+    head.push_str(&facts.ask);
+    head
 }
 
 /// The style the ask (and the mark that leads it) is painted in: the tool-label
@@ -270,13 +285,13 @@ mod tests {
             // offset would compare the glyphs' own lengths instead of the ask's
             // column.
             let column = |row: &str| {
-                row.find("read_file")
+                row.find("src/a.rs")
                     .map(|at| UnicodeWidthStr::width(&row[..at]))
             };
             assert_eq!(
                 column(&wide),
                 column(&narrow).map(|at| at + 1),
-                "width {width}: the name stands one column later"
+                "width {width}: the ask stands one column later"
             );
             for row in [&narrow, &wide] {
                 assert!(
@@ -291,6 +306,47 @@ mod tests {
         read.details = vec!["of 812 lines".into()];
         assert_eq!(text(&details(&read, 60, "▤ ")[0]), "  of 812 lines");
         assert_eq!(text(&details(&read, 60, "▤▤ ")[0]), "   of 812 lines");
+    }
+
+    /// The mark *is* the tool's name: a call of a tool the table knows leads
+    /// with its mark and no repeated name (`▤ src/a.rs 5→7`), a call that takes
+    /// no arguments is its bare mark (`◐`, `⧗`), and a name no tool answers to
+    /// keeps the generic mark *and* its own name, because the glyph alone says
+    /// nothing about a call mush has never heard of.
+    #[test]
+    fn a_known_tool_is_its_mark_and_an_invented_name_keeps_both() {
+        let known = facts("src/a.rs 5→7", Some("3 lines"));
+        assert_eq!(
+            text(&header(&call("read_file"), &known, 60, "▤ ")[0]),
+            grid_row_text("▤ src/a.rs 5→7", "3 lines", 60),
+            "the mark is the name: `read_file` is not painted again"
+        );
+        let none = facts("", Some("2 agents · 1 job"));
+        assert_eq!(
+            text(&header(&call("status"), &none, 60, "◐ ")[0]),
+            grid_row_text("◐", "2 agents · 1 job", 60),
+            "a tool that takes no arguments is its bare mark"
+        );
+        let invented = facts("x", Some("error: no such tool"));
+        assert_eq!(
+            text(&header(&call("frobnicate"), &invented, 60, "⚙ ")[0]),
+            grid_row_text("⚙ frobnicate x", "error: no such tool", 60),
+            "an invented name keeps the generic mark and its own name"
+        );
+    }
+
+    /// One row as the grid lays it out: the ask, the gap to the arrow's own
+    /// column, and the outcome cut to its budget — what
+    /// [`a_known_tool_is_its_mark_and_an_invented_name_keeps_both`] reads
+    /// instead of spelling the spaces by hand.
+    fn grid_row_text(ask: &str, outcome: &str, width: usize) -> String {
+        let grid = Grid::of(width);
+        let gap = grid.arrow_x().saturating_sub(UnicodeWidthStr::width(ask));
+        format!(
+            "{ask}{}→ {}",
+            " ".repeat(gap),
+            truncate(outcome, grid.outcome_columns())
+        )
     }
 
     fn facts(ask: &str, outcome: Option<&str>) -> CallFacts {

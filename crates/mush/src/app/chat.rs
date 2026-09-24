@@ -44,7 +44,7 @@
 //! human's own words or the model's reply is folded to its kind's number of rows
 //! ([`Fold`], with the `…` row that says what is hidden), and the `Ctrl-O` view is
 //! the compact log: a tool's result at no rows at all — the call's own line,
-//! `▤ read_file src/a.rs → 3 lines`, is the event ([`crate::agent::digest`]) —
+//! `▤ src/a.rs → 3 lines`, is the event ([`crate::agent::digest`]) —
 //! and mush's reports and another agent's words at one row each, with a blank
 //! closing only
 //! the messages that painted words of their own. The foot is capped and counted.
@@ -991,27 +991,32 @@ pub struct Chat {
     pending: Option<String>,
     /// Whether the model's own reasoning is painted above the turn it decided.
     ///
-    /// A *view*, shown by default: the reasoning is already stored with the
-    /// turn in the session file and replayed to the endpoint (a thinking
+    /// A *view*, hidden when a chat opens: the reasoning is already stored with
+    /// the turn in the session file and replayed to the endpoint (a thinking
     /// endpoint refuses a replayed turn without it), so hiding it costs the
     /// conversation nothing — which is why `Ctrl-T` writes no notice and
-    /// touches no stored line. It lives here, beside the transcript it hides,
-    /// rather than in `App`, because every pane paints through this one
-    /// transcript and the choice is about the reading, not about the frame.
+    /// touches no stored line, and why the first frame mush paints is the dense
+    /// one: the rows are asked for rather than pushed away. It lives here,
+    /// beside the transcript it hides, rather than in `App`, because every pane
+    /// paints through this one transcript and the choice is about the reading,
+    /// not about the frame.
     reasoning: bool,
     /// Whether a pane paints the *shown* view — every block at its fold's
     /// number — rather than the compact log (`Ctrl-O`): one line per tool call,
     /// a report and another agent's words at one row each, and a result at none.
     ///
     /// A *view*, in the family of [`Self::reasoning`] and `App`'s zen
-    /// (`Ctrl-F`), and shown by default: `Ctrl-O` changes only what the panes
-    /// paint, so it is not said into the conversation and not stored — the rows
-    /// are still in the transcript and come back on the next press, and a
-    /// restart paints them again. It lives here, beside the transcript it
-    /// folds, for the same reason the reasoning view does: every pane paints
-    /// through this one `Chat`, so one flip is every pane's. The fold's own
-    /// rule — a failure is never what the fold gives up ([`Fold`]) — is what
-    /// keeps a hidden failure visible; this flag knows nothing about it.
+    /// (`Ctrl-F`), and **off** when a chat opens: a fresh mush starts in the
+    /// compact log, so `Ctrl-O`'s first press at launch is the one that brings
+    /// the rows back. `Ctrl-O` changes only what the panes paint, so it is not
+    /// said into the conversation and not stored — the rows are still in the
+    /// transcript and come back on the next press, and a restart opens compact
+    /// again, because it reads the launch default and never a remembered view.
+    /// It lives here, beside the transcript it folds, for the same reason the
+    /// reasoning view does: every pane paints through this one `Chat`, so one
+    /// flip is every pane's. The fold's own rule — a failure is never what the
+    /// fold gives up ([`Fold`]) — is what keeps a hidden failure visible; this
+    /// flag knows nothing about it.
     output: bool,
     /// The glyph rung every call's mark is painted through: the symbols the
     /// human's font can show, or the ascii rung for a terminal that cannot
@@ -1062,8 +1067,8 @@ impl Chat {
             workspace,
             revisions: HashMap::new(),
             pending: None,
-            reasoning: true,
-            output: true,
+            reasoning: false,
+            output: false,
             symbols: Symbols::from_env(),
             fold: Fold::DEFAULT,
         }
@@ -1086,11 +1091,13 @@ impl Chat {
         self.output
     }
 
-    /// `Ctrl-O`: show the compact log — a tool's result at no rows at all (the
-    /// call's own line is the event, and its outcome is read from the result's
-    /// own sentence), mush's own report about a child or a job and another
-    /// agent's words at one row each. The two states are two [`Fold`] values, so
-    /// the same key brings the rows back exactly as they were.
+    /// `Ctrl-O`: the compact log and back — a tool's result at no rows at all
+    /// (the call's own line is the event, and its outcome is read from the
+    /// result's own sentence), mush's own report about a child or a job and
+    /// another agent's words at one row each. A fresh chat already opens in the
+    /// compact log ([`Self::new`]), so at launch this key's first press is the
+    /// one that brings the rows back. The two states are two [`Fold`] values,
+    /// so the same key brings the rows back exactly as they were.
     ///
     /// A view, like [`Self::set_reasoning`]: not a change to the conversation
     /// and not a thing to say, and `clear` deliberately leaves it alone — the
@@ -1113,9 +1120,10 @@ impl Chat {
         self.symbols = symbols;
     }
 
-    /// The fold this conversation's panes paint through: the conversation's own
-    /// numbers, or the compact log's ([`Fold::compact`]) while the human has
-    /// asked for it ([`Self::set_output`]).
+    /// The fold this conversation's panes paint through: the compact log's
+    /// ([`Fold::compact`]) — the launch view — until the human asks for the
+    /// conversation's own numbers ([`Self::set_output`]), which is what
+    /// `Ctrl-O`'s first press at launch does.
     ///
     /// The one read for both roads that measure a block — the painter
     /// ([`Self::chunk`]) and the select mode's stop walk ([`Self::stops_at`]) —
@@ -3494,8 +3502,12 @@ pub struct Fold {
 }
 
 impl Fold {
-    /// The numbers a conversation opens with: eight rows for a result, a
-    /// report or a brief, and no bound for the reasoning.
+    /// The conversation's own numbers: eight rows for a result, a report or a
+    /// brief, and no bound for the reasoning. **Not the launch view** — a fresh
+    /// chat paints the compact log ([`Fold::compact`], [`Chat::new`]) — but the
+    /// numbers `Ctrl-O` puts back, which is why nothing may zero them: a human
+    /// who pressed the key to bring the rows back would then have none to come
+    /// back to.
     pub const DEFAULT: Fold = Fold {
         rows: [8, 8, 8, usize::MAX],
     };
@@ -3521,9 +3533,10 @@ impl Fold {
     /// never touches). The reasoning is deliberately untouched: it is not
     /// output, and `Ctrl-T` owns that block.
     ///
-    /// The same key brings the rows back because this is a value: the shown
-    /// state is [`Fold::DEFAULT`] and the compact one is this, and the view is
-    /// which of the two a pane paints ([`Chat::set_output`]).
+    /// This is the launch view: [`Chat::new`] paints it until the human asks
+    /// for the rows back. The same key brings them because this is a value: the
+    /// shown state is [`Fold::DEFAULT`] and the compact one is this, and the
+    /// view is which of the two a pane paints ([`Chat::set_output`]).
     pub fn compact(self) -> Self {
         self.with(Kind::Result, 0)
             .with(Kind::Mush, 1)
@@ -4498,7 +4511,10 @@ mod tests {
 
     /// A tool result is copied whole, byte for byte, including the lines the
     /// fold hides: the fold bounds the frame, not the transcript — and a
-    /// soft wrap would have eaten the tab or the indent.
+    /// soft wrap would have eaten the tab or the indent. The chat asks for the
+    /// shown view (`Ctrl-O`): a fresh chat opens in the compact log, where the
+    /// result paints no block at all and there is no row for the cursor to
+    /// stand on, let alone a hidden tail under one.
     #[test]
     fn a_tool_result_is_copied_byte_exact() {
         let result = (0..20)
@@ -4506,6 +4522,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
         chat.start_select(AgentId::ROOT);
         // The cursor starts on the newest line, so a shift-page back past the
@@ -4720,7 +4737,8 @@ mod tests {
     /// A line behind a folded result's cap still has a row to stand on — the `…`
     /// that hides it, which the frame clamps the cursor onto — and that row is
     /// the whole hidden tail's one stop: the copy takes every line it stands
-    /// for, because the fold is the pane's, not the transcript's.
+    /// for, because the fold is the pane's, not the transcript's. The chat asks
+    /// for the shown view: the compact log paints no row of a result at all.
     #[test]
     fn a_line_behind_a_tool_results_cap_stands_on_the_ellipsis() {
         let result = (0..12)
@@ -4728,6 +4746,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
         chat.start_select(AgentId::ROOT);
         // The pane's own measure first: that is where its cap falls, and the
@@ -4760,7 +4779,8 @@ mod tests {
     /// hides: from the result's last painted line, one `↓` reaches the elided
     /// stop (the cursor's own row is the `…`), the next `↓` is the following
     /// message's first line, and `↑` walks back the same way. Before this, a
-    /// 30-line result cost 22 `↓` presses on that same `…` row.
+    /// 30-line result cost 22 `↓` presses on that same `…` row. The chat asks
+    /// for the shown view: the launch compact log paints no result row.
     #[test]
     fn the_cursor_steps_over_an_elided_tail_in_one() {
         let result = (0..30)
@@ -4768,6 +4788,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
         chat.push_message(AgentId::ROOT, Message::assistant("after the result"));
         chat.start_select(AgentId::ROOT);
@@ -4818,7 +4839,8 @@ mod tests {
     /// `Enter` hands the writer every source line behind the `…`, in order and
     /// byte for byte — the message's own text, not the pane's screen — and the
     /// line mush says counts them. Before this, the same gesture copied the one
-    /// line the first `…` press landed on.
+    /// line the first `…` press landed on. The chat asks for the shown view:
+    /// the launch compact log paints no result row, and so no `…` either.
     #[test]
     fn shift_over_the_ellipsis_copies_the_whole_tail() {
         let result = (0..30)
@@ -4827,6 +4849,7 @@ mod tests {
             .join("\n");
         let message = Message::tool("call_1", &result);
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, message.clone());
         chat.push_message(AgentId::ROOT, Message::assistant("after the result"));
         chat.start_select(AgentId::ROOT);
@@ -5155,17 +5178,17 @@ mod tests {
             let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), width, 4));
             let label = rows
                 .iter()
-                .find(|row| row.contains("read_file"))
+                .find(|row| row.contains("crates/"))
                 .unwrap_or_else(|| panic!("no label at {width}: {rows:?}"));
             assert!(
                 UnicodeWidthStr::width(label.as_str()) <= width,
                 "a {width}-column pane painted {}: {label:?}",
                 UnicodeWidthStr::width(label.as_str())
             );
-            assert!(label.contains("read_file"), "the name stays: {label:?}");
+            assert!(label.starts_with("▤ "), "the mark is the name: {label:?}");
             assert!(
-                label.ends_with('…'),
-                "a cut path says so: {label:?} at {width}"
+                label.ends_with('…') || label.ends_with("file.rs"),
+                "a cut path says so, and one the pane can hold is whole: {label:?} at {width}"
             );
         }
 
@@ -5188,10 +5211,7 @@ mod tests {
             },
         );
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 4));
-        assert!(
-            rows.iter().any(|row| row == "▤ read_file src/a.rs"),
-            "{rows:?}"
-        );
+        assert!(rows.iter().any(|row| row == "▤ src/a.rs"), "{rows:?}");
     }
 
     /// The pane's row is made of the picture's own facts, and the size is one of
@@ -5369,11 +5389,15 @@ mod tests {
 
     /// The model's own reasoning is painted above the turn it decided, dim, with
     /// the mark on the first row only: the endpoint's `reasoning_content` was
-    /// already captured, stored and replayed, and no pane ever showed it.
+    /// already captured, stored and replayed, and no pane ever showed it. The
+    /// block is the human's `Ctrl-T` view — a fresh chat opens without it — so
+    /// the test asks for it, and
+    /// `a_fresh_chat_opens_compact_with_the_reasoning_hidden` pins what a chat
+    /// paints when nobody asks.
     #[test]
-    fn the_reasoning_is_shown_by_default_above_the_turn_it_decided() {
+    fn the_reasoning_is_painted_above_the_turn_it_decided() {
         let mut chat = Chat::bare();
-        assert!(chat.shows_reasoning(), "shown until the human hides it");
+        chat.set_reasoning(true);
         say(&mut chat, AgentId::ROOT, "make it faster");
         chat.push_message(
             AgentId::ROOT,
@@ -5414,15 +5438,126 @@ mod tests {
         assert_eq!(rows[mark].to_string().matches('⋯').count(), 1, "one mark");
     }
 
+    /// A fresh chat opens in the compact view: the model's reasoning hidden
+    /// (`Ctrl-T`'s block) and the output folded to the compact log's numbers
+    /// (`Ctrl-O`'s) — the first frame mush paints is the dense one, and the rows
+    /// are asked for rather than pushed away. Both keys still flip both ways,
+    /// and each leaves the other's view alone: they are two views of one
+    /// transcript, and neither touches the conversation.
+    #[test]
+    fn a_fresh_chat_opens_compact_with_the_reasoning_hidden() {
+        let mut chat = Chat::bare();
+        assert!(!chat.shows_reasoning(), "a fresh chat hides the reasoning");
+        assert!(
+            !chat.shows_output(),
+            "and paints the compact log, not the conversation's own numbers"
+        );
+
+        let call = mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "run_command".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+            },
+        };
+        say(&mut chat, AgentId::ROOT, "run the tests");
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                reasoning_content: Some("the log says enough".into()),
+                tool_calls: Some(vec![call]),
+                ..Message::assistant("")
+            },
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool("call_1", "test result: ok\n[exit 0]"),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::mush("#1 done: the parser is written"),
+        );
+        let pane = pane(AgentId::ROOT);
+        let fresh = shown(&pane_rows(&chat, &pane, 60, 12));
+
+        // The compact log: the call's own row carries the outcome, the result's
+        // payload is not painted, the report keeps its one row, and the
+        // reasoning — `Ctrl-T`'s block, not output — is no row at all.
+        assert!(
+            fresh.iter().any(|row| row.contains("→ exit 0 · 1 line")),
+            "the call's row carries its outcome: {fresh:?}"
+        );
+        assert!(
+            !fresh.iter().any(|row| row.contains("test result: ok")),
+            "the result's payload is folded away: {fresh:?}"
+        );
+        assert!(
+            !fresh.iter().any(|row| row.contains("the log says enough")),
+            "and the reasoning is hidden: {fresh:?}"
+        );
+        assert!(
+            fresh.iter().any(|row| row.contains("· #1 done:")),
+            "a report keeps its one row: {fresh:?}"
+        );
+
+        // `Ctrl-T`: the reasoning back, above the turn it decided, and the
+        // output fold exactly where it was — one view's key is not the other's.
+        chat.set_reasoning(true);
+        let with_reasoning = shown(&pane_rows(&chat, &pane, 60, 12));
+        assert!(
+            with_reasoning
+                .iter()
+                .any(|row| row.contains("the log says enough")),
+            "Ctrl-T shows the reasoning: {with_reasoning:?}"
+        );
+        assert!(
+            !with_reasoning
+                .iter()
+                .any(|row| row.contains("test result: ok")),
+            "and leaves the compact log folded: {with_reasoning:?}"
+        );
+        chat.set_reasoning(false);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 12)),
+            fresh,
+            "and the same key returns the first frame exactly"
+        );
+
+        // `Ctrl-O`: the rows back — the result's payload under the call's own
+        // row — and the same press returns the compact frame exactly.
+        chat.set_output(true);
+        let expanded = shown(&pane_rows(&chat, &pane, 60, 12));
+        assert!(
+            expanded.iter().any(|row| row.contains("test result: ok")),
+            "Ctrl-O brings the rows back: {expanded:?}"
+        );
+        chat.set_output(false);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 12)),
+            fresh,
+            "and the same key returns the compact frame exactly"
+        );
+    }
+
     /// `Ctrl-T` off is the whole block gone, and `Ctrl-N` keeps the choice: a
     /// view the human set is not a fact about the conversation, and a new chat
     /// they cannot read the way they just asked for is a preference the UI
-    /// forgot.
+    /// forgot. The kept choice is pinned *against the launch default*: the test
+    /// shows the reasoning a fresh chat opens without, and `clear` keeps the
+    /// shown view — a state a fresh chat does not open in.
     #[test]
     fn hiding_the_reasoning_paints_no_row_and_a_new_chat_keeps_the_choice() {
         let mut chat = Chat::bare();
         say(&mut chat, AgentId::ROOT, "make it faster");
         chat.push_message(AgentId::ROOT, thinking("done", "weighing the words"));
+        chat.set_reasoning(true);
+        assert!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 24, 5))
+                .iter()
+                .any(|row| row.contains("weighing the words")),
+            "shown after the human asks"
+        );
         chat.set_reasoning(false);
 
         assert!(!chat.shows_reasoning());
@@ -5431,23 +5566,24 @@ mod tests {
             vec!["you › make it faster", "", "mush › done"]
         );
 
+        chat.set_reasoning(true);
         chat.clear();
         assert!(
-            !chat.shows_reasoning(),
+            chat.shows_reasoning(),
             "the human's view outlives the chat it was set in"
         );
-        chat.set_reasoning(true);
-        assert!(chat.shows_reasoning());
     }
 
     /// A reasoning that trims to nothing costs no row at all: DeepSeek really
     /// returns `""` for a reply that did no thinking, and `None` is every other
     /// model's line — a bare `⋯ ` row would spend a row of the pane on most
-    /// turns of a long session and say nothing with it.
+    /// turns of a long session and say nothing with it. Shown, so the emptiness
+    /// is the block's own and not the launch view's.
     #[test]
     fn an_empty_reasoning_paints_no_row_at_all() {
         for reasoning in [None, Some(""), Some("   "), Some("\n\t ")] {
             let mut chat = Chat::bare();
+            chat.set_reasoning(true);
             say(&mut chat, AgentId::ROOT, "make it faster");
             chat.push_message(
                 AgentId::ROOT,
@@ -5466,10 +5602,13 @@ mod tests {
 
     /// A tool-call turn is a turn too, and its reasoning is the only place the
     /// model said why it is calling: the block is painted above the call rows,
-    /// and the turn's empty `content` paints no `mush › ` row above them.
+    /// and the turn's empty `content` paints no `mush › ` row above them. The
+    /// reasoning is `Ctrl-T`'s view and the launch one is off, so the test asks
+    /// for it.
     #[test]
     fn a_tool_call_turn_shows_its_reasoning_above_the_calls() {
         let mut chat = Chat::bare();
+        chat.set_reasoning(true);
         chat.push_message(
             AgentId::ROOT,
             Message {
@@ -5488,7 +5627,7 @@ mod tests {
         );
         assert_eq!(
             shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 2)),
-            vec!["  ⋯ read the file first", "▤ read_file src/a.rs"]
+            vec!["  ⋯ read the file first", "▤ src/a.rs"]
         );
     }
 
@@ -5546,10 +5685,12 @@ mod tests {
     /// one out of a log file. Neither reaches the terminal that paints the pane:
     /// the reply that erased the border, the OSC that set the window title and
     /// the CSI that wiped the frame are all just text now — and text that lost
-    /// its commands, not text that kept them.
+    /// its commands, not text that kept them. The result's payload is what this
+    /// reads, so the chat asks for the shown view: the compact log hides it.
     #[test]
     fn a_pane_paints_no_escape_sequence_and_no_carriage_return() {
         let mut chat = Chat::bare();
+        chat.set_output(true);
         say(&mut chat, AgentId::ROOT, "look at this");
         chat.push_message(
             AgentId::ROOT,
@@ -5595,7 +5736,7 @@ mod tests {
 
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
         assert!(!rows.contains('\x1b'), "{rows:?}");
-        assert!(rows.contains("▤ read_file src/"), "{rows:?}");
+        assert!(rows.contains("▤ src/"), "{rows:?}");
 
         // And a command whose argument carries an escape: the label keeps its
         // words and loses the sequence.
@@ -5617,16 +5758,19 @@ mod tests {
             },
         );
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
-        assert!(rows.contains("❯ run_command cat log"), "{rows:?}");
+        assert!(rows.contains("❯ cat log"), "{rows:?}");
     }
 
     /// A result that came back `error: …` is not a result. Painting it exactly
     /// like one left the word at the front as the only difference, so a call
     /// that was refused or failed — "this call was not run" — read as work that
-    /// happened.
+    /// happened. Both results are compared as painted rows, so the chat asks
+    /// for the shown view: the compact log paints the failure row and no row of
+    /// the success at all.
     #[test]
     fn a_failed_tool_result_is_not_painted_as_a_success() {
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(
             AgentId::ROOT,
             Message::tool(
@@ -7631,7 +7775,9 @@ mod tests {
     /// The human's ask: a child's or a job's report arriving in the parent's
     /// conversation folds like a command's result, through the one [`Fold`] —
     /// at most its number of rows, the `…` row saying how much is hidden — and
-    /// the select mode still hands out the report's own bytes.
+    /// the select mode still hands out the report's own bytes. The chat asks for
+    /// the shown view (`Ctrl-O`): the launch compact log keeps one row of the
+    /// report, which is not the fold this test is about.
     ///
     /// Before this, a report was a `user`-role line painted by `mark_rows`,
     /// which has no cap at all: the 25-line report below painted 26 rows,
@@ -7644,6 +7790,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::mush(report.clone()));
 
         // Eight wrapped rows, the `…` that stands for the rest; the pane trims
@@ -7790,8 +7937,11 @@ mod tests {
         );
 
         // And a child's failed report, painted through the pane the human
-        // reads: the fold rides on `Chat`, so this is the whole road.
+        // reads: the fold rides on `Chat`, so this is the whole road. The chat
+        // asks for the shown view, or the launch compact log would paint the
+        // report's one row from its own numbers and not the zero this is about.
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.fold = zero;
         chat.push_message(
             AgentId::ROOT,
@@ -7836,16 +7986,18 @@ mod tests {
         assert_eq!(shown(&reply)[0], "mush › line 0");
     }
 
-    /// The human's ask: a way out if all they want to see is the main model's
-    /// output. `Ctrl-O` hides the output rows — a tool's result and mush's own
+    /// `Ctrl-O` hides the output rows — a tool's result and mush's own
     /// report about a child — and leaves every other row exactly where it was.
-    /// The assistant's turn keeps its `mark name args` labels, so the human can
-    /// still see that a call happened, and there is no `…` left behind
-    /// counting what the pane no longer shows. The same key brings the same
-    /// rows back.
+    /// The assistant's turn keeps its call's own row — the mark that names the
+    /// tool and the ask it made — so the human can still see that a call
+    /// happened, and there is no `…` left behind counting what the pane no
+    /// longer shows. The same key brings the same rows back. The chat asks for
+    /// the shown view first: the compact log is what a fresh chat opens in, and
+    /// this test is about the toggle.
     #[test]
     fn ctrl_o_hides_and_shows_command_output() {
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(
             AgentId::ROOT,
             Message {
@@ -7877,7 +8029,7 @@ mod tests {
         let before_title = chat.painted(&pane, 60, 20).title;
         assert!(
             before.iter().any(|row| row.contains("test result: ok")),
-            "the result is shown by default: {before:?}"
+            "the result is painted in the shown view: {before:?}"
         );
         assert!(
             before.iter().any(|row| row.contains("· #1 done:")),
@@ -7890,7 +8042,7 @@ mod tests {
             hidden,
             vec![
                 "mush › running the tests".to_string(),
-                grid_row("❯ run_command cargo test", "exit 0 · 3 lines", 60),
+                grid_row("❯ cargo test", "exit 0 · 3 lines", 60),
                 String::new(),
                 "· #1 done: the parser is written".to_string(),
             ],
@@ -8102,8 +8254,8 @@ mod tests {
     /// outcome; and the two-row block exactly where the ask floor says.
     ///
     /// What it returns is the calls' own header rows, in transcript order — the
-    /// row each mark and name opens, and the row its arrow stands on — so the
-    /// two views can be compared on exactly the rows they share.
+    /// row each mark opens, and the row its arrow stands on — so the two views
+    /// can be compared on exactly the rows they share.
     fn check_matrix(
         rows: &[String],
         width: usize,
@@ -8121,12 +8273,11 @@ mod tests {
         let mut headers = Vec::new();
         let mut from = 0;
         for (tool, settled) in calls {
-            // The head is the mark and the *start* of the tool's name: at the
-            // ask floor the name itself is what the column cuts (`run_comma…`),
-            // so only the first eight columns are a call's identity at every
-            // width. The walk below is ordered, so two calls of one tool never
-            // read each other's row.
-            let head = format!("{}{}", symbols.mark(tool), &tool[..tool.len().min(8)]);
+            // The head is the mark alone: the mark *is* the tool's name
+            // ([`crate::app::symbols`]), so a call's identity on the row is its
+            // mark and the ask behind it. The walk below is ordered, so two
+            // calls of one tool never read each other's row.
+            let head = symbols.mark(tool).to_string();
             let ask = rows[from..]
                 .iter()
                 .position(|row| row.contains(&head))
@@ -8187,6 +8338,9 @@ mod tests {
         for symbols in [Symbols::SYMBOLS, Symbols::ASCII] {
             let (mut chat, calls) = matrix_chat();
             chat.set_symbols(symbols);
+            // The matrix reads both views and starts with the shown one; a fresh
+            // chat opens in the compact log, so ask for it.
+            chat.set_output(true);
             for width in 20..=200 {
                 let shown_rows = shown(&pane_rows(&chat, &pane, width, 400));
                 let shown_headers = check_matrix(&shown_rows, width, &calls, "shown", symbols);
@@ -8347,8 +8501,9 @@ mod tests {
     /// spoken.
     #[test]
     fn the_compact_log_is_one_row_per_tool_call() {
-        let mut chat = drawn_transcript();
-        toggle_output(&mut chat);
+        // No toggle: a fresh chat opens in the compact log, which is the view
+        // this test pins.
+        let chat = drawn_transcript();
         let pane = pane(AgentId::ROOT);
         let rows = shown(&pane_rows(&chat, &pane, 88, 60));
         // Every call's arrow stands at the same column — the pane's own outcome
@@ -8372,25 +8527,17 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                grid_row("◐ status", "2 agents · 1 job · 1 unread", 88),
-                grid_row("▤ read_file text.rs 1408→1530", "123 lines · 4 KB", 88),
+                grid_row("◐", "2 agents · 1 job · 1 unread", 88),
+                grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
+                grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
+                grid_row("± text.rs", "3 hunks", 88),
+                grid_row("❯ cargo test -p mush-core", "exit 0 · 41 lines · 5s", 88),
+                grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
+                grid_row("↳ table layout fixes", "#185 on mush/185", 88),
+                grid_row("⧗", "#185 done", 88),
+                grid_row("⧗", "user spoke", 88),
                 grid_row(
-                    "⌕ search \"column_widths\" in crates",
-                    "7 hits · 3 files",
-                    88
-                ),
-                grid_row("± edit_file text.rs", "3 hunks", 88),
-                grid_row(
-                    "❯ run_command cargo test -p mush-core",
-                    "exit 0 · 41 lines · 5s",
-                    88
-                ),
-                grid_row("❯ run_command cargo clippy --all-targets", "exit 101", 88),
-                grid_row("↳ spawn_agent table layout fixes", "#185 on mush/185", 88),
-                grid_row("⧗ wait", "#185 done", 88),
-                grid_row("⧗ wait", "user spoke", 88),
-                grid_row(
-                    "⇄ control #9 stop",
+                    "⇄ #9 stop",
                     "error: no such child agent #9 — status lists yours",
                     88
                 ),
@@ -8497,7 +8644,7 @@ mod tests {
             AgentId::ROOT,
             Message::user("do the thing\nand then the other"),
         );
-        toggle_output(&mut chat);
+        // No toggle: a fresh chat opens in the compact log this test is about.
         let pane = pane(AgentId::ROOT);
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 20)),
@@ -8532,17 +8679,18 @@ mod tests {
                 ..Message::assistant("")
             },
         );
-        toggle_output(&mut chat);
+        // No toggle: a fresh chat opens in the compact log, where one call is
+        // one row and the arrow's arrival is the whole difference.
         let pane = pane(AgentId::ROOT);
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 6)),
-            vec!["❯ run_command cargo test".to_string()],
+            vec!["❯ cargo test".to_string()],
             "a call with no result paints no arrow"
         );
         chat.push_message(AgentId::ROOT, Message::tool("c1", "ok\n[exit 0]"));
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 60, 6)),
-            vec![grid_row("❯ run_command cargo test", "exit 0 · 1 line", 60)],
+            vec![grid_row("❯ cargo test", "exit 0 · 1 line", 60)],
             "the result landed: the arrow is read from the message that carried it"
         );
     }
@@ -8560,38 +8708,33 @@ mod tests {
     /// rows and its blanks included.
     #[test]
     fn the_shown_view_keeps_its_rows_for_the_same_transcript() {
-        let chat = drawn_transcript();
+        let mut chat = drawn_transcript();
+        // The launch view is the compact log; this test is about the other one,
+        // so it asks for it.
+        chat.set_output(true);
         let pane = pane(AgentId::ROOT);
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 88, 400)),
             vec![
                 // The calls' own headers — the same rows the compact log paints,
                 // arrow and all — and the detail rows their results hold.
-                grid_row("◐ status", "2 agents · 1 job · 1 unread", 88),
+                grid_row("◐", "2 agents · 1 job · 1 unread", 88),
                 "  #1 running".to_string(),
                 "  #2 done".to_string(),
                 "  #c1 running".to_string(),
-                grid_row("▤ read_file text.rs 1408→1530", "123 lines · 4 KB", 88),
+                grid_row("▤ text.rs 1408→1530", "123 lines · 4 KB", 88),
                 "  of 9000 lines".to_string(),
-                grid_row("⌕ search \"column_widths\" in crates", "7 hits · 3 files", 88),
+                grid_row("⌕ \"column_widths\" in crates", "7 hits · 3 files", 88),
                 "  7 hits in crates/a.rs, crates/b.rs, crates/c.rs".to_string(),
-                grid_row("± edit_file text.rs", "3 hunks", 88),
-                grid_row(
-                    "❯ run_command cargo test -p mush-core",
-                    "exit 0 · 41 lines · 5s",
-                    88
-                ),
-                grid_row("❯ run_command cargo clippy --all-targets", "exit 101", 88),
-                grid_row("↳ spawn_agent table layout fixes", "#185 on mush/185", 88),
+                grid_row("± text.rs", "3 hunks", 88),
+                grid_row("❯ cargo test -p mush-core", "exit 0 · 41 lines · 5s", 88),
+                grid_row("❯ cargo clippy --all-targets", "exit 101", 88),
+                grid_row("↳ table layout fixes", "#185 on mush/185", 88),
                 "  mush/185 · .mush/wt/185".to_string(),
-                grid_row("⧗ wait", "#185 done", 88),
+                grid_row("⧗", "#185 done", 88),
                 "  from #185".to_string(),
-                grid_row("⧗ wait", "user spoke", 88),
-                grid_row(
-                    "⇄ control #9 stop",
-                    "error: no such child agent #9 — status lists yours",
-                    88
-                ),
+                grid_row("⧗", "user spoke", 88),
+                grid_row("⇄ #9 stop", "error: no such child agent #9 — status lists yours", 88),
                 String::new(),
                 // Each result at the fold's eight rows (or fewer, where the
                 // result is shorter), with the `…` where it runs on — and every
@@ -8665,10 +8808,13 @@ mod tests {
     /// `! error: …` row and a `#1 failed: …` report's first row are painted in
     /// both states, because a hidden failure would be a lie about what
     /// happened. They are painted *alone*: the log behind them is output, and
-    /// the hidden state has no `…` for it either.
+    /// the hidden state has no `…` for it either. The chat asks for the shown
+    /// view first — the compact log is the launch one — to pin the difference
+    /// the toggle makes.
     #[test]
     fn ctrl_o_never_hides_a_failure() {
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(
             AgentId::ROOT,
             Message::tool(
@@ -8719,7 +8865,8 @@ mod tests {
     /// The two states are the folded number and none, and the *shown* one is
     /// exactly the fold's own table: eight wrapped rows and the `…` for a long
     /// result, before and after the toggle — the key does not touch a number,
-    /// it only decides which state the pane paints.
+    /// it only decides which state the pane paints. The chat asks for the shown
+    /// view first: the compact log is what a fresh chat opens in.
     #[test]
     fn ctrl_o_keeps_the_folds_numbers_in_the_shown_state() {
         let many = (0..25)
@@ -8727,6 +8874,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
+        chat.set_output(true);
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &many));
         let pane = pane(AgentId::ROOT);
 
@@ -8754,7 +8902,8 @@ mod tests {
     /// around it, and the text is still in the transcript and comes back with
     /// the toggle. The failure row the fold keeps is one stop with no tail,
     /// because the `…` that would stand for the log behind it is not painted
-    /// either.
+    /// either. No toggle opens the view: a fresh chat opens in the compact log,
+    /// which is the hidden state this test walks.
     #[test]
     fn ctrl_o_leaves_no_stop_over_a_hidden_block() {
         let on = AgentId::ROOT;
@@ -8764,7 +8913,6 @@ mod tests {
             on,
             Message::tool("call_1", "a diff, one line\nthe rest of the log"),
         );
-        toggle_output(&mut chat);
         assert!(chat.start_select(on).is_none(), "the human's line stands");
         assert_eq!(
             chat.clamped_cursor(on),
@@ -8783,7 +8931,6 @@ mod tests {
             on,
             Message::tool("call_1", "error: the call was refused\nthe log line one"),
         );
-        toggle_output(&mut chat);
         let stops = chat
             .stops_at(on, 0, None)
             .expect("the failure row is a stop");

@@ -413,10 +413,13 @@ pub enum Intent {
     /// and, on the pane's own grid, what came back ([`crate::app::call_grid`])
     /// — with mush's own report about a child
     /// or a job and another agent's words at one row each, so only what was
-    /// actually spoken keeps whole words. A view in [`Intent::ToggleReasoning`]'s
+    /// actually spoken keeps whole words. The compact log is the launch view —
+    /// a fresh mush opens in it, so the key's first press at launch is the one
+    /// that brings the rows back. A view in [`Intent::ToggleReasoning`]'s
     /// sense: it is not said into the transcript and not stored, the rows are
-    /// still there and come back on the next press, and a restart paints them
-    /// again. The failure exemption is the fold's, not this key's: a failed
+    /// still there and come back on the next press, and a restart opens compact
+    /// again, the default rather than a remembered choice. The failure
+    /// exemption is the fold's, not this key's: a failed
     /// result's own row and a `#1 failed: …` report stay in both states.
     ToggleOutput,
     /// Show or hide the zen view: the focused pane takes the whole screen

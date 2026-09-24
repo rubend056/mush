@@ -13,7 +13,7 @@ and see what changed.
 │▶◐ #0 root  thinking 4s         ││you › rename the lexer module                                   │
 │   ◐ #1 lexer  mush/1 +12−3     ││                                                                │
 │   ✓ #2 docs  wrote README.md   ││mush › Starting with the rename.                                │
-│                                ││± edit_file src/lex.rs                     → 3 hunks            │
+│                                ││± src/lex.rs                               → 3 hunks            │
 │                                ││                                                                │
 │                                ││  edited src/lex.rs — 3 edits                                   │
 │                                ││                                                                │

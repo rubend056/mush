@@ -43,7 +43,7 @@ spec: the spec is the doc comments beside the code, written as the reason, and
   one *tool* road an image can travel by (§3).
 - mush holds **no file state**: agents read and write files directly, and the UI
   shows their tree, their transcripts, and the git facts.
-- The agent's system prompt and the ten schemas are
+- The agent's system prompt and the eleven schemas are
   `crates/mush-core/src/prompt.rs` (`RULES`, `DELEGATION`, `MACHINE`,
   `ROOT_ROLE`) and `crates/mush-core/src/tools.rs` (`TOOL_NAMES`).
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
@@ -529,7 +529,9 @@ not waited on. The bar says `copied 12 lines from #1's reply — 1,284 bytes` on
 the clipboard has taken the text.
 
 A thinking endpoint's own reasoning is painted above the turn it decided, dim and
-marked `⋯ `, one block per assistant turn. It is the endpoint's
+marked `⋯ `, one block per assistant turn — once `Ctrl-T` asks for it: mush
+opens with the reasoning hidden, and the key is how the block is read. It is the
+endpoint's
 `reasoning_content` for that turn and nothing else: it is already stored with the
 turn in `.mush/session.json` and replayed with it on the next request — a
 thinking endpoint refuses a replayed turn without it — so the block adds a *view*
@@ -537,7 +539,8 @@ of what the request already carries. `Ctrl-T` shows or hides it in every pane;
 the toggle writes nothing, sends nothing and is not stored, and a new chat keeps
 whatever the human chose. A reasoning that trims to nothing paints no row at all.
 
-`Ctrl-O` is the compact log: the conversation folded to one row per tool call.
+Mush opens in `Ctrl-O`'s compact log: the conversation folded to one row per
+tool call; the key brings the rows back, and a second press folds them away.
 The call's row is the *same row in both views* — the pane's call grid — and the
 compact log differs only in what follows it: a header, no details, no payload.
 
@@ -575,21 +578,28 @@ the model's reply, which the fold never touches. A message paints its closing
 blank only where it painted rows of its own, and in the compact log a turn whose
 only rows are its call lines paints no blank either, so consecutive command-only
 turns read as one dense list. Like `Ctrl-T` the key writes nothing and is not
-stored, and the same press brings every row back. Two rows stay in both states,
+stored, and the same press brings every row back — a restart opens compact
+again, because the launch view is the default and not a remembered one. Two rows
+stay in both states,
 because a hidden failure would be a lie about what happened: a failed result's
 own `! error: …` row and a `#1 failed: …` report.
 
-Each tool's call wears one glyph before its name — `▤ read_file`, `❯
-run_command`, `⌕ search`, `↳ spawn_agent`, `⧗ wait` — and a result's payload
+Each tool's call wears one glyph *instead of* its name — `▤ src/a.rs 5→7`, `❯
+cargo test`, `⌕ "held" crates`, `↳ #2 on mush/2`, `⧗` — so the row reads as the
+mark and the ask it made, and a result's payload
 stands at that mark's own width, so a call and its output read as one block.
 The table is the tool's: `read_file ▤`, `write_file ✎`, `edit_file ±`,
 `list_files ☰`, `search ⌕`, `run_command ❯`, `spawn_agent ↳`, `status ◐`,
-`control ⇄`, `wait ⧗`, and `⚙` for a name no tool answers to (the model can
-invent one); each mark is one glyph and one space, and every glyph is one
+`control ⇄`, `wait ⧗`, `outline ☷`, and `⚙` for a name no tool answers to (the
+model can invent one); each mark is one glyph and one space, and every glyph is
+one
 column, which is what lets a result — carrying a call's id and not its tool's
-name — paint its payload under a blank of the same width. A terminal whose
+name — paint its payload under a blank of the same width. A name no tool
+answers to keeps the generic mark *and* its own name — `⚙ frobnicate x` —
+because `⚙` alone would say nothing about a call mush has never heard of. A
+terminal whose
 encoding cannot be shown to carry UTF-8 gets the **ascii rung** instead: `R`,
-`W`, `E`, `L`, `?`, `$`, `+`, `S`, `!`, `.`, and `#` for an invented name, one
+`W`, `E`, `L`, `?`, `$`, `+`, `S`, `!`, `.`, `O`, and `#` for an invented name, one
 seven-bit mark per tool, so a font or a locale that mangles `⧗` still shows
 something for the wait. The rung is the locale's answer — the first non-empty
 of `LC_ALL`, `LC_CTYPE`, `LANG`, with `utf-8`/`utf8` anywhere in it (case-blind)
@@ -696,13 +706,13 @@ row painter, and a whole frame at 100×28 with one row per mark:
 │▶◐ #0 ✉2 root  thinking 4s      ││you › make the tree show every state                            │
 │   ⧗ #1  waiting on results 3s  ││                                                                │
 │     ◐ #2 tests                 ││mush › Spawning the children.                                   │
-│   ✗ #3 probe  no route to host ││↳ spawn_agent tests probe                  → #2 on mush/2       │
+│   ✗ #3 probe  no route to host ││↳ tests probe                              → #2 on mush/2       │
 │   ⊘ #4 run                     ││  mush/2 · .mush/wt/2                                           │
 │   ⚠ #5 build                   ││                                                                │
 │   ≡ #6 fold  compacting 2s     ││  spawned agent #2 on mush/2 at 3a1b2c3 · runs until it stops   │
 │   ✓ #7 ✉ docs  wrote README.md ││  calling tools · wait returns its summary                      │
 │   ✓ #8 ⚮  wrote src/lex.rs     ││                                                                │
-│                                ││⧗ wait                                     → #2 still running   │
+│                                ││⧗                                          → #2 still running   │
 │                                ││                                                                │
 │                                ││  wait timed out — #2 still running                             │
 │                                ││                                                                │
@@ -744,7 +754,8 @@ steer a run included: `⇄ #4 message "…"`). The transcript paints a call as i
 digest row — the ask the call really made (a read's window, a search's pattern,
 a command without its redundant `cd` or its output-shaping tail) and, at the
 pane's own outcome column, what came back: `▤ text.rs 1408→1530    → 123 lines ·
-4 KB` — the same row in `Ctrl-O`'s compact log, which hides the details and the
+4 KB` — the same row in `Ctrl-O`'s compact log, the view mush opens in, which
+hides the details and the
 payload under it. Notices are neutral `·`
 unless something actually failed (`!`).
 

@@ -4522,6 +4522,8 @@ impl App {
     }
 
     /// `Ctrl-T`: show or hide the model's reasoning above the turn it decided.
+    /// A fresh chat opens with the reasoning hidden — the view is the human's
+    /// to ask for — and the key is how they ask.
     ///
     /// A view, so it is not said and not stored: a notice would be written into
     /// the conversation ([`Chat::stored_notices`]) and the reasoning is already
@@ -4534,12 +4536,15 @@ impl App {
     }
 
     /// `Ctrl-O`: show or hide the output — a tool's result, mush's own report
-    /// about a child or a job, and the brief a child's pane opens with.
+    /// about a child or a job, and the brief a child's pane opens with. A fresh
+    /// chat opens in the compact log, so at launch the key's first press is the
+    /// one that brings the rows back.
     ///
     /// A view like [`Self::toggle_reasoning`], so it is not said and not
     /// stored: the rows are still in the transcript, the same key brings them
-    /// back exactly as they were, and a restart paints them again —
-    /// `dirty_screen` is the whole record. The failure exemption is not here:
+    /// back exactly as they were, and a restart opens compact again — it reads
+    /// the launch default, never a remembered view, so `dirty_screen` is the
+    /// whole record. The failure exemption is not here:
     /// it lives on `chat::Fold`, so at no rows a failed result's
     /// `! error: …` row and a `#1 failed: …` report still paint
     /// ([`Chat::set_output`]).
@@ -11757,6 +11762,10 @@ mod tests {
             .join("\n");
         app.chat
             .push_message(AgentId::ROOT, Message::tool("call-1", text));
+        // The 30 rows the cursor walks are the shown view's: the launch compact
+        // log paints a result at no rows at all, and this test is about the
+        // fold boundary moving under a resize.
+        app.chat.set_output(true);
 
         // Frame one, at 40 columns: the paint publishes the measure, and the
         // cursor is walked onto the second source line.
@@ -11840,6 +11849,10 @@ mod tests {
             !app.chat.selecting(),
             "the fold takes the mode with the rows"
         );
+        // The summary's own words are what says the fold landed; they paint in
+        // the shown view, while the launch compact log keeps one row of the
+        // block. This test is about the frame after a fold, not about the view.
+        app.chat.set_output(true);
         let grid = frame_grid(&mut app, 80, 24);
         assert!(
             !grid.iter().any(|row| row.contains("Enter copies")),
@@ -14846,7 +14859,9 @@ mod tests {
 
     /// `Ctrl-T` flips what the chat pane paints — the endpoint's own reasoning
     /// above the turn it decided — and `Ctrl-N` leaves the choice as the human
-    /// made it: the toggle is a view, not a fact about the conversation.
+    /// made it: the toggle is a view, not a fact about the conversation. A fresh
+    /// chat opens with the reasoning hidden, so the key's first press is the one
+    /// that shows it.
     #[test]
     fn ctrl_t_shows_and_hides_the_reasoning_and_ctrl_n_keeps_the_choice() {
         let (mut app, _rx) = test_app("reasoning");
@@ -14858,10 +14873,20 @@ mod tests {
             },
         );
         assert!(
+            !chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("weighing the greeting")),
+            "hidden when the chat opens: {:?}",
+            chat_rows(&mut app)
+        );
+
+        ctrl(&mut app, 't');
+        assert!(app.chat.shows_reasoning());
+        assert!(
             chat_rows(&mut app)
                 .iter()
                 .any(|row| row.contains("⋯ weighing the greeting")),
-            "shown by default: {:?}",
+            "one toggle shows it in the pane: {:?}",
             chat_rows(&mut app)
         );
 
@@ -14871,30 +14896,26 @@ mod tests {
             !chat_rows(&mut app)
                 .iter()
                 .any(|row| row.contains("weighing the greeting")),
-            "one toggle hides it in the pane: {:?}",
+            "and the same key hides it again: {:?}",
             chat_rows(&mut app)
         );
 
+        // Ctrl-N starts a new chat, not a new preference: the shown view is
+        // what `clear` keeps, and it is not the launch default.
         ctrl(&mut app, 't');
-        assert!(
-            app.chat.shows_reasoning(),
-            "and the same key brings it back"
-        );
-
-        // Ctrl-N starts a new chat, not a new preference.
-        ctrl(&mut app, 't');
-        assert!(!app.chat.shows_reasoning());
+        assert!(app.chat.shows_reasoning());
         ctrl(&mut app, 'n');
         assert!(
-            !app.chat.shows_reasoning(),
+            app.chat.shows_reasoning(),
             "the human's view outlives the chat it was set in"
         );
     }
 
-    /// `Ctrl-O` is a view in `Ctrl-T`'s family: it hides the output rows in the
-    /// pane, writes no line about itself — not to the transcript, not to the
-    /// bar, not to the session file — and a fresh `App` on the same store
-    /// paints the output again, which is what "not stored" means.
+    /// `Ctrl-O` is a view in `Ctrl-T`'s family: it brings the output rows back
+    /// — a fresh mush opens in the compact log, so the key's first press is the
+    /// way out — writes no line about itself — not to the transcript, not to the
+    /// bar, not to the session file — and a fresh `App` on the same store opens
+    /// compact again, which is what "not stored" means.
     #[test]
     fn ctrl_o_is_a_view_and_is_not_stored() {
         let root = dir("ctrl-o-view");
@@ -14908,16 +14929,16 @@ mod tests {
             "nothing has asked for a save yet"
         );
         assert!(
-            chat_rows(&mut app)
+            !chat_rows(&mut app)
                 .iter()
                 .any(|row| row.contains("the rest of the log")),
-            "the output is painted by default: {:?}",
+            "the compact log is the launch view: {:?}",
             chat_rows(&mut app)
         );
 
         ctrl(&mut app, 'o');
 
-        assert!(!app.chat.shows_output());
+        assert!(app.chat.shows_output());
         assert!(text_of(&app).is_empty(), "a view is not said");
         assert!(
             app.session_dirty_at.is_none(),
@@ -14934,26 +14955,25 @@ mod tests {
             "and not a line in the foot either"
         );
         assert!(
+            chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("the rest of the log")),
+            "one toggle brings the rows back: {:?}",
+            chat_rows(&mut app)
+        );
+
+        // The same key folds them away again...
+        ctrl(&mut app, 'o');
+        assert!(!app.chat.shows_output());
+        assert!(
             !chat_rows(&mut app)
                 .iter()
                 .any(|row| row.contains("the rest of the log")),
-            "one toggle hides it in the pane: {:?}",
+            "and the same key folds them away: {:?}",
             chat_rows(&mut app)
         );
 
-        // The same key brings the rows back...
-        ctrl(&mut app, 'o');
-        assert!(app.chat.shows_output());
-        assert!(
-            chat_rows(&mut app)
-                .iter()
-                .any(|row| row.contains("the rest of the log")),
-            "and the same key brings the output back: {:?}",
-            chat_rows(&mut app)
-        );
-
-        // ...and a restart paints it too: the store never heard of the view.
-        ctrl(&mut app, 'o');
+        // ...and a restart opens compact too: the store never heard of the view.
         app.flush_session();
         let stored = Session::load(&root).expect("the flush wrote the conversation");
         assert_eq!(
@@ -14967,11 +14987,11 @@ mod tests {
         );
         let mut fresh = reopened(&root);
         assert!(
-            fresh.chat.shows_output(),
-            "a restart opens with the output shown"
+            !fresh.chat.shows_output(),
+            "a restart opens in the compact log"
         );
         assert!(
-            chat_rows(&mut fresh)
+            !chat_rows(&mut fresh)
                 .iter()
                 .any(|row| row.contains("the rest of the log")),
             "and paints it: {:?}",
@@ -14979,12 +14999,13 @@ mod tests {
         );
 
         // Ctrl-N starts a new chat, not a new preference — the family rule
-        // `Ctrl-T`'s choice already has.
+        // `Ctrl-T`'s choice already has. The shown view is the one `clear`
+        // keeps, and it is not the launch default.
         ctrl(&mut fresh, 'o');
-        assert!(!fresh.chat.shows_output());
+        assert!(fresh.chat.shows_output());
         ctrl(&mut fresh, 'n');
         assert!(
-            !fresh.chat.shows_output(),
+            fresh.chat.shows_output(),
             "the human's view outlives the chat it was set in"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -19286,10 +19307,15 @@ mod tests {
             for case in ["reply", "error", "result"] {
                 let (mut app, _rx) = test_app("hostile-one-line");
                 feed_hostile(&mut app, case, &payload(case, true));
+                // A tool result's payload paints in the shown view: the launch
+                // compact log hides it, and this test is about the payload
+                // reaching the screen with its commands gone.
+                app.chat.set_output(true);
                 let frame = frame_grid(&mut app, width, height);
 
                 let (mut clean, _rx) = test_app("hostile-one-line-plain");
                 feed_hostile(&mut clean, case, &payload(case, false));
+                clean.chat.set_output(true);
                 let pristine = frame_grid(&mut clean, width, height);
 
                 let painted = frame.join("\n");
