@@ -5042,7 +5042,7 @@ mod tests {
 
         // The byte roads keep every byte.
         assert!(ws.read_file("bom.rs").unwrap().starts_with('\u{feff}'));
-        let searched = ws.search("held", "bom.rs", false, 10).unwrap();
+        let searched = ws.search("held", "bom.rs", 10).unwrap();
         assert!(
             searched.matches[0].starts_with("bom.rs:1: \u{feff}fn held() {}"),
             "{:?}",
@@ -5126,16 +5126,16 @@ mod tests {
         // The search road is the bytes road: it shows the lines as the file
         // holds them, ending and all (`text::file_lines`, finding B8).
         assert_eq!(
-            ws.search("held", "crlf.txt", false, 10).unwrap().matches,
+            ws.search("held", "crlf.txt", 10).unwrap().matches,
             vec!["crlf.txt:1: held\r", "crlf.txt:2: held\r"]
         );
         assert_eq!(
-            ws.search("held", "pair.txt", false, 10).unwrap().matches,
+            ws.search("held", "pair.txt", 10).unwrap().matches,
             vec!["pair.txt:1: held", "pair.txt:2: \rheld"],
             "a `\\n\\r` pair leaves the `\\r` at the head of the next line"
         );
         assert_eq!(
-            ws.search("held", "final.txt", false, 10).unwrap().matches,
+            ws.search("held", "final.txt", 10).unwrap().matches,
             vec!["final.txt:1: held"],
             "a last line without a line feed is a line"
         );
@@ -5179,7 +5179,7 @@ mod tests {
         assert_eq!(found.scanned, 1);
         assert_eq!(found.skipped, 1, "the cap is counted, not silent");
         // The search road has the same cap and the same count.
-        let searched = ws.search("held", ".", false, 10).unwrap();
+        let searched = ws.search("held", ".", 10).unwrap();
         assert_eq!(searched.matches.len(), 1);
         assert_eq!(searched.skipped, 1);
 
@@ -5237,7 +5237,7 @@ mod tests {
 
         let refused = ws.outline("mostly.txt").unwrap_err();
         assert!(refused.contains("binary"), "{refused}");
-        let found = ws.search("held", ".", false, 10).unwrap();
+        let found = ws.search("held", ".", 10).unwrap();
         assert!(found.matches.is_empty());
         assert_eq!(found.skipped, 1);
 
@@ -5377,8 +5377,8 @@ mod tests {
         );
         assert_eq!(
             ws.outline("blank.rs").unwrap().render(4_000, ""),
-            "blank.rs — 1 line; no definitions (textual, Rust-first — not a compiler's \
-             answer); read_file shows the text"
+            "blank.rs — 1 line; no definitions (textual, many languages, best-effort — not a \
+             compiler's answer); read_file shows the text"
         );
 
         // A comment holds the word, so it is a usage row; it is never a
