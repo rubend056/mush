@@ -750,9 +750,11 @@ pub enum AgentMsg {
     /// not a run ([`revive`]), and the next `Run` still wins — its arm replaces
     /// the transcript with the UI's newer copy.
     Adopt(Vec<Message>),
-    /// Append a user message the human typed; if idle, run again. The UI echoed
-    /// these words before sending them, so the actor folds them in without
-    /// telling it to add them again.
+    /// Append a user message the human typed; if idle, run again. The UI paints
+    /// these words the moment they are sent and lands its own copy at the turn
+    /// boundary this arm is read at — it reads that boundary from the
+    /// conversation, the reply still on the wire included — so the actor folds
+    /// them in without telling it to add them again.
     ///
     /// A whole [`Message`] and not a string, because a human steering an agent
     /// with a screenshot is a thing that has to work: a nudge *is* a user
@@ -4419,8 +4421,11 @@ fn drain_mailbox(
     let parked = std::mem::take(&mut state.deferred);
     for command in parked.into_iter().chain(actor.rx.try_iter()) {
         match command {
-            // The human's own words: the UI echoed them before sending, so the
-            // actor folds them in without telling the UI to add them again.
+            // The human's own words: the UI paints them the moment they are
+            // sent — dim, marked `queued` — and lands its copy at the turn
+            // boundary this fold is, waiting out the reply that was already on
+            // the wire when they were sent, so the actor folds them in without
+            // telling the UI to add them again.
             AgentMsg::Nudge(message) => messages.push(message),
             // A parent's steering was never echoed anywhere: this is the only
             // way it reaches the human's copy of this agent's transcript.

@@ -2840,6 +2840,30 @@ impl App {
         // without a key, because the tick already repaints a second at a time
         // while anything runs (`DOT_PERIOD`).
         self.chat.set_call_clock(id, self.tree.call_started_at(id));
+        // The other boundary a held line lands at: an event that leaves `id`
+        // out of flight — `Done`, `Error`, `Stopped`, a thread that was cut
+        // off, the end of a fold that ran on its own — is a run that will ask
+        // for nothing more, and the words it was holding would wait for a turn
+        // that is not coming. Landing them here is what keeps a failure or a
+        // stop from swallowing the human's request: the pane's copy is the
+        // only one the UI owns, and the actor's own (`state.deferred`, folded
+        // by the next wake's `fold_parked`) must not be the only one that
+        // survives.
+        //
+        // The phase is the witness, not the event's kind: the tree is where
+        // "in flight" is decided for every other reader — the row, Ctrl-C, the
+        // tick — and a list of ending variants here would be a second spelling
+        // that the next ending could be added beside. A folded run's phase
+        // stays busy (`AgentTree::compacted`), so a fold inside a run does not
+        // land the words early.
+        //
+        // No session mark: the stored view already carried the words at the end
+        // of the conversation ([`Chat::bounded_transcript`], written by the
+        // send's own `flush_session`), so landing moves them only from the
+        // pane's queued block into the transcript it was heading for.
+        if !self.tree.node(id).is_some_and(|node| node.phase.is_busy()) {
+            self.chat.land_queued(id);
+        }
     }
 
     /// Whether anything in the tree is working: derived from the phases and the
@@ -3352,15 +3376,29 @@ impl App {
             // The root's own phase, not the tree's: a napping orchestrator is idle, and
             // idle, and its next message starts a run rather than nudging a
             // conversation that is not in flight.
-            let root_busy = self
-                .tree
-                .node(AgentId::ROOT)
-                .map(|node| node.phase.is_busy())
-                .unwrap_or(false);
+            let phase = self.tree.node(AgentId::ROOT).map(|node| node.phase.clone());
+            let root_busy = phase.as_ref().is_some_and(|phase| phase.is_busy());
             if root_busy {
-                // Human steering while the root runs: queued as a nudge. If the
-                // root's mailbox is dead (it was cancelled), fall through and
-                // start a fresh run instead of spinning forever on a ghost.
+                // Human steering while the root runs: the words are **queued**,
+                // and the pane paints them the instant they are sent. The
+                // actor parks a nudge and folds it in at its next message
+                // boundary — a user message between an assistant's tool calls
+                // and their results makes strict servers reject the whole
+                // conversation (`agent::drain_signals`) — so appending it here
+                // put the human's line *before* rows of a turn that had already
+                // begun, and the model's old reply then read as the answer to
+                // it (the human's own report). The queued line is painted dim
+                // and marked `queued` ([`Chat::queued_rows`]) and joins the
+                // transcript when the turn it was sent into is over
+                // ([`Chat::queue_message`], which also says why a reply already
+                // on the wire is a turn of its own). There is no bar line for
+                // the send: the pane's own row says "sent, not read yet" — more
+                // than `noted — folded in as the agent continues` said, and true
+                // at the moment it is read (the house rule: a row says only what
+                // is news).
+                //
+                // If the root's mailbox is dead (it was cancelled), fall through
+                // and start a fresh run instead of spinning forever on a ghost.
                 let alive = self
                     .tree
                     .agent_tx
@@ -3368,10 +3406,17 @@ impl App {
                     .map(|tx| tx.send(AgentMsg::Nudge(message.clone())).is_ok())
                     .unwrap_or(false);
                 if alive {
-                    self.chat.expect_human(message.text());
-                    self.chat.push_message(AgentId::ROOT, message);
+                    self.chat.queue_message(
+                        AgentId::ROOT,
+                        message,
+                        matches!(phase, Some(Phase::Thinking)),
+                    );
+                    // The queued words are part of the stored conversation
+                    // ([`Chat::bounded_transcript`]), so the one write per turn
+                    // still carries the human's request before this returns:
+                    // queueing the echo must not undo the rule that a crash
+                    // between the send and the boundary cannot lose the words.
                     self.flush_session();
-                    self.say("noted — folded in as the agent continues");
                     return Ok(());
                 }
                 self.tree.idle(AgentId::ROOT);
@@ -3384,6 +3429,14 @@ impl App {
             // Sending does not send the pane to the bottom either: the human
             // chose where to read, and the key that puts a pane back at the
             // newest line is the one they press (finding U3).
+            //
+            // Words still queued for a boundary are landed first: the phase
+            // says this agent is at rest, so the run that would have read them
+            // never came back (the run-end road is what normally lands one),
+            // and the conversation this run is handed is built from the
+            // transcript — a queue left standing would be left out of it,
+            // behind the new message's own place in the order.
+            self.chat.land_queued(AgentId::ROOT);
             let mut messages = self.chat.conversation();
             messages.push(message.clone());
             match self.tree.agent_tx.get(&AgentId::ROOT) {
@@ -3423,6 +3476,20 @@ impl App {
             // the message is what starts it. If the words cannot be delivered at
             // all the node's phase is put back exactly as it was, instead of
             // leaving a lie on the row (finding B10).
+            //
+            // Read before `nudge` moves the row to `thinking…`: that phase is
+            // the optimistic one *this send* sets, and reading it afterwards
+            // would make every nudge look like one to a run in flight.
+            let phase = self.tree.node(target).map(|node| node.phase.clone());
+            let awaiting = phase.as_ref().is_some_and(|phase| phase.is_busy());
+            if !awaiting {
+                // The root's idle half, in the same words: a line still queued
+                // for a run that is over lands before the wake, because a
+                // revived actor is seeded from the transcript
+                // (`deliver_to_actor`) and a queue left standing would be left
+                // out of that seed — and out of the run it starts with.
+                self.chat.land_queued(target);
+            }
             let previous = self.tree.nudge(target);
             let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(message.clone()));
             if !delivered {
@@ -3431,12 +3498,23 @@ impl App {
                 self.fail(&line);
                 return Err(line);
             }
-            // The human's line lands in the pane on the same turn, and *after*
-            // the send: a revived actor's first event cannot be applied until
-            // this `update` returns, so the answer can never be painted above
-            // the question that asked for it.
-            self.chat.expect_human(message.text());
-            self.chat.push_message(target, message);
+            if awaiting {
+                // A run is in flight, so the actor parks the nudge for its next
+                // message boundary: the echo is queued like the root's, and the
+                // pane paints it as waiting until that boundary
+                // (`Chat::queue_message`, and the root's half above for why the
+                // append may not happen here). The phase read above is what
+                // says whether a reply is already on the wire.
+                self.chat
+                    .queue_message(target, message, matches!(phase, Some(Phase::Thinking)));
+            } else {
+                // The human's line lands in the pane on the same turn, and
+                // *after* the send: a revived actor's first event cannot be
+                // applied until this `update` returns, so the answer can never
+                // be painted above the question that asked for it.
+                self.chat.expect_human(message.text());
+                self.chat.push_message(target, message);
+            }
             // The human resumed a child its parent may believe is at rest: the
             // parent's books decide its waits and the one-shared-child guard, so
             // they are told (audit row 1).
@@ -11343,12 +11421,15 @@ mod tests {
             "byte-identical to what rides"
         );
 
-        // And the message the child is sent carries the same path.
+        // And the message the child is sent carries the same path — read from
+        // the queued block, because the child this test spawns is a run in
+        // flight and its actor reads the words at the next message boundary
+        // (`Chat::queue_message`).
         app.chat.insert("look");
         app.send_message();
         let sent = app
             .chat
-            .transcript(AgentId(1))
+            .queued(AgentId(1))
             .last()
             .expect("the message the child received");
         assert_eq!(sent.role, "user");
@@ -12925,9 +13006,12 @@ mod tests {
             }
             other => panic!("a nudge with an image: {other:?}"),
         }
+        // The pane's own copy of the nudge: the same message, carried by the
+        // queued block because #1 is a run in flight — its actor reads the
+        // words at the next message boundary (`Chat::queue_message`).
         assert_eq!(
             app.chat
-                .transcript(AgentId(1))
+                .queued(AgentId(1))
                 .last()
                 .map(|message| message.images.len()),
             Some(1),
@@ -16017,26 +16101,462 @@ mod tests {
         );
     }
 
+    /// One event from an agent's actor, the way its thread sends them: the tag
+    /// is the tree's own conversation, so the event is adopted and not dropped
+    /// as stale.
+    fn from_actor(app: &mut App, id: AgentId, event: AgentEvent) {
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id,
+            event,
+        });
+    }
+
+    /// An agent's transcript as the texts it holds, oldest first.
+    fn said(app: &App, id: AgentId) -> Vec<String> {
+        app.chat
+            .transcript(id)
+            .iter()
+            .map(|message| message.text().to_string())
+            .collect()
+    }
+
+    /// An assistant turn that asked for `calls` tool calls, the shape the actor
+    /// emits when it runs a batch: the turn is in flight until every call has a
+    /// result (`Chat::turn_over`, the boundary a queued line waits for).
+    fn asking(calls: usize) -> Message {
+        Message {
+            tool_calls: Some(
+                (0..calls)
+                    .map(|at| mush_core::message::ToolCall {
+                        id: format!("call-{at}"),
+                        kind: "function".to_string(),
+                        function: mush_core::message::FunctionCall {
+                            name: "run_command".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            ..Message::assistant(format!("asking for {calls}"))
+        }
+    }
+
     /// A steering message sent while the root is busy is folded into the run,
-    /// and it must also be visible: the human has to see what they said.
+    /// and it must also be visible: the human has to see what they said —
+    /// *where the model reads it*, and not one row earlier (the human's own
+    /// report of their line standing between the rows of a turn already begun).
     #[test]
-    fn steering_text_is_echoed_in_the_chat() {
+    fn steering_lands_where_the_model_reads_it() {
         let (mut app, _rx) = test_app("steer");
         app.tree.begin(AgentId::ROOT, None);
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the turn before")),
+        );
         app.chat.insert("also rename the module");
 
         app.send_message();
 
+        // Queued: the run has not reached a boundary, and the pane says so —
+        // dim and marked, so the human sees their words the instant they send
+        // them without being told the model has read them.
         assert_eq!(
-            app.chat.transcript(AgentId::ROOT).len(),
+            said(&app, AgentId::ROOT),
+            ["the turn before"],
+            "the words are queued, not in the transcript"
+        );
+        let rows = chat_rows(&mut app);
+        let at = rows
+            .iter()
+            .position(|row| row.contains("also rename the module"))
+            .expect("the pane shows the words the moment they are sent");
+        assert!(
+            rows[at].contains("queued"),
+            "and says they have not been read: {:?}",
+            rows[at]
+        );
+        assert_eq!(
+            text_of(&app),
+            "",
+            "the queued row is the whole acknowledgement; the bar adds nothing"
+        );
+
+        // The reply that was already on the wire is not an answer to them —
+        // the actor parks the nudge only after it has read that reply — so it
+        // is painted above, and the words land under it.
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the reply in flight")),
+        );
+
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            [
+                "the turn before",
+                "the reply in flight",
+                "also rename the module"
+            ],
+            "the human's line lands after the reply it was sent under, not before it"
+        );
+        assert!(
+            !chat_rows(&mut app).iter().any(|row| row.contains("queued")),
+            "and the pane stops saying they are waiting"
+        );
+    }
+
+    /// A line sent while a *tool* runs waits for that turn's results: the
+    /// assistant message is already in the transcript, so the words land after
+    /// the batch — the boundary the actor folds them in at — and not between
+    /// the turn's own rows, which is the shape the human reported.
+    #[test]
+    fn a_line_sent_while_a_tool_runs_lands_after_the_turns_results() {
+        let (mut app, _rx) = test_app("steer-tool");
+        app.tree.begin(AgentId::ROOT, None);
+        from_actor(&mut app, AgentId::ROOT, AgentEvent::Message(asking(2)));
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::tool("call-0", "one line")),
+        );
+        app.tree
+            .activity(AgentId::ROOT, "run_command cargo test".to_string());
+
+        app.chat.insert("also rename the module");
+        app.send_message();
+
+        assert_eq!(
+            said(&app, AgentId::ROOT).len(),
+            2,
+            "the words wait for the turn in flight"
+        );
+        assert!(
+            chat_rows(&mut app).iter().any(|row| row.contains("queued")),
+            "and the pane paints them as waiting"
+        );
+
+        // The turn's last remaining row, its second result: the turn is over,
+        // and the words land where the actor folded them in — before the reply
+        // of the request that read them.
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::tool("call-1", "two lines")),
+        );
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            [
+                "asking for 2",
+                "one line",
+                "two lines",
+                "also rename the module"
+            ],
+            "the words land after the results, not between the calls"
+        );
+        assert_eq!(
+            app.chat.queued(AgentId::ROOT).count(),
+            0,
+            "nothing is left waiting"
+        );
+    }
+
+    /// Two sends before one boundary keep their order: the actor folds parked
+    /// nudges in the order it parked them (`drain_mailbox`), so the pane lands
+    /// them in that order too — and both are painted while they wait.
+    #[test]
+    fn two_queued_words_land_in_the_order_they_were_sent() {
+        let (mut app, _rx) = test_app("steer-order");
+        app.tree.begin(AgentId::ROOT, None);
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the turn before")),
+        );
+        for words in ["first", "second"] {
+            app.chat.insert(words);
+            app.send_message();
+        }
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 2, "both wait");
+        let rows = chat_rows(&mut app);
+        let first = rows
+            .iter()
+            .position(|row| row.contains("you › first"))
+            .expect("the first words are painted");
+        let second = rows
+            .iter()
+            .position(|row| row.contains("you › second"))
+            .expect("the second words are painted");
+        assert!(
+            first < second,
+            "painted in the order they were sent: {rows:?}"
+        );
+
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("on it")),
+        );
+
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            ["the turn before", "on it", "first", "second"],
+            "both land, in order, under the reply they were sent beneath"
+        );
+    }
+
+    /// A run can end without another assistant message — a failure, a stop, a
+    /// thread that was cut off — and the queued words must still land then, in
+    /// order and once: the pane's copy is the one the UI owns, and a request
+    /// the human sent may not be lost because the run reading it died.
+    #[test]
+    fn a_failed_run_lands_the_humans_queued_words() {
+        let (mut app, _rx) = test_app("steer-failed");
+        app.tree.begin(AgentId::ROOT, None);
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the turn before")),
+        );
+        app.chat.insert("try the parser instead");
+        app.send_message();
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 1, "queued");
+
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Error("no route to host".into()),
+        );
+
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            ["the turn before", "try the parser instead"],
+            "the words land at the run's end"
+        );
+        assert_eq!(
+            app.chat.queued(AgentId::ROOT).count(),
+            0,
+            "and they land once"
+        );
+    }
+
+    /// The other ending: a stop is not a failure, and the words the human sent
+    /// before it are still theirs to have answered.
+    #[test]
+    fn a_stopped_run_lands_the_humans_queued_words() {
+        let (mut app, _rx) = test_app("steer-stopped");
+        app.tree.begin(AgentId::ROOT, None);
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the turn before")),
+        );
+        app.chat.insert("do the parser next");
+        app.send_message();
+
+        from_actor(&mut app, AgentId::ROOT, AgentEvent::Stopped);
+
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            ["the turn before", "do the parser next"]
+        );
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 0);
+    }
+
+    /// A nudge to an agent at rest is not queued: its run starts with these
+    /// words in it, so the line belongs in the transcript on the send's own
+    /// turn (finding B8's road, the one that is not the echo).
+    #[test]
+    fn a_nudge_to_an_idle_agent_is_not_queued() {
+        let (mut app, _rx) = test_app("steer-idle");
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            fork: None,
+            cmd,
+        });
+        // A spawn is a run, so a freshly inserted node is `thinking…` — the
+        // running half of this pair is `a_nudge_to_a_running_child_is_queued`.
+        // These words go to an agent at rest.
+        app.tree
+            .finish(AgentId(1), Some("did the work".to_string()));
+        app.tree.focus(AgentId(1));
+
+        app.chat.insert("carry on");
+        app.send_message();
+
+        assert_eq!(
+            said(&app, AgentId(1)),
+            ["carry on"],
+            "the line is in the pane"
+        );
+        assert_eq!(app.chat.queued(AgentId(1)).count(), 0, "nothing is queued");
+        assert!(
+            matches!(mailbox.try_recv(), Ok(AgentMsg::Nudge(message)) if message.text() == "carry on"),
+            "and the words still reach the actor"
+        );
+    }
+
+    /// The child road queues too: a running child's actor parks the nudge for
+    /// its next boundary exactly as the root's does, so the pane may not append
+    /// the echo here either.
+    #[test]
+    fn a_nudge_to_a_running_child_is_queued() {
+        let (mut app, _rx) = test_app("steer-child");
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            fork: None,
+            cmd,
+        });
+        app.tree.focus(AgentId(1));
+        app.tree.begin(AgentId(1), None);
+
+        app.chat.insert("carry on");
+        app.send_message();
+
+        assert!(
+            said(&app, AgentId(1)).is_empty(),
+            "a run in flight has not read the words yet"
+        );
+        assert_eq!(
+            app.chat.queued(AgentId(1)).count(),
             1,
-            "the steering message is echoed"
+            "so the line is queued"
         );
+        assert!(
+            matches!(mailbox.try_recv(), Ok(AgentMsg::Nudge(message)) if message.text() == "carry on"),
+            "the words reach the running actor"
+        );
+    }
+
+    /// `Ctrl-N` does not resurrect a queued line: the words were sent into the
+    /// conversation the key clears, and the new chat's first run must not read a
+    /// request typed at the one before it (`Chat::clear`).
+    #[test]
+    fn a_new_chat_does_not_resurrect_a_queued_line() {
+        let (mut app, _rx) = test_app("steer-new-chat");
+        app.tree.begin(AgentId::ROOT, None);
+        app.chat.insert("a request for the old chat");
+        app.send_message();
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 1, "queued");
+
+        new_chat(&mut app);
+
         assert_eq!(
-            app.chat.transcript(AgentId::ROOT)[0].text(),
-            "also rename the module"
+            app.chat.queued(AgentId::ROOT).count(),
+            0,
+            "the queued line goes with the chat it was sent to"
         );
-        assert_eq!(text_of(&app), "noted — folded in as the agent continues");
+        assert!(
+            said(&app, AgentId::ROOT).is_empty(),
+            "and the new one is empty"
+        );
+    }
+
+    /// A line queued for a run that never came back is not left behind the
+    /// message that follows it: the send road that finds the agent at rest lands
+    /// it first (`App::deliver`'s idle halves), because the conversation a new
+    /// run is handed is built from the transcript — and a queue left standing
+    /// would be left out of it, in the wrong place in the order.
+    #[test]
+    fn a_line_queued_for_a_run_that_vanished_lands_before_the_next_message() {
+        let (mut app, _rx) = test_app("steer-vanished");
+        app.tree.begin(AgentId::ROOT, None);
+        app.chat.insert("the first words");
+        app.send_message();
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 1, "queued");
+
+        // The actor is gone and the row is put back at rest the way
+        // `App::deliver` does when the mailbox refuses a nudge: a run that will
+        // never reach the boundary the words were queued for.
+        app.tree.idle(AgentId::ROOT);
+        app.chat.insert("the second words");
+        app.send_message();
+
+        assert_eq!(
+            said(&app, AgentId::ROOT),
+            ["the first words", "the second words"],
+            "the older words come first, and neither is left waiting"
+        );
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 0);
+    }
+
+    /// The meter counts the human's words as soon as they are sent, queued or
+    /// not (finding B8): the next request carries them, and the number is a
+    /// question about the next request — the held line is part of the bounded
+    /// view for exactly that reason.
+    #[test]
+    fn the_context_meter_counts_the_words_a_busy_agent_has_not_read() {
+        let (mut app, _rx) = test_app("meter-queued");
+        app.tree.begin(AgentId::ROOT, None);
+        let before = app.context_used_tokens();
+        app.chat.insert("a question long enough to weigh something");
+
+        app.send_message();
+
+        assert_eq!(app.chat.queued(AgentId::ROOT).count(), 1, "queued");
+        assert!(
+            app.context_used_tokens() > before,
+            "the meter ignores a queued message"
+        );
+    }
+
+    /// The record holds the words from the send, boundary or not: the session's
+    /// conversation is the bounded view, which carries a queued line at the end
+    /// the boundary will put it at — and once it lands, the same conversation
+    /// holds it once. A crash between the send and the boundary must not lose
+    /// the request the send blocks on.
+    #[test]
+    fn the_session_holds_the_words_that_are_still_waiting() {
+        let (mut app, _rx) = test_app("steer-session");
+        app.tree.begin(AgentId::ROOT, None);
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("the turn before")),
+        );
+        app.chat.insert("the words a crash must not lose");
+        app.send_message();
+
+        let stored = |app: &App| -> Vec<String> {
+            app.session_snapshot()
+                .messages
+                .iter()
+                .map(|message| message.text().to_string())
+                .collect()
+        };
+        assert_eq!(
+            stored(&app),
+            ["the turn before", "the words a crash must not lose"],
+            "the file holds a line the pane has not landed"
+        );
+
+        from_actor(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Message(Message::assistant("heard")),
+        );
+
+        assert_eq!(
+            stored(&app),
+            [
+                "the turn before",
+                "heard",
+                "the words a crash must not lose"
+            ],
+            "and once, where the boundary put it"
+        );
     }
 
     /// The meter counts the human's own words as soon as they are sent, not
@@ -22222,6 +22742,12 @@ mod tests {
             fork: None,
             cmd,
         });
+        // A spawn is a run, and a send to a run in flight is queued for its next
+        // message boundary (`Chat::queue_message`) — which is the contract of
+        // *its* own test. This one is about the door's `send: true` talking to
+        // an agent at rest: the words land on the turn, as a typed message does.
+        app.tree
+            .finish(AgentId(1), Some("did the work".to_string()));
         let base = app.chat.revision(AgentId(1));
 
         let body = attach_ok(app.handle_attach(

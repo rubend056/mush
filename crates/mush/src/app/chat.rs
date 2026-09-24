@@ -16,6 +16,22 @@
 //! line that answers a send is theirs and a line that arrives unasked is
 //! somebody else's — the fact that keeps `you › ` meaning the human.
 //!
+//! A line the human sends while the agent is *busy* is the exception the box
+//! cannot speak for on the same turn. The actor's own rule parks a nudge and
+//! folds it in at its next message boundary, because a user message between an
+//! assistant's tool calls and their results makes strict servers reject the
+//! whole conversation (`agent::drain_signals`) — so a pane that painted the
+//! words at send time put them *before* rows of a turn that had already begun,
+//! and the model's old reply then read as the answer to them (the human's own
+//! report). The words are **queued** instead ([`Chat::queue_message`]): painted at
+//! once as the human's own line, dim, marked `queued` ([`Chat::queued_rows`]),
+//! and landed in the transcript at the boundary the actor reads them at
+//! ([`Chat::push_message`]), or at the end of a run that ends without another
+//! turn. Both other answers fake one of the two facts: appending early is a
+//! transcript that lies about the order the model read things in, and hiding
+//! the line until the model reads it takes away the acknowledgement a send has
+//! — the only place the human can see what they said while a run takes minutes.
+//!
 //! A notice is a line *about* a conversation, and it has a lifetime here rather
 //! than a life of its own. It carries when it happened and which agent it
 //! concerns; it is one of two kinds, and they age differently. **Chatter** — a
@@ -99,6 +115,13 @@ fn dotted(words: &str, beats: u64) -> String {
 /// the one that says how many lines are not shown. The transcript is the point
 /// of the pane, so a foot of twenty lines is a transcript of four.
 const FOOT_ROWS: usize = 3;
+
+/// How many rows a pane spends on the human's unread lines: a foot of its own,
+/// and like the foot it may not show everything — a paste sent mid-turn can be
+/// longer than the pane. The rows are bottom-anchored, so what a cut keeps is
+/// the newest of what is waiting.
+const QUEUED_ROWS: usize = 3;
+
 /// Of those rows, how many the notes themselves may have before the rest are
 /// arithmetical. Two, because the third is what says they are an excerpt.
 const FOOT_NOTE_ROWS: usize = 2;
@@ -1027,6 +1050,24 @@ pub struct Chat {
     /// voices, and the pane then reads the flags the lines carry
     /// ([`unrecorded`]).
     spoken: HashMap<AgentId, HashMap<usize, Voice>>,
+    /// The human's words a *busy* agent has not read yet, keyed by the agent
+    /// they were sent to, oldest first.
+    ///
+    /// A nudge to a running agent is parked by its actor and folded in at the
+    /// next message boundary (`agent::drain_mailbox`), so the model does not
+    /// read the words until that boundary — and a pane that put them in the
+    /// transcript at send time painted them *before* the rows of the turn in
+    /// flight (see the module doc). They are queued here instead: painted by
+    /// [`Self::queued_rows`] as dim `you › ` lines marked `queued`, and landed
+    /// by [`Self::land_ready`] when the turn they were sent into is over, or by
+    /// [`Self::land_queued`] when the run ends without another one.
+    ///
+    /// The stored view counts them ([`Self::bounded_transcript`]), unlike
+    /// [`Self::spoken`] and [`Self::reading`], because the words are what the
+    /// next request carries: the record must hold them from the moment they
+    /// are sent, or a crash between the send and the boundary loses exactly
+    /// what the send blocks on ([`crate::app::App::deliver`]).
+    queued: HashMap<AgentId, Vec<Queued>>,
     /// Each painted tool call's digest — the ask, the paired result's outcome,
     /// and that result's detail rows ([`crate::agent::digest`]) — keyed like
     /// [`Self::spoken`]: the agent, then the index of the line it sits in, then
@@ -1131,6 +1172,18 @@ pub struct Chat {
     call_at: HashMap<AgentId, Instant>,
 }
 
+/// One line the human sent to a busy agent, and the turn it is waiting for.
+///
+/// `ready_at` is the number of assistant messages the conversation must hold
+/// before the line lands — the reply to the request that will read it is the
+/// `ready_at`-th (`Chat::queue_message`). A count rather than an index: the row
+/// it names may not have landed when the line is queued, and it survives every
+/// line that arrives in between without needing its own bookkeeping.
+struct Queued {
+    message: Message,
+    ready_at: usize,
+}
+
 /// Every tool call's digest in one message, and the length the agent's
 /// transcript had when the reading was taken.
 ///
@@ -1158,6 +1211,7 @@ impl Chat {
             reading: HashMap::new(),
             select: None,
             spoken: HashMap::new(),
+            queued: HashMap::new(),
             facts: RefCell::new(HashMap::new()),
             workspace,
             revisions: HashMap::new(),
@@ -1335,6 +1389,19 @@ impl Chat {
     /// and every other user line was written by another agent or by mush (see
     /// [`unrecorded`]).
     ///
+    /// It is also the one place a *queued* line lands: the human's words to a
+    /// busy agent ([`Self::queue_message`]) join the transcript at the moment
+    /// the turn in flight is over — the actor folds a parked nudge in at
+    /// exactly that point, "after the previous assistant message and its tool
+    /// results, before the next request" (`agent::drain_signals`). The rule
+    /// lives in this one door rather than in every road that appends a line,
+    /// because two roads would drift and the drift *is* the lie this fixes: a
+    /// pane that said the model had read words it had not. Which turn a line
+    /// is waiting for is [`Self::turn_over`]'s question, read here after the
+    /// append so the row that *ends* a turn counts (`land_ready`): a reply
+    /// already on the wire when the human sent comes above their words, not
+    /// below them.
+    ///
     /// It is also where a dropped-turns note is *placed*: the note reaches the
     /// pane through the same append road every line takes, while its place is
     /// the transcript's front ([`transcript::place_dropped_note`], the one
@@ -1350,6 +1417,169 @@ impl Chat {
     /// rule before it builds a request, so what the pane holds and what travels
     /// are bounded by one fact.
     pub fn push_message(&mut self, agent: AgentId, message: Message) {
+        self.append(agent, message);
+        // After the append, so the row that *ends* the turn in flight is part of
+        // it: a reply with no calls ends it at its own row, and a batch's last
+        // result ends it at its own. The map is asked first because a
+        // conversation holding nothing (almost every one) owes this no walk of
+        // its tail.
+        if self.queued.contains_key(&agent) {
+            self.land_ready(agent);
+        }
+    }
+
+    /// Queue the human's line for a *busy* agent: painted at once
+    /// ([`Self::queued_rows`]), read by the model at the boundary the actor
+    /// folds it in at ([`Self::push_message`], [`Self::land_ready`]). The send
+    /// roads are the only callers — an agent at rest has the words inside the
+    /// run they start, so its line is appended on the turn
+    /// ([`crate::app::App::deliver`]).
+    ///
+    /// `reply_coming` is the one fact the UI knows and this module does not:
+    /// whether a *model call* was in flight when the words were sent. The actor
+    /// parks a nudge and folds it in at its next message boundary, so the
+    /// request that reads these words is the next one — except that a reply
+    /// already on the wire is written *before* that fold (`agent::run_turns`
+    /// parks a nudge only after the reply is read), and the pane must paint
+    /// that reply above the human's line or it tells the same lie the other way
+    /// round, showing the model answering words it had already read. So the
+    /// line waits for that reply's turn to end — its own message and every
+    /// result of the calls it made — and for nothing else: the boundary is the
+    /// same one, counted one turn later.
+    pub fn queue_message(&mut self, agent: AgentId, message: Message, reply_coming: bool) {
+        // The assistant message the request that reads this line answers from:
+        // the one in the transcript now, or the reply in flight. Counted rather
+        // than named because the row it names may not have landed yet — and
+        // counted in assistant messages, so a later line's boundary is a number
+        // too (`land_ready` lands a prefix in send order).
+        let assistants = self.assistants(agent);
+        let ready_at = assistants + usize::from(reply_coming);
+        self.queued
+            .entry(agent)
+            .or_default()
+            .push(Queued { message, ready_at });
+        // A line sent into a conversation whose turn is already over is at its
+        // boundary from the start: the actor's next iteration begins with the
+        // fold. Landing it here is the pane painting it where it will be read,
+        // rather than as queued for a turn that has nothing left to say.
+        self.land_ready(agent);
+    }
+
+    /// An agent's queued lines, oldest first: what the pane paints as waiting
+    /// and what the stored view owes the record. The message alone — the
+    /// boundary a line waits for is this module's business, not the pane's and
+    /// not the file's.
+    pub fn queued(&self, agent: AgentId) -> impl Iterator<Item = &Message> {
+        self.queued
+            .get(&agent)
+            .into_iter()
+            .flatten()
+            .map(|queued| &queued.message)
+    }
+
+    /// Land every queued line, whatever it was waiting for: the run is over
+    /// (`App::on_agent`), so there is no boundary left to wait for and the
+    /// words would be stranded in a hold nothing reaches. Returns whether
+    /// anything landed.
+    ///
+    /// The voice is stated before each line, through the echo rule's own slot:
+    /// a queued line is the human's by construction — it is what the box sent —
+    /// and by the time it lands, other user lines may have come and gone
+    /// through that rule, so it must not depend on what is left in the slot.
+    pub fn land_queued(&mut self, agent: AgentId) -> bool {
+        let Some(waiting) = self.queued.remove(&agent) else {
+            return false;
+        };
+        for queued in waiting {
+            self.land(agent, queued.message);
+        }
+        true
+    }
+
+    /// Land the queued lines whose boundary has been reached: the prefix of the
+    /// hold whose assistant message has landed and whose turn is over.
+    ///
+    /// A prefix and not a filter over the whole list, because the lines are one
+    /// conversation's words in the order the human sent them and a later one may
+    /// not overtake an earlier one. `ready_at` is non-decreasing in send order —
+    /// the count it is computed from only grows — so the first line still
+    /// waiting is where the landing stops.
+    fn land_ready(&mut self, agent: AgentId) -> bool {
+        if !self.turn_over(agent) {
+            return false;
+        }
+        let assistants = self.assistants(agent);
+        let ready = self
+            .queued
+            .get(&agent)
+            .map(|waiting| {
+                waiting
+                    .iter()
+                    .take_while(|queued| queued.ready_at <= assistants)
+                    .count()
+            })
+            .unwrap_or(0);
+        if ready == 0 {
+            return false;
+        }
+        let Some(mut waiting) = self.queued.remove(&agent) else {
+            return false;
+        };
+        let rest = waiting.split_off(ready);
+        for queued in waiting {
+            self.land(agent, queued.message);
+        }
+        if !rest.is_empty() {
+            self.queued.insert(agent, rest);
+        }
+        true
+    }
+
+    /// Whether the conversation has no turn in flight: the newest assistant
+    /// message has every call it asked for answered, or there is none at all.
+    ///
+    /// This is the UI's reading of the actor's message boundary — "after the
+    /// previous assistant message and its tool results, before the next
+    /// request" (`agent::drain_signals`, which parks a nudge for exactly that
+    /// point). A turn is its assistant message plus the results of the calls it
+    /// made, and the next request is built after all of them have landed.
+    fn turn_over(&self, agent: AgentId) -> bool {
+        let messages = self.transcript(agent);
+        let Some(last) = messages
+            .iter()
+            .rposition(|message| message.role == "assistant")
+        else {
+            return true;
+        };
+        let asked = messages[last].tool_calls().len();
+        let answered = messages[last + 1..]
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count();
+        answered >= asked
+    }
+
+    /// How many assistant messages this conversation holds: what makes
+    /// [`Queued::ready_at`] a number that means the same thing before and after
+    /// the reply it names.
+    fn assistants(&self, agent: AgentId) -> usize {
+        self.transcript(agent)
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .count()
+    }
+
+    /// One queued line reaches the transcript. The voice is the human's, stated
+    /// through the echo rule's own slot rather than assumed: the rule's memory
+    /// may have been spent by a line that arrived in between.
+    fn land(&mut self, agent: AgentId, message: Message) {
+        self.pending = Some(message.text().trim().to_string());
+        self.append(agent, message);
+    }
+
+    /// [`Self::push_message`]'s body, without the boundary rule — the road a
+    /// queued line takes when it lands, so the rule cannot recurse.
+    fn append(&mut self, agent: AgentId, message: Message) {
         let prior = self.revision(agent);
         let note = transcript::is_dropped_note(&message);
         if message.role == "user" {
@@ -1468,9 +1698,16 @@ impl Chat {
     /// which the pane's title then read as a live position (finding D15). A
     /// fold *is* a new transcript, and a pane reads a new transcript from the
     /// bottom.
+    ///
+    /// The queued lines go with it for the same reason as the voices: a queued
+    /// line is a *row* of the conversation it was sent into, and a
+    /// replacement is a *different* conversation — a fold's summary, or a
+    /// restored transcript — not a place the words may be dropped into
+    /// afterwards.
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
         let prior = self.revision(agent);
         self.spoken.remove(&agent);
+        self.queued.remove(&agent);
         // The readings are keyed by the indices of the transcript that just
         // went, exactly as the voices are: a stale one would label a message
         // with another call's arguments (see the field).
@@ -1591,6 +1828,15 @@ impl Chat {
     /// its stored size, and the session writer writes the placeholder line it
     /// always wrote. Copying them was a memcpy of bytes `Session::save` dropped
     /// a moment later, and a second copy alive for the length of the write.
+    ///
+    /// The human's queued lines are part of the view ([`Self::queued`]), because
+    /// the next request is: the actor folds them in before it asks, so a
+    /// bounded view that left them out would price the request a message short
+    /// and — the half that matters — a crash between the send and the boundary
+    /// would lose the words the send blocks on. They are placed exactly where
+    /// the boundary will put them, at the end, so what the file holds and what
+    /// the next request sends are the same conversation and a restore reads
+    /// them back as the lines they were about to become.
     pub fn bounded_transcript(&self, id: AgentId, budget: usize) -> Vec<Message> {
         let mut messages: Vec<Message> = self.system_for(id).into_iter().cloned().collect();
         messages.extend(
@@ -1598,6 +1844,7 @@ impl Chat {
                 .iter()
                 .map(Message::without_image_payloads),
         );
+        messages.extend(self.queued(id).map(Message::without_image_payloads));
         // The note — the one the trim adds, or the one the copy already carried
         // and the trim moves back into place — is part of the view: a transcript
         // that lost turns says so once, and the stored row and the meter count
@@ -1606,15 +1853,20 @@ impl Chat {
         messages
     }
 
-    /// How many lines [`Self::clear`] would drop: the root transcript and every
-    /// child's, because a new chat empties all of them.
+    /// How many lines [`Self::clear`] would drop: the root transcript, every
+    /// child's, and the words still queued for a busy agent — because a new chat
+    /// empties all of them.
     ///
     /// What the armed `Ctrl-N`'s warning counts, derived on read so the line
     /// cannot disagree with the chat it is about. Notices are not lines: a
     /// failure is the workspace's, not the conversation's, and a count of what
-    /// the copy keeps must not claim one.
+    /// the copy keeps must not claim one. A queued line *is* one — it is in the
+    /// record and it weighs on the next request — so a warning that left it out
+    /// would promise less than the key takes.
     pub fn lines_to_drop(&self) -> usize {
-        self.root.len() + self.agents.values().map(Vec::len).sum::<usize>()
+        self.root.len()
+            + self.agents.values().map(Vec::len).sum::<usize>()
+            + self.queued.values().map(Vec::len).sum::<usize>()
     }
 
     /// Ctrl-N: the conversation is gone, the box and the scrollback with it.
@@ -1632,6 +1884,10 @@ impl Chat {
         // mode that survives Ctrl-N would be a cursor over nothing.
         self.select = None;
         self.spoken.clear();
+        // The conversation's lines go with it, the queued ones included: they are
+        // rows of the chat the key is emptying, and the new chat's first run
+        // must not read a request typed at the one before it.
+        self.queued.clear();
         self.facts.borrow_mut().clear();
         self.pending = None;
         // The road back goes with the conversation the loss was in: a Ctrl-N
@@ -1672,11 +1928,12 @@ impl Chat {
     ///
     /// Every map in here is keyed by the agent's id, so every one of them goes
     /// with it: the transcript itself, the voices keyed by line index, the
-    /// revision an attach client edits against, and the pane's reading
-    /// position. The notices go too — they are tagged with the agent they were
-    /// written about, and only failures are written to the session, so leaving
-    /// them behind would keep the file growing with `!` lines about an agent
-    /// nothing can open (`Chat::stored_notices`).
+    /// words queued for a busy run that will never read them now, the revision an
+    /// attach client edits against, and the pane's reading position. The
+    /// notices go too — they are tagged with the agent they were written about,
+    /// and only failures are written to the session, so leaving them behind
+    /// would keep the file growing with `!` lines about an agent nothing can
+    /// open (`Chat::stored_notices`).
     ///
     /// The revision is *dropped* rather than stepped forward the way
     /// [`Self::clear`] steps it, and that is safe only because the id is spent:
@@ -1690,6 +1947,7 @@ impl Chat {
         self.agents.remove(&agent);
         self.systems.remove(&agent);
         self.spoken.remove(&agent);
+        self.queued.remove(&agent);
         self.drop_facts(agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
@@ -2394,8 +2652,9 @@ impl Chat {
 
     /// The rows a pane `height` rows tall and `width` columns wide is showing:
     /// the tail of the agent's transcript, bottom-anchored, with the blank
-    /// separator that closes a message trimmed before the window is cut, and the
-    /// foot — the notes mush wrote, capped and counted — pinned under it.
+    /// separator that closes a message trimmed before the window is cut, the
+    /// human's unread lines — dim and marked `queued` — under it, and the foot —
+    /// the notes mush wrote, capped and counted — pinned under that.
     ///
     /// The trim is what keeps a one-row pane from showing that blank instead of
     /// the message it separates (finding B4); only the tail is built, so a long
@@ -2417,6 +2676,25 @@ impl Chat {
         let protected = usize::from(!transcript.is_empty());
         let room = FOOT_ROWS.min(height.saturating_sub(protected));
         let foot = self.foot(pane, width, room);
+        // The human's unread lines are composed here, between the window and
+        // the foot, and their rows come out of the room the window would have
+        // had: the block is bottom-anchored like the transcript and pinned like
+        // the foot, so neither the window's arithmetic (`body`) nor the foot's
+        // cap has to know there is a third block on the pane. Capped twice, as
+        // the foot is: `QUEUED_ROWS` rows at most, and never the transcript's own
+        // last row — a pane too short for both still has a conversation in it.
+        let queued = self.queued_rows(
+            pane.agent,
+            width,
+            QUEUED_ROWS.min(
+                height
+                    .saturating_sub(foot.lines.len())
+                    .saturating_sub(protected),
+            ),
+        );
+        let window = height
+            .saturating_sub(foot.lines.len())
+            .saturating_sub(queued.len());
         // The window: the select mode's own while it is on this pane, the
         // human's reading otherwise. The mode counts as on only while the
         // transcript still has a line under its cursor: `clamped_cursor` is the
@@ -2438,26 +2716,20 @@ impl Chat {
         let cursor = self.clamped_cursor(pane.agent);
         let mode = select.zip(cursor);
         let (mut body, cursor_at) = match mode {
-            Some((select, cursor)) => self.select_body(
-                select,
-                cursor,
-                pane.agent,
-                width,
-                height.saturating_sub(foot.lines.len()),
-            ),
-            None => (
-                self.body(pane, width, height.saturating_sub(foot.lines.len())),
-                None,
-            ),
+            Some((select, cursor)) => self.select_body(select, cursor, pane.agent, width, window),
+            None => (self.body(pane, width, window), None),
         };
-        // Read before the foot is appended: the mode's rows are transcript
-        // rows, and the foot never carries the cursor. The row the cursor
-        // stands on is the one the placement decided (`select_body`), so the
-        // paint and the copy cannot disagree about which stop it is.
+        // Read before the queued rows and the foot are appended: the mode's
+        // rows are transcript rows, and neither the foot nor a queued line —
+        // which has no source line to be a stop of — carries the cursor. The
+        // row the cursor stands on is the one the placement decided
+        // (`select_body`), so the paint and the copy cannot disagree about which
+        // stop it is.
         let select_rows = match (mode, cursor_at) {
             (Some((select, cursor)), Some(at)) => select_rows(&body.rows, select, cursor, at),
             _ => None,
         };
+        body.lines.extend(queued);
         body.lines.extend(foot.lines);
         let lines = body.lines;
 
@@ -2516,6 +2788,71 @@ impl Chat {
             title,
             select: select_rows,
         }
+    }
+
+    /// The rows of the human's unread lines for one pane, bottom-anchored in
+    /// `room` the way the transcript's window is: one dim line each, wearing the
+    /// human's own mark ([`Voice::mark`], so the two cannot drift apart), with
+    /// `queued` at the pane's own right edge — the pane's way of saying "sent,
+    /// not read yet".
+    ///
+    /// The mark stands where a call row's measure does (`41L 1.2KB`, the same
+    /// right edge) rather than leading the row as a glyph: a `⧗` would need a
+    /// slot in the tool glyph table for a fact that is not a tool's, and it
+    /// would be a mark the ascii rung cannot show — the word reads on both
+    /// rungs, and a row that has no room for it keeps the dim paint, which is
+    /// the half of the mark that says *unread*. It is dropped whole rather
+    /// than cut, the way a title clause is: a clipped mark is not a mark.
+    ///
+    /// The rows carry no [`Stop`]: the select mode walks the *transcript*'s
+    /// source lines, and a queued line has no index in it — a cursor that stepped
+    /// onto one would copy the message at some other index ([`Self::copy`]). So
+    /// a queued line is painted and not copied until it lands, which is also the
+    /// moment it becomes a line the mode can walk.
+    ///
+    /// Nothing is said about a line the pane cut off (a paste taller than the
+    /// pane): the pane's own reading of the block is bottom-anchored, so what a
+    /// cut keeps is the end of what is waiting, and a count row here would
+    /// spend a row on arithmetic about rows that are about to leave.
+    fn queued_rows(&self, agent: AgentId, width: usize, room: usize) -> Vec<Line<'static>> {
+        if room == 0 {
+            return Vec::new();
+        }
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for message in self.queued(agent) {
+            let start = rows.len();
+            marked(
+                &mut rows,
+                Voice::Human.mark().0,
+                dim(),
+                message.text(),
+                width,
+            );
+            // The whole line is dim, its mark included: the pane paints what
+            // has not been read yet in the grey it paints mush's own lines in,
+            // so a queued row cannot be taken for a turn the model has seen.
+            for row in rows.iter_mut().skip(start) {
+                for span in &mut row.spans {
+                    span.style = dim();
+                }
+            }
+            image_rows(&mut rows, message, width);
+            // The first row's own words are the reading here; `Line::width`
+            // counts them the way the pane does, so the mark is placed by the
+            // measure the row was wrapped at rather than by an assumed one.
+            if let Some(first) = rows.get_mut(start) {
+                let used = first.width();
+                let label = "queued";
+                if width >= used + 1 + label.width() {
+                    let fill = width - used - label.width();
+                    first.spans.push(Span::styled(" ".repeat(fill), dim()));
+                    first.spans.push(Span::styled(label, dim()));
+                }
+            }
+        }
+        let cut = rows.len().saturating_sub(room);
+        rows.drain(..cut);
+        rows
     }
 
     /// The window the select mode's cursor is shown through, placed so the
@@ -4818,6 +5155,27 @@ mod tests {
         chat.painted(pane, width, height).lines
     }
 
+    /// An assistant turn that asked for `calls` tool calls, the shape the actor
+    /// emits when it runs a batch — `turn_over` counts the results that answer
+    /// it, so a test that wants a turn *in flight* has to ask with a call.
+    fn called(calls: usize) -> Message {
+        Message {
+            tool_calls: Some(
+                (0..calls)
+                    .map(|at| ToolCall {
+                        id: format!("call-{at}"),
+                        kind: "function".to_string(),
+                        function: mush_core::message::FunctionCall {
+                            name: "run_command".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            ..Message::assistant(format!("asking for {calls}"))
+        }
+    }
+
     /// One message's rows, as `render_message` paints them: the map beside them
     /// is the select mode's own, and these tests read the words.
     fn message_rows(
@@ -5221,6 +5579,196 @@ mod tests {
             .expect("Enter copies");
         assert_eq!(copied.text, "one\ntwo");
         assert_eq!(copied.line, "copied 2 lines from your message — 7 bytes");
+    }
+
+    /// The human's words to a busy agent are painted the instant they are sent —
+    /// dim, marked `queued`, under the window and above the foot — while the
+    /// transcript itself does not have them yet: the actor reads them at its
+    /// next message boundary, and a pane that said otherwise is the lie the
+    /// human reported (their line between the rows of a turn already begun, the
+    /// model's old reply reading as the answer to it). The mark stands at the
+    /// pane's right edge, the column a tool row's measure uses, and the row is
+    /// no stop of the select mode: that walk is over transcript source lines,
+    /// and a queued line has none.
+    #[test]
+    fn the_humans_queued_words_are_painted_dim_and_marked_queued() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, called(2));
+        chat.push_message(AgentId::ROOT, Message::tool("call-0", "one line"));
+        chat.start_select(AgentId::ROOT);
+        chat.queue_message(
+            AgentId::ROOT,
+            Message::user("also rename the module"),
+            false,
+        );
+
+        assert_eq!(
+            chat.transcript(AgentId::ROOT).len(),
+            2,
+            "the words are queued, not in the transcript"
+        );
+        let painted = chat.painted(&pane(AgentId::ROOT), 60, 12);
+        let rows = shown(&painted.lines);
+        let at = rows
+            .iter()
+            .position(|row| row.contains("also rename the module"))
+            .expect("the pane paints the words the moment they are sent");
+        assert!(rows[at].starts_with("you › "), "{:?}", rows[at]);
+        assert!(rows[at].ends_with("queued"), "{:?}", rows[at]);
+        // The whole row is dim: the pane paints what the model has not read in
+        // its own grey — the mark included, so it cannot be taken for a turn the
+        // model has seen.
+        assert!(
+            painted.lines[at]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(Color::DarkGray)),
+            "{:?}",
+            painted.lines[at]
+        );
+        let select = painted.select.expect("the mode is on");
+        assert!(
+            !select.cursor.contains(&at) && !select.selected.contains(&at),
+            "the queued row is not a stop the cursor can stand on"
+        );
+    }
+
+    /// A reply already on the wire when the human sent comes *above* their
+    /// words: the actor parks a nudge only after the reply is read
+    /// (`agent::run_turns`), so the reply is not an answer to the words and the
+    /// pane may not make it one — the reported lie, in the other direction.
+    /// The words land when that reply's own turn is over.
+    #[test]
+    fn a_reply_already_on_the_wire_lands_above_the_humans_words() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("the turn before"));
+        chat.queue_message(AgentId::ROOT, Message::user("also rename the module"), true);
+
+        chat.push_message(AgentId::ROOT, Message::assistant("the reply in flight"));
+
+        let said: Vec<String> = chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(|message| message.text().to_string())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "the turn before",
+                "the reply in flight",
+                "also rename the module"
+            ],
+            "the reply the human interrupted is not painted as the answer"
+        );
+        assert!(
+            !shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12))
+                .iter()
+                .any(|row| row.contains("queued")),
+            "and the pane stops saying they are waiting"
+        );
+    }
+
+    /// A line sent while a *tool* was running waits for that turn: its assistant
+    /// message is already in the transcript, so the words land after the results
+    /// the batch still owes — where the actor folds them in — and not one row
+    /// earlier. Two sends before one boundary keep their order, and both paint
+    /// while they wait.
+    #[test]
+    fn the_queued_words_land_when_the_turn_in_flight_is_over() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, called(2));
+        chat.push_message(AgentId::ROOT, Message::tool("call-0", "one line"));
+        chat.queue_message(AgentId::ROOT, Message::user("first"), false);
+        chat.queue_message(AgentId::ROOT, Message::user("second"), false);
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12));
+        let first = rows
+            .iter()
+            .position(|row| row.contains("you › first"))
+            .expect("the first words are painted");
+        let second = rows
+            .iter()
+            .position(|row| row.contains("you › second"))
+            .expect("the second words are painted");
+        assert!(first < second, "in the order they were sent: {rows:?}");
+
+        // The second and last result of the batch: the turn is over, and only
+        // now do the words belong in the conversation.
+        chat.push_message(AgentId::ROOT, Message::tool("call-1", "two lines"));
+
+        let said: Vec<String> = chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(|message| message.text().to_string())
+            .collect();
+        assert_eq!(
+            said,
+            ["asking for 2", "one line", "two lines", "first", "second"]
+        );
+        assert_eq!(
+            chat.queued(AgentId::ROOT).count(),
+            0,
+            "nothing is left waiting"
+        );
+    }
+
+    /// The record holds the words from the send — the stored view is what the
+    /// next request carries (`Chat::bounded_transcript`) — and holds them once:
+    /// landing moves the line into the transcript it was heading for, it does
+    /// not add a second copy. A crash between the send and the boundary must
+    /// not lose the request the send blocks on.
+    #[test]
+    fn the_stored_view_carries_the_words_the_pane_has_not_landed() {
+        let budget = 1 << 20;
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("the turn before"));
+        chat.queue_message(AgentId::ROOT, Message::user("a request from the box"), true);
+        let stored = |chat: &Chat| -> Vec<String> {
+            chat.bounded_transcript(AgentId::ROOT, budget)
+                .into_iter()
+                .filter(|message| message.role != "system")
+                .map(|message| message.text().to_string())
+                .collect()
+        };
+        assert_eq!(
+            stored(&chat),
+            ["the turn before", "a request from the box"],
+            "the file holds a line the pane has not landed"
+        );
+        assert!(
+            chat.used_weight_for(AgentId::ROOT, budget) > 0,
+            "and the meter counts the words the next request will carry"
+        );
+
+        chat.push_message(AgentId::ROOT, Message::assistant("heard"));
+        assert_eq!(
+            stored(&chat),
+            ["the turn before", "heard", "a request from the box"]
+        );
+    }
+
+    /// A replacement takes the queued lines with it — a fold's summary and a
+    /// restore are *other* conversations — and so does `Ctrl-N` (`clear`) and a
+    /// reaped agent (`forget`): a line the human sent into a conversation that
+    /// is gone must not be dropped into the one that took its place.
+    #[test]
+    fn a_replaced_transcript_takes_the_queued_lines_with_it() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), called(1));
+        chat.queue_message(AgentId(1), Message::user("half said"), false);
+        assert_eq!(chat.queued(AgentId(1)).count(), 1);
+        chat.replace_transcript(AgentId(1), vec![Message::user("a summary")]);
+        assert_eq!(chat.queued(AgentId(1)).count(), 0, "the summary is new");
+
+        chat.push_message(AgentId(2), called(1));
+        chat.queue_message(AgentId(2), Message::user("half said"), false);
+        chat.forget(AgentId(2));
+        assert_eq!(chat.queued(AgentId(2)).count(), 0, "a reaped agent is gone");
+
+        chat.push_message(AgentId(3), called(1));
+        chat.queue_message(AgentId(3), Message::user("half said"), false);
+        chat.clear();
+        assert_eq!(chat.queued(AgentId(3)).count(), 0, "so is the last chat");
     }
 
     /// A message whose bytes are gone carries its placeholder, and that is what

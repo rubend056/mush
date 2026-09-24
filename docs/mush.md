@@ -471,6 +471,19 @@ Nothing that arrived after a loss is taken away by the key that restores it.
 `Esc` says what it cleared and names the road back (`cleared the box and 2
 images · Ctrl-Z puts it back`).
 
+A `Enter` pressed while the agent on screen is *running* does not put the human's
+line anywhere yet — it paints it at once and lands it where the model reads it.
+The line is a dim `you › ` row with `queued` at the pane's own right edge (the
+column a tool row's measure stands in), pinned under the window like the foot,
+until the turn in flight is over: the assistant reply already on the wire comes
+first, then its tool results, and only then the words — the message boundary at
+which the actor folds a nudge in (`Chat::queue_message`). A run that ends without
+another turn (a failure, a stop, a `CutOff`) lands them at the transcript's end
+anyway, and the session's record carries them from the moment they are sent, so a
+crash between the send and the boundary cannot lose the request. The bar says
+nothing on such a send: the pane's own row is the acknowledgement, and
+`noted — folded in as the agent continues` claimed a fold that had not happened.
+
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
 transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
 what puts them in the box, where typing reaches the agent on screen. A page is
@@ -1375,8 +1388,8 @@ them should ask rather than build.
   lifetimes, per-conversation scrollback, the floor refusing every key but
   `Ctrl-Q`, config precedence, schema/prompt invariants, word wrapping, the actor
   mailbox (parked nudges, Stop vs Shutdown, completion delivery), and the
-  new-chat, Ctrl-C, stale-event, steering-echo and phase-restore state
-  transitions.
+  new-chat, Ctrl-C, stale-event, steering-boundary (painted at once, landed at
+  the boundary the model reads it at) and phase-restore state transitions.
 - **End-to-end (pty).** `scripts/smoke.py` drives the real binary over a
   pseudo-terminal with the pty as its controlling terminal, so window size and
   SIGWINCH behave as they do in a terminal. Scenarios: agent (needs a model),
