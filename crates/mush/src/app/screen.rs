@@ -113,6 +113,27 @@ fn inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
+/// The measure a transcript pane paints at, from its own rect: the inner room,
+/// and never more than [`MAX_TRANSCRIPT`] columns — a 200-column transcript is
+/// not read, it is skimmed, and the rest is margin. `None` for a pane with no
+/// inner room at all: that short a pane paints its border and nothing else.
+///
+/// One derivation with two readers. The frame lays every transcript row out at
+/// this measure ([`App::chat_pane_with`]), and a key that changes the fold
+/// reads it to re-base the window a pane is holding
+/// ([`super::chat::Chat::re_anchor`]): a
+/// measure derived beside this one is how the row a human was reading comes
+/// back at the wrong wrap — the shift that key exists to stop, in a new shape.
+pub(super) fn transcript_measure(transcript_area: Rect) -> Option<(usize, usize)> {
+    let room = inner(transcript_area);
+    (room.height > 0 && room.width > 0).then(|| {
+        (
+            (room.width as usize).min(MAX_TRANSCRIPT as usize),
+            room.height as usize,
+        )
+    })
+}
+
 /// The message box's attachment rows: `▣ path (format · size)`, one per image,
 /// at most `cap` rows and never more than [`MAX_ATTACHMENT_ROWS`], in the order
 /// they were attached.
@@ -723,10 +744,7 @@ impl App {
         // is built from, and asking the tree twice is one thing more to keep in
         // step (finding R9).
         let node = self.tree.node(self.tree.focused);
-        let transcript = (room.height > 0 && room.width > 0).then(|| {
-            // A 200-column transcript is not read, it is skimmed. Cap the
-            // measure and leave the rest as margin.
-            let width = (room.width as usize).min(MAX_TRANSCRIPT as usize);
+        let transcript = transcript_measure(transcript_area).map(|(width, height)| {
             let pane = Pane {
                 agent: self.tree.focused,
                 // The run's own words, the same derivation the row paints
@@ -743,7 +761,7 @@ impl App {
             // Only the rows the window can show are built — the whole
             // scrollback to display forty lines cost 55 ms a frame on a long
             // session, and `tick` repaints every frame while an agent works.
-            let mut painted = self.chat.painted(&pane, width, room.height as usize);
+            let mut painted = self.chat.painted(&pane, width, height);
             // Zen takes the agents pane off the screen, and its title with it:
             // the counts that say who is working move to the one title still
             // painted, the conversation pane's (`zen_title`).

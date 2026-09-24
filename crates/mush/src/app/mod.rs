@@ -4706,8 +4706,7 @@ impl App {
     /// `dirty_screen` records. Every pane reads through the same `Chat`, so one
     /// flip is every pane's.
     fn toggle_reasoning(&mut self) {
-        self.chat.set_reasoning(!self.chat.shows_reasoning());
-        self.dirty_screen = true;
+        self.re_anchor_fold(|chat| chat.set_reasoning(!chat.shows_reasoning()));
     }
 
     /// `Ctrl-O`: show or hide the output — a tool's result, mush's own report
@@ -4724,7 +4723,44 @@ impl App {
     /// `! error: …` row and a `#1 failed: …` report still paint
     /// ([`Chat::set_output`]).
     fn toggle_output(&mut self) {
-        self.chat.set_output(!self.chat.shows_output());
+        self.re_anchor_fold(|chat| chat.set_output(!chat.shows_output()));
+    }
+
+    /// The half the two fold keys share: the frame on screen is read for the row
+    /// at its bottom edge, `view` changes what the panes paint, and the window
+    /// the pane is holding is re-based around that row ([`Chat::re_anchor`]) —
+    /// so `Ctrl-O` and `Ctrl-T` no longer slide a conversation a human has
+    /// scrolled away from the bottom to read.
+    ///
+    /// The frame is derived here and not remembered from the last paint:
+    /// [`Self::screen`] is the pure function `ui::draw` runs, so the row the
+    /// fold keeps, and the measure it is kept at
+    /// ([`screen::transcript_measure`]), are the ones the rows on screen were
+    /// made of. A layout read anywhere else — the terminal, a remembered size —
+    /// is exactly the second derivation that would put the row back at a width
+    /// the pane never painted.
+    ///
+    /// A pane at the bottom, a pane painting no transcript, and a pane whose
+    /// window has no source row at its edge all read as `None` here and change
+    /// nothing but the view: there is no row of theirs to keep.
+    fn re_anchor_fold(&mut self, view: impl FnOnce(&mut Chat)) {
+        let area = Rect::new(0, 0, self.term_width, self.term_height);
+        let held = match self.screen(area) {
+            Screen::Panes(panes) => panes
+                .chat
+                .transcript
+                .as_ref()
+                .and_then(|painted| painted.anchor)
+                .zip(screen::transcript_measure(panes.chat.transcript_area)),
+            Screen::Floor { .. } => None,
+        };
+        // The view is the human's either way: the folded rows are still the
+        // ones the fold says they are, held window or not.
+        view(&mut self.chat);
+        if let Some((anchor, (width, height))) = held {
+            self.chat
+                .re_anchor(self.tree.focused, width, height, anchor);
+        }
         self.dirty_screen = true;
     }
 
@@ -8375,6 +8411,38 @@ mod tests {
     /// them. A pane's border is stripped: what a test reads is the row's text.
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         shot(app, width, height).rows()
+    }
+
+    /// The chat pane of a frame the app derived itself, for the tests that read
+    /// what a key did to the pane rather than to the words.
+    fn chat_pane(screen: &Screen) -> &ChatPane {
+        match screen {
+            Screen::Panes(panes) => &panes.chat,
+            Screen::Floor { .. } => panic!("this test's terminal is above the floor"),
+        }
+    }
+
+    /// The row at the chat pane's bottom edge, as the frame publishes it:
+    /// the fact a fold key has to keep (finding: the human's report of the
+    /// conversation sliding when `Ctrl-O` or `Ctrl-T` was pressed).
+    fn bottom_edge(screen: &Screen) -> Option<super::chat::Anchor> {
+        chat_pane(screen)
+            .transcript
+            .as_ref()
+            .and_then(|painted| painted.anchor)
+    }
+
+    /// The rows the chat pane's title says it is holding, or `None` for a pane
+    /// at the bottom: the reading's own count, as the pane spells it.
+    fn held_rows(screen: &Screen) -> Option<usize> {
+        let title = &chat_pane(screen).transcript.as_ref()?.title;
+        title
+            .split("scrolled ↑")
+            .nth(1)?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
     }
 
     /// The painted rows that wear the agents pane's selection highlight — the
@@ -12544,6 +12612,268 @@ mod tests {
                 && copied.text.lines().count() == 28,
             "the copy is the `…`'s own middle: {:?}",
             copied.text
+        );
+    }
+
+    /// A fold key pressed on a pane scrolled away from the bottom keeps the row
+    /// at its bottom edge where it was: the window it is holding is re-based
+    /// around that row rather than left counting rows the fold changed under
+    /// it. Pressed through the app, because the anchor and the measure the
+    /// re-base reads are the frame's own — the same derivation the next paint
+    /// runs, and not a second layout beside it.
+    ///
+    /// The fold here is the one that *adds* rows: the launch compact log paints
+    /// no payload, and `Ctrl-O` shows it under the row the human is reading.
+    /// The count grows by the rows that arrived, and the row keeps the blank
+    /// line under it that the pane's edge was showing.
+    ///
+    /// A note is on the foot, because the pane's own room — foot and all — is
+    /// what the frame hands the re-base
+    /// ([`Chat::re_anchor`](super::chat::Chat::re_anchor)): the rows the foot
+    /// took off the bottom of the pane are under the anchor in the count and
+    /// gone from the window, and the row still comes back at the edge.
+    #[test]
+    fn ctrl_o_keeps_the_held_row_at_the_panes_bottom_edge() {
+        let (mut app, _rx) = test_app("fold-anchor");
+        let (width, height) = (100, 30);
+        for line in 0..20 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("line {line}")));
+        }
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    serde_json::json!({"command": "cargo test -p mush-core --all-targets"}),
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        let output: String = (0..20)
+            .map(|n| format!("test line_{n} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.chat
+            .push_message(AgentId::ROOT, Message::tool("c1", &output));
+        assert!(
+            !app.chat.shows_output(),
+            "the launch view is the compact log: this key shows the payload"
+        );
+        // One row up: the human's own last line is what the pane's edge reads,
+        // with the blank that closes it under it, and the call block below the
+        // window the fold is about to grow.
+        app.chat.scroll_by(AgentId::ROOT, 1);
+        app.chat.note_for(AgentId::ROOT, "reading the tree");
+
+        app.set_term_size(width, height);
+        let area = Rect::new(0, 0, width, height);
+        let before = app.screen(area);
+        assert!(
+            chat_pane(&before)
+                .transcript
+                .as_ref()
+                .and_then(|painted| painted.lines.last())
+                .is_some_and(|row| row.to_string().contains("reading the tree")),
+            "the note is the pane's last row: it is the foot, and the room the \
+             frame measured is not the conversation's"
+        );
+        let anchor = bottom_edge(&before).expect("the pane's bottom edge has a source row");
+        assert_eq!(held_rows(&before), Some(1), "the pane is holding a window");
+
+        ctrl(&mut app, 'o');
+        let after = app.screen(area);
+        assert_eq!(
+            bottom_edge(&after),
+            Some(anchor),
+            "the row the human was reading is at the edge again, and the rows \
+             under it are the ones that were under it"
+        );
+        let now = held_rows(&after).expect("and the pane holds, rather than following");
+        assert!(now > 1, "the fold's rows went under the window: {now}");
+
+        // The other way: the payload goes again, and the count and the row come
+        // back to what they were.
+        ctrl(&mut app, 'o');
+        let back = app.screen(area);
+        assert_eq!(bottom_edge(&back), Some(anchor), "the row the fold found");
+        assert_eq!(held_rows(&back), Some(1), "and the count it was holding");
+    }
+
+    /// The same for the reasoning: `Ctrl-T` adds and takes away the rows under
+    /// the human's place, and the row its edge shows is still the row it was
+    /// reading — the count it holds is the fold's own arithmetic.
+    #[test]
+    fn ctrl_t_keeps_the_held_row_at_the_panes_bottom_edge() {
+        let (mut app, _rx) = test_app("fold-reasoning-anchor");
+        let (width, height) = (100, 30);
+        for line in 0..14 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("line {line}")));
+        }
+        let reasoning: String = (0..30)
+            .map(|n| format!("weighing line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                reasoning_content: Some(reasoning),
+                ..Message::assistant("")
+            },
+        );
+        app.chat.set_reasoning(true);
+        // The human has scrolled up past the whole thought: their own last line
+        // is the pane's bottom edge, and the blank that closes it with the
+        // thought's 30 rows under it are held below — the 31 rows a count of
+        // rows keeps naming while the fold is taking them away.
+        app.chat.scroll_by(AgentId::ROOT, 31);
+
+        app.set_term_size(width, height);
+        let area = Rect::new(0, 0, width, height);
+        let before = app.screen(area);
+        let anchor = bottom_edge(&before).expect("the pane's bottom edge has a source row");
+        assert_eq!(held_rows(&before), Some(31), "the pane is holding a window");
+
+        // Hidden: the thought's rows go, and the row the human was reading is
+        // the pane's bottom again — the count is the fold's own arithmetic, and
+        // the row is the same source row.
+        ctrl(&mut app, 't');
+        let after = app.screen(area);
+        assert_eq!(
+            bottom_edge(&after),
+            Some(anchor),
+            "the same source row is what the edge reads"
+        );
+        assert_eq!(
+            held_rows(&after),
+            Some(0),
+            "a zero offset is still a hold: the bottom of the held transcript"
+        );
+
+        // Shown again: the rows come back under it, the count with them, and
+        // the row is where the fold found it.
+        ctrl(&mut app, 't');
+        let back = app.screen(area);
+        assert_eq!(
+            bottom_edge(&back),
+            Some(anchor),
+            "the window the fold started from, to the row"
+        );
+        assert_eq!(held_rows(&back), Some(31), "and the count it was holding");
+    }
+
+    /// A fold key on a pane at the bottom changes the view and nothing else: a
+    /// pane that follows has no window to keep, so the newest row is still what
+    /// its edge shows.
+    #[test]
+    fn a_fold_key_leaves_a_pane_at_the_bottom_following() {
+        let (mut app, _rx) = test_app("fold-following");
+        let (width, height) = (100, 30);
+        for line in 0..10 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("line {line}")));
+        }
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    serde_json::json!({"command": "cargo test -p mush-core --all-targets"}),
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        let output: String = (0..20)
+            .map(|n| format!("test line_{n} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.chat
+            .push_message(AgentId::ROOT, Message::tool("c1", &output));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("done"));
+
+        app.set_term_size(width, height);
+        let area = Rect::new(0, 0, width, height);
+        let before = app.screen(area);
+        assert_eq!(held_rows(&before), None, "the pane is at the bottom");
+        let edge = bottom_edge(&before).expect("the newest row has a source row");
+
+        ctrl(&mut app, 'o');
+
+        let after = app.screen(area);
+        assert_eq!(
+            held_rows(&after),
+            None,
+            "a pane at the bottom still follows"
+        );
+        assert_eq!(
+            bottom_edge(&after),
+            Some(edge),
+            "and the newest row is still what its edge shows"
+        );
+    }
+
+    /// `Ctrl-O` while the select mode is on is still a view of a pane the mode
+    /// is not painting: the mode's window is placed on its cursor, so there is
+    /// no reading row at the pane's edge to put back — the fold leaves the
+    /// count the human had, and the frame after it clamps the cursor and paints.
+    #[test]
+    fn a_fold_while_selecting_leaves_the_held_reading_alone() {
+        let (mut app, _rx) = test_app("fold-selecting");
+        let (width, height) = (100, 30);
+        let area = Rect::new(0, 0, width, height);
+        for line in 0..14 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("line {line}")));
+        }
+        app.chat.scroll_by(AgentId::ROOT, 5);
+        app.set_term_size(width, height);
+        assert_eq!(
+            held_rows(&app.screen(area)),
+            Some(5),
+            "the pane is holding a window"
+        );
+
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on");
+        let before = app.screen(area);
+        assert!(
+            chat_pane(&before).transcript.is_some(),
+            "the frame paints the mode's own window"
+        );
+        assert_eq!(
+            bottom_edge(&before),
+            None,
+            "and the mode's window is not the reading's: it publishes no edge row"
+        );
+
+        ctrl(&mut app, 'o');
+
+        assert!(
+            app.chat.selecting(),
+            "a fold is a view: the mode is still on"
+        );
+        let after = app.screen(area);
+        assert!(
+            chat_pane(&after).transcript.is_some(),
+            "and the frame after the fold clamps the cursor and paints"
+        );
+        assert_eq!(
+            bottom_edge(&after),
+            None,
+            "still no reading's row at the edge"
+        );
+        // The count is read where the pane spells it: the mode has the title,
+        // so leaving it leaves the fold's work to be seen.
+        app.chat.cancel_select();
+        let left = app.screen(area);
+        assert_eq!(
+            held_rows(&left),
+            Some(5),
+            "the mode's window is not the reading's, so the fold re-based nothing"
         );
     }
 

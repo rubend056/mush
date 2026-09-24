@@ -631,6 +631,9 @@ pub(crate) mod tests {
                 ],
                 title: " mush ".to_string(),
                 select,
+                // The rows are the test's own words, not a conversation's: no
+                // reading of them for a fold to keep (`Chat::re_anchor`).
+                anchor: None,
             }),
             input: None,
         }

@@ -353,6 +353,17 @@ pub struct Painted {
     /// Where the select mode is painted, when it is on this pane's
     /// conversation. `None` is the ordinary reading.
     pub select: Option<SelectRows>,
+    /// The row the conversation's bottom edge is reading from, and what the
+    /// pane painted under it ([`Anchor`]) — `None` for a pane with no source
+    /// row there (a body of call rows and blanks, an empty state) and while the
+    /// select mode paints a window of its own: the mode is not the reading, so
+    /// there is no reading's row at the edge for a fold to put back.
+    ///
+    /// The fold keys read this from the frame they lay out
+    /// ([`Chat::re_anchor`]) because the bottom edge is a fact about *these*
+    /// rows: a key that re-derived it, or mixed a row from one frame with a
+    /// width from another, would land the row on a pane the frame never painted.
+    pub anchor: Option<Anchor>,
 }
 
 /// The rows of a painted pane the select mode marks: indices into
@@ -699,6 +710,45 @@ impl Body {
         self.lines.truncate(kept);
         self.rows.truncate(kept);
     }
+
+    /// The row the body's bottom edge is reading from, and the rows the pane
+    /// painted under it that are nobody's source line — or `None` for a body
+    /// whose every row is a call's, a picture's or a blank, where there is no
+    /// row for a fold to follow.
+    fn anchor(&self) -> Option<Anchor> {
+        let at = self.rows.iter().rposition(|row| row.is_some())?;
+        Some(Anchor {
+            at: self.rows[at].expect("the row the walk just found"),
+            below: self.rows.len() - 1 - at,
+        })
+    }
+}
+
+/// The row at a pane's bottom edge, as a fold key needs it: **what** the pane
+/// is showing there, not merely how much.
+///
+/// The row is identified by its provenance — the message index and [`Stop`] a
+/// [`Chunk`] carries once the message is known ([`Body::rows`]) — and not by a
+/// count of rows from the bottom, because the count is exactly what a fold
+/// changes. `Ctrl-O` takes a result's payload to no rows at all and a call's
+/// own ask from many rows to one; `Ctrl-T` takes a whole thought out of the
+/// turn it decided. A held window is a count ([`Reading::Holding`]), so one of
+/// those keystrokes used to slide every line a human had scrolled away from the
+/// bottom to read: the count still named "that many rows above the newest
+/// line", and the row it named was a different one. The provenance survives the
+/// fold the way a count cannot, because it names the source row itself.
+///
+/// A row that has no provenance — a blank closing a message, a call's own
+/// header — is no anchor, and the `below` count is how the walk keeps the
+/// position they were read at: the re-base puts that many rows under the
+/// anchor again, so the anchor stays where it was on the pane even where the
+/// rows under it are not its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// The message index and stop of the bottom-most row with a provenance.
+    at: (usize, Stop),
+    /// Rows the pane painted below it, with no source line of their own.
+    below: usize,
 }
 
 /// The source lines of one message the pane paints text rows for, or `None` for
@@ -2650,6 +2700,114 @@ impl Chat {
         self.reading.insert(agent, next);
     }
 
+    /// Re-base the window `agent`'s pane is holding around the row its bottom
+    /// edge was showing, so the fold key that is about to change the rows leaves
+    /// that row at that edge: the hold is kept, and the row is the same source
+    /// row in the same place on the pane.
+    ///
+    /// `Ctrl-O` and `Ctrl-T` change how many rows a block paints, and a held
+    /// window is a count of rows from the bottom ([`Reading::Holding`]), so one
+    /// of those keystrokes used to slide every line a human had scrolled away
+    /// from the bottom to read. `anchor` is the row they were reading, taken
+    /// from the frame that painted it ([`Painted::anchor`]) together with the
+    /// pane's own `width` and `height` ([`super::screen::transcript_measure`]),
+    /// and the offset is re-read as the rows the *new* fold paints under that
+    /// row.
+    ///
+    /// The room the frame hands over is the pane's, foot and all, and not the
+    /// conversation's: the foot takes the pane's last rows ([`Self::painted`]),
+    /// so the walk measures a window a row or two taller than the painted one
+    /// and names the same offset all the same — the rows a foot adds sit *under*
+    /// the anchor, and cancel out of the count that puts it back at the edge.
+    ///
+    /// Those rows are counted by painting, not by arithmetic beside the
+    /// painter: the held transcript's own bottom window at offset zero, widened
+    /// by doubling until the row appears, so a fold that added rows under the
+    /// human's place costs a few walks and not one per row. The count is the
+    /// painter's count at `width` too: a wrapped row costs what the pane pays
+    /// for it, and not what a second wrap thinks it costs.
+    ///
+    /// The count is a fact about the transcript's rows; the pane's own window
+    /// is what lands a row at its edge, and the two are not always the same
+    /// number — a build's closing blanks are trimmed before its window is cut,
+    /// so an offset can show a row or two other than the count names. The count
+    /// and its nearest neighbours are tried, and the offset whose window
+    /// publishes the anchor as its own reading of the edge is the one taken:
+    /// the re-base is checked against what the pane paints, not against the
+    /// count alone.
+    ///
+    /// A row the fold took away (a result the compact log paints nothing of)
+    /// is not there to put back: the position is left exactly as it was, rather
+    /// than guessed at or snapped to the bottom.
+    ///
+    /// Only the pane the frame painted is re-based. Another agent's reading is
+    /// a window nobody is looking at, measured at a width and a room this frame
+    /// did not lay out; it keeps its count until the human reads it, and the
+    /// keys they press there are theirs.
+    pub fn re_anchor(&mut self, agent: AgentId, width: usize, height: usize, anchor: Anchor) {
+        // A pane at the bottom has nothing to anchor: it follows the newest
+        // line, and the fold's own rows are already the newest thing it shows.
+        let Some((_, up_to)) = self.reading(agent).held(self.transcript(agent).len()) else {
+            return;
+        };
+        // The first walk is the pane's own room; from there the window doubles,
+        // because the rows a fold *added* below the anchor can reach past it.
+        // `seen` is the transcript's own beginning: a walk that painted no more
+        // rows than the last one has nothing above it to reach.
+        let mut height = height.max(1);
+        let mut seen = 0usize;
+        let rows_below = loop {
+            let body = self.window(agent, &self.transcript(agent)[..up_to], width, height, 0);
+            if let Some(at) = body
+                .rows
+                .iter()
+                .rposition(|row| row.as_ref() == Some(&anchor.at))
+            {
+                break Some(body.rows.len() - 1 - at);
+            }
+            let painted = body.rows.len();
+            if painted <= seen {
+                break None;
+            }
+            seen = painted;
+            height = height.saturating_mul(2);
+        };
+        // The row is gone from the whole held transcript — the fold painted it
+        // away. A position is the human's; this one cannot be put back, and
+        // guessing at another would be a jump they did not ask for.
+        let Some(rows_below) = rows_below else {
+            return;
+        };
+        // The rows under the anchor that are not its own stay under it, so the
+        // anchor keeps the height on the pane it was read at.
+        let want = rows_below.saturating_sub(anchor.below);
+        let mut offset = want;
+        'near: for step in 0..=2usize {
+            // The larger offset first: the pane's window falls *short* of the
+            // count where the two differ, so the row that is one row too new at
+            // the count is at the edge one step further up.
+            for candidate in [want.saturating_add(step), want.saturating_sub(step)] {
+                let body = self.window(
+                    agent,
+                    &self.transcript(agent)[..up_to],
+                    width,
+                    height,
+                    candidate,
+                );
+                if body.anchor() == Some(anchor) {
+                    offset = candidate;
+                    break 'near;
+                }
+            }
+        }
+        // An offset of zero is still a hold — the bottom of a transcript that
+        // may have grown since the human scrolled — because the step that
+        // rejoins the newest line is theirs to take, not a view's to take for
+        // them.
+        self.reading
+            .insert(agent, Reading::Holding { offset, up_to });
+    }
+
     /// The rows a pane `height` rows tall and `width` columns wide is showing:
     /// the tail of the agent's transcript, bottom-anchored, with the blank
     /// separator that closes a message trimmed before the window is cut, the
@@ -2719,6 +2877,14 @@ impl Chat {
             Some((select, cursor)) => self.select_body(select, cursor, pane.agent, width, window),
             None => (self.body(pane, width, window), None),
         };
+        // The row at the pane's bottom edge, for the fold keys. It is the
+        // *reading*'s window's edge, so the mode publishes nothing: the mode's
+        // window is placed on the cursor, and the fold is not the mode's to
+        // re-base.
+        let anchor = match mode {
+            None => body.anchor(),
+            Some(_) => None,
+        };
         // Read before the queued rows and the foot are appended: the mode's
         // rows are transcript rows, and neither the foot nor a queued line —
         // which has no source line to be a stop of — carries the cursor. The
@@ -2787,6 +2953,7 @@ impl Chat {
             lines,
             title,
             select: select_rows,
+            anchor,
         }
     }
 
@@ -3240,47 +3407,58 @@ impl Chat {
         // A pane with nothing in it says what it is waiting for rather than
         // being blank.
         if messages.is_empty() && self.notices_for(pane.agent).next().is_none() {
-            let hint: Vec<String> = if pane.agent == AgentId::ROOT {
-                vec![
-                    "Ask for a change — the agent reads and edits this workspace directly."
-                        .to_string(),
-                    String::new(),
-                    pane.label.to_string(),
-                    "Tab cycles panes · Enter sends · /help lists commands".to_string(),
-                ]
-            } else {
-                vec![format!(
-                    "Agent {} has no messages yet — typing here sends it a nudge.",
-                    pane.agent
-                )]
-            };
-            // Wrapped to the pane and windowed to its height, like every other
-            // row: returned raw, the hint was cut mid-word on a narrow pane
-            // ("the agent reads and") and the lines under it never appeared.
-            let lines: Vec<Line<'static>> = hint
-                .iter()
-                .flat_map(|line| wrap_text(line, width))
-                .take(height)
-                .map(|line| Line::from(Span::styled(line, dim())))
-                .collect();
-            return Body {
-                rows: vec![None; lines.len()],
-                lines,
-            };
+            return waiting(pane, width, height);
         }
 
+        self.window(pane.agent, messages, width, height, scroll)
+    }
+
+    /// The tail of `messages` a window `height` rows tall shows: the newest rows
+    /// at the bottom, `scroll` rows of older ones above them — the walk
+    /// [`Self::body`] paints a pane through, and the one [`Self::re_anchor`]
+    /// measures a held window's rows with.
+    ///
+    /// Split out so the two are one walk and not two readings of one
+    /// transcript: a re-base that counted the rows below a row itself, with a
+    /// wrap of its own, would land the row on a pane the frame did not paint.
+    fn window(
+        &self,
+        agent: AgentId,
+        messages: &[Message],
+        width: usize,
+        height: usize,
+        scroll: usize,
+    ) -> Body {
         // Built back to front and then reversed: each chunk is one message's
         // rows in their own order, and the pane is anchored at the bottom, so
         // the newest line is the one that must be there.
+        //
+        // `want` counts the blanks the trim below will drop as well: they are
+        // the newest message's closing rows, and a build that stopped a blank
+        // short of the window left the window anchored one row too low — the
+        // offset then named a row the pane did not show, which is a scroll that
+        // does not move (a step up and a step down landing on the same rows).
         let want = height + scroll;
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut count = 0usize;
+        let mut closing = 0usize;
 
         for index in (0..messages.len()).rev() {
-            if count >= want {
+            if count >= want + closing {
                 break;
             }
-            let chunk = self.chunk(pane.agent, index, width);
+            let chunk = self.chunk(agent, index, width);
+            if chunks.is_empty() {
+                // The rows the build ends with are the newest message's, so
+                // this is the count of blanks `trim_trailing_blanks` will take
+                // off the bottom of it.
+                closing = chunk
+                    .lines
+                    .iter()
+                    .rev()
+                    .take_while(|line| line.width() == 0)
+                    .count();
+            }
             count += chunk.lines.len();
             chunks.push(chunk);
         }
@@ -3625,6 +3803,41 @@ impl Chat {
                 None
             }
         }
+    }
+}
+
+/// The rows a pane with nothing said yet paints: what mush is waiting for, and
+/// which pane it is, rather than blank rows.
+///
+/// Split out of [`Chat::body`] so the window walk it hands over to can be one
+/// thing — messages that exist, walked at a measure — and so the empty state's
+/// wrap, which is nobody's source line, is not read as a conversation's.
+fn waiting(pane: &Pane<'_>, width: usize, height: usize) -> Body {
+    let hint: Vec<String> = if pane.agent == AgentId::ROOT {
+        vec![
+            "Ask for a change — the agent reads and edits this workspace directly.".to_string(),
+            String::new(),
+            pane.label.to_string(),
+            "Tab cycles panes · Enter sends · /help lists commands".to_string(),
+        ]
+    } else {
+        vec![format!(
+            "Agent {} has no messages yet — typing here sends it a nudge.",
+            pane.agent
+        )]
+    };
+    // Wrapped to the pane and windowed to its height, like every other row:
+    // returned raw, the hint was cut mid-word on a narrow pane ("the agent
+    // reads and") and the lines under it never appeared.
+    let lines: Vec<Line<'static>> = hint
+        .iter()
+        .flat_map(|line| wrap_text(line, width))
+        .take(height)
+        .map(|line| Line::from(Span::styled(line, dim())))
+        .collect();
+    Body {
+        rows: vec![None; lines.len()],
+        lines,
     }
 }
 
@@ -5283,7 +5496,11 @@ mod tests {
     }
 
     /// The window follows the scrollback, and the bottom is where the newest
-    /// line is: a pane that is at the bottom needs nothing done to it.
+    /// line is: a pane that is at the bottom needs nothing done to it. A row of
+    /// pane is a row of the conversation, so the blank that separates the newest
+    /// line from the one before it is painted above it — the pane fills itself,
+    /// rather than leaving the bottom row empty and its content floating at the
+    /// top of the box.
     #[test]
     fn the_window_follows_the_scrollback() {
         let mut chat = Chat::bare();
@@ -5292,7 +5509,11 @@ mod tests {
         }
         let pane = pane(AgentId::ROOT);
         let bottom = shown(&pane_rows(&chat, &pane, 20, 2));
-        assert_eq!(bottom, vec!["you › line 4"], "anchored at the newest");
+        assert_eq!(
+            bottom,
+            vec!["", "you › line 4"],
+            "anchored at the newest, with the row above it"
+        );
 
         // Up and down are the pane's own keys.
         assert!(press(&mut chat, key(KeyCode::Up)));
@@ -5304,7 +5525,10 @@ mod tests {
         assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), bottom);
         // And a new line arrives at the bottom, where the pane already is.
         say(&mut chat, AgentId::ROOT, "line 5");
-        assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), vec!["you › line 5"]);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 20, 2)),
+            vec!["", "you › line 5"]
+        );
     }
 
     /// A pane the human has scrolled away from holds the window it is showing:
@@ -5411,6 +5635,438 @@ mod tests {
             shown(&pane_rows(&chat, &child, 20, 2)),
             child_rows,
             "the child's pane did not move"
+        );
+    }
+
+    /// The provenance of the row at the pane's bottom edge, as the frame
+    /// publishes it: what a fold key re-bases a held window around.
+    fn bottom_row(chat: &Chat, pane: &Pane<'_>, width: usize, height: usize) -> (usize, Stop) {
+        chat.painted(pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row")
+            .at
+    }
+
+    /// Scroll the pane until the row with provenance `at` is *provably* its
+    /// bottom edge: the frame's anchor is that provenance with nothing painted
+    /// under it.
+    ///
+    /// The offset is found by painting the pane's own windows — the walk the
+    /// frame runs ([`Chat::window`]) — until one shows the row at the edge,
+    /// rather than by counting rows and hoping the count is what a window
+    /// makes: a build's closing blanks are trimmed before its window is cut,
+    /// and the count can land a row or two off it.
+    fn scroll_to(chat: &mut Chat, pane: &Pane<'_>, width: usize, height: usize, at: (usize, Stop)) {
+        assert_eq!(
+            chat.reading(pane.agent),
+            Reading::Following,
+            "the helper starts at the bottom"
+        );
+        let transcript = chat.transcript(pane.agent);
+        // The whole transcript painted: the search's bound, and what says the
+        // row is nowhere to be found when no offset shows it.
+        let all = chat.window(pane.agent, transcript, width, usize::MAX / 2, 0);
+        for offset in 0..=all.rows.len() {
+            let window = chat.window(pane.agent, transcript, width, height, offset);
+            if window.anchor() == Some(Anchor { at, below: 0 }) {
+                chat.scroll_by(pane.agent, offset as i64);
+                assert_eq!(
+                    chat.painted(pane, width, height).anchor,
+                    Some(Anchor { at, below: 0 }),
+                    "the pane the frame paints shows the row at the edge: {:?}",
+                    shown(&chat.body(pane, width, height).lines),
+                );
+                return;
+            }
+        }
+        panic!("no offset puts {at:?} at the edge: {:?}", shown(&all.lines));
+    }
+
+    /// The conversation the fold tests scroll through: the human's own lines —
+    /// the last of them long enough to wrap on a narrow pane — and then a turn
+    /// whose call and result are what `Ctrl-O` changes: the payload at the
+    /// fold's eight rows, or at none.
+    fn a_call_to_scroll_through() -> Chat {
+        let mut chat = Chat::bare();
+        for line in 0..11 {
+            say(&mut chat, AgentId::ROOT, &format!("line {line}"));
+        }
+        say(
+            &mut chat,
+            AgentId::ROOT,
+            "line 11, with enough words on it to wrap on a narrow pane and not on a wide one",
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    r#"{"command":"cargo test -p mush-core --all-targets -- --nocapture"}"#,
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        let output: String = (0..20)
+            .map(|n| format!("test line_{n} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        chat.push_message(AgentId::ROOT, Message::tool("c1", &output));
+        // The shown view: the launch compact log paints none of the payload,
+        // and this test is about the fold that takes the rows away.
+        chat.set_output(true);
+        chat
+    }
+
+    /// A conversation whose last turn is a thought with nothing said around it:
+    /// `Ctrl-T` adds and takes away the rows under the human's own line, and
+    /// the thought is long enough that putting them back needs a window taller
+    /// than the pane.
+    fn a_thought_to_scroll_through() -> Chat {
+        let mut chat = Chat::bare();
+        for line in 0..14 {
+            say(&mut chat, AgentId::ROOT, &format!("line {line}"));
+        }
+        let reasoning: String = (0..30)
+            .map(|n| format!("weighing line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        chat.push_message(AgentId::ROOT, thinking("", &reasoning));
+        chat.set_reasoning(true);
+        chat
+    }
+
+    /// A fold key pressed on a pane that is holding a window re-bases it: the
+    /// row at the bottom edge is the same source row afterwards, in the same
+    /// place on the pane, and the pane is still holding. A count of rows could
+    /// not do this — the offset *is* a count, and the fold changes the rows it
+    /// counts — and the pane pays the count back by painting the held
+    /// transcript's own tail, at the width its rows were painted at.
+    #[test]
+    fn a_fold_keeps_the_held_row_at_the_panes_bottom_edge() {
+        let (width, height) = (60, 12);
+        let pane = pane(AgentId::ROOT);
+        let mut chat = a_call_to_scroll_through();
+        // The human's own line, with the whole call block under it: the rows
+        // the compact log is about to take away.
+        let at = (11, Stop::Line(0));
+        scroll_to(&mut chat, &pane, width, height, at);
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+        assert_eq!(held.at, at);
+        assert_eq!(held.below, 0, "the edge itself is the row");
+        let edge = shown(&chat.body(&pane, width, height).lines)
+            .last()
+            .cloned()
+            .expect("the pane has rows");
+        let Reading::Holding {
+            offset: shown_rows,
+            up_to,
+        } = chat.reading(AgentId::ROOT)
+        else {
+            panic!("the pane is holding a window");
+        };
+
+        // The compact log: the payload is gone, the call's own ask is one row.
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(
+            bottom_row(&chat, &pane, width, height),
+            at,
+            "the row is at the edge again: {:?}",
+            shown(&chat.body(&pane, width, height).lines),
+        );
+        assert_eq!(
+            shown(&chat.body(&pane, width, height).lines)
+                .last()
+                .cloned(),
+            Some(edge),
+            "and it is still the same painted row"
+        );
+        let Reading::Holding {
+            offset: compact,
+            up_to: same,
+        } = chat.reading(AgentId::ROOT)
+        else {
+            panic!("the pane is still holding, not following");
+        };
+        assert!(compact > 0, "the window is still above the bottom");
+        assert!(
+            compact < shown_rows,
+            "the fold took rows from under it: {compact} < {shown_rows}"
+        );
+        assert_eq!(same, up_to, "the window is the held transcript's");
+
+        // And back: the same key brings the rows again, and the search walks
+        // past what it added under the row.
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(bottom_row(&chat, &pane, width, height), at);
+        let Reading::Holding {
+            offset: folded_back,
+            ..
+        } = chat.reading(AgentId::ROOT)
+        else {
+            panic!("the pane is still holding");
+        };
+        assert!(
+            folded_back > compact,
+            "the rows came back under the row: {folded_back} > {compact}"
+        );
+    }
+
+    /// The reasoning is rows like any other kind's, and `Ctrl-T` adds and takes
+    /// them away: a pane holding a window keeps the row at its edge through
+    /// both, and holds it rather than following even where the fold leaves the
+    /// held transcript's own bottom at the edge.
+    #[test]
+    fn a_fold_keeps_the_held_row_at_the_edge_when_the_reasoning_moves() {
+        let (width, height) = (60, 14);
+        let pane = pane(AgentId::ROOT);
+        let mut chat = a_thought_to_scroll_through();
+        // The human's own line, with the thought's rows under it.
+        let at = (13, Stop::Line(0));
+        scroll_to(&mut chat, &pane, width, height, at);
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+        let Reading::Holding {
+            offset: thinking,
+            up_to,
+        } = chat.reading(AgentId::ROOT)
+        else {
+            panic!("the pane is holding a window");
+        };
+
+        // Hidden: the thought's rows go, and what is under the row is the
+        // transcript's own bottom — the hold is kept, at zero.
+        chat.set_reasoning(false);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(bottom_row(&chat, &pane, width, height), at);
+        assert_eq!(
+            chat.reading(AgentId::ROOT),
+            Reading::Holding { offset: 0, up_to },
+            "a zero offset is still a hold: the bottom of the held transcript"
+        );
+
+        // Shown again: the rows come back under the row — the same window the
+        // fold started from, and the search needed a walk taller than the pane
+        // to find it.
+        chat.set_reasoning(true);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(bottom_row(&chat, &pane, width, height), at);
+        assert_eq!(
+            chat.reading(AgentId::ROOT),
+            Reading::Holding {
+                offset: thinking,
+                up_to
+            },
+            "the thought's rows are under the row again"
+        );
+        assert!(
+            thinking > height,
+            "the rows under the row are past the pane's own window: {thinking}"
+        );
+    }
+
+    /// A pane at the bottom has nothing to anchor: the fold key leaves it
+    /// following, with the newest row at its bottom edge.
+    #[test]
+    fn a_fold_leaves_a_pane_at_the_bottom_following() {
+        let (width, height) = (60, 12);
+        let pane = pane(AgentId::ROOT);
+        let mut chat = a_call_to_scroll_through();
+        // A line after the call block, so the fold changes rows *above* the
+        // edge: the bottom row itself is not the fold's to keep.
+        say(&mut chat, AgentId::ROOT, "and now?");
+        assert_eq!(chat.reading(AgentId::ROOT), Reading::Following);
+        let newest = bottom_row(&chat, &pane, width, height);
+        assert_eq!(
+            newest,
+            (14, Stop::Line(0)),
+            "the newest line is at the edge"
+        );
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(
+            chat.reading(AgentId::ROOT),
+            Reading::Following,
+            "a pane at the bottom still follows"
+        );
+        assert_eq!(
+            bottom_row(&chat, &pane, width, height),
+            newest,
+            "and the newest line is still what its edge shows"
+        );
+    }
+
+    /// A fold that paints the anchor's own row away cannot put it back. The
+    /// position is the human's: the count they had is the count they keep, and
+    /// neither a jump to the bottom nor a guess at another row is theirs to be
+    /// given.
+    #[test]
+    fn a_fold_that_takes_the_anchors_row_away_leaves_the_position_alone() {
+        let (width, height) = (60, 12);
+        let pane = pane(AgentId::ROOT);
+        let mut chat = a_call_to_scroll_through();
+        // A row of the result's own payload: on the pane in the shown view, and
+        // nothing at all in the compact log.
+        let at = (13, Stop::Line(1));
+        scroll_to(&mut chat, &pane, width, height, at);
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+        let before = chat.reading(AgentId::ROOT);
+
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        assert_eq!(
+            chat.reading(AgentId::ROOT),
+            before,
+            "the count is the one the human had"
+        );
+        // No panic, and the pane paints the conversation it has: the rows above
+        // the anchor, and none of the payload the fold took away.
+        let rows = shown(&pane_rows(&chat, &pane, width, height));
+        assert!(
+            rows.iter().any(|row| row.contains("you › line 4")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("test line_19")),
+            "the compact log paints no payload: {rows:?}"
+        );
+    }
+
+    /// A block's rows are a fact about the pane's width — the wrap and the cut —
+    /// so the re-base counts them at the width the rows were painted at: the
+    /// anchor comes back at a wide pane and at a narrow one, and neither paints
+    /// a row the fold took away.
+    #[test]
+    fn the_held_row_comes_back_at_the_width_the_pane_wraps_at() {
+        for (width, height) in [(100, 14), (28, 14)] {
+            let pane = pane(AgentId::ROOT);
+            let mut chat = a_call_to_scroll_through();
+            // The wrapped human line: the row the pane's edge shows is its last
+            // wrapped row, and the fold changes rows below it at both widths.
+            let at = (11, Stop::Line(0));
+            scroll_to(&mut chat, &pane, width, height, at);
+            let held = chat
+                .painted(&pane, width, height)
+                .anchor
+                .expect("the pane's bottom edge has a source row");
+            let edge = shown(&chat.body(&pane, width, height).lines)
+                .last()
+                .cloned()
+                .expect("the pane has rows");
+
+            toggle_output(&mut chat);
+            chat.re_anchor(AgentId::ROOT, width, height, held);
+            assert_eq!(
+                bottom_row(&chat, &pane, width, height),
+                at,
+                "{width} columns: the row is at the edge again"
+            );
+            let after = chat.body(&pane, width, height);
+            assert_eq!(
+                shown(&after.lines).last().cloned(),
+                Some(edge),
+                "{width} columns: the same wrapped row"
+            );
+            let rows = shown(&pane_rows(&chat, &pane, width, height));
+            assert!(
+                !rows.iter().any(|row| row.contains("test line_19")),
+                "{width} columns: the compact log paints no payload: {rows:?}"
+            );
+        }
+    }
+
+    /// Re-basing is a position, not a mode: the hold it leaves is the one
+    /// `scroll_by` moves, so a step up and back down lands on the same row at
+    /// the edge, and the step that leaves the held window is still the step
+    /// that takes the newest line.
+    #[test]
+    fn re_basing_leaves_the_step_that_rejoins_the_newest_line_alone() {
+        let (width, height) = (60, 12);
+        let pane = pane(AgentId::ROOT);
+        let mut chat = a_call_to_scroll_through();
+        let at = (10, Stop::Line(0));
+        scroll_to(&mut chat, &pane, width, height, at);
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+        let Reading::Holding { offset, up_to } = chat.reading(AgentId::ROOT) else {
+            panic!("the pane is holding");
+        };
+        assert!(offset > 0);
+
+        // One row up: the window moves and the row leaves the edge. One row
+        // down again: the row is back at the edge, at the offset the re-base
+        // set.
+        chat.scroll_by(AgentId::ROOT, 1);
+        assert_ne!(chat.painted(&pane, width, height).anchor, Some(held));
+        chat.scroll_by(AgentId::ROOT, -1);
+        assert_eq!(chat.painted(&pane, width, height).anchor, Some(held));
+        assert_eq!(
+            chat.reading(AgentId::ROOT),
+            Reading::Holding { offset, up_to }
+        );
+
+        // Down to the bottom of the held window and one step past it: the step
+        // that leaves the held window is the step that takes the newest line.
+        // The newest row the compact log *paints* is the call's own, above the
+        // payload the fold took away, and the bottom edge is its last source
+        // row — the human's own line under which the call block sits.
+        chat.scroll_by(AgentId::ROOT, -(offset as i64));
+        assert_eq!(chat.reading(AgentId::ROOT), Reading::Following);
+        assert_eq!(bottom_row(&chat, &pane, width, height), (11, Stop::Line(0)));
+    }
+
+    /// The re-base is the painted pane's, and only its: another agent's held
+    /// window has no frame, no measure and nobody reading it, so the fold
+    /// leaves its count alone until the human is looking at that pane.
+    #[test]
+    fn a_fold_re_bases_only_the_pane_the_frame_painted() {
+        let (width, height) = (60, 12);
+        let mut chat = a_call_to_scroll_through();
+        for line in 0..8 {
+            say(&mut chat, AgentId(1), &format!("child {line}"));
+        }
+        chat.scroll_by(AgentId::ROOT, 9);
+        chat.scroll_by(AgentId(1), 4);
+        let child = pane(AgentId(1));
+        let before = shown(&pane_rows(&chat, &child, width, height));
+        let reading = chat.reading(AgentId(1));
+
+        let pane = pane(AgentId::ROOT);
+        let held = chat
+            .painted(&pane, width, height)
+            .anchor
+            .expect("the pane's bottom edge has a source row");
+        toggle_output(&mut chat);
+        chat.re_anchor(AgentId::ROOT, width, height, held);
+
+        assert_eq!(
+            chat.reading(AgentId(1)),
+            reading,
+            "the child's reading is the child's"
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &child, width, height)),
+            before,
+            "and its rows did not move"
         );
     }
 

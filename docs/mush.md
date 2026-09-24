@@ -558,6 +558,9 @@ whatever the human chose. A reasoning that trims to nothing paints no row at all
 
 Mush opens in `Ctrl-O`'s compact log: the conversation folded to one row per
 tool call; the key brings the rows back, and a second press folds them away.
+Either key leaves a pane scrolled away from the bottom where the human was
+reading: the row at its bottom edge is the same source row afterwards, because
+a held window is a count of rows and a fold is exactly what changes them.
 The call's row is the *same row in both views* — the pane's call grid — and the
 compact log differs only in what follows it: a header, no details, no payload.
 

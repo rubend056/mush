@@ -905,6 +905,9 @@ pub(crate) mod tests {
                 transcript: Some(Painted {
                     lines: transcript,
                     title: " mush ".to_string(),
+                    // Synthetic rows, not a conversation: there is no reading
+                    // of them for a fold to keep (`Chat::re_anchor`).
+                    anchor: None,
                     select: None,
                 }),
                 input: Some(InputPane {
