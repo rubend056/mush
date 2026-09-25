@@ -208,8 +208,8 @@ fn form(truecolor: bool) -> Form {
     }
 }
 
-/// The two inks of an agents row's line delta: `+N` in `#3FB950` and `−M` in
-/// `#F85149`, green for what a branch added and red for what it removed.
+/// The two inks of an agents row's line delta: `+N` in `#389A46` and `−M` in
+/// `#CC4640`, green for what a branch added and red for what it removed.
 ///
 /// The halves are deliberately not one ink, and now they read the conventional
 /// way. The pair before this one made the removed half the good direction — a
@@ -227,11 +227,20 @@ fn form(truecolor: bool) -> Form {
 /// bytes of their own, so they travel in the form the terminal announced,
 /// exactly as the accent does — a bare `Color::Rgb` would be the one ink mush
 /// paints at a terminal that never claimed it. Both are chosen to hold up on a
-/// dark terminal: against a near-black `#1c1c1c` the green reads at about 6.7:1
-/// and the red at about 5.1:1 (more against pure black), and the indexed form
-/// keeps the two hues apart (entries 71 and 203).
-const ADDED_RGB: (u8, u8, u8) = (0x3F, 0xB9, 0x50);
-const REMOVED_RGB: (u8, u8, u8) = (0xF8, 0x51, 0x49);
+/// dark terminal without shouting: against a near-black `#1c1c1c` the green
+/// reads at about 4.8:1 and the red at about 3.7:1 (more against pure black),
+/// and the indexed form keeps the two hues apart (entries 65 and 167).
+///
+/// The rule behind these bytes is a *mix*, not a taste. The pair before them
+/// (`#3FB950`/`#F85149`) read a tad too loud in the human's own terminal, so
+/// both were mixed about 20 % toward the background they sit on: the hue
+/// survives, the shout does not (6.7:1 → 4.8:1 and 5.1:1 → 3.7:1), and the
+/// indexed pair dims with them (71/203 → 65/167). A future tune re-derives
+/// from the same rule rather than re-tasting; the floor to hold is 3.5:1,
+/// because the row paints the `+`/`−` glyphs and colour only ever reinforces
+/// the sign.
+const ADDED_RGB: (u8, u8, u8) = (0x38, 0x9A, 0x46);
+const REMOVED_RGB: (u8, u8, u8) = (0xCC, 0x46, 0x40);
 
 /// [`ADDED_RGB`] and [`REMOVED_RGB`] in `form`.
 fn delta_inks(form: Form) -> (Color, Color) {
@@ -765,27 +774,28 @@ mod tests {
     /// gets the nearest entry.
     #[test]
     fn the_delta_inks_follow_the_form_they_are_painted_in() {
-        assert_eq!(Theme::default().added(), Color::Rgb(0x3F, 0xB9, 0x50));
-        assert_eq!(Theme::default().removed(), Color::Rgb(0xF8, 0x51, 0x49));
+        assert_eq!(Theme::default().added(), Color::Rgb(0x38, 0x9A, 0x46));
+        assert_eq!(Theme::default().removed(), Color::Rgb(0xCC, 0x46, 0x40));
 
         let on_truecolor = Theme::resolve(&truecolor(), &nowhere()).unwrap();
-        assert_eq!(on_truecolor.added(), Color::Rgb(0x3F, 0xB9, 0x50));
-        assert_eq!(on_truecolor.removed(), Color::Rgb(0xF8, 0x51, 0x49));
+        assert_eq!(on_truecolor.added(), Color::Rgb(0x38, 0x9A, 0x46));
+        assert_eq!(on_truecolor.removed(), Color::Rgb(0xCC, 0x46, 0x40));
 
         let indexed = Theme::resolve(&text(None, None, Some("linux")), &nowhere()).unwrap();
         assert_eq!(
             indexed.added(),
-            Color::Indexed(nearest_256((0x3F, 0xB9, 0x50)))
+            Color::Indexed(nearest_256((0x38, 0x9A, 0x46)))
         );
         assert_eq!(
             indexed.removed(),
-            Color::Indexed(nearest_256((0xF8, 0x51, 0x49)))
+            Color::Indexed(nearest_256((0xCC, 0x46, 0x40)))
         );
-        // Both forms keep the reading: entry 71 is a green and entry 203 a red,
+        // Both forms keep the reading: entry 65 is a green and entry 167 a red,
         // pinned by hand so the search's arithmetic is not compared with
-        // itself (the same habit as the teal pin above).
-        assert_eq!(nearest_256(ADDED_RGB), 71);
-        assert_eq!(nearest_256(REMOVED_RGB), 203);
+        // itself (the same habit as the teal pin above). The dimmed pair dims
+        // in this form too: 71 and 203 were the cube's loud neighbours.
+        assert_eq!(nearest_256(ADDED_RGB), 65);
+        assert_eq!(nearest_256(REMOVED_RGB), 167);
 
         // The pair is fixed: a hue changes the chrome and not the delta.
         let named = Theme::resolve(&text(Some("teal"), None, Some("linux")), &nowhere()).unwrap();
@@ -793,8 +803,8 @@ mod tests {
         assert_eq!(named.removed(), indexed.removed());
 
         let off = Theme::resolve(&text(Some("off"), Some("truecolor"), None), &nowhere()).unwrap();
-        assert_eq!(off.added(), Color::Rgb(0x3F, 0xB9, 0x50));
-        assert_eq!(off.removed(), Color::Rgb(0xF8, 0x51, 0x49));
+        assert_eq!(off.added(), Color::Rgb(0x38, 0x9A, 0x46));
+        assert_eq!(off.removed(), Color::Rgb(0xCC, 0x46, 0x40));
     }
 
     /// A named hue is that hue, whatever the path is, and it follows the same
