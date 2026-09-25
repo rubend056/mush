@@ -48,11 +48,29 @@ pub struct RepoStatus {
     pub stat: Stat,
 }
 
-/// One `git` call with the terminal untouched (`output()`, never `status()`:
-/// the TUI owns stdout). `None` on any failure, including a missing git.
+/// One read-only `git` call, with the terminal untouched (`output()`, never
+/// `status()`: the TUI owns stdout). `None` on any failure, including a missing
+/// git.
 ///
 /// `LC_ALL=C` keeps the output parseable: a localized `--shortstat` would not
 /// match the English words the parser knows, and would read as `±0`.
+///
+/// The one place the reading half starts a child: [`git`] and [`git_bytes`]
+/// differ only in what they make of the answer, and the command line is spelled
+/// once instead of twice. (The writing half is `run_named`, which wants the
+/// error text an `Option` here throws away.)
+fn git_output(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args).env("LC_ALL", "C");
+    let output = scrub(&mut command).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output)
+}
+
+/// [`git_output`] as a line answer: the stdout, decoded and with its end
+/// trimmed.
 ///
 /// Only the *end* is trimmed: the trailing newline is the one whitespace git
 /// adds to an answer, while the front of an answer is data. `git status
@@ -62,18 +80,27 @@ pub struct RepoStatus {
 /// every positional read on it moved one byte left: the code became the
 /// worktree column and the path lost its first character (a ` M lib/sub` line
 /// named `ib/sub`), which is a name no file has. A path is not a token.
+///
+/// The one answer that is not lines — `git status --porcelain -z`, whose paths
+/// must arrive byte-exact — is read by [`git_bytes`] beside this helper rather
+/// than folded into it: "a line answer, its trailing newline gone" is this
+/// helper's whole contract, and a NUL-separated answer has no trailing newline
+/// to trim and no `String` to be. Both start their child through
+/// [`git_output`].
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args).env("LC_ALL", "C");
-    let output = scrub(&mut command).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
     Some(
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&git_output(dir, args)?.stdout)
             .trim_end()
             .to_string(),
     )
+}
+
+/// [`git_output`] as raw bytes, for the one question whose answer is not lines:
+/// `git status --porcelain=v1 -z` separates entries with a NUL and prints every
+/// path verbatim, so the bytes *are* the names and nothing may be decoded,
+/// trimmed, or split before [`changes`] has them field by field.
+fn git_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    Some(git_output(dir, args)?.stdout)
 }
 
 /// The reason `run` gives when the git process could not be started at all.
@@ -163,9 +190,14 @@ pub fn status(dir: &Path) -> Option<RepoStatus> {
     })
 }
 
-/// One path `git status --porcelain --ignored=matching` reports in `dir`: its
-/// name, and whether it is there only because an ignore rule covers it (an `!!`
-/// line).
+/// One path `git status --porcelain=v1 -z --ignored=matching` reports in `dir`:
+/// its name, and whether it is there only because an ignore rule covers it (an
+/// `!!` entry).
+///
+/// `path` is the name as git printed it, not a quoted spelling of it: with `-z`
+/// there is no quoting to undo, so a name holding ` -> `, a space, or a
+/// non-ASCII byte arrives whole — and a name whose bytes are not valid UTF-8 is
+/// decoded lossily rather than dropped ([`changes`] argues that choice).
 ///
 /// Telling the ignored half apart is what lets one reading answer both
 /// questions the tree asks of a checkout: whether a commit would take anything
@@ -185,31 +217,68 @@ struct Change {
 /// files first, the ignored ones after them. One process and one parse, so the
 /// reclaim probe and [`commit_all`] cannot disagree about whether a run changed
 /// anything (finding F1).
+///
+/// The answer is read in git's *machine* format, `--porcelain=v1 -z`, not the
+/// human porcelain. The line format was ambiguous twice over. A rename's new
+/// name is a filename and may itself contain ` -> `, so `R  old -> a -> b.txt`
+/// right-split to `b.txt"` — a name no file has (#246, which fixed the
+/// neighbouring off-by-one and left this one open). And with `core.quotePath`
+/// at its default git C-quotes any path holding a non-ASCII or control byte, so
+/// `café.txt` arrived as `"caf\303\251.txt"`; that quoted text is what
+/// `Change.path` held and what a human read in every sentence built from it
+/// ([`kept_checkout`]'s ignored paths, [`commit_all`]'s `Ignored` list, the
+/// row's paths). In `-z` there is no quoting to undo and no separator to guess
+/// at: a rename or copy entry is `XY new` in its own field and the *old* name
+/// in the next NUL-separated one (measured on git 2.55: `git mv old "a ->
+/// b.txt"` reads `R  a -> b.txt\0old\0`), which is consumed with it and never
+/// becomes an entry of its own.
+///
+/// **A name need not be valid UTF-8, and `Change.path` is a `String`.** The
+/// bytes are decoded the way every other git answer in this file is —
+/// [`git`]'s `String::from_utf8_lossy` — so such a name reads with U+FFFD in
+/// place of each bad byte. Skipping the entry was the alternative, and it is
+/// the dangerous one: `status().dirty` is this list minus the ignored half, so
+/// a checkout whose only uncommitted work has a non-UTF-8 name would read
+/// *clean* — the answer that lets the reclaim sweep delete the only copy
+/// (finding F1). A replacement character is a wrong name in a sentence a human
+/// reads; a skipped entry is a wrong answer about whether work exists. The
+/// path is never handed back to git as an argument, so nothing downstream
+/// depends on the lossy spelling resolving.
 fn changes(dir: &Path) -> Option<Vec<Change>> {
-    let porcelain = git(dir, &["status", "--porcelain", "--ignored=matching"])?;
-    Some(
-        porcelain
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                // Read from the line's first byte, which is why [`git`] never
-                // trims the front of an answer: a ` M path` line leads with the
-                // index column, and eating it would make the code here read the
-                // worktree column and the path one character short.
-                let code = line.get(..2).unwrap_or("");
-                // A rename is `R  old -> new`: the path that exists is the new
-                // one. Everything else is `XY path`, the path from the third
-                // byte on (a quoted path keeps its quoting — it is a name in a
-                // sentence here, not something mush hands back to git).
-                let path = line.get(3..).unwrap_or("");
-                let path = path.rsplit_once(" -> ").map(|(_, to)| to).unwrap_or(path);
-                Change {
-                    path: path.to_string(),
-                    ignored: code == "!!",
-                }
-            })
-            .collect(),
-    )
+    let listing = git_bytes(
+        dir,
+        &["status", "--porcelain=v1", "-z", "--ignored=matching"],
+    )?;
+    // NUL cannot occur inside a path, and a lossy decode maps no byte *to* a
+    // NUL, so splitting after the decode cuts exactly where git put the fields.
+    let listing = String::from_utf8_lossy(&listing);
+    let mut fields = listing.split('\0');
+    let mut found = Vec::new();
+    while let Some(field) = fields.next() {
+        // The listing ends with the NUL after its last entry, whose split
+        // leaves one empty field; a path cannot be empty, so nothing else is
+        // skipped.
+        if field.is_empty() {
+            continue;
+        }
+        // Read from the entry's first byte, which is why [`git_bytes`] does not
+        // trim: `XY` leads the field, and a ` M path` entry's index column is
+        // data, not padding — the trim that used to eat it named `ib/sub`.
+        let code = field.get(..2).unwrap_or("");
+        // The name follows `XY `, from byte 3 on. There is no separator to look
+        // for: whatever follows is the name, ` -> ` included.
+        let path = field.get(3..).unwrap_or("");
+        // A rename or copy is the one entry that carries two names; the second
+        // field is the name it came from, already accounted for by this entry.
+        if matches!(code.as_bytes().first(), Some(b'R' | b'C')) {
+            fields.next();
+        }
+        found.push(Change {
+            path: path.to_string(),
+            ignored: code == "!!",
+        });
+    }
+    Some(found)
 }
 
 /// The first one or two of `paths`, and a count for the rest: `a.txt`,
@@ -677,7 +746,9 @@ fn populate_submodules(worktree: &Path) -> Vec<String> {
 }
 
 /// One line of `git submodule status --recursive`, read from its first byte the
-/// way [`changes`] reads `git status --porcelain`: the state git prints in
+/// way [`changes`] reads a status entry's `XY` code — the leading state byte is
+/// data, not padding, the same rule [`git`] keeps by never trimming the front of
+/// a line answer. The state git prints in
 /// front of the submodule (a space for one at the commit the tree records, `-`
 /// for one the checkout does not hold, `+` for one at another commit) and its
 /// path.
@@ -2600,12 +2671,16 @@ mod tests {
 
     /// The first line of `git status --porcelain` for a checkout whose staged
     /// column is blank is ` M a.txt`: its leading space *is* the index column,
-    /// the one whitespace in the listing that is not padding. A `trim()` on the
-    /// shared helper ate it and every positional read on that line shifted one
-    /// byte left — the code read `M ` (the worktree column, not ` M`) and the
-    /// path read `.txt`, one character short of a file that exists (a
-    /// ` M lib/sub` line was read as `ib/sub`). A path is not a token; its
-    /// first character is not a status column.
+    /// the one whitespace in a *line* answer that is not padding. A `trim()` on
+    /// the shared line reader ate it and every positional read on that line
+    /// shifted one byte left — the code read `M ` (the worktree column, not
+    /// ` M`) and the path read `.txt`, one character short of a file that
+    /// exists (a ` M lib/sub` line was read as `ib/sub`). A path is not a token;
+    /// its first character is not a status column. The status read below no
+    /// longer goes through that reader — it takes the machine format, whose
+    /// fields never meet a trim — but the rule still binds every other line
+    /// answer ([`submodule_line`] reads `git submodule status`'s leading space
+    /// as data), so the fixture and its front-intact assertion stay.
     #[test]
     fn the_first_porcelain_line_keeps_its_leading_space() {
         let dir = init_repo("porcelain-first-space");
@@ -2667,9 +2742,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A rename is `R  old -> new`, and the path that exists is the new one: the
-    /// only porcelain line that carries two names, and the read takes the
-    /// right-hand one.
+    /// A rename names the file that exists, and names it once: the human format
+    /// spells it `R  old -> new`, while the machine format this read takes puts
+    /// the new name in the entry's own field and the old name in the next
+    /// NUL-separated one.
     #[test]
     fn a_rename_is_named_by_the_path_that_exists() {
         let dir = init_repo("porcelain-rename");
@@ -2681,6 +2757,164 @@ mod tests {
                 ignored: false
             }],
             "R  a.txt -> renamed.txt names the file that is there"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename's new name is a filename and may itself contain ` -> `:
+    /// `R  old -> a -> b.txt` right-split to `b.txt"` — a name no file has.
+    /// The machine format carries the two names as separate NUL-terminated
+    /// fields, so there is no separator left to mistake for syntax, and the old
+    /// name is consumed with its entry instead of leaking as a second change.
+    #[test]
+    fn a_rename_to_a_name_holding_the_arrow_separator_is_that_name() {
+        let dir = init_repo("porcelain-rename-arrow");
+        git_in(&dir, &["mv", "a.txt", "a -> b.txt"]);
+        // The fixture has to be the trap: git's human format quotes the new
+        // name, and the last ` -> ` on the line is inside the quotes.
+        let human = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        let (_, misread) = human.rsplit_once(" -> ").expect("a rename line");
+        assert_eq!(misread, "b.txt\"", "the human line is the trap: {human:?}");
+
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "a -> b.txt".into(),
+                ignored: false
+            }],
+            "the path that exists is the whole new name, once — the old one is not a change of its own"
+        );
+        assert!(
+            dir.join("a -> b.txt").exists(),
+            "the change names the file on disk"
+        );
+        assert_eq!(
+            status(&dir).unwrap().dirty,
+            1,
+            "one path a commit would take"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `core.quotePath` at its default C-quotes any path with a non-ASCII byte,
+    /// so `café.txt` arrived as `"caf\303\251.txt"` — the quoting, not the
+    /// name, is what mush then named to the human. `-z` prints the bytes
+    /// themselves.
+    #[test]
+    fn a_rename_to_a_non_ascii_name_is_the_name_not_gits_quoting() {
+        let dir = init_repo("porcelain-rename-cafe");
+        git_in(&dir, &["mv", "a.txt", "café.txt"]);
+        // The fixture has to be the trap: the human line carries the octal
+        // escape instead of the name.
+        let human = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        assert!(
+            human.contains("\\303\\251"),
+            "git quotes the name: {human:?}"
+        );
+
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "café.txt".into(),
+                ignored: false
+            }],
+            "the name on disk, not git's quoted spelling of it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An untracked file's name is a filename too: `a -> b.txt` and
+    /// `two words.txt` are quoted in the human format and printed verbatim by
+    /// `-z`, so the entry names the path on disk.
+    #[test]
+    fn an_untracked_name_with_spaces_or_an_arrow_is_whole() {
+        let dir = init_repo("porcelain-untracked-names");
+        fs::write(dir.join("a -> b.txt"), "arrow\n").unwrap();
+        fs::write(dir.join("two words.txt"), "space\n").unwrap();
+        let human = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        assert!(human.contains("\"a -> b.txt\""), "{human:?}");
+        assert!(human.contains("\"two words.txt\""), "{human:?}");
+
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![
+                Change {
+                    path: "a -> b.txt".into(),
+                    ignored: false
+                },
+                Change {
+                    path: "two words.txt".into(),
+                    ignored: false
+                },
+            ],
+            "names as they are on disk, spaces and arrows included"
+        );
+        assert_eq!(
+            status(&dir).unwrap().dirty,
+            2,
+            "both are work a commit would take"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The ignored half is read from the entry code, and the machine format
+    /// keeps it: `!!` is still the mark that a path is there only because an
+    /// ignore rule covers it — the classification finding F1's sweep depends on.
+    #[test]
+    fn an_ignored_name_still_carries_its_ignored_mark() {
+        let dir = init_repo("porcelain-ignored-name");
+        fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        git_in(&dir, &["add", ".gitignore"]);
+        git_in(&dir, &["commit", "-qm", "ignore logs"]);
+        fs::write(dir.join("run.log"), "log\n").unwrap();
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "run.log".into(),
+                ignored: true
+            }],
+            "an ignored path is a change a commit cannot keep"
+        );
+        assert_eq!(
+            status(&dir).unwrap().dirty,
+            0,
+            "and it is not a path a commit would take"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A filename need not be valid UTF-8, and `Change.path` is a `String`:
+    /// the bytes are decoded lossily — the same road every other git answer in
+    /// this file takes — and the entry is **not** dropped. `status().dirty` is
+    /// this list minus the ignored half, so a dropped entry would read as a
+    /// clean checkout, the answer that lets the sweep delete the only copy of
+    /// such work.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_read_lossily_never_dropped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = init_repo("porcelain-untracked-non-utf8");
+        let name = OsStr::from_bytes(b"caf\xe9.txt");
+        fs::write(dir.join(name), "latin-1 name\n").unwrap();
+        // The fixture has to be the trap: the bytes are not UTF-8, and the
+        // human format spells them as an octal escape.
+        let human = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        assert!(human.contains("\\351"), "git quotes the name: {human:?}");
+
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "caf\u{fffd}.txt".into(),
+                ignored: false
+            }],
+            "the bad byte reads as the replacement character"
+        );
+        assert_eq!(
+            status(&dir).unwrap().dirty,
+            1,
+            "a name mush cannot spell is still work a commit would take"
         );
         let _ = fs::remove_dir_all(&dir);
     }
