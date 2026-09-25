@@ -6,6 +6,16 @@ one command. It drives the real binary over a pty — the pty is the controlling
 terminal, exactly as a shell would give it — and renders the screen mush painted
 as text, so it can be read (or pasted into an issue) without a screenshot.
 
+A cell is a column, and a glyph is as wide as a terminal makes it: the standard
+library's `unicodedata` is the East-Asian-Width table, so a Wide or Fullwidth
+glyph takes two cells and everything else one — an Ambiguous glyph also one,
+which is `unicode-width`'s default and what mush's grid assumes; painting such
+a glyph wide is the terminal's own locale policy, held in
+`docs/audits/paint-and-measure.md`. A combining mark takes no cell at all: it
+joins the cell it follows. A wide glyph with only the row's last column left
+wraps to the next row, as a terminal wraps it, rather than overrunning the row
+or leaving half a glyph in it.
+
 Usage:
     python3 scripts/screen.py [BINARY] [WORKDIR]
         [--sizes 200x50,120x32,80x24,60x17,40x10,30x8]
@@ -33,6 +43,7 @@ import struct
 import sys
 import termios
 import time
+import unicodedata
 
 CSI = re.compile(r"\x1b\[([\x20-\x3f]*)([@-~])", re.S)
 # An escape sequence that has not completed after this many characters is
@@ -75,6 +86,22 @@ def decode_keys(text: str) -> str:
     return KEY_ESCAPE.sub(one, text)
 
 
+def glyph_width(char: str) -> int:
+    """The columns a terminal advances for one code point.
+
+    The table is the standard library's own East-Asian-Width table — the one a
+    terminal's `wcwidth(3)` reaches for: Wide and Fullwidth take two columns,
+    everything else takes one — Ambiguous included, which is `unicode-width`'s
+    default and the answer mush's own grid is built on. A combining mark takes
+    none, because it attaches to the cell it follows.
+    """
+    if unicodedata.combining(char):
+        return 0
+    if unicodedata.east_asian_width(char) in ("W", "F"):
+        return 2
+    return 1
+
+
 class Screen:
     """Just enough terminal to render ratatui: a grid, a cursor, and the
     control sequences it actually emits (no colours — this review is about
@@ -94,6 +121,40 @@ class Screen:
             for y, row in enumerate(old[:rows]):
                 self.grid[y][: len(row[:cols])] = row[:cols]
         self.clamp()
+        # Where the cursor last wrote a base glyph — its first cell, for a
+        # wide one. A combining mark joins that cell; a cursor move leaves it
+        # behind, so it is forgotten then (and here, where the grid moved).
+        self.last = None
+
+    def blank(self, x: int, y: int) -> None:
+        """Blank one cell, and a wide glyph's other half with it.
+
+        A glyph is one unit to a terminal: writing into or erasing either of a
+        wide glyph's two columns takes the glyph away, because half a glyph is
+        not something a terminal can show. The empty string stands in a cell
+        for the right half of the wide glyph written in the cell before it.
+        """
+        if not (0 <= x < self.cols and 0 <= y < self.rows):
+            return
+        if self.grid[y][x] == "" and x > 0:
+            self.grid[y][x - 1] = " "
+        if x + 1 < self.cols and self.grid[y][x + 1] == "":
+            self.grid[y][x + 1] = " "
+        self.grid[y][x] = " "
+
+    def paint(self, x: int, y: int, char: str, width: int) -> None:
+        """Write one base glyph at (x, y); a wide one takes the next cell too."""
+        if not (0 <= x < self.cols and 0 <= y < self.rows):
+            return
+        self.blank(x, y)
+        self.grid[y][x] = char
+        self.last = (x, y)
+        if width == 2 and x + 1 < self.cols:
+            # The second cell may hold half of another wide glyph, whose own
+            # first cell is one further right; blanking it takes that glyph
+            # whole, after which the cell becomes this glyph's second half.
+            self.blank(x + 1, y)
+            self.grid[y][x + 1] = ""
 
     def clamp(self) -> None:
         """Keep the cursor on the grid.
@@ -132,29 +193,50 @@ class Screen:
                 else:
                     index += 2
             elif char == "\r":
-                self.x = 0
+                self.x, self.last = 0, None
                 index += 1
             elif char == "\n":
                 self.y = min(self.y + 1, self.rows - 1)
+                self.last = None
                 index += 1
             elif char == "\b":
-                self.x = max(0, self.x - 1)
+                self.x, self.last = max(0, self.x - 1), None
                 index += 1
             elif char == "\t":
                 self.x = min(self.cols - 1, (self.x // 8 + 1) * 8)
+                self.last = None
                 index += 1
             elif char < " ":
                 index += 1
             else:
-                if 0 <= self.x < self.cols and 0 <= self.y < self.rows:
-                    self.grid[self.y][self.x] = char
-                self.x += 1
-                if self.x >= self.cols:
-                    self.x, self.y = 0, min(self.y + 1, self.rows - 1)
+                width = glyph_width(char)
+                if width == 0:
+                    if self.last is not None:
+                        lx, ly = self.last
+                        self.grid[ly][lx] += char
+                else:
+                    if width == 2 and self.x + width > self.cols:
+                        # The wide glyph has only the row's last column left:
+                        # a terminal wraps it to the next row's first two
+                        # cells instead of splitting it, and the cell it could
+                        # not fit in keeps what it had. At the bottom row
+                        # there is nowhere to wrap to (this grid has no
+                        # scrollback), so it lands on that row's own first
+                        # cells — the same clamp a newline takes.
+                        self.x = 0
+                        self.y = min(self.y + 1, self.rows - 1)
+                    self.paint(self.x, self.y, char, width)
+                    self.x += width
+                    if self.x >= self.cols:
+                        self.x, self.y = 0, min(self.y + 1, self.rows - 1)
                 index += 1
         self.pending = ""
 
     def control(self, params: str, final: str) -> None:
+        if final in "HfABCDGdJKX":
+            # These move the cursor or erase cells, so the cell a combining
+            # mark would have joined is no longer the one it follows.
+            self.last = None
         numbers = [int(p) for p in re.findall(r"\d+", params)]
         # J and K default to 0 (cursor to end); the rest default to 1.
         first = numbers[0] if numbers else (0 if final in "JK" else 1)
@@ -187,11 +269,11 @@ class Screen:
                 else:
                     start, end = min(self.x, self.cols), self.cols
                 for x in range(start, end):
-                    row[x] = " "
+                    self.blank(x, self.y)
         elif final == "X":
             if 0 <= self.y < self.rows:
                 for x in range(self.x, min(self.cols, self.x + first)):
-                    self.grid[self.y][x] = " "
+                    self.blank(x, self.y)
 
         # A terminal clamps the cursor to the screen, whatever a program asks
         # for: `\x1b[999;1H` puts it on the last row. Without this the next
@@ -286,7 +368,7 @@ def main() -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="check the screen decoder against escapes a TUI really emits",
+        help="check the screen decoder and its width arithmetic",
     )
     args = parser.parse_args()
 
@@ -346,7 +428,10 @@ def self_test() -> int:
     What this catches is not what ratatui normally emits but what it can be made
     to emit by a smaller terminal or an odd keystroke, which is exactly how the
     decoder was wrong before: an `X` (erase characters) after a cursor that had
-    been pushed off the grid raised instead of painting.
+    been pushed off the grid raised instead of painting. The widths are the
+    other half of the same question — a terminal measures a glyph by its
+    East-Asian width and a combining mark by nothing at all, and the emulator
+    must agree or a smoke assertion reads a column that is not on the glass.
     """
     failures = 0
 
@@ -387,13 +472,82 @@ def self_test() -> int:
     screen = painted(b"one\x1b]0;title\x07two")
     check("OSC is swallowed to its terminator", screen.text().splitlines()[0] == "onetwo")
 
+    # Width is what a terminal measures, not one column per code point. The
+    # table is `unicodedata`'s, in the three answers a TUI meets: Wide and
+    # Fullwidth take two columns, Ambiguous one (`unicode-width`'s default and
+    # mush's), and a combining mark none at all.
+    check(
+        "Wide and Fullwidth are two columns, Ambiguous and the rest one",
+        glyph_width("日") == 2
+        and glyph_width("☷") == 2
+        and glyph_width("Ａ") == 2
+        and unicodedata.east_asian_width("▦") == "A"
+        and glyph_width("▦") == 1
+        and glyph_width("a") == 1,
+    )
+    check("a combining mark is no column", glyph_width("\u0301") == 0)
+
+    # The class this pins: `☷` (U+2637, TRIGRAM FOR EARTH) is East-Asian-Wide,
+    # so a terminal gives it two cells, and the text after it stands a column
+    # right of where a one-column-per-code-point emulator put it. The glyph is
+    # deliberately *not* one of mush's marks any more — commit 332f7e1 dropped
+    # it from `outline` for this very width; it is here as a fixture.
+    screen = painted(b"\x1b[2J\x1b[1;1H\xe2\x98\xb7 15 defs")
+    check(
+        "text after a wide glyph lands in the terminal's column",
+        screen.grid[0][0] == "☷"
+        and screen.grid[0][1] == ""
+        and screen.grid[0][3] == "1"
+        and screen.text().splitlines()[0] == "☷ 15 defs",
+        repr(screen.text().splitlines()[0]),
+    )
+
+    screen = Screen(5, 2)
+    screen.feed("☷abcd".encode())
+    lines = screen.text().splitlines()
+    check(
+        "a wide glyph's two cells move the row's wrap one column left",
+        lines[0] == "☷abc" and lines[1] == "d",
+        repr(lines),
+    )
+
+    # A wide glyph with only the row's last column left cannot fit: it wraps
+    # to the next row, where a terminal puts it, and the cell it could not fit
+    # in keeps what it had. The cursor never steps past the row's end.
+    screen = Screen(4, 2)
+    screen.feed(b"\x1b[1;4H\xe2\x98\xb7x")
+    lines = screen.text().splitlines()
+    check(
+        "a wide glyph in the last column wraps to the next row",
+        lines[0] == "" and lines[1] == "☷x" and (screen.x, screen.y) == (3, 1),
+        repr(lines) + f"; cursor {screen.x},{screen.y}",
+    )
+
+    screen = Screen(5, 2)
+    screen.feed("e\u0301x".encode())
+    check(
+        "a combining mark joins the cell before it instead of advancing",
+        screen.grid[0][0] == "e\u0301" and screen.grid[0][1] == "x" and screen.x == 2,
+        repr(screen.text().splitlines()[0]),
+    )
+
+    # A write into either half of a wide glyph takes the glyph whole: half a
+    # glyph is not a screen a terminal can show.
+    screen = Screen(4, 1)
+    screen.feed("☷\x1b[1;2Hz".encode())
+    check(
+        "a write into a wide glyph's tail clears the glyph whole",
+        screen.text().splitlines()[0] == " z",
+        repr(screen.text().splitlines()[0]),
+    )
+
     check("a literal non-ascii key survives", decode_keys("é") == "é")
     check("an escape decodes", decode_keys("\\e[B") == "\x1b[B")
     check("a hex escape decodes", decode_keys("\\x1bq") == "\x1bq")
     check("tab and enter decode", decode_keys("\\t") == "\t" and decode_keys("\\r") == "\r")
     check("an unknown escape is its own letter", decode_keys("\\q") == "q")
 
-    print("all decoder checks passed" if not failures else f"{failures} check(s) failed")
+    print("all screen checks passed" if not failures else f"{failures} check(s) failed")
     return 0 if not failures else 1
 
 
