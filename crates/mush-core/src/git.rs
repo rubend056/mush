@@ -53,6 +53,15 @@ pub struct RepoStatus {
 ///
 /// `LC_ALL=C` keeps the output parseable: a localized `--shortstat` would not
 /// match the English words the parser knows, and would read as `±0`.
+///
+/// Only the *end* is trimmed: the trailing newline is the one whitespace git
+/// adds to an answer, while the front of an answer is data. `git status
+/// --porcelain` puts the `XY` status code first, so a tracked edit in the
+/// worktree begins with a space (` M a.txt`) — the index column, which is not
+/// padding. A leading `trim()` ate that column from the *first* line only, and
+/// every positional read on it moved one byte left: the code became the
+/// worktree column and the path lost its first character (a ` M lib/sub` line
+/// named `ib/sub`), which is a name no file has. A path is not a token.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(args).env("LC_ALL", "C");
@@ -60,7 +69,11 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string(),
+    )
 }
 
 /// The reason `run` gives when the git process could not be started at all.
@@ -179,6 +192,10 @@ fn changes(dir: &Path) -> Option<Vec<Change>> {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
+                // Read from the line's first byte, which is why [`git`] never
+                // trims the front of an answer: a ` M path` line leads with the
+                // index column, and eating it would make the code here read the
+                // worktree column and the path one character short.
                 let code = line.get(..2).unwrap_or("");
                 // A rename is `R  old -> new`: the path that exists is the new
                 // one. Everything else is `XY path`, the path from the third
@@ -2067,6 +2084,112 @@ mod tests {
         assert_eq!(stat.files, 1);
         assert_eq!(stat.added, 2);
         assert_eq!(stat.removed, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The first line of `git status --porcelain` for a checkout whose staged
+    /// column is blank is ` M a.txt`: its leading space *is* the index column,
+    /// the one whitespace in the listing that is not padding. A `trim()` on the
+    /// shared helper ate it and every positional read on that line shifted one
+    /// byte left — the code read `M ` (the worktree column, not ` M`) and the
+    /// path read `.txt`, one character short of a file that exists (a
+    /// ` M lib/sub` line was read as `ib/sub`). A path is not a token; its
+    /// first character is not a status column.
+    #[test]
+    fn the_first_porcelain_line_keeps_its_leading_space() {
+        let dir = init_repo("porcelain-first-space");
+        fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "-A"]);
+        git_in(
+            &dir,
+            &["commit", "-qm", "a second tracked file and an ignore rule"],
+        );
+        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        fs::write(dir.join("b.txt"), "b\ntwo\n").unwrap();
+        fs::write(dir.join("u.txt"), "new\n").unwrap();
+        fs::write(dir.join("run.log"), "log\n").unwrap();
+
+        // The fixture has to be the trap: the *first* line is the worktree-side
+        // edit, and its first byte is a space.
+        let porcelain = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        assert!(
+            porcelain.starts_with(" M a.txt"),
+            "the fixture's first line leads with the index column: {porcelain:?}"
+        );
+
+        // The first line is the one the trim ate from; the others are the
+        // shapes that must keep working: a second tracked edit (` M b.txt`,
+        // whose path was never touched — the trim only ever ate the first
+        // line), an untracked file (`?? u.txt`) and an ignored one
+        // (`!! run.log`, whose code is what `ignored` is read from). Neither
+        // `??` nor `!!` has a blank column to lose.
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![
+                Change {
+                    path: "a.txt".into(),
+                    ignored: false
+                },
+                Change {
+                    path: "b.txt".into(),
+                    ignored: false
+                },
+                Change {
+                    path: "u.txt".into(),
+                    ignored: false
+                },
+                Change {
+                    path: "run.log".into(),
+                    ignored: true
+                },
+            ],
+            "every path whole, and the ignored line classified by its `!!`"
+        );
+        // `status`'s count is fed by the same parse: the ignore rule's own file
+        // is a path a commit cannot keep, so it is not one of the three.
+        assert_eq!(
+            status(&dir).unwrap().dirty,
+            3,
+            "three paths a commit would take"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename is `R  old -> new`, and the path that exists is the new one: the
+    /// only porcelain line that carries two names, and the read takes the
+    /// right-hand one.
+    #[test]
+    fn a_rename_is_named_by_the_path_that_exists() {
+        let dir = init_repo("porcelain-rename");
+        git_in(&dir, &["mv", "a.txt", "renamed.txt"]);
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "renamed.txt".into(),
+                ignored: false
+            }],
+            "R  a.txt -> renamed.txt names the file that is there"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An untracked file leading the listing when nothing tracked changed: `??`
+    /// is two code columns and no blank one, so its path never had a first
+    /// character to lose.
+    #[test]
+    fn an_untracked_path_leads_its_own_listing_whole() {
+        let dir = init_repo("porcelain-untracked");
+        fs::write(dir.join("new.txt"), "nobody committed this\n").unwrap();
+        let porcelain = git(&dir, &["status", "--porcelain", "--ignored=matching"]).unwrap();
+        assert!(porcelain.starts_with("?? new.txt"), "{porcelain:?}");
+        assert_eq!(
+            changes(&dir).unwrap(),
+            vec![Change {
+                path: "new.txt".into(),
+                ignored: false
+            }]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
