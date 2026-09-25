@@ -6711,6 +6711,17 @@ mod tests {
         save: Arc<dyn SessionSave>,
         base_url: &str,
     ) -> (App, Receiver<Msg>) {
+        // The home-config *write* is pointed at a throwaway file before this
+        // App exists (see [`isolate_user_config`]): `App::new` reads
+        // `MUSH_CONFIG` once into the field every save goes through, so an App
+        // built before the first isolate call carries the human's own path —
+        // and any `/url`, `/provider` or picker in its test then rewrites
+        // `~/.config/mush/config.json` with a fixture's endpoint and model.
+        // Measured: `switching_to_a_provider_forgets_the_key`, run alone with
+        // `XDG_CONFIG_HOME` at a throwaway directory, wrote that directory's
+        // `mush/config.json` with `http://127.0.0.1:2` while its own `test_app`
+        // preceded the isolate call.
+        isolate_user_config();
         let ws = Workspace::new(root).unwrap();
         let cfg = Config::new(base_url, "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
@@ -16183,6 +16194,15 @@ mod tests {
     /// `~/.config/mush/config.json` with a fixture's endpoint and model.
     /// `MUSH_CONFIG` is the override `mush_core::userconfig` documents for
     /// exactly this, and nothing else here reads the home config.
+    ///
+    /// No test has to remember to call this first: the fixture every `App` is
+    /// built through ([`app_root_at`]) calls it, so the path is the throwaway
+    /// one by the time `App::new` reads it. The explicit calls in the tests
+    /// below say which tests write a file at all — they are documentation, not
+    /// the protection. The one road the fixture does not cover is a test that
+    /// builds its own `App` ([`app_with_scripted_root_at`],
+    /// [`app_with_live_scripted_root`] and one sweep test); none of those
+    /// reaches a save, so none needs the path.
     ///
     /// The path lives under a root of its own, created once and held in a
     /// `static` because the name is process-wide. A `static` is never dropped,
