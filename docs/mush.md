@@ -993,8 +993,9 @@ selection. The *content* colours — the alert red, the notice yellow, the dim g
 and the body gray — stay fixed, because *what happened* reads the same in every
 window and only *whose window this is* changes; the agents pane's line delta is
 fixed too, and it is the content's one pair with bytes of its own — `+add` in
-`#446901` and `−del` in `#0d6901` (`theme.rs`'s `ADDED_RGB`/`REMOVED_RGB`),
-painted in the form the terminal announced, the same ladder the hue follows.
+`#3FB950` (green) and `−del` in `#F85149` (red) (`theme.rs`'s
+`ADDED_RGB`/`REMOVED_RGB`), painted in the form the terminal announced, the
+same ladder the hue follows.
 `MUSH_THEME` overrules the hash:
 a hue's name, `256` to demand the indexed form on a truecolor terminal, `off` for
 the fixed palette of every version before this one, `auto` for unset; an unknown
