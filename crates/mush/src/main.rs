@@ -1684,6 +1684,26 @@ fn install_panic_hook_for(
     }));
 }
 
+/// The process's one panic hook, owned by one test at a time.
+///
+/// `std::panic::set_hook` replaces the hook for the whole process, every thread
+/// at once, and two tests in this binary install one:
+/// `tests::a_worker_panic_leaves_the_terminal_alone` and
+/// `session_save::tests::the_writer_thread_is_named`. Run together they race on
+/// it, both ways: the writer's hook meets the worker test's panic and hands it
+/// to whatever hook the writer captured rather than to the worker test's route,
+/// and the worker test's closing `take_hook` puts the default back under the
+/// writer while its own worker is still to panic. Measured on the two names
+/// alone: 119 failures in 300 runs (90 one way, 27 the other), and 17 in 150
+/// under load.
+///
+/// A test that installs the process's hook holds this for as long as its hook
+/// is installed, so the two can never overlap — the same
+/// one-mutex-per-global shape as `machine::tests::PATH_LOCK` (the process's
+/// `PATH`) and the doc blocks' `WRITER` (the repo's generated files).
+#[cfg(test)]
+pub(crate) static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3026,6 +3046,11 @@ mod tests {
     /// the human's UI was left painting into their shell.
     #[test]
     fn a_worker_panic_leaves_the_terminal_alone() {
+        // The hook is the process's: hold it for as long as this test's hook is
+        // installed (see [`PANIC_HOOK_LOCK`]).
+        let _hook = crate::PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The hook that was there before this one: it records that it ran,
         // standing in for the default hook's stderr write.
         let printed = Arc::new(AtomicBool::new(false));
@@ -3061,10 +3086,16 @@ mod tests {
             !printed.load(Ordering::SeqCst),
             "a worker's panic was printed into the alternate screen"
         );
+        // The hook is the process's, so a panic on another test's thread is
+        // held in this route too: the account is read by the worker it names —
+        // exactly one of those, carrying the worker's own words.
         let words = route.lower();
-        assert_eq!(words.len(), 1, "one panic, one account: {words:?}");
-        assert!(words[0].contains("mush-job-1"), "{words:?}");
-        assert!(words[0].contains("a worker died"), "{words:?}");
+        let account: Vec<&String> = words
+            .iter()
+            .filter(|word| word.contains("mush-job-1"))
+            .collect();
+        assert_eq!(account.len(), 1, "one panic, one account: {words:?}");
+        assert!(account[0].contains("a worker died"), "{words:?}");
 
         // Once the terminal is handed back, the next panic's words go where
         // they always did: to the hook that was there before.
@@ -3095,9 +3126,13 @@ mod tests {
             written.contains("\u{1b}[?1000l") && written.contains("\u{1b}[?1006l"),
             "and puts the mouse back before the human's shell gets it: {written:?}"
         );
+        // The owner's panic is the one account that must not be here; the route
+        // is the process's, so the check is for that panic's own words.
+        let held = route.lower();
         assert!(
-            route.lower().is_empty(),
-            "the owner's panic is not held: it is the terminal's own"
+            held.iter()
+                .all(|word| !word.contains("the terminal's thread died")),
+            "the owner's panic is not held: it is the terminal's own: {held:?}"
         );
 
         // The hook is the process's: put the default back, so whatever panic

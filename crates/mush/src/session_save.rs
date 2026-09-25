@@ -932,6 +932,11 @@ mod tests {
     /// the default hook reads it, and formatted the way that hook formats it.
     #[test]
     fn the_writer_thread_is_named() {
+        // The panic hook this test installs is the process's: hold it for as
+        // long as it is installed (see `crate::PANIC_HOOK_LOCK`).
+        let _hook = crate::PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = root("named");
         let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
         // The worker's own death: the queue it must take is poisoned under it.
@@ -968,6 +973,12 @@ mod tests {
 
         let message = seen.lock().unwrap().clone().expect("the worker panicked");
         assert!(message.contains("mush-save"), "{message}");
+        // The hook runs before the panic's unwind reaches the worker's `Alive`
+        // guard — the hook is called where the panic starts — so "the worker
+        // panicked" is not yet "the worker is gone". Wait for the death
+        // itself, or the flush below finds `alive` still set and the queue
+        // poisoned under it, and panics on that lock instead of reporting it.
+        wait_until_dead(&writer);
         // And the app can read that the worker is gone.
         writer.flush();
         assert!(writer.take_error().is_some(), "the dead worker is reported");
