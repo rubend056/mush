@@ -1,7 +1,7 @@
 //! Workspace filesystem access: safe paths, reads, listings, search, atomic
 //! writes.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -337,6 +337,10 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 /// A single workspace root. All agent file access goes through here, which is
 /// what keeps a runaway model inside the directory the human opened.
+///
+/// [`Workspace::new`] opens a directory that is there; [`Workspace::pending`]
+/// opens the place one is about to be made at (an isolated agent's worktree
+/// before its first run).
 #[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
@@ -433,10 +437,70 @@ pub enum LineCount {
     NotText,
 }
 
+/// The longest existing ancestor of `path`, canonicalized, with the missing
+/// names appended verbatim: the root a workspace is about to be made at.
+///
+/// Used by [`Workspace::pending`] and nowhere else. Every error that is not a
+/// missing leaf is the caller's own error: a path whose ancestor is a file is
+/// not a root waiting to be made, and saying it is would open a workspace
+/// nothing can write in.
+fn canonical_ancestor(path: &Path) -> io::Result<PathBuf> {
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut base) => {
+                for name in missing.iter().rev() {
+                    base.push(name);
+                }
+                return Ok(base);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (cursor.file_name(), cursor.parent()) else {
+                    return Err(error);
+                };
+                missing.push(name);
+                cursor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
             root: fs::canonicalize(root)?,
+            opened: now_millis(),
+        })
+    }
+
+    /// Open the workspace of an agent whose root is not on disk *yet*: the
+    /// place its worktree will be made, before it is made.
+    ///
+    /// A row lives on refs alone — a restored session keeps its branch, its id
+    /// and its place and creates no checkout — so the actor revived from a
+    /// stored session is built with a root that does not exist until the door
+    /// before its first run makes it ([`git::ensure_worktree`]). The path is
+    /// still the place all its tools resolve in, and the door makes exactly
+    /// this path, so the workspace is opened as far as it exists: the longest
+    /// existing ancestor is canonicalized and the missing names are appended
+    /// verbatim, so a root under a symlinked directory reads the same here as
+    /// [`Workspace::new`] would read it a moment later.
+    ///
+    /// A caller with a directory that must be there wants [`Workspace::new`]:
+    /// this is only for the one root mush itself is about to create, and it
+    /// must never be the thing that lets an application open a directory nobody
+    /// has.
+    pub fn pending(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref();
+        let root = match fs::canonicalize(root) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => canonical_ancestor(root)?,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            root,
             opened: now_millis(),
         })
     }
@@ -2669,6 +2733,40 @@ mod tests {
         let path = dir.path().join(format!("{name}.png"));
         fs::write(&path, bytes).unwrap();
         dir.hold(path)
+    }
+
+    /// A pending workspace is the *place* a worktree will be made: the path is
+    /// canonical as far as it exists and the missing names are appended
+    /// verbatim, so it reads exactly like the workspace `new` opens a moment
+    /// later, when the door has made the directory. A root that exists is the
+    /// same root either way, and a path whose ancestor is a file is nobody's
+    /// pending root.
+    #[test]
+    fn a_pending_workspace_is_the_place_the_worktree_will_be_made() {
+        let dir = Scratch::new("pending-root");
+        let missing = dir.join("a/b/c");
+        assert!(
+            Workspace::new(&missing).is_err(),
+            "the directory is not there yet"
+        );
+        let pending = Workspace::pending(&missing).unwrap();
+        assert_eq!(
+            pending.root(),
+            dir.path().join("a/b/c"),
+            "the missing names are appended to the canonical root"
+        );
+        fs::create_dir_all(&missing).unwrap();
+        assert_eq!(
+            pending.root(),
+            Workspace::new(&missing).unwrap().root(),
+            "and it is the same root the strict door opens once it exists"
+        );
+        let file = dir.join("plain.txt");
+        fs::write(&file, "not a directory\n").unwrap();
+        assert!(
+            Workspace::pending(file.join("below")).is_err(),
+            "a path below a file is not a root waiting to be made"
+        );
     }
 
     /// A path that is not under the root is shown as it is: a workspace opened

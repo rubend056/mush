@@ -747,127 +747,99 @@ pub fn is_checkout(path: &Path) -> bool {
     path.join(".git").is_file()
 }
 
-/// What putting a checkout back on its branch did, told apart the way a caller
-/// has to use it: the checkout is there, the branch git no longer had was
-/// re-created at the root's `HEAD` with a checkout on it, or git refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Restored {
-    /// The checkout is on disk and on `branch`, at the branch's tip — the
-    /// revision the agent's own `HEAD` was on when the directory was taken.
-    Done(PathBuf),
-    /// Git no longer had the branch, and both it and the checkout were made
-    /// again on the **root's `HEAD`**. A revived actor has no recorded fork —
-    /// its stored session does not hold one — so that is the only base this
-    /// door has, and it is the conservative direction [`reclaim`] already
-    /// argues: it keeps more than it should rather than less. What the
-    /// re-creation cannot bring back is the branch's own commits and the
-    /// directory a run was working in; it is the rescue of last resort, and a
-    /// caller must say so where the agent's own context will read it.
-    Recreated(PathBuf),
-    /// Git would not make the checkout, in git's own words — or in mush's, for
-    /// a repository git cannot branch from at all ([`can_branch_from`]).
-    Failed(String),
-}
-
-/// Put the checkout of agent `id` back at [`worktree_path`], on the branch that
-/// outlived it — or make both again, at the root's `HEAD`, when git no longer
-/// has the branch.
+/// Materialize the worktree of agent `id` on `branch`: the one door that makes a
+/// checkout, and the only one.
 ///
-/// The road back from a worktree that was taken away while its branch stayed:
-/// a hand-run `git worktree remove`, or the [`reclaim`] of a nested child whose
-/// branch `git branch -d` would not delete. The branch is checked out as it
-/// stands — the checkout's `HEAD` is the branch's tip, so the agent resumes
-/// exactly where its commits left it.
+/// A row lives on refs alone — a restored session keeps its branch, its id and
+/// its place on screen and creates nothing — and the checkout is made the
+/// moment the agent is about to work: at a fresh spawn ([`worktree_add`], which
+/// also makes the branch) and at this door, which every road to a resume passes
+/// before its run (`agent::place_worktree`). The three states it tells apart
+/// are the whole of the rule:
 ///
-/// A branch git no longer has is the human's report: a run's own end reaped a
-/// branch that had no commits and took the checkout with it, and the later wake
-/// had nothing to run in at all — ten minutes of context orphaned because both
-/// the directory and the branch it needed were gone. So the answer is a
-/// *rebuild*: the branch is re-created at the **root's `HEAD`** and the
-/// checkout made on it ([`Restored::Recreated`]). `HEAD` is the only base a
-/// revived actor has — its stored session records no fork — and it is the
-/// conservative direction [`reclaim`] already argues: the branch starts with
-/// everything the root has, rather than at a revision a later sweep could
-/// mistake for work to throw away. What this cannot do is bring back the
-/// branch's old commits or the directory the run was working in; that is why
-/// the caller's own line has to say where the branch now stands.
+/// * the checkout is there ([`is_checkout`], a real checkout git made, dirty or
+///   not): it is left exactly as it is. A run's uncommitted work is the only
+///   copy of it, and no door may write over one — a dirty tree is never
+///   "restored" clean;
+/// * there is no checkout and git still has the branch: `worktree add` puts a
+///   checkout back on the branch, at the branch's tip, so the agent resumes
+///   exactly where its commits left it. This is the road back from a hand-run
+///   `git worktree remove`, and the road a restored row takes the first time it
+///   is asked to work. A path git registers with no directory behind it is
+///   pruned first — `worktree add` refuses that entry as "a missing but already
+///   registered worktree" (measured on git 2.55), and `prune` drops exactly the
+///   entries whose directories are gone and touches nothing on disk;
+/// * git no longer has the branch: the work is gone — it landed, it was
+///   discarded, or the run never committed — and there is nothing to resume.
+///   `Err` carries the sentence that says so. A branch is the only thing that
+///   says where a run's work is, and a run in a directory no surface can show
+///   is the defect finding S1's wake half is about: the branch is never
+///   re-created at the root's `HEAD` ([`worktree_add`] is the door a *new*
+///   branch is made at, and only a spawn asks for one).
+///
+/// The answer's second element is the one [`worktree_add`] answers, for the
+/// same reason: the checkout this door makes is a checkout of the branch's
+/// tree, and the submodules that tree records but the checkout does not hold are
+/// left empty rather than wrong (`populate_submodules` below is where the rule
+/// lives). A resume is a tree
+/// being handed to a run exactly as a spawn is, so the fact has the same right to
+/// be said; a checkout that was already there is not asked, because its
+/// population happened when it was born.
 ///
 /// The branch is resolved *before* anything is created, so "git still has it"
-/// and "there is nothing to branch from" are two answers and not one. A path
-/// git cannot be given is refused before either road, in the sentence the add
-/// itself used to write. A path git still registers with no directory behind it
-/// is pruned first: `worktree add` refuses such an entry as "a missing but
-/// already registered worktree" (measured on git 2.55), and the entry is the
-/// residue of the very removal being undone — `prune` drops exactly the entries
-/// whose directories are gone and touches nothing that is on disk. A path that
-/// exists and is *not* a checkout (a plain directory left by a run in a gone
-/// workspace, finding S1) is left for git to refuse rather than deleted: it may
-/// hold the only copy of something a human wrote there by hand.
-///
-/// A repository git cannot branch from at all is the one refusal left, and it
-/// is asked *before* the rebuild's add so the human reads mush's sentence for
-/// the state and not git's about whatever name came in (finding F16).
-pub fn worktree_restore(root: &Path, id: u64, branch: &str) -> Restored {
+/// and "the work is gone" are two answers and not one. When it is gone, the
+/// repository's own state is asked for its sentence first: "not a git
+/// repository" and "the repo has no commits yet" are states a human can act on,
+/// while "the branch is gone" about a repository that could never hold one would
+/// send them looking for work that was never there (finding F16). A path git
+/// cannot be given is refused before either road, in the sentence the add itself
+/// used to write (finding F10); a path that exists and is *not* a checkout (a
+/// plain directory a run in a gone workspace left, finding S1) is left for git
+/// to refuse rather than deleted — it may hold the only copy of something a
+/// human wrote there by hand.
+pub fn ensure_worktree(
+    root: &Path,
+    id: u64,
+    branch: &str,
+) -> Result<(PathBuf, Vec<String>), String> {
     let path = worktree_path(root, id);
     if is_checkout(&path) {
-        return Restored::Done(path);
+        return Ok((path, Vec::new()));
     }
-    // Refused before anything is created, on either road: git cannot be handed
-    // this path, and the branch and checkout would be a partial add whose id
-    // the caller has to keep either way (finding F10).
     let Some(path_arg) = path.to_str() else {
-        return Restored::Failed(format!(
+        return Err(format!(
             "cannot create a worktree at `{}`: the path is not valid UTF-8, and git cannot be given it",
             path.display()
         ));
     };
-    // The branch git still has: the checkout goes back on it, at its tip.
-    if resolve(root, branch).is_some() {
-        let _ = run(root, &["worktree", "prune"]);
-        return match run_named(root, "worktree add", &["worktree", "add", path_arg, branch]) {
-            Ok(_) => Restored::Done(path),
-            Err(error) => Restored::Failed(error),
-        };
-    }
-    // Git no longer has it: rebuild the branch at the root's `HEAD`, if there
-    // is a commit to start from at all. A fresh `git init` has none, and every
-    // base name fails there — the state's own sentence is the one to read
-    // (finding F16).
-    if let Err(why) = can_branch_from(root) {
-        return Restored::Failed(why);
+    if resolve(root, branch).is_none() {
+        return Err(match can_branch_from(root) {
+            Err(why) => why,
+            Ok(()) => format!("{branch} is gone — the work cannot be resumed"),
+        });
     }
     let _ = run(root, &["worktree", "prune"]);
-    match run_named(
-        root,
-        "worktree add",
-        &["worktree", "add", "-b", branch, path_arg, "HEAD"],
-    ) {
-        Ok(_) => Restored::Recreated(path),
-        Err(error) => Restored::Failed(error),
-    }
+    run_named(root, "worktree add", &["worktree", "add", path_arg, branch])?;
+    let unplaced = populate_submodules(&path);
+    Ok((path, unplaced))
 }
 
 /// Whether the wake of an isolated agent has somewhere to run: its worktree is
 /// on disk (a checkout git made, or the directory a run in a gone workspace
 /// left — both are paths its own tools resolve, and telling them apart is
-/// [`worktree_restore`]'s job at the run itself), the branch a checkout is put
-/// back from is still in git, or git can branch from the root — a branch git no
-/// longer has is *re-created* at the root's `HEAD` and the checkout made on it
-/// ([`Restored::Recreated`]).
+/// [`ensure_worktree`]'s job at the run itself), or the branch it works on is
+/// still in git, which that door puts a checkout back on.
 ///
 /// The one question every gate before a wake asks — the UI's own
 /// (`App::worktree_gone`), a parent's `control message`, and the actor's run
 /// start — because "the directory is missing" and "the agent cannot work"
-/// stopped being the same fact when [`worktree_restore`] learned to put a
-/// checkout back, and stopped being it for good when it learned to rebuild one.
-/// What is still refused is a repository git cannot branch from at all: no
-/// repository, no commit for a branch to start at, no git binary — the states
-/// [`can_branch_from`] names, and the refusal `agent::worktree_gone_line`
-/// states.
+/// stopped being the same fact when the door learned to put a checkout back on a
+/// branch that outlived one. What is refused is the branch being gone with the
+/// directory: the work was merged, discarded or never committed, and the run
+/// that would start without it is a run in a directory no surface can show —
+/// the sentence for that state is `agent::worktree_gone_line`'s.
 pub fn checkout_restorable(root: &Path, id: u64, branch: &str) -> bool {
-    worktree_path(root, id).exists()
-        || resolve(root, branch).is_some()
-        || can_branch_from(root).is_ok()
+    worktree_path(root, id).exists() || resolve(root, branch).is_some()
 }
 
 /// Which of the two ways a branch adds nothing to its base: what one word,
@@ -1751,8 +1723,8 @@ mod tests {
     /// The road back from a checkout that was taken away under a branch that
     /// outlived it: the checkout goes back on the branch, at the branch's tip,
     /// with the branch's own work in it. A branch git no longer has is the other
-    /// road — a *rebuild* at the root's `HEAD`, the base a revived actor has
-    /// when its session records no fork.
+    /// answer — a refusal, because the work is gone and there is nothing to
+    /// resume ([`ensure_worktree`]).
     #[test]
     fn a_checkout_is_put_back_on_the_branch_that_outlived_it() {
         let dir = init_repo("restore-checkout");
@@ -1765,6 +1737,18 @@ mod tests {
             "a linked worktree carries a `.git` file"
         );
 
+        // A checkout that is already there is left exactly as it is: the door
+        // never blows away a tree a run is working in.
+        assert_eq!(
+            ensure_worktree(&dir, 3, &branch),
+            Ok((path.clone(), vec![]))
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("work.txt")).unwrap(),
+            "the work\n",
+            "and nothing about it moved"
+        );
+
         // A hand-run `git worktree remove`: the checkout goes, the branch stays.
         run(&dir, &["worktree", "remove", "--force", &worktree_rel(3)]).unwrap();
         assert!(!path.exists());
@@ -1773,8 +1757,8 @@ mod tests {
             "a branch git still has is a checkout away"
         );
         assert_eq!(
-            worktree_restore(&dir, 3, &branch),
-            Restored::Done(path.clone())
+            ensure_worktree(&dir, 3, &branch),
+            Ok((path.clone(), vec![]))
         );
         assert!(
             is_checkout(&path),
@@ -1791,33 +1775,49 @@ mod tests {
             "and the branch's work is in it"
         );
 
-        // A branch git no longer has: both it and the checkout are made again,
-        // at the root's `HEAD`. The branch's own commits are not reachable from
-        // there and the old work is not in the directory — this is the rescue
-        // of last resort, not the road back.
+        // A branch git no longer has: the work is gone, and no run starts in a
+        // directory no branch names. The path is not made either — a branch git
+        // lost is never re-created at the root's `HEAD`: `worktree_add` is the
+        // door a *new* branch is made at, and only a spawn asks for one.
         run(&dir, &["worktree", "remove", "--force", &worktree_rel(3)]).unwrap();
         run(&dir, &["branch", "-D", &branch]).unwrap();
         assert_eq!(
-            worktree_restore(&dir, 3, &branch),
-            Restored::Recreated(path.clone())
+            ensure_worktree(&dir, 3, &branch),
+            Err(format!("{branch} is gone — the work cannot be resumed"))
         );
+        assert!(!path.exists(), "and nothing was created in its place");
         assert!(
-            is_checkout(&path),
-            "a checkout git made on the re-created branch"
+            !checkout_restorable(&dir, 3, &branch),
+            "the gates refuse a wake with no branch to run on"
         );
-        assert_eq!(super::branch(&path).as_deref(), Some(branch.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A checkout that is there is never written over, and that is the whole of
+    /// the door's first state: a run's uncommitted work is the only copy of it,
+    /// so "put the checkout back" must not mean "make a clean one".
+    #[test]
+    fn a_dirty_checkout_is_left_exactly_as_it_is() {
+        let dir = init_repo("restore-dirty");
+        let (path, branch, _) = worktree_add(&dir, 12, None).unwrap();
+        fs::write(path.join("tracked.txt"), "before\n").unwrap();
+        commit_all(&path, "mush #12: the tracked file").unwrap();
+        fs::write(path.join("tracked.txt"), "edited in the checkout\n").unwrap();
+        fs::write(path.join("untracked.txt"), "only here\n").unwrap();
+
         assert_eq!(
-            resolve(&path, "HEAD"),
-            resolve(&dir, "HEAD"),
-            "the branch starts at the root's HEAD — the only base a revive has"
+            ensure_worktree(&dir, 12, &branch),
+            Ok((path.clone(), vec![]))
         );
-        assert!(
-            !path.join("work.txt").exists(),
-            "and the branch's old commits are not under it"
+        assert_eq!(
+            fs::read_to_string(path.join("tracked.txt")).unwrap(),
+            "edited in the checkout\n",
+            "the dirty edit is still there"
         );
-        assert!(
-            checkout_restorable(&dir, 3, &branch),
-            "a repository git can branch from has a checkout to build, so no gate may refuse the wake"
+        assert_eq!(
+            fs::read_to_string(path.join("untracked.txt")).unwrap(),
+            "only here\n",
+            "and so is the file no commit would keep"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1839,21 +1839,18 @@ mod tests {
                 .any(|worktree| worktree.path == path),
             "git still lists the checkout whose directory is gone"
         );
-        assert_eq!(
-            worktree_restore(&dir, 4, &name),
-            Restored::Done(path.clone())
-        );
+        assert_eq!(ensure_worktree(&dir, 4, &name), Ok((path.clone(), vec![])));
         assert!(is_checkout(&path));
         assert_eq!(branch(&path).as_deref(), Some(name.as_str()));
         let _ = fs::remove_dir_all(&dir);
     }
 
     /// A directory in a checkout's place is what a run in a *gone* workspace
-    /// leaves behind (finding S1), and it is not a checkout: the restore refuses
-    /// rather than hand a second life to a directory git cannot see. With the
-    /// branch gone too the rebuild is tried — and git refuses to make a worktree
-    /// inside a directory that is not empty, in git's own words, which is the
-    /// whole point of leaving the path for git's own add.
+    /// leaves behind (finding S1), and it is not a checkout: with the branch
+    /// gone the door refuses on the branch, and with the branch still there it
+    /// leaves the path for git's own add, which refuses a directory that is not
+    /// empty. Either way the file a removal would have destroyed is still
+    /// there.
     #[test]
     fn a_plain_directory_is_not_a_checkout_to_put_back() {
         let dir = init_repo("restore-plain");
@@ -1861,12 +1858,14 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("phantom.txt"), "written in a gone workspace\n").unwrap();
         assert!(!is_checkout(&path));
-        // No branch either, so the rebuild road runs; git's own refusal is the
-        // answer, and the file is not something a rebuild may write over.
-        assert!(matches!(
-            worktree_restore(&dir, 8, &branch_name(8)),
-            Restored::Failed(_)
-        ));
+        // No branch: the door refuses before git is asked anything.
+        assert_eq!(
+            ensure_worktree(&dir, 8, &branch_name(8)),
+            Err(format!(
+                "{} is gone — the work cannot be resumed",
+                branch_name(8)
+            ))
+        );
         assert!(!is_checkout(&path), "nothing was created on top of it");
         assert_eq!(
             fs::read_to_string(path.join("phantom.txt")).unwrap(),
@@ -1883,10 +1882,7 @@ mod tests {
         run(&dir, &["worktree", "remove", "--force", &worktree_rel(9)]).unwrap();
         fs::create_dir_all(&real).unwrap();
         fs::write(real.join("phantom.txt"), "written in a gone workspace\n").unwrap();
-        assert!(matches!(
-            worktree_restore(&dir, 9, &branch_name(9)),
-            Restored::Failed(_)
-        ));
+        assert!(ensure_worktree(&dir, 9, &branch_name(9)).is_err());
         assert!(!is_checkout(&real), "nothing was created on top of it");
         assert_eq!(
             fs::read_to_string(real.join("phantom.txt")).unwrap(),
@@ -1896,19 +1892,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The one state the rebuild still refuses: a repository git cannot branch
-    /// from at all. A fresh `git init` has no commit for a new branch to start
-    /// at, and a directory that is not a repository has no `HEAD` either; both
-    /// answer with mush's own sentence for the state, not git's about the name,
-    /// and neither creates anything before it asks (finding F16).
+    /// A repository with no branch to put back is refused in the repository's
+    /// own words, not in a sentence about a branch that never existed there: a
+    /// fresh `git init` has no commit for any branch to start at, and a
+    /// directory that is not a repository has no `HEAD` either. Neither creates
+    /// anything before it asks (finding F16).
     #[test]
-    fn a_repo_nothing_can_be_branched_from_refuses_the_rebuild_in_mush_words() {
+    fn a_repo_nothing_can_be_branched_from_refuses_in_mush_words() {
         let unborn = Scratch::new("restore-unborn");
         run(&unborn, &["init", "-q"]).unwrap();
         let branch = branch_name(10);
         assert_eq!(
-            worktree_restore(&unborn, 10, &branch),
-            Restored::Failed("the repo has no commits yet — commit first or drop isolated".into())
+            ensure_worktree(&unborn, 10, &branch),
+            Err("the repo has no commits yet — commit first or drop isolated".into())
         );
         assert!(
             !checkout_restorable(&unborn, 10, &branch),
@@ -1924,8 +1920,8 @@ mod tests {
         let plain = Scratch::new("restore-not-a-repo");
         let branch = branch_name(11);
         assert_eq!(
-            worktree_restore(&plain, 11, &branch),
-            Restored::Failed("not a git repository".into())
+            ensure_worktree(&plain, 11, &branch),
+            Err("not a git repository".into())
         );
         assert!(!checkout_restorable(&plain, 11, &branch));
         assert!(!plain.join(crate::session::MUSH_DIR).exists());
@@ -2248,6 +2244,90 @@ mod tests {
         assert!(
             changes(&path).unwrap().is_empty(),
             "and the worktree is clean with it in place"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&recorded);
+    }
+
+    /// A checkout [`ensure_worktree`] makes is born as clean as a spawn's: the
+    /// same population, and the same honesty about a submodule that cannot sit
+    /// at its recorded commit. A row that lives on refs and materializes on its
+    /// first message gets the tree a spawn would have got, not a half-built one
+    /// whose ` M lib/sub` the run's own end would commit as the agent's work and
+    /// the row's `+1−1` would report for ever.
+    #[test]
+    fn a_lazily_materialized_checkout_is_as_clean_as_a_spawns() {
+        // The source the branch's tree points at, with a history of its own.
+        let source = init_repo("ensure-submodule-source");
+        // ... and the commit the superproject records for the submodule, made
+        // in *another* repository: the clone can serve the source's `HEAD` but
+        // not this commit, which is the measured shape of "the recorded gitlink
+        // commit is not fetchable from the submodule's source".
+        let recorded = init_repo("ensure-submodule-recorded");
+        fs::write(recorded.join("elsewhere.txt"), "a different history\n").unwrap();
+        run(&recorded, &["add", "-A"]).unwrap();
+        run(&recorded, &["commit", "-qm", "a different history"]).unwrap();
+        let sha = resolve(&recorded, "HEAD").unwrap();
+
+        let dir = init_repo("ensure-submodule");
+        fs::write(
+            dir.join(".gitmodules"),
+            format!(
+                "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = {}\n",
+                source.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let entry = format!("160000,{sha},lib/sub");
+        run(&dir, &["update-index", "--add", "--cacheinfo", &entry]).unwrap();
+        run(&dir, &["add", ".gitmodules"]).unwrap();
+        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+        // The branch a row lives on, with no checkout: what a restore leaves.
+        run(&dir, &["branch", &branch_name(6)]).unwrap();
+        assert!(
+            !worktree_path(&dir, 6).exists(),
+            "the row's checkout is not there yet"
+        );
+
+        // A local submodule clones over the `file` transport, which git refuses
+        // for submodules unless the human says otherwise; the test is that
+        // human, through git's own road for saying it.
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        let made = ensure_worktree(&dir, 6, &branch_name(6));
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        let (path, unplaced) = made.unwrap();
+
+        assert_eq!(path, worktree_path(&dir, 6));
+        assert_eq!(
+            unplaced,
+            vec!["lib/sub".to_string()],
+            "the run is told which recorded submodule its checkout does not hold"
+        );
+        assert_eq!(
+            status(&path).unwrap().dirty,
+            0,
+            "and the checkout is born clean — the run's end has no dirt to commit"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "git disagrees with nothing in it"
+        );
+        assert!(
+            matches!(
+                commit_all(&path, "mush #6: write the report").unwrap(),
+                Commit::Nothing
+            ),
+            "so the run's own end makes no commit out of the missing submodule"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("a.txt")).unwrap(),
+            "one\n",
+            "and the rest of the checkout is the tree the branch records"
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&source);

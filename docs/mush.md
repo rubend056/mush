@@ -1147,6 +1147,19 @@ git worktree remove .mush/wt/3   # reclaim the checkout
 git branch -D mush/3             # drop the branch
 ```
 
+**A worktree is made when an agent works, not when a row is listed.** A row
+lives on refs alone: closing and reopening mush restores every isolated row's
+branch, id and place and makes *no* checkout, and the checkout appears when the
+agent is about to work — at a spawn, or at the door before a resumed run, which
+puts it back on the branch git still has (`git::ensure_worktree`, called from
+`agent::place_worktree`). A checkout that is already there is left exactly as it
+is, dirty tree and all. A row whose branch git no longer has cannot be resumed:
+its work landed, was discarded, or was never committed, and a message to it is
+refused with a sentence rather than run in a directory no surface can show.
+Restoring forty rows therefore costs no directories at all, and reclaiming a
+ref-only row is a ref operation — the registration is pruned when one is left
+and the branch is deleted when git certifies it.
+
 **mush never auto-merges.** Leftover worktrees (a `mush/*` branch with a checkout
 still on disk) are rediscovered on startup from `git worktree list`, so those
 commands keep working after a restart. The worktree and commit code:

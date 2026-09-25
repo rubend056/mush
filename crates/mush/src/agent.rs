@@ -1700,69 +1700,42 @@ pub fn revive(
         messages,
         parent,
     } = spec;
-    // An isolated agent's checkout is put back, never handed the root. The
-    // branch is the mark that this agent works in a worktree of its own, and it
-    // is also the road back: a branch git still has is a checkout away
-    // (`git::worktree_restore`), its `HEAD` the branch's tip, so the agent
-    // resumes exactly where its commits left it — and a branch git no longer has
-    // is *rebuilt* at the root's `HEAD`, with a line in the transcript saying so
-    // before the actor starts. That rebuild is the human's report answered: a
-    // failed run's own end reaped a branch that had no commits and took the
-    // checkout with it, and the wake that was refused left ten minutes of
-    // context with nowhere to resume. Only a repository git cannot branch from
-    // is refused, and never with the parent's checkout as the fallback: a run
-    // there is the defect the human reported, where four in-flight children
-    // came back as writers in the main tree.
-    let mut rebuilt: Option<String> = None;
+    // An isolated agent's checkout is made when it is about to *work*, not when
+    // it is revived: a restored session's rows keep their branches, their ids
+    // and their places on screen and create no directories, and the one door
+    // every road to a run passes (`place_worktree`) is what materializes the
+    // worktree ([`git::ensure_worktree`]). So the root here is the worktree's
+    // *place* — the path the actor's own tools will resolve once the door has
+    // made it — and [`Workspace::pending`] opens it without asking the
+    // directory to exist. The root's own checkout is a different fact: it is
+    // there now, or there is nowhere to run at all, and [`Workspace::new`]
+    // keeps saying so.
     let ws_root = match branch.as_deref() {
         None => root.clone(),
-        Some(branch) => match git::worktree_restore(&root, id, branch) {
-            git::Restored::Done(path) => path,
-            git::Restored::Recreated(path) => {
-                // The branch is back, at the root's `HEAD` — the only base a
-                // revived actor has, and the one that keeps more than it should
-                // rather than less. The fact is pushed into the transcript
-                // below, before the actor starts, so the pane, the stored
-                // session and the agent's own next request all carry where its
-                // branch now stands.
-                rebuilt = Some(format!("{branch} re-created at HEAD"));
-                path
-            }
-            git::Restored::Failed(error) => {
-                // The one refusal left: a repository git cannot branch from (no
-                // repository, no commit, no git), or an add git would not make
-                // (a path that is not valid UTF-8, a plain directory in the
-                // checkout's place). Same door as the workspace failure below.
-                let sink: Arc<dyn Events> = Arc::new(Ui::new(tx, ConversationId(conversation)));
-                sink.emit(
-                    AgentId(id),
-                    AgentEvent::Error(format!(
-                        "agent #{id}'s worktree could not be put back: {error} — this message did \
-                         not run"
-                    )),
-                );
-                return dead_mailbox();
-            }
-        },
+        Some(_) => git::worktree_path(&root, id),
+    };
+    let opened = match branch.as_deref() {
+        Some(_) => Workspace::pending(&ws_root),
+        None => Workspace::new(&ws_root),
     };
     // The copy this revival resumes from is the one record that outlives the
     // process, and it names the jobs its lines carry: the tree-wide job
     // counter is fresh every launch, so it is raised before the actor can
     // start a job of its own (finding A22).
     raise_job_floor(&ids, &messages);
-    let ws = match Workspace::new(&ws_root) {
+    let ws = match opened {
         Ok(ws) => ws,
         Err(error) => {
-            // The other window the restore's own check cannot close: the
-            // checkout was there when it was asked and is gone by the time the
-            // workspace is built (a sibling's `git worktree remove` — the
-            // repair mush's own refusal sentence tells a model to run). This
-            // runs on the UI thread (`App::deliver_to_actor`,
-            // `App::restore_agents`), where the old `expect` panicked the
-            // process (finding A21). The command is refused, not lost: the
-            // dead mailbox makes the caller's own send fail, and its refusal
-            // sentence reaches the human — this event says *why* the
-            // workspace could not be built.
+            // The root's own checkout is built here and nowhere else: an
+            // isolated row's root may be a directory that is not there yet
+            // ([`Workspace::pending`]), but a *shared* agent's is the directory
+            // mush is standing in, and a workspace nothing can open is a run
+            // with nowhere to write. This runs on the UI thread
+            // (`App::deliver_to_actor`, `App::restore_agents`), where the old
+            // `expect` panicked the process (finding A21). The command is
+            // refused, not lost: the dead mailbox makes the caller's own send
+            // fail, and its refusal sentence reaches the human — this event
+            // says *why* the workspace could not be built.
             let sink: Arc<dyn Events> = Arc::new(Ui::new(tx, ConversationId(conversation)));
             sink.emit(
                 AgentId(id),
@@ -1811,8 +1784,16 @@ pub fn revive(
     // The system prompt is regenerated, and an agent with no transcript but a
     // known brief is seeded with the task — so a worktree found on disk resumes
     // knowing what it was for, even though it has no memory of the run.
+    //
+    // The prompt names the workspace the run will be handed — for an isolated
+    // agent, the worktree's place, which the door before its first run makes
+    // ([`git::ensure_worktree`]). The one line this revival cannot carry is
+    // where the branch now stands: a branch git no longer has is not rebuilt
+    // any more, it refuses the run with a sentence (`place_worktree`), and a
+    // branch git still has puts a checkout back at its own tip — the branch
+    // the agent left, so there is nothing to say.
     let isolated = actor.branch.is_some();
-    let mut transcript = revived_transcript(
+    let transcript = revived_transcript(
         Message::system(prompt::subagent_prompt(
             &ws_root_str,
             depth,
@@ -1822,15 +1803,6 @@ pub fn revive(
         &brief,
         messages,
     );
-    // A rebuild is a fact the model has to read before it runs: the branch it
-    // resumes on is not the branch it left, and nothing under it is the commits
-    // it made. Pushed after the transcript is built — it is the newest line,
-    // the one every later reader of this conversation (the pane, the stored
-    // session, the request) finds at the end — and before `start`, so the
-    // actor's own first request already carries it.
-    if let Some(line) = rebuilt {
-        push_mush_line(&actor, &mut transcript, line);
-    }
     // It comes back at rest, not running: a restart is not a request. Starting
     // a run here replayed every restored agent's task against the endpoint the
     // moment mush opened — thirteen agents, thirteen requests nobody asked for,
@@ -2248,9 +2220,9 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // No run starts in a directory that is not this agent's own worktree.
         // The absorb-time guard covers the two messages that start a run, but a
         // completion folded in from a child or a job can start one too, and the
-        // door has to be the same for every road: put the checkout back if its
-        // branch is still around, rebuild the branch and checkout when git no
-        // longer has it, and say why nothing ran if even that cannot be built. A
+        // door has to be the same for every road: make the checkout if the
+        // branch git still has it, leave a checkout that is already there
+        // exactly as it is, and say why nothing ran when the work is gone. A
         // refusal leaves the words in the transcript and the actor at rest — the
         // notice is the answer, and a later wake retries the same door.
         if let Err(line) = place_worktree(&actor, &mut transcript) {
@@ -2705,10 +2677,9 @@ fn absorb(
         }
         AgentMsg::Nudge(message) => {
             // A message that cannot run is answered where it was asked: the
-            // worktree is put back when its branch is still there, and the
-            // branch and checkout are rebuilt when git no longer has it — a wake
-            // into the parent's checkout is the defect, and a refusal is only
-            // for a repository git cannot branch from (`place_worktree`).
+            // checkout is made when the branch is still there, and refused — a
+            // wake into the parent's checkout is the defect — when the work is
+            // gone (`place_worktree`).
             if let Err(line) = place_worktree(actor, transcript) {
                 actor.ctx.emit(actor.id, AgentEvent::Notice(line));
                 return Fold::Idle;
@@ -2884,22 +2855,18 @@ fn absorb(
 /// A *failed* run is that same fact for the opposite reason, and it is the
 /// other half of the human's report: the endpoint (or the wire) ended the run —
 /// the run did not choose to end — and what the worktree holds is the only copy
-/// of the context the human's next `control message` resumes with. That wake
-/// runs in this directory, and [`place_worktree`] can now put a checkout back
-/// even when the branch is gone — but only by *rebuilding* it, at the root's
-/// `HEAD`, which forgets everything this directory is: the run's fork, the
-/// commits it made, the files it was working in. That rebuild is the rescue of
-/// last resort, for a worktree already lost, and a failure must not be the thing
-/// that spends it: a sweep that took both would turn ten minutes of context into
-/// a resume on a branch that never saw any of it, or — before the rebuild
-/// existed — into no resume at all. The UI's own sweep already behaves this way
-/// (`App::refresh_git`'s walk asks for `matches!(node.phase, Phase::Done)`:
-/// "Only a run that ended on its own terms leaves residue. A row that is
-/// stopped, cut off, failed or never asked is one a message can still wake *into
-/// its own worktree*"), so this guard was the one road that disagreed with it.
-/// The cost is named and accepted: a failed agent holds its worktree slot — and
-/// the cap counts it — until a later run's end settles it or the human takes it
-/// by hand, which is the smaller price than a resume with nowhere to write.
+/// of the context the human's next `control message` resumes with. A sweep that
+/// took both would turn ten minutes of context into a resume on a branch that
+/// never saw any of it; the run-end guard is what keeps it, and a branch git
+/// still has is a checkout [`place_worktree`] puts back. The UI's own sweep
+/// behaves this way too (`App::refresh_git`'s walk asks for
+/// `matches!(node.phase, Phase::Done)`: "Only a run that ended on its own terms
+/// leaves residue. A row that is stopped, cut off, failed or never asked is one
+/// a message can still wake *into its own worktree*"), so this guard was the one
+/// road that disagreed with it. The cost is named and accepted: a failed agent
+/// holds its worktree slot — and the cap counts it — until a later run's end
+/// settles it or the human takes it by hand, which is the smaller price than a
+/// resume with nowhere to write.
 fn reclaim_own_worktree(
     actor: &Actor,
     state: &ActorState,
@@ -2919,48 +2886,70 @@ fn reclaim_own_worktree(
     }
 }
 
-/// The whole door before a run: where this actor will write, and what its own
-/// transcript is told when that place had to be built again.
+/// The whole door before a run: where this actor will write.
 ///
-/// [`git::worktree_restore`]'s answers, used at the one moment that matters:
-/// `Done` is the checkout that is there; `Recreated` is a branch git no longer
-/// had — the run's own end reaped a branch that committed nothing and took the
-/// checkout with it — rebuilt at the root's `HEAD`, a fact the transcript must
-/// carry because the branch it resumes on is not the branch it left; `Failed`
-/// is git's own refusal (an add it would not make), or mush's sentence for a
-/// repository git cannot branch from at all ([`git::can_branch_from`], finding
-/// F16) — the one state [`worktree_gone_line`] still states, and never as a
-/// fallback into the parent's checkout.
+/// [`git::ensure_worktree`]'s one materializer, used at the one moment that
+/// matters: a checkout already on disk is left exactly as it is (dirty or not),
+/// a branch git still has is what a checkout is put back on (the road back from
+/// a hand-run `git worktree remove`, and the road a restored row takes the first
+/// time it is asked to work), and a branch git no longer has is refused with the
+/// sentence that says the work cannot be resumed. A fresh spawn does not come
+/// through here: it makes its branch and checkout together ([`git::worktree_add`]).
+///
+/// This is the *only* place a worktree is materialized outside a spawn, and it
+/// is enough because every road to a run passes it: the run loop's own top, and
+/// the two messages that start a run (`Nudge`, `Steer`) so a message that cannot
+/// run is refused as a `Notice` rather than folded into the transcript. A
+/// restored or parked actor is built with the worktree's *place* as its
+/// workspace ([`Workspace::pending`]) and materializes nothing until it is
+/// actually asked to work; a fresh spawn already has its checkout.
 ///
 /// Called before every run *and* before the two messages that start one, because
 /// the door is the same one: a run in a directory that is not the agent's own
 /// worktree is a directory no surface — not `git status`, not `git diff`, not
-/// `git merge` — can show, diff or land (finding S1). One helper rather than a
-/// match at each site, so the three callers cannot spell the same door three
-/// ways: `Recreated` says the line [`push_mush_line`]'s road puts in mush's
-/// voice, and `Failed` hands back the one sentence a caller can pass on.
+/// `git merge` — can show, diff or land (finding S1).
+///
+/// A checkout this door *makes* carries one more fact into the transcript: the
+/// submodules the branch's tree records that the checkout does not hold
+/// ([`left_empty_line`]), in the same words the spawn road hands its caller —
+/// the run works in the same tree and has the same right to know it is one fact
+/// short. A checkout that was already there says nothing: its population
+/// happened when it was born.
 fn place_worktree(actor: &Actor, transcript: &mut Vec<Message>) -> Result<(), String> {
     let Some(branch) = actor.branch.as_deref() else {
         // A shared child runs in this workspace, which is still here.
         return Ok(());
     };
-    match git::worktree_restore(&actor.ctx.root, actor.id, branch) {
-        git::Restored::Done(_) => Ok(()),
-        // The branch and the checkout are back, at the root's `HEAD`. The agent
-        // has to read where its branch now stands before its next request: its
-        // commits are not under it, and neither is the directory it was working
-        // in. The pane, the stored session and the request all read this
-        // transcript, so this one push is the whole report.
-        git::Restored::Recreated(_) => {
-            push_mush_line(actor, transcript, format!("{branch} re-created at HEAD"));
+    match git::ensure_worktree(&actor.ctx.root, actor.id, branch) {
+        Ok((_, unplaced)) if unplaced.is_empty() => Ok(()),
+        Ok((_, unplaced)) => {
+            push_mush_line(actor, transcript, left_empty_line(branch, &unplaced));
             Ok(())
         }
-        // git's own reason, or mush's for a repository it cannot branch from,
-        // in the one shape a caller can hand the human.
-        git::Restored::Failed(why) => Err(format!(
+        Err(why) => Err(format!(
             "agent #{}'s worktree could not be put back: {why} — this message did not run",
             actor.id
         )),
+    }
+}
+
+/// What a resumed run reads about the checkout it was just handed: the paths
+/// its branch's tree records that the checkout does not hold, in the same words
+/// the spawn road's reply uses (`spawn_tool`) — an absent submodule is honest,
+/// and the run is told rather than left to find an empty directory. One line,
+/// pushed into the agent's own transcript, where the pane, the stored session
+/// and the agent's next request all read it.
+fn left_empty_line(branch: &str, unplaced: &[String]) -> String {
+    match unplaced {
+        [path] => format!(
+            "{branch} — its checkout leaves {path} empty: the submodule could not be placed \
+             at the commit the tree records"
+        ),
+        paths => format!(
+            "{branch} — its checkout leaves {} empty: the submodules could not be placed at \
+             the commits the tree records",
+            git::named_paths(paths)
+        ),
     }
 }
 
@@ -2970,15 +2959,14 @@ fn place_worktree(actor: &Actor, transcript: &mut Vec<Message>) -> Result<(), St
 /// because this line cannot see which one took *this* worktree, and claiming
 /// "merged" about a run that never committed is the lie the row stopped telling.
 ///
-/// It is now reached only when even a new branch cannot be made: a repository
-/// git cannot branch from (no repository, no commit, no git) or an add git
-/// refuses. A branch git no longer had is not this any more — [`place_worktree`]
-/// rebuilds it at the root's `HEAD` and says so — and the sentence is unchanged
-/// because the landing it names is still what a gone branch usually means.
+/// This is the sentence for a branch that is gone with the directory:
+/// [`place_worktree`] refuses the resume with it, and the UI's own gate says it
+/// toward the human's message box before the words are sent
+/// (`App::worktree_gone`). A branch git still has is not this — a checkout goes
+/// back on it, and the run resumes where its commits left it.
 ///
-/// `pub(crate)` because the UI's own gate says the same sentence toward the
-/// human's message box (`App::worktree_gone`): one home for the refusal, so the
-/// pane and the tool result cannot tell the same fact two ways.
+/// `pub(crate)` so one home serves both: the pane and the tool result cannot
+/// tell the same fact two ways.
 pub(crate) fn worktree_gone_line(id: u64) -> String {
     format!(
         "agent #{id}'s worktree is gone (it was merged, discarded or never committed) — \
@@ -6187,12 +6175,10 @@ fn hand_to_ui(actor: &Actor, child: u64, command: AgentMsg) {
 /// can never arrive. The human's own path refuses the same message up front
 /// (`App::worktree_gone`); this is the parent's half of that rule, in the words
 /// the child itself reports for a message that reached a gone worktree. What the
-/// child's own door can now do is wider than when this gate was written: a
-/// branch git still has is a checkout put back, and a branch git no longer has
-/// is *rebuilt* at the root's `HEAD` ([`place_worktree`]) — that is the wake a
-/// child whose branch a failure's end reaped needs, and a parent must not refuse
-/// it. The refusal left is a repository git cannot branch from at all, which is
-/// exactly [`git::checkout_restorable`]'s `false`.
+/// child's own door can do is put a checkout back on the branch git still has —
+/// a landed child's branch is gone with its dir, so that door refuses too
+/// ([`place_worktree`]) — and a repository the branch cannot be put back in at
+/// all is exactly [`git::checkout_restorable`]'s `false`.
 ///
 /// A *parked* child is the other shape a missing actor takes, and there the
 /// answer is the opposite one: the words are handed to the UI, which wakes the
@@ -21437,37 +21423,66 @@ mod tests {
         git::run(root, &["branch", "-D", "mush/1"]).expect("delete the branch");
     }
 
-    /// The rebuild line a child's own transcript carries, if it does: it is
-    /// emitted as the message every reader of that conversation sees — the pane,
-    /// the stored session, the agent's own next request.
-    fn recreated_line(events: &Recorder, id: u64) -> Option<String> {
+    /// The refusal a child's own door reports when a message reaches a worktree
+    /// whose work is gone, if it does: emitted as a `Notice` — the pane's line —
+    /// it is the child's own answer to a nudge or a steer (`place_worktree`).
+    fn refused_notice(events: &Recorder, id: u64) -> Option<String> {
         events
             .events_for(AgentId(id))
             .into_iter()
             .find_map(|event| match event {
-                AgentEvent::Message(message) if message.text().contains("re-created at HEAD") => {
-                    Some(message.text().to_string())
+                AgentEvent::Notice(line) if line.contains("cannot be resumed") => {
+                    Some(line.to_string())
                 }
                 _ => None,
             })
     }
 
-    /// After a merge by hand, a nudge to the child runs — in a branch and a
-    /// checkout rebuilt at the root's `HEAD`, never in the root.
-    ///
-    /// The old answer refused the nudge: with the branch gone, a run would have
-    /// recreated `.mush/wt/1` as a plain directory no surface could see
-    /// (finding S1). That premise is superseded — the checkout the wake builds is
-    /// a real one git knows, on a branch git knows — and the refusal orphaned
-    /// exactly the context a resume carries. The test pins the new road: the work
-    /// lands in the rebuilt checkout, the main tree stays clean, and the child's
-    /// transcript says what happened to its branch.
+    /// The line a resumed run reads when the checkout it was just handed does
+    /// not hold a submodule its branch stays records: the same fact the spawn
+    /// road's reply carries, in the child's own transcript — one path named,
+    /// several listed by `named_paths`.
     #[test]
-    fn a_nudge_to_a_merged_child_rebuilds_the_branch_and_runs_in_it() {
+    fn a_resumed_checkout_names_the_submodules_it_could_not_place() {
+        assert_eq!(
+            left_empty_line("mush/2", &["lib/sub".to_string()]),
+            "mush/2 — its checkout leaves lib/sub empty: the submodule could not be placed at \
+             the commit the tree records"
+        );
+        assert_eq!(
+            left_empty_line("mush/2", &["lib/a".to_string(), "lib/b".to_string()]),
+            "mush/2 — its checkout leaves lib/a, lib/b empty: the submodules could not be \
+             placed at the commits the tree records"
+        );
+        assert_eq!(
+            left_empty_line(
+                "mush/2",
+                &[
+                    "lib/a".to_string(),
+                    "lib/b".to_string(),
+                    "lib/c".to_string()
+                ]
+            ),
+            "mush/2 — its checkout leaves lib/a, lib/b and 1 more empty: the submodules could \
+             not be placed at the commits the tree records"
+        );
+    }
+
+    /// After a merge by hand, a nudge to the child is refused with a sentence —
+    /// and no directory is fabricated at the reclaimed path.
+    ///
+    /// The branch went with the checkout (the merge's reclaim took both), so a
+    /// resumed run has nowhere to write: re-creating `mush/1` at the root's
+    /// `HEAD` would resume it on a branch that never saw the run, and making
+    /// `.mush/wt/1` as a plain directory is the phantom path no surface can see
+    /// (finding S1). The door refuses instead, the work stays where the landing
+    /// put it, and the main tree is untouched.
+    #[test]
+    fn a_nudge_to_a_merged_child_is_refused_and_makes_no_checkout() {
         let (root, events, child_tx) = finished_isolated_child("s1-merged");
         // A settled root keeps `.mush/` out of `git status` the way the app's own
         // startup does (`session::ensure_mush_dir`); the harness does not, and
-        // this test reads the root's status with a worktree back under it.
+        // this test reads the root's status with the merge's residue around.
         fs::write(root.join(".mush/.gitignore"), "*\n").unwrap();
         let worktree = git::worktree_path(&root, 1);
         land_with_merge(&root);
@@ -21481,39 +21496,25 @@ mod tests {
             .send(AgentMsg::Nudge("write extra.txt".into()))
             .unwrap();
 
-        // The rebuild is the actor's own act, pushed before the run starts, so
-        // the line is the door's receipt.
+        // The refusal is the actor's own act, before anything runs, so the
+        // notice is the door's receipt.
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&events, WAIT, |_| recreated_line(&events, 1).is_some()),
-            "the child's transcript must carry the rebuild: {:?}",
+            seen.wait(&events, WAIT, |_| refused_notice(&events, 1).is_some()),
+            "the child must refuse the nudge: {:?}",
             events.events_for(AgentId(1))
         );
         assert_eq!(
-            recreated_line(&events, 1).as_deref(),
-            Some("mush/1 re-created at HEAD"),
-            "one sentence: the branch's name and where it now stands"
-        );
-
-        // The run writes `extra.txt` where it was handed: the rebuilt checkout.
-        let wanted = worktree.join("extra.txt");
-        assert!(
-            seen.wait(&events, WAIT, |_| wanted.exists()),
-            "the resumed run writes in the rebuilt checkout: {:?}",
-            events.events_for(AgentId(1))
+            refused_notice(&events, 1).as_deref(),
+            Some(
+                "agent #1's worktree could not be put back: mush/1 is gone — the work \
+                 cannot be resumed — this message did not run"
+            ),
+            "one sentence: nothing ran, and why"
         );
         assert!(
-            git::is_checkout(&worktree),
-            "a checkout git made on the re-created branch"
-        );
-        assert_eq!(git::branch(&worktree).as_deref(), Some("mush/1"));
-        // Read after the run's own end moved the branch: its tip may already
-        // carry the commit that end makes, so "the rebuild's base is under it"
-        // is the assertion that holds at both moments.
-        assert!(
-            git_answers(&root, &["merge-base", "--is-ancestor", "HEAD", "mush/1"]),
-            "the branch is back and the root's HEAD is under it: {:?}",
-            git::run(&root, &["log", "--oneline", "-2", "mush/1"])
+            !worktree.exists(),
+            "and nothing is created at the reclaimed path"
         );
         assert!(!root.join("extra.txt").exists(), "never in the root");
         assert_eq!(
@@ -21524,12 +21525,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The same after a discard by hand: the work was thrown away on purpose,
-    /// and the nudge no longer quietly recreates the path it was thrown from as
-    /// a directory nothing can see — it makes a branch and a checkout git knows,
-    /// at the root's `HEAD`, and runs there.
+    /// The same after a discard by hand, through the door's other caller: a
+    /// parent's `Steer` — the words a `control message` delivers — is refused
+    /// exactly as the human's own nudge is, so a parent cannot promise its model
+    /// a resume that will never run.
     #[test]
-    fn a_nudge_to_a_discarded_child_rebuilds_the_branch_and_runs_in_it() {
+    fn a_steer_to_a_discarded_child_is_refused_and_makes_no_checkout() {
         let (root, events, child_tx) = finished_isolated_child("s1-discarded");
         fs::write(root.join(".mush/.gitignore"), "*\n").unwrap();
         let worktree = git::worktree_path(&root, 1);
@@ -21541,33 +21542,22 @@ mod tests {
         );
 
         child_tx
-            .send(AgentMsg::Nudge("write extra.txt".into()))
+            .send(AgentMsg::Steer("write extra.txt".into()))
             .unwrap();
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&events, WAIT, |_| recreated_line(&events, 1).is_some()),
-            "the child's transcript must carry the rebuild: {:?}",
+            seen.wait(&events, WAIT, |_| refused_notice(&events, 1).is_some()),
+            "the child must refuse the steer: {:?}",
             events.events_for(AgentId(1))
         );
-        assert_eq!(
-            recreated_line(&events, 1).as_deref(),
-            Some("mush/1 re-created at HEAD"),
-            "one sentence: the branch's name and where it now stands"
-        );
-
-        let wanted = worktree.join("extra.txt");
         assert!(
-            seen.wait(&events, WAIT, |_| wanted.exists()),
-            "the resumed run writes in the rebuilt checkout: {:?}",
-            events.events_for(AgentId(1))
+            refused_notice(&events, 1).is_some_and(|line| line.contains("mush/1 is gone")),
+            "naming the branch the discard took"
         );
-        assert!(git::is_checkout(&worktree));
-        assert_eq!(git::branch(&worktree).as_deref(), Some("mush/1"));
         assert!(
-            git_answers(&root, &["merge-base", "--is-ancestor", "HEAD", "mush/1"]),
-            "the branch is back and the root's HEAD is under it: {:?}",
-            git::run(&root, &["log", "--oneline", "-2", "mush/1"])
+            !worktree.exists(),
+            "nothing is created at the reclaimed path"
         );
         assert!(!root.join("extra.txt").exists(), "never in the root");
         assert_eq!(
@@ -21621,8 +21611,8 @@ mod tests {
             "and the parent's tree does not see the work: {status}"
         );
         assert!(
-            recreated_line(&events, 1).is_none(),
-            "a branch that was still there is restored, not re-created — the two roads \
+            refused_notice(&events, 1).is_none(),
+            "a branch that was still there is put back on, not refused — the two roads \
              must not blur: {:?}",
             events.events_for(AgentId(1))
         );
@@ -24176,6 +24166,140 @@ mod tests {
         assert!(
             handle.tx.send(AgentMsg::Shutdown).is_err(),
             "no actor was started: every send into the handle's mailbox fails"
+        );
+    }
+
+    /// A revival makes no directory, and the checkout arrives with the first
+    /// message — the parked half of the rule a restore lives by. `revive`
+    /// builds the actor with the worktree's *place* as its workspace
+    /// (`Workspace::pending`) and nothing else; the one door every road to a run
+    /// passes (`place_worktree`) is what puts a checkout back on the branch, and
+    /// a second message reuses the same one rather than making another.
+    #[test]
+    fn a_revive_makes_no_checkout_and_the_runs_own_door_makes_exactly_one() {
+        let root = init_git_repo("revive-no-checkout");
+        // The branch a row lives on, with no checkout: the shape a restore
+        // leaves and the shape a hand removal leaves.
+        git_in(&root, &["branch", &git::branch_name(5)]);
+        let worktree = git::worktree_path(&root, 5);
+        assert!(!worktree.exists(), "the fixture makes no checkout");
+
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
+        let ids = Ids::default();
+        let clock: Arc<dyn clock::Clock> = Arc::new(clock::System);
+        let handles = TreeHandles {
+            ids: ids.clone(),
+            live: Arc::new(AtomicU64::new(0)),
+            jobs: jobs::Registry::new(clock, events, ids),
+        };
+        let mailbox = revive(
+            handles,
+            test_cfg(),
+            tx,
+            1,
+            root.to_path_buf(),
+            ReviveSpec {
+                id: 5,
+                depth: 1,
+                brief: "the brief".to_string(),
+                branch: Some(git::branch_name(5)),
+                messages: Vec::new(),
+                parent: None,
+            },
+        );
+        assert!(
+            !worktree.exists(),
+            "a revival makes no directory: the row lives on refs alone"
+        );
+
+        // What the actor has been told about agent #5's runs: the ones that
+        // started, and the endings they reached. This fixture's endpoint
+        // (`test_cfg`) has nothing listening on 127.0.0.1:1, so a run ends in an
+        // `Error` rather than a `Done` — an ending either way, which is what
+        // tells "the run is over" from "a run is in flight".
+        fn tally(rx: &crossbeam_channel::Receiver<Msg>, started: &mut usize, ended: &mut usize) {
+            while let Ok(msg) = rx.try_recv() {
+                if let Msg::Agent { id, event, .. } = &msg {
+                    if *id != AgentId(5) {
+                        continue;
+                    }
+                    match event {
+                        AgentEvent::Running { .. } => *started += 1,
+                        AgentEvent::Done | AgentEvent::Error(_) | AgentEvent::Stopped => {
+                            *ended += 1
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // What a refused endpoint costs one call — three dials and the two
+        // backoffs between them (`model::retrying`) — is most of the module's
+        // `WAIT` on its own, and this test waits for two whole runs to end.
+        let wait = WAIT * 4;
+        mailbox
+            .send(AgentMsg::Nudge("carry on".into()))
+            .expect("the revived actor is alive to take the message");
+        // Wait for that run to be *over*: a message arriving while one is in
+        // flight is folded into it (`drain_mailbox`) and starts nothing, so the
+        // second message is a second run only once the first has ended.
+        let mut started = 0;
+        let mut ended = 0;
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            tally(&rx, &mut started, &mut ended);
+            if started >= 1 && ended >= 1 && git::is_checkout(&worktree) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            (started, ended),
+            (1, 1),
+            "the first message made one run, and it ended"
+        );
+        assert!(
+            git::is_checkout(&worktree),
+            "the run's own door put a checkout back on the branch"
+        );
+        assert_eq!(
+            fs::read_dir(git::worktree_dir(&root)).unwrap().count(),
+            1,
+            "exactly one, at the row's path"
+        );
+
+        // The run is over, and what it left in the tree is what the next run
+        // must find: a second message reuses this checkout — one directory —
+        // and the work in it is still in it.
+        let marker = worktree.join("in-progress.txt");
+        fs::write(&marker, "the run's uncommitted work\n").unwrap();
+        mailbox
+            .send(AgentMsg::Nudge("carry on again".into()))
+            .expect("the same actor takes it");
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            tally(&rx, &mut started, &mut ended);
+            if started >= 2 && ended >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            (started, ended),
+            (2, 2),
+            "the second message started a run of its own, and it ended"
+        );
+        assert_eq!(
+            fs::read_dir(git::worktree_dir(&root)).unwrap().count(),
+            1,
+            "and made no second checkout"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "the run's uncommitted work\n",
+            "the checkout it was working in is the one it got"
         );
     }
 
