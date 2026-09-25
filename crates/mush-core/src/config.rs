@@ -576,9 +576,12 @@ fn host_of(url: &str) -> &str {
         .unwrap_or(after_scheme)
 }
 
-/// Tokens every request reserves for the tool schemas. Twelve schemas measure
-/// ~7.8 KB (~2.6 K tokens at the 3 bytes/token heuristic), so the reserve
-/// rounds up; `prompt` tests that they keep fitting.
+/// Tokens every request reserves for the tool schemas. The twelve schemas
+/// serialise to 8,363 bytes — ~8.4 kB, ~2.8 K tokens at the 3 bytes/token
+/// heuristic — against the bound `prompt`'s `schemas_fit_the_budget_reserve`
+/// test enforces (`SCHEMA_TOKENS * 3` = 9,000 bytes): the reserve rounds up, so
+/// the round number is the reserve and not the measurement, and the schemas have
+/// ~600 bytes of room before a growth is what moves the number.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
 /// Ownership keeps it down: the prompts carry how to work (the rules, the
