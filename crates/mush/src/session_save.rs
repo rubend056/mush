@@ -747,6 +747,18 @@ mod tests {
     /// Whether a `flush` on its own thread returned within `deadline` — the UI
     /// thread's experience of a flush that parks, kept as a probe: a regression
     /// fails the test rather than hanging the suite.
+    ///
+    /// Wall-clock bounds in this module are runaway guards, never claims about
+    /// this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    /// scale where the subject is complexity, else size the ceiling as a
+    /// multiple of a measured worst case and say where the measurement came
+    /// from.
+    ///
+    /// The deadline its consumers pass is the production `FLUSH_DEADLINE`
+    /// (10 s), and a flush with a dead worker measured 2.3 ms standing still
+    /// (box load 25) and 3.5 ms with twelve extra busy loops on the box: the
+    /// ceiling is thousands of times the fact it guards, and a busy box only
+    /// makes a return later, never earlier.
     fn flushed_within(writer: &Arc<Writer>, deadline: Duration) -> bool {
         let (done, waited) = crossbeam_channel::bounded::<()>(1);
         let writer = writer.clone();
@@ -760,6 +772,10 @@ mod tests {
     /// Wait, bounded, for the worker's `Drop` guard to clear the flag it owns:
     /// the wait is on the thread's own stack clearing, not a guess at how long
     /// a panic takes.
+    ///
+    /// Five seconds is the same kind of guard as [`flushed_within`]'s: the
+    /// flag cleared 1.03 ms after the poke, measured standing still and under
+    /// peak load — thousands of times the reading it bounds.
     fn wait_until_dead(writer: &Writer) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while writer.inner.alive.load(Ordering::SeqCst) {
@@ -940,6 +956,9 @@ mod tests {
             }));
         }
         writer.poke();
+        // The panic hook ran 1.02 ms after the poke, measured standing still
+        // (load 25) and under peak load; 5 s is the runaway guard around that
+        // reading, not a schedule.
         let deadline = Instant::now() + Duration::from_secs(5);
         while seen.lock().unwrap().is_none() {
             assert!(Instant::now() < deadline, "the worker never panicked");
@@ -974,6 +993,10 @@ mod tests {
         let first = writer
             .flush_within(Duration::from_millis(50), || false)
             .expect_err("a stuck worker is not an answer");
+        // A lower bound, and the subject of the test: the give-up happens at
+        // the budget it was handed, so a busy box only helps it pass. The
+        // upper side is deliberately unasserted — how long after the deadline
+        // the poll notices is the box's business.
         assert!(
             started.elapsed() >= Duration::from_millis(50),
             "the deadline is the clock: {:?}",
@@ -1068,6 +1091,9 @@ mod tests {
         let reason = writer
             .close_within(Duration::from_millis(50), || false)
             .expect("a stuck worker outlives the deadline");
+        // A lower bound, and the subject of the test: the give-up happens at
+        // the budget it was handed, so a busy box only helps it pass; the
+        // upper side is deliberately unasserted.
         assert!(
             started.elapsed() >= Duration::from_millis(50),
             "the deadline is the clock: {:?}",
@@ -1115,6 +1141,11 @@ mod tests {
         let hurried = writer
             .flush_within(Duration::from_secs(30), || true)
             .expect_err("a hurried wait is not an answer");
+        // The hurry ended at its next poll: 29 µs measured standing still and
+        // 49 µs under peak load (twelve extra busy loops over load 25). One
+        // second is that loosened four orders of magnitude, and still a
+        // thirtieth of the 30 s deadline it discriminates — a regression that
+        // waited the deadline out cannot pass it.
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the hurry is not the deadline: {:?}",
@@ -1142,6 +1173,9 @@ mod tests {
         let reason = writer
             .close_within(Duration::from_secs(30), || true)
             .expect("a hurried close is not an answer");
+        // The hurry ended at its next poll: 20 µs measured standing still and
+        // 23 µs under peak load. One second is that loosened, and still a
+        // thirtieth of the 30 s deadline it discriminates.
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the hurry is not the deadline: {:?}",

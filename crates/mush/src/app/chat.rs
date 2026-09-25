@@ -9272,7 +9272,9 @@ mod tests {
     /// rows 20.3 s, 40k rows 70.5 s — quadratic — and 127 ms / 216 ms after).
     /// The bound is generous on purpose: this is a liveness guard, not a
     /// performance budget, because the gap between the two shapes at this size
-    /// is minutes against milliseconds (finding IN3).
+    /// is minutes against milliseconds (finding IN3). Measured again: the
+    /// restore call itself took 1.15 s at 200k rows with twelve busy loops on
+    /// top of the box's own load 25, so the 30 s is ~26x that.
     #[test]
     fn restoring_a_store_sized_notice_list_is_one_pass() {
         let stored: Vec<session::StoredNotice> = (0..200_000u64)

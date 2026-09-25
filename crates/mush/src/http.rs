@@ -1687,6 +1687,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
+    // Wall-clock bounds in this module are runaway guards, never claims about
+    // this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    // scale where the subject is complexity, else size the ceiling as a
+    // multiple of a measured worst case and say where the measurement came
+    // from. Each resized bound below carries its own reading.
+
     #[test]
     fn parses_urls() {
         assert_eq!(
@@ -1824,8 +1830,16 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
         assert_eq!(error.to_string(), "request cancelled", "{error}");
+        // The Stop lands in the slice after it is asked for — the setter waits
+        // 100 ms and a slice is 200 ms — measured at 253-259 ms over five runs
+        // standing still and five with twelve busy loops beside it on a box
+        // whose own load average was 13-16. Two seconds is ~8× that, and still
+        // under the 3 s watch this test hands the handshake, where the deadline
+        // case is the error's own kind and sentence above: what the clock no
+        // longer catches is a wedge ending somewhere between one and two
+        // seconds, which those two assertions still do.
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(2),
             "the Stop waited out the socket's own timeout: {elapsed:?}"
         );
     }
@@ -2507,8 +2521,14 @@ mod tests {
         let _server = listener.accept().unwrap().0;
         let started = Instant::now();
         assert!(live.still_open(), "an idle peer is no reason to dial again");
+        // A scheduler pause is the only thing that can stretch a non-blocking
+        // peek: measured 6-16 µs over ten runs, five of them with twelve busy
+        // loops beside it on a box whose own load average was 13-16. The peer
+        // below never speaks and this socket carries no read timeout of its
+        // own, so a check that waited for it could not return at all — the
+        // guard only has to sit past a pause, and a second does.
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < Duration::from_secs(1),
             "the check never waits for the peer: {:?}",
             started.elapsed()
         );

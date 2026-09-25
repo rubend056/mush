@@ -1178,6 +1178,13 @@ mod tests {
                 && !refused.contains("did not reach the clipboard"),
             "a stall is neither a missing writer nor a failed write: {refused}"
         );
+        // The guard is sized from the measurement and must stay below the
+        // production `DEADLINE` (2 s) it discriminates: the call returned
+        // 251-253 ms after the start — its own 250 ms deadline — measured
+        // standing still (load 25) and with twelve extra busy loops on the
+        // box. A regression that ignored the deadline it was handed and gave
+        // up only at the module's 2 s would come back past this, where a
+        // ceiling of the module's own size would have let it pass.
         assert!(
             waited < Duration::from_secs(2),
             "30s of sleep may not be waited on: the call took {waited:?}"
@@ -1214,11 +1221,24 @@ mod tests {
     /// already started name itself: the tests below read the kill and the reap
     /// off the pid it wrote, and a process killed before `sh` could run would
     /// leave the instrument unread rather than the fact unproven.
+    ///
+    /// Wall-clock bounds in this module are runaway guards, never claims about
+    /// this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    /// scale where the subject is complexity, else size the ceiling as a
+    /// multiple of a measured worst case and say where the measurement came
+    /// from.
+    ///
+    /// One second carries that reason, where the old 300 ms was a claim: `sh`
+    /// naming itself measured at most 70 ms (it had written its pid on all
+    /// twenty runs when the child was given a 70 ms deadline), standing still
+    /// (load 25) and with twelve extra busy loops on top — so the breath is
+    /// some fourteen times the worst reading, and the pid the tests below read
+    /// is there before the refusal is even made.
     fn refuse_after_a_breath(
         _name: &str,
         _job: Box<dyn FnOnce() + Send + 'static>,
     ) -> std::io::Result<()> {
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_secs(1));
         Err(std::io::Error::other("the box is at its thread limit"))
     }
 

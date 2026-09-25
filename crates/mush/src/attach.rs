@@ -1461,7 +1461,12 @@ mod tests {
         // nothing — the accept thread may close it under the request, so even
         // the write is allowed to fail — and a served one is replied to. Ids
         // tell a reply that raced an earlier drop from this attempt's.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        //
+        // The reap is the injected 500 ms idle window plus the thread's own
+        // turnaround: the poll measured 2.06 s with twelve busy loops on top of
+        // the box's own load 25, so 60 s is ~30x that — a slot that never comes
+        // back fails the test, a box that is merely busy does not.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut attempt = 0_u64;
         let mut reader = loop {
             attempt += 1;
@@ -1695,8 +1700,14 @@ mod tests {
         )
         .unwrap();
         let silent = UnixStream::connect(socket_path(&idle)).unwrap();
+        // The close comes from the server's 250 ms idle window, so the read
+        // timeout is a runaway guard over it, sized from the measurement: the
+        // window cost 258 ms with twelve busy loops on top of the box's own
+        // load 25, and 15 s is ~60x that. The floor below (25 ms) is the
+        // behaviour; the ceiling no longer catches a close that comes much
+        // later than the window, only one that never comes.
         silent
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(15)))
             .unwrap();
         let started = std::time::Instant::now();
         line.clear();
@@ -1704,7 +1715,7 @@ mod tests {
         let waited = started.elapsed();
         assert_eq!(read, 0, "the silent client was answered with a close");
         assert!(
-            waited >= Duration::from_millis(25) && waited < Duration::from_secs(5),
+            waited >= Duration::from_millis(25) && waited < Duration::from_secs(15),
             "the close came from the idle window, not at once: {waited:?}"
         );
         drop(guard);
@@ -1970,13 +1981,21 @@ mod tests {
     }
 
     /// How long the filler fixture waits for another queued connection before
-    /// deciding the accept queue is full.
-    const FILL_QUIET: Duration = Duration::from_millis(100);
+    /// deciding the accept queue is full. The filler can be descheduled between
+    /// two connects, and the longest such gap measured while the queue was
+    /// filling (4097 connects, twelve busy loops on top of the box's own load
+    /// 25) was 31.5 ms: a quiet window shorter than a real gap would call a
+    /// queue that is not full full, and the test's own connect would then
+    /// succeed and fail on its `unwrap_err`. 1 s is ~30x the measured gap.
+    const FILL_QUIET: Duration = Duration::from_secs(1);
 
     /// How long the fixture goes on filling before it calls the queue
-    /// unfillable. Filling takes one connect per backlog slot, and the depth is
-    /// the kernel's number, not the test's.
-    const FILL_DEADLINE: Duration = Duration::from_secs(10);
+    /// unfillable. Filling takes one connect per backlog slot — 4097 of them
+    /// here — and the whole fill measured 0.19-0.30 s with twelve busy loops on
+    /// top of the box's own load 25, so 60 s is ~200x that: the kernel's depth
+    /// can change, a premise that cannot fill still fails the test, and a busy
+    /// box is not a broken premise.
+    const FILL_DEADLINE: Duration = Duration::from_secs(60);
 
     /// A connect whose listener never drains is cut by its own bound: a full
     /// accept queue parks `connect` in the kernel, and without a deadline the
@@ -1994,8 +2013,15 @@ mod tests {
             io::ErrorKind::TimedOut,
             "the bound, not the kernel, ended the wait: {error}"
         );
+        // The bound is the subject and the kernel is the counter-subject, so
+        // the discriminator is the error kind above — `TimedOut` is this test's
+        // own bound ending the wait, where the kernel would leave it parked.
+        // The ceiling is a runaway guard, not a second budget: a call given
+        // 20 ms measured 20.2 ms with twelve busy loops on top of the box's own
+        // load 25, and 1 s still catches a bound that ignored its argument
+        // (production's `CONNECT_TIMEOUT` is 5 s).
         assert!(
-            waited < Duration::from_millis(200),
+            waited < Duration::from_secs(1),
             "a 20 ms bound and {waited:?} waited"
         );
         assert!(
@@ -2018,8 +2044,11 @@ mod tests {
         let started = std::time::Instant::now();
         let error = ask_with(full.dir(), &request, Duration::from_millis(20)).unwrap_err();
         let waited = started.elapsed();
+        // The same shape as the test above: the CLI's own bound ended the wait,
+        // and 1 s is the runaway guard (~48x the 21 ms measured with twelve
+        // busy loops on top of the box's own load 25).
         assert!(
-            waited < Duration::from_millis(200),
+            waited < Duration::from_secs(1),
             "the CLI's own bound ended the wait: {waited:?}"
         );
         let dir = full.dir().display().to_string();

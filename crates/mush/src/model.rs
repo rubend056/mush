@@ -923,6 +923,24 @@ mod tests {
             .collect()
     }
 
+    // Wall-clock bounds in this module are runaway guards, never claims about
+    // this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    // scale where the subject is complexity, else size the ceiling as a
+    // multiple of a measured worst case and say where the measurement came
+    // from.
+    /// How long a test's server keeps accepting connections after the call it
+    /// serves — long enough that the box cannot fail the test by delaying the
+    /// first dial, and long enough that a retry, which dials at once, is still
+    /// counted rather than missed.
+    ///
+    /// Sized from the measurement: the served call reached `accept` 51-57 ms
+    /// after the call began, on this box standing still (load 25) and with
+    /// twelve extra busy loops on top. Two seconds is thirty-five times that
+    /// worst reading; a busy box can only delay a dial further, never shorten
+    /// the window, and a fixture that never connects still fails in the test's
+    /// own time.
+    const ACCEPT_WINDOW: Duration = Duration::from_secs(2);
+
     /// The classification itself, on the `io::Error`s `http.rs` really returns:
     /// what the wire does is the transport's, and what the transport *refused*
     /// — a body past the cap, a cancellation, a name that does not resolve — is
@@ -977,10 +995,18 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         // Nothing listens for the first attempt...
         drop(listener);
+        // ...and the endpoint the retry reaches is bound the moment the
+        // refusal is announced, on this thread and before the backoff begins:
+        // no sleep, and no server thread the box has not scheduled yet racing
+        // the retry's dial. The thread below only has to accept what the
+        // kernel has already queued — a dial completes into the listener's
+        // backlog whatever the thread is doing.
+        let (endpoint, opened) = std::sync::mpsc::channel::<TcpListener>();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            // ...and the endpoint the retry reaches never answers.
-            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let Ok(listener) = opened.recv() else {
+                return;
+            };
+            // The endpoint never answers: a byte per slice, never a frame.
             if let Ok((mut connection, _)) = listener.accept() {
                 for _ in 0..40 {
                     if connection.write_all(b"a").is_err() {
@@ -1014,11 +1040,21 @@ mod tests {
         let log = Recorder::new();
         let deadline = Duration::from_secs(1);
         let started = Instant::now();
+        let once = std::cell::Cell::new(true);
         let error = retrying(
             crate::clock::system(),
             deadline,
             &cancel,
-            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |line| {
+                log.emit(AgentId(7), AgentEvent::Notice(line.to_string()));
+                // The first dial was refused: this is the moment the endpoint
+                // the retry reaches must exist, so it is bound here.
+                if once.replace(false) {
+                    let listener = TcpListener::bind(("127.0.0.1", port))
+                        .expect("the refused port is free for the retry's endpoint");
+                    let _ = endpoint.send(listener);
+                }
+            },
             |left| model.chat(&request, &cancel, left),
         )
         .unwrap_err();
@@ -1034,6 +1070,11 @@ mod tests {
             elapsed >= deadline,
             "the call waits out its one deadline: {elapsed:?}"
         );
+        // The upper side is the runaway guard, sized from the measurement:
+        // the call came back 4-12 ms past its one-second deadline on this box
+        // under both loads, and 300 ms is some twenty-five times that. It
+        // stays well below the two seconds a second full deadline would cost
+        // — the shape it exists to fail.
         assert!(
             elapsed < deadline + Duration::from_millis(300),
             "one ask spends one deadline, not one per attempt: {elapsed:?}"
@@ -1045,7 +1086,7 @@ mod tests {
     /// not there for the first attempt serves the second (finding A2).
     #[test]
     fn a_call_that_cannot_connect_is_retried() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1053,15 +1094,21 @@ mod tests {
         // Nothing listens yet: the first attempt is refused, which is the one
         // failure a repeat cannot duplicate.
         drop(listener);
+        // The endpoint comes into existence the moment the refusal is
+        // announced, on this thread and before the backoff begins — the same
+        // shape as [`one_ask_spends_one_call_deadline`]'s and for the same
+        // reason: a server thread the box has not scheduled yet cannot lose
+        // the retry's dial to a sleep.
+        let (endpoint, opened) = std::sync::mpsc::channel::<TcpListener>();
         let served = Arc::new(AtomicUsize::new(0));
         let counter = served.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let Ok(listener) = opened.recv() else {
+                return;
+            };
             if let Ok((mut connection, _)) = listener.accept() {
                 counter.fetch_add(1, Ordering::SeqCst);
-                let mut scratch = [0u8; 8192];
-                let _ = connection.read(&mut scratch);
+                read_whole_request(&mut connection);
                 let answer = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -1070,8 +1117,13 @@ mod tests {
                 let _ = connection.write_all(head.as_bytes());
                 let _ = connection.write_all(answer.as_bytes());
                 let _ = connection.flush();
-                // Long enough that the reply is read whole before the close.
-                std::thread::sleep(Duration::from_millis(100));
+                // The reply is read whole before the close because the close
+                // *waits* for the client: the FIN goes out behind the bytes
+                // (a bare drop on unread request bytes would be an RST that
+                // could discard them), and the drain reads whatever of the
+                // request is left, so the close below cannot RST either. No
+                // fixed sleep is needed, and none can be beaten by a busy box.
+                fin_then_drain(&mut connection);
             }
         });
 
@@ -1096,12 +1148,19 @@ mod tests {
             reasoning_effort: None,
         };
         let log = Recorder::new();
-
+        let once = std::cell::Cell::new(true);
         let reply = retrying(
             crate::clock::system(),
             Duration::from_secs(10),
             &cancel,
-            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |line| {
+                log.emit(AgentId(7), AgentEvent::Notice(line.to_string()));
+                if once.replace(false) {
+                    let listener = TcpListener::bind(("127.0.0.1", port))
+                        .expect("the refused port is free for the retry's endpoint");
+                    let _ = endpoint.send(listener);
+                }
+            },
             |left| model.chat(&request, &cancel, left),
         )
         .unwrap();
@@ -1237,7 +1296,14 @@ mod tests {
         // The first call: a fresh dial, answered, and its connection kept.
         let first = model.chat(&request, &cancel, CHAT_DEADLINE).unwrap();
         assert_eq!(first.choices[0].message.text(), "one");
-        // The idle gap between two calls, long enough for the close to land.
+        // The idle gap between two calls: a grace, not a bound. The server's
+        // close is the statement after its flush (`drop(connection)` in the
+        // loop above), so this only has to outlast the FIN's transit on
+        // loopback and the server thread's scheduling between those two
+        // statements; no assertion reads its duration. It cannot be replaced
+        // by a wait for a fact — a client cannot observe a FIN it has not
+        // read yet — and it is left as it was, because a box that delayed the
+        // close past it is the only thing that could fail on it.
         std::thread::sleep(Duration::from_millis(100));
 
         // The second call, through the retry layer the run uses: it must be
@@ -1281,6 +1347,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut held = Vec::new();
+            // Long enough for the endpoint to have seen the request and every
+            // send a regression would have made after it: the request was seen
+            // 50-53 ms after the call began, measured under peak load (twelve
+            // busy loops over the box's own load 25).
             let until = Instant::now() + Duration::from_secs(2);
             while Instant::now() < until {
                 match listener.accept() {
@@ -1332,10 +1402,18 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ModelError::Transport(_)), "{error:?}");
-        // A retry would have connected at once; give the endpoint a moment to
-        // have seen it, then count what it saw.
+        // A retry would have connected at once; wait, bounded, for the one
+        // request the endpoint is owed, then give any later one the same
+        // 150 ms grace the old fixed sleep did, and count what arrived. The
+        // wait is sized from the measurement — 50-53 ms, under peak load —
+        // and a busy box can only lengthen it, never shorten it: the endpoint
+        // being slow can no longer read as a missing request.
+        let mut seen: Vec<()> = Vec::new();
+        if rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+            seen.push(());
+        }
         std::thread::sleep(Duration::from_millis(150));
-        let seen: Vec<()> = rx.try_iter().collect();
+        seen.extend(rx.try_iter());
         assert_eq!(
             seen.len(),
             1,
@@ -1586,8 +1664,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let mut accepted = 0;
-            // Long enough that a retry would have connected at once.
-            let until = Instant::now() + Duration::from_millis(400);
+            // Long enough that a retry would have connected at once; see
+            // [`ACCEPT_WINDOW`] for the measurement behind it.
+            let until = Instant::now() + ACCEPT_WINDOW;
             while Instant::now() < until {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
@@ -1795,8 +1874,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let mut accepted = 0;
-            // Long enough that a retry would have connected at once.
-            let until = Instant::now() + Duration::from_millis(400);
+            // Long enough that a retry would have connected at once; see
+            // [`ACCEPT_WINDOW`] for the measurement behind it.
+            let until = Instant::now() + ACCEPT_WINDOW;
             while Instant::now() < until {
                 match listener.accept() {
                     Ok((mut connection, _)) => {

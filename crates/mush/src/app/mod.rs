@@ -6588,6 +6588,21 @@ mod tests {
         items.iter().map(|item| item.label.as_str()).collect()
     }
 
+    /// The `{stamp} · {text}` lead of a `/notes` row, split and checked: a note
+    /// these tests just made is stamped from the same wall clock the paint
+    /// reads, so the paint can be one second past the stamp and no more — `0s`
+    /// or `1s`, never minutes. A busy box only widens the window a second
+    /// boundary can fall in, so pinning `0s` alone was a race; a stamp past
+    /// `1s` is a defect, not a slow box.
+    fn note_row(label: &str) -> (&str, &str) {
+        let (stamp, text) = label.split_once(" · ").expect("a stamp leads the row");
+        assert!(
+            matches!(stamp, "0s" | "1s"),
+            "a note the test just made is `0s` or `1s`, never a wider stamp: {label:?}"
+        );
+        (stamp, text)
+    }
+
     /// Pretend a status line was written `seconds` ago.
     fn age_status(app: &mut App, seconds: u64) {
         if let Some(status) = app.status.as_mut() {
@@ -6807,7 +6822,35 @@ mod tests {
     /// registered (the restore waits for the sweep, the order H21 needs). Tests
     /// that work on such a repository pump that answer here, so what they see is
     /// what the synchronous `App::new` handed back.
+    ///
+    /// A wall-clock bound in a test is a runaway guard, never a claim about
+    /// this machine. Two shapes, in this order of preference:
+    ///
+    /// 1. Scaling, where the subject is complexity: measure the same operation
+    ///    at two sizes and assert the *ratio* stays inside a stated factor. A
+    ///    busy box stretches both readings alike, so the ratio is the
+    ///    machine's own; linear is the size ratio, a blow-up is its square,
+    ///    and the factor is what a scheduler pause cannot manufacture — take
+    ///    the fastest of a few readings per size and say so.
+    /// 2. A sized ceiling, where the subject is a wait for a condition: size
+    ///    the bound as a multiple of a *measured* worst case, and put the
+    ///    measurement (what was run, on what box, under what load) and the
+    ///    multiple's reason in the comment.
+    ///
+    /// A bound nobody can justify from a measurement is worse than no bound.
+    ///
+    /// This helper and the shared waits around it (`wait_git`, `runs`, `pump`,
+    /// `wait_for_runs`, `next_models`) carry their own reading. The box is the
+    /// shared 14-core one; each reading is the suite's own worst call standing
+    /// still at load ~16, and then again with twelve busy loops on top of the
+    /// other agents' load ~25 — the second is what the bounds are sized from.
     fn settle_sweep(app: &mut App, rx: &Receiver<Msg>) {
+        // A worker running real `git` reads over a restored repository: the
+        // worst call measured 93 ms standing still over the suite's 405 calls,
+        // and 195 ms over the app tests' calls under the twelve busy loops (the
+        // slowest: `a_nested_merge_reads_merged_and_never_claims_head`, a
+        // restore with a merge in it). 30 s is ~150x that — a sweep worker that
+        // never answers fails the test, a slow box does not.
         let deadline = Instant::now() + Duration::from_secs(30);
         while app.sweep_in_flight && Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(20)) {
@@ -6822,8 +6865,15 @@ mod tests {
     /// Adopt the next `Msg::Git` that arrives within the deadline, applying any
     /// message in front of it. A read that never comes back is a test failure,
     /// so this panics rather than proceeding on a stale snapshot.
+    ///
+    /// The read is a real `git` subprocess on a worker thread: the worst of
+    /// this module's 23 calls measured 190 ms standing still and 225 ms under
+    /// the twelve busy loops
+    /// (`a_node_that_starts_running_after_the_read_keeps_its_worktree`, a
+    /// repository with a worktree to sweep). 30 s is ~130x that, and a read
+    /// that never comes back still fails the test in half a minute.
     fn wait_git(app: &mut App, rx: &Receiver<Msg>) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(msg) => {
@@ -6876,6 +6926,12 @@ mod tests {
     /// Wait for `id` to report that a run began, applying whatever else arrives.
     /// The actor's own word is the only evidence that words woken with started
     /// work, so this is what "the child runs" is asserted on.
+    ///
+    /// The event is an actor thread's own `Running`, a few ms after the words
+    /// that wake it: the worst of the suite's five calls measured 6.6 ms
+    /// standing still and 7.1 ms under the twelve busy loops. 5 s is ~700x
+    /// that — a message that never starts a run is a failure in seconds, not a
+    /// hang.
     fn runs(app: &mut App, rx: &Receiver<Msg>, id: AgentId) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -10217,13 +10273,19 @@ mod tests {
     /// that needs a fact the *tree* owns — that a child's run is over, say,
     /// which a parent knows before the UI does — has to apply the events that
     /// move it, exactly as the window would (§8.39).
+    ///
+    /// The condition is a fact a scripted run moves: the worst of the suite's
+    /// calls measured 1.14 s under the twelve busy loops
+    /// (`twenty_children_end_read_and_park`, twelve warm actors parking at
+    /// once; 14 ms standing still for the same test). 60 s is ~50x that, and a
+    /// run that never moves the tree fails the test.
     fn pump(
         app: &mut App,
         rx: &Receiver<Msg>,
         scripted: &Arc<Scripted>,
         until: impl Fn(&App, &[Asked]) -> bool,
     ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             while let Ok(msg) = rx.try_recv() {
                 app.update(msg);
@@ -11065,8 +11127,12 @@ mod tests {
         // The row's `+N −M` comes from `branch_stat`, which resolves the branch
         // — no directory needed. The read that paints it lands with a stat for
         // every one of the forty-two rows, none of which has a checkout.
+        // Forty-two `branch_stat` reads, each a `git` subprocess on a worker:
+        // the worst of the suite's calls measured 848 ms under the twelve busy
+        // loops on top of the box's own load 25. 60 s is ~70x that — the read
+        // is a worker answering, not a budget.
         let mut painted = 0;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while painted < 42 && Instant::now() < deadline {
             while let Ok(msg) = rx.try_recv() {
                 app.update(msg);
@@ -11084,6 +11150,12 @@ mod tests {
     /// Pump the app's own loop until agent #2 has finished `wanted` runs from
     /// now, and answer whether it did. The run's own events are the whole wait:
     /// the `Done` is this child's, and no other agent's run is counted.
+    ///
+    /// A run is a scripted turn on the loopback server: the worst of the
+    /// suite's calls measured 183 ms standing still and 460 ms under the twelve
+    /// busy loops
+    /// (`a_restored_isolation_makes_one_checkout_and_only_when_a_message_comes`).
+    /// 20 s is ~40x that.
     fn wait_for_runs(app: &mut App, rx: &Receiver<Msg>, wanted: usize) -> bool {
         let id = AgentId(2);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -11195,7 +11267,11 @@ mod tests {
             app.chat.insert("carry on");
             app.send_message();
             let wake = worktree.join("wake.txt");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // The child's woken actor writes the file and commits it: the worst
+            // iteration measured 314 ms under the twelve busy loops on top of
+            // the box's own load 25 (a real subprocess and a real commit), so
+            // 30 s is ~100x that.
+            let deadline = Instant::now() + Duration::from_secs(30);
             let moved = |root: &std::path::Path| {
                 git_of(
                     root,
@@ -13482,7 +13558,10 @@ mod tests {
 
         // The new tree's read lands and clears the flag: the dropped one did
         // not leave mush unable to read git again.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // In step with `wait_git`'s own 30 s: this loop's deadline must not
+        // cut a read the helper is still legitimately waiting for. Measured
+        // 28 ms under the twelve busy loops.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while app.git_in_flight && Instant::now() < deadline {
             wait_git(&mut app, &rx);
         }
@@ -14827,11 +14906,17 @@ mod tests {
 
     /// How long one frame costs on a session the size of a real one.
     ///
-    /// `#[ignore]`d on purpose: the 16 ms budget is a property of an *idle* box,
-    /// and this suite runs while sibling agents build on the same machine, so a
-    /// bar this tight flakes and a gate that is green "usually" is not a gate
-    /// (finding H6). Run it deliberately, alone, with
-    /// `cargo test -- --ignored a_frame_fits`.
+    /// The reading is the fastest of five batches of thirty frames: a scheduler
+    /// pause inflates one batch, not all five, so the fastest batch is the
+    /// code's own cost. Measured 11.5 ms per frame standing still and 13.9 ms
+    /// with twelve busy loops on top of the box's own load 11 — inside the
+    /// 16 ms a 60 fps budget allows.
+    ///
+    /// `#[ignore]`d anyway: it costs seconds, and the budget is a property of
+    /// the machine as much as of the code — a slower box, or one whose cores
+    /// the busy loops already eat, can still read over 16 ms, and a gate that
+    /// is green "usually" is not a gate (finding H6). Run it deliberately,
+    /// alone, with `cargo test -- --ignored a_frame_fits`.
     ///
     /// When it is run, a frame that does not fit a 60 fps budget is felt as lag,
     /// so it is a regression guard as much as a measurement.
@@ -14867,14 +14952,22 @@ mod tests {
             })
             .unwrap();
         const FRAMES: u32 = 30;
-        let start = Instant::now();
-        for _ in 0..FRAMES {
-            let screen = app.screen(area);
-            terminal
-                .draw(|f| crate::ui::draw(f, &screen, &crate::theme::Theme::default()))
-                .unwrap();
+        // The reading is the fastest of five batches, not one: a scheduler
+        // pause inflates a batch, not all five, so the fastest batch is the
+        // code's own cost. Measured: 11.5 ms per frame standing still, 13.9 ms
+        // with twelve busy loops on top of the box's own load 11.
+        const BATCHES: usize = 5;
+        let mut per_frame = Duration::MAX;
+        for _ in 0..BATCHES {
+            let start = Instant::now();
+            for _ in 0..FRAMES {
+                let screen = app.screen(area);
+                terminal
+                    .draw(|f| crate::ui::draw(f, &screen, &crate::theme::Theme::default()))
+                    .unwrap();
+            }
+            per_frame = per_frame.min(start.elapsed() / FRAMES);
         }
-        let per_frame = start.elapsed() / FRAMES;
         eprintln!("measured: {per_frame:?} per frame");
         assert!(
             per_frame < Duration::from_millis(16),
@@ -15644,10 +15737,10 @@ mod tests {
             5,
             "every note, not only the held-back ones"
         );
-        assert_eq!(
-            picker.items[0].label, "0s · note 0",
-            "oldest first, like the pane"
-        );
+        // The stamp is read as a shape, not pinned to `0s`: `note_row` says
+        // why. What this test is about is that the list opens on the oldest.
+        let (_, oldest) = note_row(&picker.items[0].label);
+        assert_eq!(oldest, "note 0", "oldest first, like the pane");
         assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
     }
 
@@ -15682,8 +15775,9 @@ mod tests {
             "the cursor is not on the last row, which is mid-sentence: {:?}",
             labels(&picker.items)
         );
+        let (_, head) = note_row(&picker.items[picker.cursor].label);
         assert_eq!(
-            picker.items[picker.cursor].label, "0s · the run failed while folding the",
+            head, "the run failed while folding the",
             "it opens on the head of the newest note, stamp included"
         );
         assert!(
@@ -23823,6 +23917,10 @@ mod tests {
 
     /// The next `Msg::Models` on the UI channel, skipping the answers of the
     /// other roads a command runs (`Msg::Git`).
+    ///
+    /// The answer is a fetch from the test's own loopback server: the worst of
+    /// the suite's calls measured 2.5 ms standing still and 54 ms under the
+    /// twelve busy loops. 5 s is ~90x that.
     fn next_models(rx: &Receiver<Msg>) -> (String, Vec<http::Model>) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

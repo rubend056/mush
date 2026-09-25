@@ -999,6 +999,19 @@ mod tests {
     ///
     /// The wait is bounded and the job killed on the way out: a command that
     /// never ends here is a defect in the test, not a hung suite.
+    ///
+    /// Wall-clock bounds in this module are runaway guards, never claims about
+    /// this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    /// scale where the subject is complexity, else size the ceiling as a
+    /// multiple of a measured worst case and say where the measurement came
+    /// from.
+    ///
+    /// Ten seconds carries that reason: the slowest consumer here is the
+    /// `ps -o ni= -p $$` of the niceness test, measured at 82 ms standing
+    /// still (box load 25) and 50 ms with twelve extra busy loops on the box;
+    /// then `printenv PATH` at 63 ms and 20 ms. Two orders of magnitude of
+    /// headroom over the worst reading, and a hung command still fails in the
+    /// suite's own time.
     #[cfg(unix)]
     fn run_to_end(command: &str, root: &std::path::Path) -> End {
         use super::{Machine, Shell, ShellCommand};
@@ -1175,6 +1188,12 @@ mod tests {
             "the deadline is the clock: {:?}",
             started.elapsed()
         );
+        // The guard, not the deadline: the 50 ms budget is the subject and
+        // the assertion above holds the give-up to it. Measured on this box
+        // standing still (load 25) and with twelve extra busy loops on top:
+        // 50.1 ms and 50.2 ms — one `REAP_POLL` past the budget. One second
+        // is twenty times that worst reading, and a reap that waited the
+        // child out — `sleep 30` below — takes thirty seconds, far past it.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "it is a deadline, not a wait: {:?}",
@@ -1198,6 +1217,11 @@ mod tests {
             reap_within(&mut child, std::time::Duration::from_secs(5), || false),
             None
         );
+        // The 5 s deadline passed above is what a regression would wait out;
+        // the reap of a child that had already ended measured 5.06 ms
+        // standing still and under peak load — one `REAP_POLL` for a child
+        // still exiting. One second is two hundred times that reading, and a
+        // fifth of the deadline it discriminates.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "the reap of a finished child is not a wait: {:?}",
@@ -1218,6 +1242,10 @@ mod tests {
         let started = std::time::Instant::now();
         let reason = reap_within(&mut child, std::time::Duration::from_secs(30), || true)
             .expect("a hurried reap is not an answer");
+        // Measured: 31 µs standing still and 24 µs under peak load — the
+        // hurry is read at the first poll. One second is four orders of
+        // magnitude over that, and a thirtieth of the 30 s deadline it
+        // discriminates.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "the hurry is not the deadline: {:?}",
@@ -1376,6 +1404,11 @@ mod tests {
     /// to start, run `echo $$ > pgid`, and have the file readable and
     /// parseable. The same bound the fixture had before the guard existed — the
     /// difference is what passing it now does.
+    ///
+    /// Sized from the measurement, because passing it now ends in a named
+    /// panic: the file arrived 5.5-24.8 ms after the spawn, measured standing
+    /// still (load 25) and with twelve extra busy loops on the box, so five
+    /// seconds is two hundred times that worst reading.
     #[cfg(unix)]
     const GROUP_START: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1528,6 +1561,10 @@ mod tests {
             let _group = waiting_group_owned(
                 root.path(),
                 "while :; do :; done & wait",
+                // The 200 ms is the subject, not a ceiling: this test drives
+                // `await_pgid_file`'s deadline to expiry to prove the panic
+                // and the guard's cleanup, so it has to be short — and a busy
+                // box only makes the file later, which here is the point.
                 std::time::Duration::from_millis(200),
                 |pgid| {
                     tx.send(pgid).expect("this test is the only reader");
@@ -1649,6 +1686,10 @@ mod tests {
         while !survivor_file.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // Ten seconds, sized from the measurement: the survivor's pid file
+        // arrived 32 ms after the spawn, standing still (load 25) and with
+        // twelve extra busy loops on the box. The loop guards a runaway and
+        // the `expect` below names the defect.
         let survivor: i32 = std::fs::read_to_string(&survivor_file)
             .expect("the survivor wrote its pid")
             .trim()
@@ -1658,7 +1699,9 @@ mod tests {
 
         // The leader is the outer `sh`, and it is gone the moment it has
         // backgrounded the command. Bounded — a defect in the test must not
-        // hang the suite — and killed on the way out.
+        // hang the suite — and killed on the way out. The leader ended 32 ms
+        // after the spawn under both measured loads; ten seconds is the
+        // runaway guard around that reading.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match job.poll().expect("a status is readable") {
@@ -1696,7 +1739,10 @@ mod tests {
 
         // The assertions are made; take the survivor and the group its own
         // session holds down, and wait, bounded, for the pid to leave `/proc`.
-        // The `sleep 30` is long enough that no assertion raced it.
+        // The `sleep 30` is long enough that no assertion raced it. No
+        // assertion follows this loop, so it is a runaway guard over a
+        // `/proc` entry the kernel has not dropped yet — 25-40 ms from the
+        // kill under the two measured loads; five seconds is that loosened.
         let _ = kill_process(Pid::from_raw(survivor).unwrap(), Signal::KILL);
         let _ = kill_process_group(Pid::from_raw(pgrp).unwrap(), Signal::KILL);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

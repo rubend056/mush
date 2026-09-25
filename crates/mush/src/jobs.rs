@@ -1777,9 +1777,19 @@ pub(crate) fn group_members(pgid: i32) -> Vec<i32> {
 
 /// Wait, bounded, for a process group to have no members left. Returns what is
 /// still there: empty means the group ended.
+///
+/// The bound is a runaway guard, not a claim about this box: what is waited
+/// for is the kernel's — a `SIGKILL`ed process has to be scheduled, die and be
+/// reaped. Measured 52-96 ms for jobs.rs's own reader
+/// (`a_dropped_hold_ends_a_real_process_group`) and 65-132 ms across every
+/// consumer in a full-suite pass with twelve busy loops beside it on a box
+/// whose own load average was 16 (`machine.rs`'s and `agent.rs`'s tests share
+/// this helper). Thirty seconds is ~230× the worst reading and the same
+/// ceiling a test here gives a real subprocess's completion; a group that is
+/// never reaped still fails the caller's assertion, half a minute later.
 #[cfg(all(test, unix))]
 pub(crate) fn wait_group_gone(pgid: i32) -> Vec<i32> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let members = group_members(pgid);
         if members.is_empty() || Instant::now() >= deadline {
@@ -1802,6 +1812,27 @@ mod tests {
     use crate::machine::{Machine, ShellCommand};
     use mush_core::scratch::Scratch;
     use mush_core::tools::ToolName;
+
+    // Wall-clock bounds in this module are runaway guards, never claims about
+    // this machine — see the rule on `settle_sweep` in `app/mod.rs`'s tests:
+    // scale where the subject is complexity, else size the ceiling as a
+    // multiple of a measured worst case and say where the measurement came
+    // from. Each resized bound below carries its own reading.
+
+    /// The longest a test waits for what it started to report back: a scripted
+    /// job's completion on its mailbox, a spawned shell's pid file, a killed
+    /// group leaving `/proc`. A runaway guard, not a schedule — what it catches
+    /// is a report that never arrives, which still fails, half a minute later.
+    ///
+    /// Its reading: in a full-suite pass with twelve busy loops beside it on a
+    /// box whose own load average was 16, the waits this bounds measured 0.4-13
+    /// ms for a scripted job's completion, 15 ms for the spawned shell's pid
+    /// file, 37 ms for the tool call's own poll and 67 ms for the real `sh`
+    /// job's completion (`a_job_takes_the_whole_group_with_it`, the slowest
+    /// consumer). Thirty seconds is ~230× the worst of those, and the ceiling
+    /// the real-subprocess half of this module already used — one number now
+    /// says it.
+    const JOB_WAIT: Duration = Duration::from_secs(30);
 
     /// The fixed part of a status headline — the id, the state (or the outcome),
     /// the age and the separators — with room to spare.
@@ -2080,7 +2111,7 @@ mod tests {
             "the first job draws from the job counter, at 1"
         );
 
-        let (reported, line, news) = match mailbox.recv_timeout(Duration::from_secs(5)) {
+        let (reported, line, news) = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { id, line, news }) => (id, line, news),
             Ok(_) => panic!("the completion must be a `CommandDone`"),
             Err(error) => panic!("the owner was never told: {error}"),
@@ -2123,7 +2154,7 @@ mod tests {
         let (registry, _events, _clock) = registry();
         let (id, mailbox) = launch(&registry, &machine, 7);
 
-        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+        let line = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone {
                 id: reported,
                 line,
@@ -2186,7 +2217,7 @@ mod tests {
         assert_eq!(registry.running(), 2);
 
         registry.kill_owned(8);
-        match other_mailbox.recv_timeout(Duration::from_secs(5)) {
+        match other_mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { id, news, .. }) => {
                 assert_ne!(id, first, "agent 8's job, not agent 7's");
                 assert!(!news, "a job mush killed is not news to wake anyone for");
@@ -2226,7 +2257,7 @@ mod tests {
         );
         let (registry, _events, _clock) = registry();
         let (_id, mailbox) = launch(&registry, &machine, 7);
-        match mailbox.recv_timeout(Duration::from_secs(5)) {
+        match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { line, .. }) => {
                 assert!(line.contains("wrote past"), "{line}")
             }
@@ -2308,7 +2339,7 @@ mod tests {
         }
         for mailbox in ends {
             assert!(matches!(
-                mailbox.recv_timeout(Duration::from_secs(5)),
+                mailbox.recv_timeout(JOB_WAIT),
                 Ok(AgentMsg::CommandDone { .. })
             ));
         }
@@ -2387,7 +2418,7 @@ mod tests {
         // same status, and both used to carry the whole command.
         let (ended, mailbox) = start(&long);
         assert!(matches!(
-            mailbox.recv_timeout(Duration::from_secs(5)),
+            mailbox.recv_timeout(JOB_WAIT),
             Ok(AgentMsg::CommandDone { .. })
         ));
         let (running, _mailbox) = start(&long);
@@ -2672,7 +2703,7 @@ mod tests {
         let held = registry.hold(7, job);
         // The child writes its own pid before it sleeps; its pid is the group.
         let pid_file = root.join("pgid");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + JOB_WAIT;
         while !pid_file.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
@@ -2867,7 +2898,7 @@ mod tests {
         );
         drop(guard);
 
-        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+        let line = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { id: done, line, .. }) => {
                 assert_eq!(done, id);
                 line
@@ -3147,7 +3178,7 @@ mod tests {
         // The job's thread sleeps on this same clock, so advancing past the
         // ceiling is what lets the poll that sees it happen at all.
         clock.advance(JOB_MAX_AGE + Duration::from_secs(1));
-        match mailbox.recv_timeout(Duration::from_secs(5)) {
+        match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone {
                 id: done,
                 line,
@@ -3180,7 +3211,7 @@ mod tests {
         let (registry, _events, _clock) = registry();
         let (id, mailbox) = launch(&registry, &machine, 7);
 
-        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+        let line = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone {
                 id: done,
                 line,
@@ -3226,7 +3257,7 @@ mod tests {
         /// `SIGKILL` is delivered at once, but the process still has to be
         /// scheduled to die and reaped (an orphan by init).
         fn wait_for(what: &str, mut gone: impl FnMut() -> bool) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + JOB_WAIT;
             while !gone() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -3262,7 +3293,7 @@ mod tests {
         let id = registry
             .launch(Launch::started(7, command.to_string(), false, tx, job))
             .expect("the job is admitted");
-        let line = match mailbox.recv_timeout(Duration::from_secs(30)) {
+        let line = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { line, .. }) => line,
             other => panic!("no completion for {id}: {other:?}"),
         };
@@ -3290,7 +3321,7 @@ mod tests {
             .spawn(&ShellCommand { command, root })
             .expect("the real shell starts");
         let mut held = registry.hold(8, job);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + JOB_WAIT;
         loop {
             match held.poll() {
                 Ok(Some(_)) => break,
@@ -3327,7 +3358,7 @@ mod tests {
         let (id, mailbox) = launch(&registry, &machine, 7);
         assert_eq!(registry.stop(7, id).unwrap(), format!("stopping job {id}"));
 
-        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+        let line = match mailbox.recv_timeout(JOB_WAIT) {
             Ok(AgentMsg::CommandDone { id: done, line, .. }) => {
                 assert_eq!(done, id);
                 line

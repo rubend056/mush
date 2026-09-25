@@ -7186,8 +7186,15 @@ fn run_shell(
         // A panic on the first instruction would be a race with the shell, not
         // a test: wait for the command's own `touch ready` so the group is up
         // and its pid is readable when the hold is dropped.
+        //
+        // Measured: the file landed within one 5 ms poll standing still and
+        // was already there under twelve busy loops (13 µs) — a shell that
+        // started cannot be slow here, only a shell that never started can
+        // spend the bound. Thirty seconds is thousands of times that, and the
+        // assertion below still fails a command that never started instead of
+        // hanging the suite.
         let ready = root.join("ready");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -11835,8 +11842,15 @@ mod tests {
             result.contains("still running"),
             "and does not claim the child finished: {result}"
         );
+        // The message is already parked when the call starts, so the wait
+        // answers on its first tick: measured 0.15 ms standing still and
+        // 0.16 ms under twelve busy loops. The guard must stay clear of the
+        // wait's own `WAIT_TIMEOUT_SECS` (600 s), which a regression that
+        // ignored the message would spend; `WAIT` is a tenth of it. What it
+        // no longer catches: a message that does end the wait, but takes tens
+        // of seconds about it.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < WAIT,
             "the wait ended on the message, not the timeout ({:?})",
             started.elapsed()
         );
@@ -13272,8 +13286,15 @@ mod tests {
             report.contains("1 process in its group was stopped"),
             "the model is told the background child is gone: {report}"
         );
+        // The one real fork/exec in this test: the call spawns a shell, lets
+        // it exit and reaps the sleeper it left behind — measured at 21 ms
+        // standing still and 42 ms under twelve busy loops. The guard must
+        // stay under the 10 s this call hands the command, so that a
+        // regression which waited for the leftover `sleep 30` still spends
+        // the binding and is caught; 8 s keeps that discrimination with two
+        // seconds to spare and is nearly two hundred times the reading.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(8),
             "took {:?}",
             started.elapsed()
         );
@@ -13285,6 +13306,13 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
+        // The call returned only once it had stopped the group and said so,
+        // and /proc agreed before this loop ran a single poll: measured zero
+        // polls — 9 ms standing still, 20 ms under twelve busy loops. The
+        // deadline must stay *under* the 30 s the leftover `sleep 30` would
+        // otherwise live, so a group nothing killed cannot pass by outliving
+        // the bound; 10 s is a third of that sleeper and five hundred times
+        // the reading.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !crate::machine::group_members(pgid).is_empty() {
             assert!(Instant::now() < deadline, "the group is still there");
@@ -13337,8 +13365,14 @@ mod tests {
             "and the command was killed, not left running"
         );
         assert_eq!(machine.spawned(), vec!["sleep 30".to_string()]);
+        // The fake clock is the real witness — it is 5 s further on and the
+        // command was killed — so this wall bound only says the test did not
+        // pay for that: measured 0.5 ms standing still and 2.7 ms under
+        // twelve busy loops. It must stay under the 5 s this call hands the
+        // command, so a regression that slept for real is still caught; 4 s
+        // is the most slack that keeps it.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(4),
             "the deadline was reached without waiting for it: {:?}",
             started.elapsed()
         );
@@ -13464,7 +13498,12 @@ mod tests {
             Duration::ZERO,
             "a cancel is not a timeout: no time had to pass"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The fake clock and the report carry the behaviour; this only says
+        // the test did not pay for it — measured 0.15 ms standing still and
+        // 0.24 ms under twelve busy loops. A real wait would spend the 30 s
+        // this call hands the command, so the guard must stay under it: 20 s
+        // is the most slack that still catches one.
+        assert!(started.elapsed() < Duration::from_secs(20));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -13537,7 +13576,12 @@ mod tests {
             "bytes stopped it, not the command's own timeout: {:?}",
             clock.elapsed()
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The fake clock carries the behaviour; this only says the test did
+        // not pay for it — measured 0.18 ms standing still and 2.7 ms under
+        // twelve busy loops. A real wait would spend the 30 s this call hands
+        // the command, so the guard must stay under it: 20 s is the most
+        // slack that still catches one.
+        assert!(started.elapsed() < Duration::from_secs(20));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -16217,8 +16261,11 @@ mod tests {
             );
         });
 
+        // A real run on its own thread reports here; the guard is the
+        // module's `WAIT` — measured delivery 1.8 ms standing still and
+        // 8.6 ms under twelve busy loops.
         let verdict = verdict_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(WAIT)
             .expect("the run must end and report its ending to the UI");
         let _ = mailbox.send(AgentMsg::Shutdown);
         assert!(run.join().is_ok(), "the actor thread ends cleanly");
@@ -16530,8 +16577,14 @@ mod tests {
             .unwrap();
         let started = Instant::now();
         let result = wait_tool(&actor, &mut state, &cancel).unwrap();
+        // The message is parked before the call and the wait answers it on
+        // the first tick: measured 0.13 ms standing still and 0.16 ms under
+        // twelve busy loops. `WAIT` is a tenth of the `WAIT_TIMEOUT_SECS`
+        // (600 s) the message must beat, so a regression that let the
+        // deadline end the wait is still caught here. What it no longer
+        // catches: a message that ends the wait, but tens of seconds late.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < WAIT,
             "the message ends the wait, not the 600 s timeout ({:?})",
             started.elapsed()
         );
@@ -16576,8 +16629,12 @@ mod tests {
             "the deadline is what ended the wait: {:?}",
             clock.elapsed()
         );
+        // The fake clock and the deadline are the witnesses — 600 s of 50 ms
+        // slices, spun in 57 ms standing still and 76 ms under twelve busy
+        // loops. `WAIT` is a tenth of the timeout it must stay clear of, so
+        // only a regression that pays those 600 s for real can trip it.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < WAIT,
             "and it was reached without waiting for it: {:?}",
             started.elapsed()
         );
@@ -16620,8 +16677,11 @@ mod tests {
         // about `wait`. The recorded event is what the wait reads
         // anyway (`drain_signals` records a `CommandDone` through this same
         // `note_job`), so this changes only *when* the report is known.
+        // The delivery is a real watcher thread's, so the wait is the module's
+        // `WAIT` — measured 0.14 ms standing still and 2.9 ms under twelve
+        // busy loops — not a claim about the box.
         for _ in 0..2 {
-            match actor.rx.recv_timeout(Duration::from_secs(10)) {
+            match actor.rx.recv_timeout(WAIT) {
                 Ok(AgentMsg::CommandDone { id, line, news }) => {
                     note_job(&mut state, id, line, news);
                 }
@@ -16761,8 +16821,12 @@ mod tests {
             "the deadline ended it: {:?}",
             clock.elapsed()
         );
+        // The fake clock and the deadline are the witnesses — here 600 s of
+        // 50 ms slices, spun in 18 ms standing still and 70 ms under twelve
+        // busy loops. `WAIT` is a tenth of the timeout it must stay clear of,
+        // so only a regression that pays those 600 s for real can trip it.
         assert!(
-            begun.elapsed() < Duration::from_secs(1),
+            begun.elapsed() < WAIT,
             "and it was reached without waiting for it: {:?}",
             begun.elapsed()
         );
@@ -16936,8 +17000,14 @@ mod tests {
         let told = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
         assert!(told.contains("interrupted"), "{told}");
         assert!(told.contains("#1 is still running"), "{told}");
+        // The message is parked before the call and the fake clock never had
+        // to move: measured 11 µs standing still and 15 µs under twelve busy
+        // loops. `WAIT` is a tenth of the `WAIT_TIMEOUT_SECS` (600 s) the
+        // message must beat, so it still catches a regression that let the
+        // deadline end the wait; what it no longer catches is a message that
+        // ends it tens of seconds late.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < WAIT,
             "the message ends it, not the timeout: {:?}",
             started.elapsed()
         );
@@ -17003,8 +17073,13 @@ mod tests {
         mailbox.send(AgentMsg::Run(transcript)).unwrap();
         let started = Instant::now();
         let result = wait_tool(&actor, &mut state, &cancel).unwrap();
+        // The `Run` is parked before the call and the wait answers it on the
+        // first tick: measured 0.13 ms standing still and 0.25 ms under
+        // twelve busy loops. `WAIT` is a tenth of the `WAIT_TIMEOUT_SECS`
+        // (600 s) it must beat, so a regression that let the deadline end the
+        // wait is still caught.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < WAIT,
             "a newer transcript ends the wait ({:?})",
             started.elapsed()
         );
@@ -17133,9 +17208,12 @@ mod tests {
             !gate.exists(),
             "the child was still blocked in its command when the human was answered"
         );
+        // The message ends the wait, and `WAIT` — a tenth of the 600 s
+        // `WAIT_TIMEOUT_SECS` it must beat — still catches a regression that
+        // lets the deadline end it instead.
         assert!(
             started.elapsed() < WAIT,
-            "answered promptly, not at the 60 s wait ({:?})",
+            "answered promptly, not at the 600 s wait ({:?})",
             started.elapsed()
         );
 
@@ -18433,10 +18511,12 @@ mod tests {
         );
 
         // And its end lands in the owner's own mailbox, once, saying it was
-        // stopped rather than blamed on an exit code.
+        // stopped rather than blamed on an exit code. A watcher thread
+        // delivers it: the guard is the module's `WAIT`, measured 0.15 ms
+        // standing still and 3.3 ms under twelve busy loops.
         let stopped = actor.ctx.registry.stop(actor.id, JobId(1)).unwrap();
         assert_eq!(stopped, "stopping job #c1");
-        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+        match actor.rx.recv_timeout(WAIT) {
             Ok(AgentMsg::CommandDone { id, line, news }) => {
                 assert_eq!(id, JobId(1));
                 assert!(!news, "a job mush killed wakes nobody: {line}");
@@ -18488,12 +18568,14 @@ mod tests {
             "the refusal must not read as try-again-now (H13): {refusal}"
         );
 
-        // And the job gives it up when it ends, not before.
+        // And the job gives it up when it ends, not before. The report rides
+        // a watcher thread, so the guard is the module's `WAIT` — measured
+        // 0.13 ms standing still and 5.4 ms under twelve busy loops.
         assert_eq!(
             actor.ctx.registry.stop(actor.id, JobId(1)).unwrap(),
             "stopping job #c1"
         );
-        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+        match actor.rx.recv_timeout(WAIT) {
             Ok(AgentMsg::CommandDone { id, .. }) => assert_eq!(id, JobId(1)),
             _ => panic!("the job must report its own end"),
         }
@@ -19437,7 +19519,11 @@ mod tests {
         .unwrap();
         assert!(report.contains("detached as #c1"), "{report}");
         clock.advance(jobs::JOB_MAX_AGE + Duration::from_secs(1));
-        let (line, news) = match actor.rx.recv_timeout(Duration::from_secs(5)) {
+        // The ceiling is the job's own thread with the clock under it; the
+        // report is a watcher thread's delivery, so the guard is the module's
+        // `WAIT` — measured 0.18 ms standing still and 2.6 ms under twelve
+        // busy loops.
+        let (line, news) = match actor.rx.recv_timeout(WAIT) {
             Ok(AgentMsg::CommandDone { id, line, news }) => {
                 assert_eq!(id, JobId(1));
                 (line, news)
@@ -19476,7 +19562,9 @@ mod tests {
             actor.ctx.registry.stop(actor.id, JobId(2)).unwrap(),
             "stopping job #c2"
         );
-        let (line, news) = match actor.rx.recv_timeout(Duration::from_secs(5)) {
+        // A watcher thread delivers this one too: `WAIT`, measured 0.09 ms
+        // standing still and 4.1 ms under twelve busy loops.
+        let (line, news) = match actor.rx.recv_timeout(WAIT) {
             Ok(AgentMsg::CommandDone { id, line, news }) => {
                 assert_eq!(id, JobId(2));
                 (line, news)
@@ -19533,8 +19621,10 @@ mod tests {
         let stopped = call(ToolName::Control, json!({ "id": "c1", "action": "stop" })).unwrap();
         assert_eq!(stopped, "stopping job #c1");
         // A stop is a request to the job's own thread; the report is what the
-        // owner reads next, and `status` then says it ended.
-        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+        // owner reads next, and `status` then says it ended. A watcher thread
+        // delivers it: the guard is the module's `WAIT`, measured 0.14 ms
+        // standing still and 1.6 ms under twelve busy loops.
+        match actor.rx.recv_timeout(WAIT) {
             Ok(AgentMsg::CommandDone { line, .. }) => assert!(line.contains("stopped after")),
             other => panic!("the stop must be reported: {:?}", other.is_ok()),
         }
@@ -19797,8 +19887,14 @@ mod tests {
         });
         // Wait for the call to be holding the command, which is the state the
         // whole fix is about: until it is held, there is nothing to kill.
+        // Measured: it landed in 1 ms / two rounds standing still and 2.1 ms
+        // / three rounds under twelve busy loops. Two thousand one-millisecond
+        // rounds used to bound that — a two-second wall-clock bound wearing an
+        // iteration count, which a busy box could trip; the module's `WAIT` is
+        // the guard the rest of this file uses.
         let mut held = false;
-        for _ in 0..2_000 {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
             if registry.holding_foreground(owner) {
                 held = true;
                 break;
@@ -23870,9 +23966,38 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// How long a scenario waits for something the run is *supposed* to do.
-    /// Only ever spent waiting for an event, never asserting on it.
-    const WAIT: Duration = Duration::from_secs(5);
+    /// A wall-clock bound in a test is a runaway guard, never a claim about
+    /// this machine. Two shapes, in this order of preference:
+    ///
+    /// 1. Scaling, where the subject is complexity: measure the same operation
+    ///    at two sizes and assert the *ratio* stays inside a stated factor. A
+    ///    busy box stretches both readings alike, so the ratio is the
+    ///    machine's own; linear is the size ratio, a blow-up is its square,
+    ///    and the factor is what a scheduler pause cannot manufacture — take
+    ///    the fastest of a few readings per size and say so.
+    /// 2. A sized ceiling, where the subject is a wait for a condition: size
+    ///    the bound as a multiple of a *measured* worst case, and put the
+    ///    measurement (what was run, on what box, under what load) and the
+    ///    multiple's reason in the comment.
+    ///
+    /// A bound nobody can justify from a measurement is worse than no bound.
+    ///
+    /// `WAIT` is this module's ceiling of the second shape: how long a
+    /// scenario waits for something the run is *supposed* to do — only ever
+    /// spent waiting for an event, never asserting on it. Its heaviest
+    /// consumer is `the_worktree_cap_refuses_a_spawn_before_the_id_is_taken`:
+    /// `git::MAX_WORKTREES` `git worktree add` runs, then a whole scripted run
+    /// against the refusal that counts them. The window this bound actually
+    /// covers measured 0.8–1.5 s standing still at load 17–18 and 4.4 s at the
+    /// heaviest peak tried — twelve extra busy loops of my own, another
+    /// worktree's twelve on top, load average 26.6. (The whole test, the
+    /// worktree runs included, was 1.8–6 s standing still and up to 8.5 s
+    /// under those peaks; that part is not `WAIT`'s to cover.) Sixty seconds is
+    /// thirteen times the worst window measured, and it stays a tenth of
+    /// `WAIT_TIMEOUT_SECS` (600 s) — the one timeout a `WAIT`-backed bound
+    /// must not cross. A hang still fails: the condition never holds and the
+    /// assertion fires after one `WAIT`.
+    const WAIT: Duration = Duration::from_secs(60);
 
     /// A run starting is told to the parent by the actor that starts it.
     ///
@@ -24236,9 +24361,14 @@ mod tests {
         }
 
         // What a refused endpoint costs one call — three dials and the two
-        // backoffs between them (`model::retrying`) — is most of the module's
-        // `WAIT` on its own, and this test waits for two whole runs to end.
-        let wait = WAIT * 4;
+        // backoffs between them (`model::retrying`: half a second, then the
+        // same again doubled) — dominates this test, and it waits for two
+        // whole runs to end: measured 3.4 s standing still at load 22 and
+        // 3.8 s under twelve busy loops. The cost is a sleep on the run's own
+        // clock, not CPU, so a busy box barely moves it; forty seconds is ten
+        // times the worst reading and a runaway guard for a run that never
+        // ends, not a claim about the machine.
+        let wait = Duration::from_secs(40);
         mailbox
             .send(AgentMsg::Nudge("carry on".into()))
             .expect("the revived actor is alive to take the message");

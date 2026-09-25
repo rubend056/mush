@@ -2888,8 +2888,13 @@ mod tests {
             Some("thinking"),
             "the row and the foot read this through `words`"
         );
+        // The row was aged 90 s and `thinking` restarts the clock, so a clock
+        // that was not restarted reads the whole age. 5 s is the guard: it
+        // tolerates a scheduler stall between the call and this reading — the
+        // reading itself measured 14 µs with twelve busy loops on top of the
+        // box's own load 25 — and stays 18x below the age it must beat.
         assert!(
-            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(1),
+            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(5),
             "the age is this request's, not the finished tool's"
         );
 
@@ -2966,8 +2971,11 @@ mod tests {
             Phase::Thinking,
             "a nudge on its way shows immediately"
         );
+        // The same shape with a longer age: 240 s is what a clock that was not
+        // restarted reads, 5 s is the guard (the reading measured 1.5 µs under
+        // the twelve busy loops), and the 48x between them is the margin.
         assert!(
-            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(1),
+            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(5),
             "and the clock it shows is the nudge's"
         );
 
