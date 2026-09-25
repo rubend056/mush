@@ -5275,7 +5275,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     let Some(id) = ctx.ids.next_agent() else {
         return Err(the_id_space_is_spent());
     };
-    let (child_ws, branch) = match named {
+    let (child_ws, branch, unplaced) = match named {
         // A worktree on `mush/<id>`, forked from the base. A base is a promise
         // about history: if git cannot make the worktree, the delegation fails
         // rather than running the brief in the wrong tree (finding H7).
@@ -5288,8 +5288,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // worktree left by a failure *after* this arm — `Workspace::new` — stays
         // spent the same way, because a `mush/<id>` branch is something.
         Some(name) => match git::worktree_add(&ctx.root, id.0, base.as_deref()) {
-            Ok((path, branch)) => match Workspace::new(&path) {
-                Ok(child_ws) => (child_ws, Some(branch)),
+            Ok((path, branch, unplaced)) => match Workspace::new(&path) {
+                Ok(child_ws) => (child_ws, Some(branch), unplaced),
                 Err(error) => return Err(format!("cannot start from `{name}`: {error}")),
             },
             Err(reason) => {
@@ -5297,7 +5297,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
                 return Err(format!("cannot start from `{name}`: {reason}"));
             }
         },
-        None => (actor.ws.clone(), None),
+        None => (actor.ws.clone(), None, Vec::new()),
     };
     // The branch the parent will need to land the work, said where it is born:
     // the parent chose the worktree, and a child whose branch it never learned
@@ -5319,6 +5319,26 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .as_deref()
         .map(|sha| format!(" at {}", short_revision(sha)))
         .unwrap_or_default();
+    // A checkout whose base tree records submodules that could not be placed at
+    // their recorded commits is a fact the spawner has to read: the child's own
+    // prompt names the road (`git submodule update --init`), but the parent
+    // chose the base — and a tree that silently lacks a directory the base
+    // records is the kind of half-truth the reply exists to prevent. The
+    // worktree itself is honest (`git::worktree_add` leaves such a submodule
+    // empty rather than at the wrong commit); this is the word that goes with
+    // it.
+    let missing = match unplaced.as_slice() {
+        [] => String::new(),
+        [path] => format!(
+            " · its checkout leaves {path} empty: the submodule could not be placed at the \
+             commit the base tree records"
+        ),
+        paths => format!(
+            " · its checkout leaves {} empty: the submodules could not be placed at the \
+             commits the base tree records",
+            git::named_paths(paths)
+        ),
+    };
     // A child with no base runs in this workspace: it is one of the children
     // the one-shared-child rule is about.
     let shares_workspace = branch.is_none();
@@ -5386,7 +5406,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // (`LOOP_ROUNDS` identical rounds) — so there is no budget to size a brief
     // against, and the line below offers none.
     Ok(format!(
-        "spawned agent {id}{on}{at} · runs until it stops calling tools · wait returns its summary"
+        "spawned agent {id}{on}{at}{missing} · runs until it stops calling tools · wait returns \
+         its summary"
     ))
 }
 
@@ -24661,6 +24682,92 @@ mod tests {
             "no base means the shared workspace, not a worktree: {report}"
         );
         assert!(state.shared.contains(&1), "the child shares this checkout");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A spawn whose base tree records a submodule the checkout could not be
+    /// given is a fact the spawner has to hear: the worktree itself is honest
+    /// (the directory is left empty, not at the wrong commit), and the reply
+    /// names it, so the parent does not read a clean tree as a complete one.
+    /// The child's own prompt names the road it would run by hand
+    /// (`git submodule update --init`); this is the word to the one who chose
+    /// the base — and the clause is absent when there is nothing to name.
+    #[test]
+    fn a_spawn_names_the_submodule_its_checkout_could_not_hold() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-unplaceable-submodule",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
+        git_in(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-qm", "init"]);
+        // The tree records `lib/sub` at a commit whose source is a path that is
+        // not there, so the population cannot place it — and `lib/sub` is left
+        // empty (which is not a change git reports) rather than wrong.
+        let recorded = "1".repeat(40);
+        fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = /nonexistent/mush-submodule\n",
+        )
+        .unwrap();
+        git_in(
+            &root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{recorded},lib/sub"),
+            ],
+        );
+        git_in(&root, &["add", ".gitmodules"]);
+        git_in(&root, &["commit", "-qm", "add the submodule"]);
+
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "a missing submodule", "base": "HEAD" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(report.contains("spawned agent #1 on mush/1"), "{report}");
+        assert!(
+            report.contains(
+                " · its checkout leaves lib/sub empty: the submodule could not be placed at \
+                 the commit the base tree records"
+            ),
+            "the spawner hears what the tree does not hold: {report}"
+        );
+        let path = git::worktree_path(&root, 1);
+        assert_eq!(
+            git::status(&path).unwrap().dirty,
+            0,
+            "and the checkout is clean: the missing submodule is not dirt to blame on a run"
+        );
+
+        // The ordinary case: a base whose tree records no submodule gets no
+        // clause. `HEAD~1` is the commit before the submodule was recorded.
+        let plain = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "a plain base", "base": "HEAD~1" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(plain.contains("spawned agent #2 on mush/2"), "{plain}");
+        assert!(
+            !plain.contains("its checkout leaves"),
+            "a tree with nothing missing says nothing: {plain}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

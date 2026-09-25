@@ -510,6 +510,12 @@ pub fn can_branch_from(dir: &Path) -> Result<(), String> {
 /// formatters above, so no caller ever spells `.mush/wt/<id>` or `mush/<id>`
 /// itself.
 ///
+/// The answer's third element names the submodules the base tree records that
+/// the new checkout does *not* hold, in git's own order — empty for an ordinary
+/// repository, and a fact a spawner has to hear when it is not: without it the
+/// tree the child was handed is one fact short of the truth about itself
+/// (`populate_submodules` below is where the rule lives).
+///
 /// A caller that has a *name* (the spawn's `base` argument) resolves it first,
 /// in the workspace whose view the name was spoken in: the object store is
 /// shared, so a revision named in a nested agent's worktree is the same commit
@@ -533,7 +539,11 @@ pub fn can_branch_from(dir: &Path) -> Result<(), String> {
 /// still taken). The spawn tool treats each of them as a refused delegation: a
 /// base is a promise about history, and a child running on the wrong one is
 /// worse than no child.
-pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
+pub fn worktree_add(
+    dir: &Path,
+    id: u64,
+    base: Option<&str>,
+) -> Result<(PathBuf, String, Vec<String>), String> {
     // The two states that refuse before any name matters are one question, and
     // [`can_branch_from`] is its one home: a directory git cannot answer for,
     // and a repository with no commit for a branch to fork from. Asking it
@@ -573,12 +583,18 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     // submodule leaves an empty directory in the new checkout while `git
     // status` stays clean, so a child told to build or test pays for a tree it
     // was never told is incomplete (finding F5). The contents are brought in
-    // here, at the one moment mush owns the checkout.
-    populate_submodules(&path);
-    Ok((path, branch))
+    // here, at the one moment mush owns the checkout — and the ones that cannot
+    // come in at the commit the tree records are left empty again, because the
+    // one thing a new worktree must never be is *wrong* about what it holds.
+    let unplaced = populate_submodules(&path);
+    Ok((path, branch, unplaced))
 }
 
-/// Bring the new checkout's submodules in, when its tree records any.
+/// Bring the new checkout's submodules in, when its tree records any — and keep
+/// only the ones that sit at the commit the tree records. A submodule that
+/// cannot is left empty: an absent submodule is honest (this worktree does not
+/// have it) where one at the wrong commit makes git call the tree dirty, and
+/// mush then attributes that dirt to the agent.
 ///
 /// `git worktree add` copies refs, not submodule contents: a base tree that
 /// records one at `lib/sub` leaves that directory empty in the new worktree,
@@ -593,14 +609,129 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
 /// that cannot be fetched (no network, a private remote, a protocol the human's
 /// git refuses) is a fact the child can act on — its prompt names the road it
 /// would run by hand — never a reason to lose the worktree a spawn is standing
-/// on. There is no surface here to *name* the failure on: the answer a caller
-/// gets back is the path and the branch, and the one who reads the empty
-/// directory is the child.
-fn populate_submodules(worktree: &Path) {
+/// on.
+///
+/// **The part that is not best-effort is honesty.** When the commit the tree
+/// records for a submodule is not fetchable from its source, the population
+/// half-succeeds: the clone succeeds at the source's default-branch `HEAD`, the
+/// checkout of the recorded commit fails (`fatal: remote error: upload-pack:
+/// not our ref …`), and the failure used to be swallowed. What is left is a
+/// submodule at the *wrong commit*, which is a change git reports — measured,
+/// the new worktree was born dirty:
+///
+/// ```text
+/// +745b9520d42f2362bc9213bdd26de1427cf22475 lib/sub (heads/master)   # submodule status
+///  M lib/sub                                                        # status --porcelain
+///  1 file changed, 1 insertion(+), 1 deletion(-)                     # diff --shortstat HEAD
+/// ```
+///
+/// That one line then became the run-end commit's whole work and the row's
+/// delta (`branch_stat`) forever read `+1−1`, on every agent of that workspace.
+/// So the population is verified with git's own answer —
+/// `git submodule status --recursive`, whose first byte is a space for a
+/// submodule at the commit the tree records, `-` for one the checkout does not
+/// hold, `+` for one at another commit (confirmed against git 2.55) — and every
+/// submodule that is not at its recorded commit is emptied again
+/// ([`unpopulate_submodule`]). The worktree then ends clean, which is the whole
+/// point: mush must never leave a tree that lies about what it holds.
+///
+/// Answers the paths the tree records that the checkout does not hold, in git's
+/// own order — the paths a spawner can name instead of letting the child
+/// discover an empty directory with no word about it.
+fn populate_submodules(worktree: &Path) -> Vec<String> {
     if !worktree.join(".gitmodules").is_file() {
-        return;
+        return Vec::new();
     }
     let _ = run(worktree, &["submodule", "update", "--init", "--recursive"]);
+    // The *read* helper, not `run`: `run` trims both ends, and the space git
+    // prints in front of a submodule that sits at the commit the tree records
+    // is a leading byte of data — the same column the porcelain read had to
+    // stop trimming (a submodule at the wrong commit begins with `+`, an
+    // unpopulated one with `-`, and a trimmed first line would begin with a
+    // commit id and be read as neither).
+    let Some(listing) = git(worktree, &["submodule", "status", "--recursive"]) else {
+        // Git cannot answer for the checkout it just wrote — a `.gitmodules` it
+        // cannot parse, say, which is also why the population came to nothing:
+        // the answer is the old best-effort one, and nothing here guesses at a
+        // state git did not print.
+        return Vec::new();
+    };
+    let found: Vec<(u8, String)> = listing.lines().filter_map(submodule_line).collect();
+    let known: Vec<String> = found.iter().map(|(_, path)| path.clone()).collect();
+    let mut unplaced = Vec::new();
+    for (state, path) in &found {
+        // A space is git saying the checkout holds this submodule at the commit
+        // the tree records — the one state that is kept. `-` is already honest:
+        // the population never got it. Anything else — `+` for another commit,
+        // `U` for a conflict, and any shape this reader does not recognise — is
+        // a submodule the tree lies about, and it goes.
+        if *state == b' ' {
+            continue;
+        }
+        if *state != b'-' {
+            let _ = unpopulate_submodule(worktree, path, &known);
+        }
+        unplaced.push(path.clone());
+    }
+    unplaced
+}
+
+/// One line of `git submodule status --recursive`, read from its first byte the
+/// way [`changes`] reads `git status --porcelain`: the state git prints in
+/// front of the submodule (a space for one at the commit the tree records, `-`
+/// for one the checkout does not hold, `+` for one at another commit) and its
+/// path.
+///
+/// `None` for a line that does not have that shape, so an answer this reader
+/// does not know is skipped rather than read as a submodule that is fine. The
+/// path is everything between the commit id and git's own trailing
+/// ` (<describe>)`, which only a submodule git could look inside carries:
+/// measured on git 2.55, an unpopulated one reads `-<sha> lib/sub` and one at
+/// another commit `+<sha> lib/sub (heads/master)`.
+fn submodule_line(line: &str) -> Option<(u8, String)> {
+    let state = *line.as_bytes().first()?;
+    let rest = line.get(1..)?;
+    let (_commit, path) = rest.split_once(' ')?;
+    let path = match path.rsplit_once(" (") {
+        Some((path, tail)) if tail.ends_with(')') => path,
+        _ => path,
+    };
+    Some((state, path.to_string()))
+}
+
+/// Undo the population of the submodule at `path` (relative to `worktree`), so
+/// its directory is empty again and the tree records a submodule that is not
+/// there — honestly — instead of one sitting at the wrong commit.
+///
+/// `git submodule deinit -f <path>` is git's road for this: measured on git
+/// 2.55, it clears the directory (which stays, empty), unregisters the submodule
+/// from the config, and leaves `git status --porcelain` empty; and a later
+/// `git submodule update --init` against a source that holds the recorded commit
+/// populates it again, so nothing here blocks the legitimate road (both
+/// measured).
+///
+/// A *nested* submodule is recorded by its parent submodule's own tree, and
+/// `git -C <worktree> submodule deinit -f lib/sub/inner` answers `pathspec
+/// 'lib/sub/inner' did not match any file(s) known to git` (measured); the road
+/// that works is deinit from inside the checkout that records it, with the path
+/// relative to it — `git -C <worktree>/lib/sub submodule deinit -f inner`.
+/// `known` — every submodule path git just named — is what finds that checkout.
+fn unpopulate_submodule(worktree: &Path, path: &str, known: &[String]) -> Result<String, String> {
+    let owner = known
+        .iter()
+        .filter(|owner| {
+            owner.len() < path.len()
+                && path.starts_with(owner.as_str())
+                && path.as_bytes()[owner.len()] == b'/'
+        })
+        .max_by_key(|owner| owner.len());
+    match owner {
+        Some(owner) => run(
+            &worktree.join(owner),
+            &["submodule", "deinit", "-f", &path[owner.len() + 1..]],
+        ),
+        None => run(worktree, &["submodule", "deinit", "-f", path]),
+    }
 }
 
 /// Whether `path` is a checkout git made: a linked worktree carries a `.git`
@@ -1625,7 +1756,7 @@ mod tests {
     #[test]
     fn a_checkout_is_put_back_on_the_branch_that_outlived_it() {
         let dir = init_repo("restore-checkout");
-        let (path, branch) = worktree_add(&dir, 3, None).unwrap();
+        let (path, branch, _unplaced) = worktree_add(&dir, 3, None).unwrap();
         fs::write(path.join("work.txt"), "the work\n").unwrap();
         commit_all(&path, "mush #3: the work").unwrap();
         let tip = resolve(&dir, &branch).unwrap();
@@ -1699,7 +1830,7 @@ mod tests {
     #[test]
     fn a_stale_registration_is_pruned_before_the_checkout_goes_back() {
         let dir = init_repo("restore-stale");
-        let (path, name) = worktree_add(&dir, 4, None).unwrap();
+        let (path, name, _unplaced) = worktree_add(&dir, 4, None).unwrap();
         fs::remove_dir_all(&path).unwrap();
         assert!(
             worktrees(&dir)
@@ -1808,7 +1939,7 @@ mod tests {
     fn a_worktree_is_added_and_committed_once() {
         let dir = init_repo("worktree-verbs");
         assert_eq!(has_commits(&dir), Some(true));
-        let (path, branch) = worktree_add(&dir, 5, None).unwrap();
+        let (path, branch, _unplaced) = worktree_add(&dir, 5, None).unwrap();
         assert_eq!(path, worktree_path(&dir, 5));
         assert_eq!(branch, branch_name(5));
         assert!(path.join(".git").exists(), "the worktree is a checkout");
@@ -1932,8 +2063,18 @@ mod tests {
             Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
             None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
         }
-        let (path, _branch) = added.unwrap();
+        let (path, _branch, unplaced) = added.unwrap();
 
+        assert!(
+            unplaced.is_empty(),
+            "the submodule came in at the commit the tree records, so nothing was left empty: \
+             {unplaced:?}"
+        );
+        assert_eq!(
+            status(&path).unwrap().dirty,
+            0,
+            "and git disagrees with nothing in the new checkout"
+        );
         assert_eq!(
             fs::read_to_string(path.join("lib/sub/s.txt")).unwrap(),
             "the submodule's file\n",
@@ -1947,6 +2088,279 @@ mod tests {
         let _ = fs::remove_dir_all(&source);
     }
 
+    /// A submodule the base tree records and its source cannot serve at that
+    /// commit used to leave the new worktree **born dirty**: the population's
+    /// clone succeeded at the source's default-branch `HEAD`, the checkout of
+    /// the recorded commit failed (`fatal: remote error: upload-pack: not our
+    /// ref …`), and the swallowed failure left `+<sha> lib/sub (heads/master)`
+    /// in `submodule status`, ` M lib/sub` in git's status and one line in the
+    /// shortstat — which the run's end then committed as the run's whole work,
+    /// so the row's delta read `+1−1` on every agent of that workspace. A
+    /// submodule that cannot be at its recorded commit is *worse than an absent
+    /// one*: an absent submodule is honest (this worktree does not have it).
+    /// So it is emptied again, and the worktree is born clean.
+    #[test]
+    fn a_submodule_that_cannot_be_placed_is_left_empty_and_the_worktree_is_clean() {
+        // The source the base tree points at, with a history of its own.
+        let source = init_repo("submodule-unplaceable-source");
+        // ... and the commit the superproject records for the submodule, made
+        // in *another* repository: the clone can serve the source's own `HEAD`
+        // but not this commit, which is the measured shape of "the recorded
+        // gitlink commit is not fetchable from the submodule's source".
+        let recorded = init_repo("submodule-unplaceable-recorded");
+        fs::write(recorded.join("elsewhere.txt"), "a different history\n").unwrap();
+        run(&recorded, &["add", "-A"]).unwrap();
+        run(&recorded, &["commit", "-qm", "a different history"]).unwrap();
+        let sha = resolve(&recorded, "HEAD").unwrap();
+
+        // The superproject records that commit for `lib/sub` without ever
+        // cloning it: `submodule add` would leave its own clone behind, and the
+        // population is the thing under test.
+        let dir = init_repo("submodule-unplaceable");
+        fs::write(
+            dir.join(".gitmodules"),
+            format!(
+                "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = {}\n",
+                source.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let entry = format!("160000,{sha},lib/sub");
+        run(&dir, &["update-index", "--add", "--cacheinfo", &entry]).unwrap();
+        run(&dir, &["add", ".gitmodules"]).unwrap();
+        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+
+        // A local submodule clones over the `file` transport, which git
+        // refuses for submodules unless the human says otherwise; the test is
+        // that human, through git's own road for saying it. mush itself never
+        // sets this: the protocol policy in a child's checkout is the human's
+        // (a repository must not be able to make mush clone a local path).
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        // The measured chain, as a control: git's own `worktree add` and the
+        // population alone leave a worktree that is *dirty* — the clone lands on
+        // the source's default-branch `HEAD`, the checkout of the recorded
+        // commit fails, and the failure leaves the submodule at the wrong
+        // commit, which git reports as a change.
+        let control = worktree_path(&dir, 7);
+        run(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch_name(7),
+                control.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        assert!(
+            run(&control, &["submodule", "update", "--init", "--recursive"]).is_err(),
+            "a recorded commit the source cannot serve makes the population fail"
+        );
+        assert_eq!(
+            status(&control).unwrap().dirty,
+            1,
+            "and the checkout it leaves behind is a change git reports ( M lib/sub)"
+        );
+
+        let added = worktree_add(&dir, 6, Some("HEAD"));
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        let (path, _branch, unplaced) = added.unwrap();
+
+        assert_eq!(
+            unplaced,
+            vec!["lib/sub".to_string()],
+            "the caller is told which recorded submodule the checkout does not hold"
+        );
+        assert!(
+            !path.join("lib/sub/.git").exists(),
+            "the wrong-commit checkout the failed population left is gone"
+        );
+        // The assertion is the worktree's own reading, through the doors the
+        // product reads it with — not a hand-rolled diff.
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the worktree is born clean"
+        );
+        assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+        assert!(
+            matches!(
+                commit_all(&path, "mush #6: write the report").unwrap(),
+                Commit::Nothing
+            ),
+            "there is no dirt for the run's end to commit as the agent's work"
+        );
+        assert_eq!(
+            subject_of(&path, "HEAD").as_deref(),
+            Some("add the submodule"),
+            "and no commit was made"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("a.txt")).unwrap(),
+            "one\n",
+            "the rest of the checkout is the base tree's"
+        );
+
+        // The agent's own work is all the branch adds: the `+1−1` the failed
+        // population used to contribute is not there.
+        fs::write(path.join("work.txt"), "the work\n").unwrap();
+        assert!(
+            matches!(
+                commit_all(&path, "mush #6: the work").unwrap(),
+                Commit::Made(_)
+            ),
+            "the agent's own work still commits"
+        );
+        let stat = branch_stat(&dir, "HEAD", "mush/6").unwrap();
+        assert_eq!(
+            (stat.files, stat.added, stat.removed),
+            (1, 1, 0),
+            "the branch adds the agent's file and nothing else"
+        );
+
+        // And the road mush left open is still open: when the source comes to
+        // hold the commit the tree records, the update the child's prompt names
+        // — `git submodule update --init` — populates the submodule at that
+        // commit, and the worktree stays clean with it in place.
+        fs::remove_dir_all(&source).unwrap();
+        fs::rename(&recorded, &source).unwrap();
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        let updated = run(&path, &["submodule", "update", "--init"]);
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        assert!(
+            updated.is_ok(),
+            "a source that does hold the recorded commit places it: {updated:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/elsewhere.txt")).unwrap(),
+            "a different history\n",
+            "the submodule is now populated, at the commit the tree records"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "and the worktree is clean with it in place"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+        let _ = fs::remove_dir_all(&recorded);
+    }
+
+    /// A submodule *inside* a submodule is recorded by its parent submodule's
+    /// own tree: `git submodule status` reads the top-level one as correct (a
+    /// space) while the recursive listing reads `+` for the inner one, and the
+    /// checkout is nevertheless a change git reports at the top — ` M lib/sub`
+    /// (measured). The verify walks the recursion the population walks, and the
+    /// undo has to run in the checkout that records the gitlink: `git -C
+    /// <worktree> submodule deinit -f lib/sub/inner` answers `pathspec … did not
+    /// match any file(s) known to git` (measured), so `lib/sub` is where it
+    /// runs.
+    #[test]
+    fn a_nested_submodule_that_cannot_be_placed_is_left_empty_too() {
+        // The inner source the outer one points at ...
+        let inner = init_repo("nested-inner-source");
+        // ... the commit the outer tree records for `inner`, made in another
+        // repository so the inner source cannot serve it ...
+        let recorded = init_repo("nested-recorded");
+        fs::write(recorded.join("elsewhere.txt"), "a different history\n").unwrap();
+        run(&recorded, &["add", "-A"]).unwrap();
+        run(&recorded, &["commit", "-qm", "a different history"]).unwrap();
+        let inner_sha = resolve(&recorded, "HEAD").unwrap();
+
+        // ... the outer source, whose own tree records it at `inner` ...
+        let outer = init_repo("nested-outer-source");
+        fs::write(
+            outer.join(".gitmodules"),
+            format!(
+                "[submodule \"inner\"]\n\tpath = inner\n\turl = {}\n",
+                inner.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let entry = format!("160000,{inner_sha},inner");
+        run(&outer, &["update-index", "--add", "--cacheinfo", &entry]).unwrap();
+        run(&outer, &["add", ".gitmodules"]).unwrap();
+        run(&outer, &["commit", "-qm", "add inner"]).unwrap();
+        let outer_sha = resolve(&outer, "HEAD").unwrap();
+
+        // ... and the superproject, which records the outer one at `lib/sub`.
+        let dir = init_repo("nested-submodule");
+        fs::write(
+            dir.join(".gitmodules"),
+            format!(
+                "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = {}\n",
+                outer.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let entry = format!("160000,{outer_sha},lib/sub");
+        run(&dir, &["update-index", "--add", "--cacheinfo", &entry]).unwrap();
+        run(&dir, &["add", ".gitmodules"]).unwrap();
+        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+
+        // A local submodule clones over the `file` transport, which git
+        // refuses for submodules unless the human says otherwise; the test is
+        // that human, through git's own road for saying it.
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        let added = worktree_add(&dir, 6, Some("HEAD"));
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        let (path, _branch, unplaced) = added.unwrap();
+
+        assert_eq!(
+            unplaced,
+            vec!["lib/sub/inner".to_string()],
+            "only the submodule that could not be placed is named"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/a.txt")).unwrap(),
+            "one\n",
+            "the outer submodule is kept at the commit the tree records"
+        );
+        assert!(
+            !path.join("lib/sub/inner/.git").exists(),
+            "and the inner one is emptied again"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the superproject ends clean — the nested dirt is not a change it reports"
+        );
+        assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outer);
+        let _ = fs::remove_dir_all(&inner);
+        let _ = fs::remove_dir_all(&recorded);
+    }
+
+    /// A repository with no submodules — the ordinary spawn — is untouched by
+    /// the honesty rule: no `.gitmodules`, so no process is spent on the
+    /// question, nothing is named as unplaced, and the checkout is exactly the
+    /// base tree's.
+    #[test]
+    fn a_repo_without_submodules_is_untouched() {
+        let dir = init_repo("no-submodules");
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
+        assert!(unplaced.is_empty(), "there is no submodule to leave empty");
+        assert!(changes(&path).unwrap().is_empty(), "and it is born clean");
+        assert_eq!(
+            fs::read_to_string(path.join("a.txt")).unwrap(),
+            "one\n",
+            "the base tree is what the checkout holds"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A put-away commit carries its own identity and its own answer to
     /// signing: a machine whose git signs every commit by default — and has no
     /// key to sign with, which is what a missing signer is — must not be able
@@ -1957,7 +2371,7 @@ mod tests {
         run(&dir, &["config", "commit.gpgsign", "true"]).unwrap();
         // The signer is not there, the shape a machine with no key has.
         run(&dir, &["config", "gpg.program", "/nonexistent/mush-no-gpg"]).unwrap();
-        let (path, _branch) = worktree_add(&dir, 8, Some("HEAD")).unwrap();
+        let (path, _branch, _unplaced) = worktree_add(&dir, 8, Some("HEAD")).unwrap();
         fs::write(path.join("work.txt"), "the work\n").unwrap();
 
         let made = commit_all(&path, "mush #8: port the parser").unwrap();
@@ -2755,7 +3169,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         let base = resolve(&sub, "HEAD").unwrap();
 
-        let (path, name) = worktree_add(&sub, 1, Some("HEAD")).unwrap();
+        let (path, name, _unplaced) = worktree_add(&sub, 1, Some("HEAD")).unwrap();
         assert_eq!(
             path,
             sub.join(".mush/wt/1"),
