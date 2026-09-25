@@ -1651,6 +1651,44 @@ mod tests {
         }
     }
 
+    /// Wait, bounded, for the survivor's pid file to hold a number, and answer
+    /// it.
+    ///
+    /// The writer is the shell's own `echo $$ > file`, and `echo` opens the
+    /// file before it writes into it: the name is on disk, empty, for a window
+    /// before the digits are. The wait is for content that parses, then, not
+    /// for a name: a read in that window is a look taken too early, not a
+    /// failure. Waiting on `exists` and then reading once — what this fixture
+    /// did — parsed `""` in 6 of 300 runs of this test alone under the box's
+    /// load (all six panics were `ParseIntError { kind: Empty }` at that
+    /// parse), and under load the name preceded a parseable pid by up to
+    /// 0.42 ms when the file was polled every 0.2 ms.
+    ///
+    /// The deadline is the runaway guard around the wait, not a claim about
+    /// the machine: a parseable pid was on disk 5.1-69.8 ms after the spawn
+    /// under both measured loads (twenty runs each, the second with twelve
+    /// extra busy loops on the box), and ten seconds is over a hundred times
+    /// that worst reading. A deadline panic names what did not arrive; nothing
+    /// can name the survivor then, so its own `sleep 30` is what ends it.
+    #[cfg(unix)]
+    fn await_survivor_pid(path: &std::path::Path) -> i32 {
+        let see = std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        loop {
+            let missed = match std::fs::read_to_string(path) {
+                Ok(text) => match text.trim().parse::<i32>() {
+                    Ok(pid) => return pid,
+                    Err(_) => format!("{} held {text:?}, which is not a pid", path.display()),
+                },
+                Err(error) => format!("{} could not be read: {error}", path.display()),
+            };
+            if started.elapsed() >= see {
+                panic!("the survivor's pid did not arrive within {see:?}: {missed}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// A process that leaves the process group mush gave it is outside every
     /// cleanup this module can run: mush's reach is the group, because the
     /// group is the only thing a signal here can name. A command that runs
@@ -1682,19 +1720,11 @@ mod tests {
             })
             .expect("the real shell starts");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !survivor_file.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        // Ten seconds, sized from the measurement: the survivor's pid file
-        // arrived 32 ms after the spawn, standing still (load 25) and with
-        // twelve extra busy loops on the box. The loop guards a runaway and
-        // the `expect` below names the defect.
-        let survivor: i32 = std::fs::read_to_string(&survivor_file)
-            .expect("the survivor wrote its pid")
-            .trim()
-            .parse()
-            .expect("the survivor's pid is a number");
+        // The survivor's pid is this test's only handle on the process that
+        // left mush's group, and the fixture writes it with the shell's `echo`
+        // — the name is on disk before the number is in it (see
+        // [`await_survivor_pid`]).
+        let survivor = await_survivor_pid(&survivor_file);
         let _survivor = SurvivorGuard(survivor);
 
         // The leader is the outer `sh`, and it is gone the moment it has
