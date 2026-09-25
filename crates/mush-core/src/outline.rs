@@ -2947,6 +2947,25 @@ command! Tiny call s:helper(\"world\")
         assert!(tiny.contains("truncated at"), "the cut is marked: {tiny:?}");
     }
 
+    /// A wall-clock bound in a test is a runaway guard, never a claim about
+    /// this machine. Two shapes, in this order of preference:
+    ///
+    /// 1. Scaling, where the subject is complexity: measure the same operation
+    ///    at two sizes and assert the *ratio* stays inside a stated factor. A
+    ///    busy box stretches both readings alike, so the ratio is the
+    ///    machine's own; linear is the size ratio, a blow-up is its square,
+    ///    and the factor is what a scheduler pause cannot manufacture — take
+    ///    the fastest of a few readings per size and say so.
+    /// 2. A sized ceiling, where the subject is a wait for a condition: size
+    ///    the bound as a multiple of a *measured* worst case, and put the
+    ///    measurement (what was run, on what box, under what load) and the
+    ///    multiple's reason in the comment.
+    ///
+    /// A bound nobody can justify from a measurement is worse than no bound.
+    ///
+    /// The first scaling guard in this file, and the rule the other guards
+    /// point at.
+    ///
     /// A million declarations in one file — the generated file, the
     /// minified-ish header, the giant table — and the answer it gets. The walk
     /// counts every line's declaration, so the header's count is the file's own
@@ -2956,13 +2975,43 @@ command! Tiny call s:helper(\"world\")
     /// row list honest.
     ///
     /// The string is built by repeating one line, so what this test spends is
-    /// the walk — a million lines under the rule — and not the fixture.
+    /// the walk — a quarter-million lines and a million lines under the rule —
+    /// and not the fixture. Three readings per size, interleaved small, large,
+    /// small, large, …, and the fastest per size kept: a scheduler pause is a
+    /// number the box did not really spend, which is why the assertion is the
+    /// ratio and never a stopwatch. Linear is four times the lines (4×),
+    /// quadratic is its square (16×), and six is the factor a deschedule
+    /// cannot manufacture.
     #[test]
     fn a_million_declarations_are_counted_and_not_kept() {
+        // Both fixtures are built before either is timed — the walk is the
+        // subject, and the smaller size is the same walk the larger one is
+        // measured against.
+        let quarter = "fn a() {}\n".repeat(250_000);
         let text = "fn a() {}\n".repeat(1_000_000);
-        let started = Instant::now();
-        let outline = Outline::within("huge.rs", &text, DEFAULT_ROOM);
-        let walked = started.elapsed();
+
+        let mut fastest = [Duration::MAX; 2];
+        let mut outline = None;
+        for _ in 0..3 {
+            for (at, fixture) in [(0usize, &quarter), (1usize, &text)] {
+                let started = Instant::now();
+                let walked = Outline::within("huge.rs", fixture, DEFAULT_ROOM);
+                let elapsed = started.elapsed();
+                // The cheap property at every timed repeat: the walk really
+                // walked, so the ratio cannot come from measuring nothing.
+                assert_eq!(
+                    walked.total(),
+                    if at == 0 { 250_000 } else { 1_000_000 },
+                    "the walk of size {at} counted its own lines"
+                );
+                fastest[at] = fastest[at].min(elapsed);
+                if at == 1 {
+                    outline = Some(walked);
+                }
+            }
+        }
+        let outline = outline.expect("the million-line fixture was walked");
+        let (quarter_time, million_time) = (fastest[0], fastest[1]);
 
         // The count is the file's own, verified line by line rather than
         // extrapolated from what was built.
@@ -3006,10 +3055,19 @@ command! Tiny call s:helper(\"world\")
             "the rows hold {held} bytes of a {} byte file",
             text.len()
         );
-        // The walk's own cost is one pass: a rule that goes quadratic shows up
-        // here, and the number is worth seeing in a `--nocapture` run.
-        eprintln!("million-line outline: {walked:?}, {held} bytes of rows kept");
-        assert!(walked < Duration::from_secs(10), "the walk took {walked:?}");
+        // The walk's own cost is one pass: a rule that goes quadratic reads as
+        // a ratio near sixteen here rather than as a report, and both numbers
+        // are worth seeing in a `--nocapture` run.
+        eprintln!(
+            "million-line outline: 250,000 lines in {quarter_time:?}, 1,000,000 lines in \
+             {million_time:?} ({:.2}×), {held} bytes of rows kept",
+            million_time.as_secs_f64() / quarter_time.as_secs_f64()
+        );
+        assert!(
+            million_time <= quarter_time * 6,
+            "four times the lines cost {million_time:?} against {quarter_time:?}: linear is 4×, \
+             a blow-up 16×, and 6 is the factor a deschedule cannot manufacture"
+        );
     }
 
     /// The answer a small file always gave, byte for byte: the header, the
@@ -3180,9 +3238,12 @@ command! Tiny call s:helper(\"world\")
     /// The property the brief calls the hard invariant, over this checkout:
     /// every `.rs` file under `crates/` is outlined, and every row of every
     /// outline is ascending, is that file's line, and re-matches the rule it
-    /// came from. Bounded, too: the sweep is a walk and a line scan, and the
-    /// bound is asserted so a rule that ever becomes quadratic is caught here
-    /// rather than as a slow tool.
+    /// came from. The sweep keeps the reading and no wall-clock bound: the
+    /// checkout grows, so a stopwatch on it records the box and not the code,
+    /// and the complexity claim is
+    /// [`the_checkout_walk_scales_with_its_corpus_and_not_its_square`]'s — the
+    /// rule behind both is the doc comment of
+    /// [`a_million_declarations_are_counted_and_not_kept`].
     #[test]
     fn every_row_in_this_checkout_is_ascending_and_never_lies() {
         let root = repo_root();
@@ -3245,11 +3306,141 @@ command! Tiny call s:helper(\"world\")
             files.len()
         );
         assert!(rows > 500, "the sweep found only {rows} rows");
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the sweep of {} files and {rows} rows took {elapsed:?}",
-            files.len()
+    }
+
+    /// A scaling guard on the sweep above's walk, which is why that sweep keeps
+    /// no wall-clock bound. The shape is the sweep's own — read each file of a
+    /// generated corpus, ask [`definitions`] of its text, then check every row's
+    /// line number ascends, re-matches the rule, and is that line cut — over
+    /// 25 files of 200 lines (every fourth line a declaration) and the same
+    /// bytes four times, written under four name prefixes. Seven readings per
+    /// size, interleaved small, large, small, large, …, fastest kept — seven
+    /// because a descheduled reading is the longer corpus's tail, and the
+    /// fastest of seven gives both sides a clean one: linear is four times the
+    /// corpus, quadratic is sixteen, and six is the factor a deschedule cannot
+    /// manufacture. The rule is the doc comment of
+    /// [`a_million_declarations_are_counted_and_not_kept`].
+    #[test]
+    fn the_checkout_walk_scales_with_its_corpus_and_not_its_square() {
+        // The corpus, built before anything is timed: every fourth line of
+        // every file is a declaration, and the second size is the same bytes
+        // again under four name prefixes, so it is exactly four times the
+        // first.
+        let base: Vec<(String, String)> = (0..25)
+            .map(|file| {
+                let text: String = (0..200)
+                    .map(|line| {
+                        if line % 4 == 0 {
+                            format!("fn item_{file}_{line}() {{}}\n")
+                        } else {
+                            format!("let field_{file}_{line} = {line};\n")
+                        }
+                    })
+                    .collect();
+                (format!("f{file:03}.rs"), text)
+            })
+            .collect();
+        let corpus: Vec<(String, String)> = (0..4)
+            .flat_map(|copy| {
+                base.iter()
+                    .map(move |(name, text)| (format!("set{copy}_{name}"), text.clone()))
+            })
+            .collect();
+
+        let scratch =
+            std::env::temp_dir().join(format!("mush-outline-scale-{}", std::process::id()));
+        let small_root = scratch.join("n");
+        let large_root = scratch.join("four_n");
+        for (root, files) in [(&small_root, &base), (&large_root, &corpus)] {
+            fs::create_dir_all(root).unwrap();
+            for (name, text) in files {
+                fs::write(root.join(name), text).unwrap();
+            }
+        }
+
+        let mut fastest = [Duration::MAX; 2];
+        let mut rows = [0usize; 2];
+        for _ in 0..7 {
+            for (at, root) in [(0usize, &small_root), (1usize, &large_root)] {
+                let started = Instant::now();
+                let walked = walk_outline_corpus(root);
+                let elapsed = started.elapsed();
+                rows[at] = walked;
+                fastest[at] = fastest[at].min(elapsed);
+            }
+        }
+        assert_eq!(rows[0], 25 * 50, "every file's quarter-declaration lines");
+        assert_eq!(rows[1], 4 * rows[0], "the same bytes, four times");
+        eprintln!(
+            "outline corpus scale: 25 files in {:?}, 100 files in {:?} ({:.2}×), {} rows",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64(),
+            rows[1]
         );
+        assert!(
+            fastest[1] <= fastest[0] * 6,
+            "four times the corpus cost {:?} against {:?} — linear is 4× and quadratic is 16×",
+            fastest[1],
+            fastest[0]
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// One reading of the scaling guard's walk, the checkout sweep's own shape:
+    /// every file of the corpus read, [`definitions`] asked of its text, and
+    /// every row checked — line number ascends, the line re-matches the rule,
+    /// and the row's text is that line cut — with the row count answered so a
+    /// guard can assert the walk really walked.
+    fn walk_outline_corpus(root: &Path) -> usize {
+        let mut files: Vec<PathBuf> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        let mut rows = 0usize;
+        for path in &files {
+            let text = fs::read_to_string(path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut last = 0usize;
+            for definition in definitions(&text) {
+                rows += 1;
+                assert!(
+                    definition.line > last,
+                    "{}: line {} after {} — rows must ascend",
+                    path.display(),
+                    definition.line,
+                    last
+                );
+                last = definition.line;
+                let line = lines[definition.line - 1];
+                assert!(
+                    is_declaration(line),
+                    "{}:{} is not a declaration: {line:?}",
+                    path.display(),
+                    definition.line
+                );
+                let body = definition
+                    .text
+                    .strip_suffix('…')
+                    .unwrap_or(&definition.text);
+                assert!(
+                    line.starts_with(body),
+                    "{}:{}: the row is not that line, cut: {:?}",
+                    path.display(),
+                    definition.line,
+                    definition.text
+                );
+                assert!(
+                    is_declaration(&definition.text),
+                    "{}:{}: a row may never lie — {:?} does not re-match the rule",
+                    path.display(),
+                    definition.line,
+                    definition.text
+                );
+            }
+        }
+        rows
     }
 
     /// Every file under `dir` whose extension is `extension`, depth-first, in

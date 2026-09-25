@@ -664,9 +664,11 @@ mod tests {
     /// row's text is that line (cut), the declaration flag is the outline
     /// rule's answer, and the rows of each half ascend.
     ///
-    /// Bounded, too: the sweep is a walk and a line scan, and the bound is
-    /// asserted so a rule that ever becomes quadratic is caught here rather
-    /// than as a slow tool.
+    /// The sweep keeps the reading and no wall-clock bound: the checkout grows,
+    /// so a stopwatch on it records the box and not the code, and the complexity
+    /// claim is [`a_usage_walk_scales_with_its_text_and_not_its_square`]'s — the
+    /// rule behind both is the doc comment of `outline.rs`'s
+    /// `a_million_declarations_are_counted_and_not_kept`.
     #[test]
     fn every_row_in_this_checkout_names_a_line_that_holds_the_word() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -750,11 +752,141 @@ mod tests {
             files.len()
         );
         assert!(counted > 500, "the sweep found only {counted} rows");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the sweep of {} files took {elapsed:?}",
-            files.len()
+    }
+
+    /// The sweep above under shape 1 of the rule in `outline.rs`'s
+    /// `a_million_declarations_are_counted_and_not_kept`, which is why that
+    /// sweep keeps no wall-clock bound. Generated text at 1,000 and 4,000
+    /// lines with the five symbols sprinkled through it as declarations and as
+    /// plain mentions, and the sweep's own checks over every row `rows`
+    /// answers; nine readings per size, interleaved small, large, small, large,
+    /// …, fastest kept. Both sizes are small on purpose: this guard runs
+    /// beside the rest of the suite, and a descheduled reading is the longer
+    /// text's tail — at 5,000 and 20,000 lines with five readings the suite's
+    /// own load once read 8.28×, because no clean two-hundred-millisecond
+    /// window was left to find. Linear is four times the lines (4×), quadratic
+    /// is its square (16×), and six is the factor a deschedule cannot
+    /// manufacture.
+    #[test]
+    fn a_usage_walk_scales_with_its_text_and_not_its_square() {
+        let symbols = ["Workspace", "usages", "is_declaration", "held", "fn"];
+        let small = usage_corpus(1_000);
+        let large = usage_corpus(4_000);
+
+        let mut fastest = [Duration::MAX; 2];
+        let mut counted = [0usize; 2];
+        for _ in 0..9 {
+            for (at, text) in [(0usize, &small), (1usize, &large)] {
+                let started = Instant::now();
+                let walked = usage_walk(&symbols, text);
+                let elapsed = started.elapsed();
+                counted[at] = walked;
+                fastest[at] = fastest[at].min(elapsed);
+            }
+        }
+        // The cheap property at every timed repeat: the walk really walked,
+        // and four times the lines is four times the rows, so the ratio cannot
+        // come from measuring nothing.
+        assert!(counted[0] > 0, "the walk found no rows to check");
+        assert_eq!(
+            counted[1],
+            counted[0] * 4,
+            "four times the lines is four times the rows"
         );
+        eprintln!(
+            "usages scale: 1,000 lines in {:?}, 4,000 lines in {:?} ({:.2}×), {} rows",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64(),
+            counted[1]
+        );
+        assert!(
+            fastest[1] <= fastest[0] * 6,
+            "four times the lines cost {:?} against {:?} — linear is 4× and quadratic is 16×",
+            fastest[1],
+            fastest[0]
+        );
+    }
+
+    /// The text the scaling guard walks: `lines` lines, the five symbols
+    /// sprinkled through it as declarations and as plain mentions — the
+    /// pattern's length divides both sizes, so the four-times text holds
+    /// exactly four times the rows — plus lines holding none of them.
+    fn usage_corpus(lines: usize) -> String {
+        let mut text = String::new();
+        for n in 0..lines {
+            match n % 8 {
+                0 => text.push_str("fn held() {}\n"),
+                1 => text.push_str("let usages = Workspace::default();\n"),
+                2 => text.push_str("if is_declaration(line) { held(); }\n"),
+                3 => text.push_str("let held = usages;\n"),
+                4 => text.push_str("// held and is_declaration in a comment\n"),
+                5 => text.push_str("struct Workspace;\n"),
+                6 => text.push_str("fn usages_row() {}\n"),
+                _ => text.push('\n'),
+            }
+        }
+        text
+    }
+
+    /// One reading of the scaling guard's walk, the checkout sweep's own shape:
+    /// [`rows`] for each symbol over `text`, then the sweep's per-row checks —
+    /// the named line holds the word at a boundary, the declaration flag is the
+    /// outline rule's, the row's text is that line cut, and each half's rows
+    /// ascend — with the row count answered so a guard can assert the walk
+    /// really walked.
+    fn usage_walk(symbols: &[&str], text: &str) -> usize {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut counted = 0usize;
+        for symbol in symbols {
+            let mut last_definition = 0usize;
+            let mut last_mention = 0usize;
+            let mut seen_mention = false;
+            for row in rows(symbol, text) {
+                counted += 1;
+                let line = lines[row.line - 1];
+                assert!(
+                    is_usage(line, symbol),
+                    "{} does not hold `{symbol}` at a boundary: {line:?}",
+                    row.line
+                );
+                assert_eq!(
+                    row.definition,
+                    is_declaration(line),
+                    "{}: the declaration flag is the outline rule's",
+                    row.line
+                );
+                let body = row.text.strip_suffix('…').unwrap_or(&row.text);
+                assert!(
+                    line.starts_with(body),
+                    "{}: the row is not that line, cut: {:?}",
+                    row.line,
+                    row.text
+                );
+                if row.definition {
+                    assert!(
+                        !seen_mention,
+                        "{}: a declaration row after a plain mention",
+                        row.line
+                    );
+                    assert!(
+                        row.line > last_definition,
+                        "{}: declaration rows must ascend",
+                        row.line
+                    );
+                    last_definition = row.line;
+                } else {
+                    seen_mention = true;
+                    assert!(
+                        row.line > last_mention,
+                        "{}: mention rows must ascend",
+                        row.line
+                    );
+                    last_mention = row.line;
+                }
+            }
+        }
+        counted
     }
 
     /// The substring half of the invariant, as a second implementation: every

@@ -4033,9 +4033,19 @@ mod tests {
                 read_ws.read_window("x.png", 1, 10, 1024),
             ));
         });
+        // A watchdog, not a bound (shape 2 of the rule in `outline.rs`'s
+        // `a_million_declarations_are_counted_and_not_kept`): a spawned thread
+        // asking two metadata questions and answering over a channel, which
+        // answered in 0.19 ms on this box at its own load of ~24 and 0.56 ms
+        // under a peak of twelve busy loops — so five seconds is thousands of
+        // times the real cost, and only a read that *parked* on the FIFO can
+        // reach it. A parked read never answers at any multiple: the timeout is
+        // here so a hang fails the suite instead of hanging it.
+        let started = Instant::now();
         let (image, text) = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a FIFO must answer, not hold an open until a writer appears");
+        eprintln!("fifo image refusal: {:?}", started.elapsed());
         assert!(
             image.unwrap().is_none(),
             "a FIFO is not an image, so the paste is the text it is"
@@ -4068,10 +4078,18 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(read_ws.read_file("x.log"));
         });
+        // The image road's watchdog, one refusal later (shape 2 of the rule in
+        // `outline.rs`'s `a_million_declarations_are_counted_and_not_kept`): a
+        // spawn and a metadata refusal, 0.24 ms on this box at its own load of
+        // ~24 and 0.18 ms under a peak of twelve busy loops, against the same
+        // five seconds — thousands of times the real cost. A parked read never
+        // answers at any multiple.
+        let started = Instant::now();
         let refused = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a FIFO must be refused, not held open until a writer appears")
             .unwrap_err();
+        eprintln!("fifo read refusal: {:?}", started.elapsed());
         assert!(
             refused.contains("x.log is not a regular file"),
             "the guard's own sentence: {refused}"
@@ -5699,9 +5717,58 @@ mod tests {
 
         let elapsed = started.elapsed();
         eprintln!("giant line: {elapsed:?}");
+
+        // The fixture's shapes are the subject and they stay as they are — a
+        // 200 KB line and a 2 MB file past the search cap — so the timing
+        // guard is the single-file read road over the same shape at four times
+        // the bytes: `ws.outline` over 800 KB against 200 KB. A reading is a
+        // batch of twenty-five reads of the same file inside one timed region,
+        // so a reading is tens of milliseconds and one cold page or one
+        // descheduled millisecond is amortized over the warm reads behind it —
+        // a single read is one cache miss away from lying about the walk.
+        // Three batches per size, interleaved small, large, small, large, …
+        // and the fastest batch kept, because a scheduler pause is a number
+        // the box did not really spend. Linear is 4× and a quadratic walk would
+        // read near 16×: the batches measured 4.0-5.4× in five tries under a
+        // peak of twelve busy loops, so 8 is the honest factor — far enough
+        // above the worst reading to be the ratio rather than the page cache,
+        // and far enough below 16 to catch the blow-up it exists for. The rule
+        // is the doc comment of `outline.rs`'s
+        // `a_million_declarations_are_counted_and_not_kept`.
+        let giant4 = format!("fn held() {{ let x = \"{}\"; }}", "x".repeat(800_000));
+        fs::write(ws.root().join("giant4.rs"), format!("{giant4}\n")).unwrap();
+        let batch = 25;
+        let mut fastest = [Duration::MAX; 2];
+        for _ in 0..3 {
+            for (at, name) in [(0usize, "giant.rs"), (1usize, "giant4.rs")] {
+                let started = Instant::now();
+                for _ in 0..batch {
+                    let outline = ws.outline(name).unwrap();
+                    // The cheap property at every timed repeat: one
+                    // declaration read out of the file this reading means to
+                    // read, so the ratio cannot come from measuring nothing.
+                    assert_eq!(
+                        outline.definitions().len(),
+                        1,
+                        "one declaration in {name}, so the read really read"
+                    );
+                }
+                let batch_time = started.elapsed();
+                fastest[at] = fastest[at].min(batch_time);
+            }
+        }
+        eprintln!(
+            "giant read road: 200 KB in {:?}, 800 KB in {:?} ({:.2}×), batches of {batch}",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64()
+        );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "the walk of two files took {elapsed:?}"
+            fastest[1] <= fastest[0] * 8,
+            "four times the bytes cost {:?} against {:?} — linear is 4×, a blow-up is 16×, and 8 \
+             is the factor a deschedule cannot manufacture",
+            fastest[1],
+            fastest[0]
         );
         let _ = fs::remove_dir_all(ws.root());
     }
@@ -5821,11 +5888,23 @@ mod tests {
     /// each holding one row, asked for a hundred, must stop at the file whose
     /// row did not fit — `scanned` says 101 names were opened, not 5,000 — and
     /// the counters must add up to the files it did visit.
+    ///
+    /// No wall-clock bound: the same call on a pool a fifth the size is the
+    /// scaling guard, because the walk stops at the 101st *name* either way and
+    /// so its cost must not follow the pool at all — a stopwatch on the 5,000
+    /// would only record the box. The rule is the doc comment of `outline.rs`'s
+    /// `a_million_declarations_are_counted_and_not_kept`.
     #[test]
     fn a_usage_walk_stops_at_the_cap_across_five_thousand_files() {
         let ws = temp_workspace("usages-pool");
         for n in 0..5_000 {
             fs::write(ws.root().join(format!("f{n:04}.txt")), "held\n").unwrap();
+        }
+        // The fifth-size pool the guard measures against: same file names, same
+        // call, a fifth the names to list and sort.
+        let thin = temp_workspace("usages-pool-thin");
+        for n in 0..1_000 {
+            fs::write(thin.root().join(format!("f{n:04}.txt")), "held\n").unwrap();
         }
 
         let started = Instant::now();
@@ -5840,21 +5919,57 @@ mod tests {
             "the walk stopped at the file whose row it could not keep"
         );
         eprintln!("usages pool: 100 rows over 5,000 files in {elapsed:?}");
+
+        // Fifty interleaved readings per pool, one walk each: each reading is
+        // a single walk, so a scheduler pause lands in a walk that is not the
+        // fastest rather than in a window the box did not really spend. The
+        // walk stops at the 101st name in both pools, so the pool's size may
+        // move the listing and the sort — a measured 2.0-2.8× for a 5× pool,
+        // min of fifty, and 2.6× under a peak of twelve busy loops — but not
+        // the walk: a cost that actually followed the pool would read all
+        // 5,000 names and not 101, landing near 5× or worse, so 4 is the
+        // ceiling — far enough above the measured listing to be the ratio
+        // rather than a stopwatch, and far enough below 5 to catch the
+        // regression it exists for.
+        let mut fastest = [Duration::MAX; 2];
+        for _ in 0..50 {
+            for (at, pool) in [(0usize, &thin), (1usize, &ws)] {
+                let started = Instant::now();
+                let found = pool.usages("held", 100).unwrap();
+                let reading = started.elapsed();
+                // The cheap property at every timed repeat: the walk stopped on
+                // its cap rather than measuring nothing.
+                assert_eq!(
+                    (found.hits(), found.more, found.scanned),
+                    (100, true, 101),
+                    "the walk really walked"
+                );
+                fastest[at] = fastest[at].min(reading);
+            }
+        }
+        eprintln!(
+            "usages pool scale: 1,000 files in {:?}, 5,000 files in {:?} ({:.2}×), \
+             fastest of fifty walks per pool",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64()
+        );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "the walk of 101 names took {elapsed:?}"
+            fastest[1] <= fastest[0] * 4,
+            "five times the pool cost {:?} against {:?}: the walk stops at the same 101st \
+             name in both, and only the listing may follow the pool",
+            fastest[1],
+            fastest[0]
         );
         let _ = fs::remove_dir_all(ws.root());
+        let _ = fs::remove_dir_all(thin.root());
     }
 
-    /// The degenerate files a workspace really holds: an empty file, a file of
-    /// one blank line, a file of only comments, a file with no final line feed,
-    /// and a file of a hundred thousand very short lines. Each answers a
-    /// sentence or an honest miss — never a panic — and the walk of the
-    /// short-line file is bounded by the answer's room, not the file's lines.
-    #[test]
-    fn degenerate_files_answer_a_sentence_and_not_a_panic() {
-        let ws = temp_workspace("degenerate");
+    /// The pool the degenerate test and its scaling guard walk: the five
+    /// shapes — an empty file, a blank line, comments, no final line feed — and
+    /// a short-line file whose size is the knob, `short_lines` lines of `held`.
+    fn degenerate_pool(name: &str, short_lines: usize) -> Held<Workspace> {
+        let ws = temp_workspace(name);
         fs::write(ws.root().join("empty.rs"), "").unwrap();
         fs::write(ws.root().join("blank.rs"), "\n").unwrap();
         fs::write(
@@ -5863,7 +5978,24 @@ mod tests {
         )
         .unwrap();
         fs::write(ws.root().join("nonl.rs"), "fn held() {}").unwrap();
-        fs::write(ws.root().join("short.txt"), "held\n".repeat(100_000)).unwrap();
+        fs::write(ws.root().join("short.txt"), "held\n".repeat(short_lines)).unwrap();
+        ws
+    }
+
+    /// The degenerate files a workspace really holds: an empty file, a file of
+    /// one blank line, a file of only comments, a file with no final line feed,
+    /// and a file of a hundred thousand very short lines. Each answers a
+    /// sentence or an honest miss — never a panic — and the walk of the
+    /// short-line file is bounded by the answer's room, not the file's lines.
+    ///
+    /// The walk is a scaling guard rather than a wall-clock bound: the same
+    /// five shapes at 25,000 and 100,000 short lines, because the fixture is
+    /// generated in-test and the checkout's own size is not the subject. The
+    /// rule is the doc comment of `outline.rs`'s
+    /// `a_million_declarations_are_counted_and_not_kept`.
+    #[test]
+    fn degenerate_files_answer_a_sentence_and_not_a_panic() {
+        let ws = degenerate_pool("degenerate", 100_000);
 
         assert_eq!(
             ws.outline("empty.rs").unwrap().render(4_000, ""),
@@ -5918,11 +6050,50 @@ mod tests {
         assert!(found.more);
         assert_eq!(found.scanned, 5, "all five files were read before the cap");
         eprintln!("degenerate corpus: five files, 100,000 short lines, {elapsed:?}");
+
+        // The same walk over the same five shapes at a quarter the short
+        // lines, three readings per size, interleaved small, large, small,
+        // large, … and the fastest kept, because a scheduler pause is a number
+        // the box did not really spend. A quarter the lines is the size ratio
+        // the other way, so linear is 4×, a walk that ever went quadratic would
+        // land near the square, and 6 is the factor a deschedule cannot
+        // manufacture. The sizes are 25,000 and 100,000 lines, not four times
+        // the hundred-thousand-line fixture: at 400,000 the file's two
+        // megabytes leave this box's caches, and the ratio then pays for the
+        // memory rather than the walk (measured 6.19×, min of three, on the
+        // box at load ~25).
+        let thin = degenerate_pool("degenerate-thin", 25_000);
+        let mut fastest = [Duration::MAX; 2];
+        for _ in 0..3 {
+            for (at, pool) in [(0usize, &thin), (1usize, &ws)] {
+                let started = Instant::now();
+                let found = pool.usages("held", 10).unwrap();
+                let reading = started.elapsed();
+                // The cheap property at every timed repeat: the walk really
+                // walked and stopped at its cap.
+                assert_eq!(
+                    (found.hits(), found.more, found.scanned),
+                    (10, true, 5),
+                    "the walk really walked"
+                );
+                fastest[at] = fastest[at].min(reading);
+            }
+        }
+        eprintln!(
+            "degenerate scale: 25,000 short lines in {:?}, 100,000 in {:?} ({:.2}×)",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64()
+        );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "the walk took {elapsed:?}"
+            fastest[1] <= fastest[0] * 6,
+            "four times the short lines cost {:?} against {:?} — linear is 4× and quadratic \
+             is 16×",
+            fastest[1],
+            fastest[0]
         );
         let _ = fs::remove_dir_all(ws.root());
+        let _ = fs::remove_dir_all(thin.root());
     }
 
     /// The corpus no checkout has: a scratch root holding every shape a real
@@ -5984,10 +6155,50 @@ mod tests {
 
         let elapsed = started.elapsed();
         eprintln!("generated corpus: {} files, {elapsed:?}", files.len());
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "the corpus sweep took {elapsed:?}"
+
+        // The corpus is generated, so the walk can be sized: `usages` with no
+        // room over the corpus the generator wrote, and over the same bytes
+        // written again under four name prefixes — linear in the corpus is 4×
+        // and quadratic is 16×, so the assertion is 6, the factor a deschedule
+        // cannot manufacture. Three readings per size, interleaved small,
+        // large, small, large, … and the fastest kept; the rule is the doc
+        // comment of `outline.rs`'s `a_million_declarations_are_counted_and_not_kept`.
+        let spaced = temp_workspace("generated-corpus-4x");
+        for set in 0..4 {
+            for (name, bytes) in &files {
+                fs::write(spaced.root().join(format!("set{set}_{name}")), bytes).unwrap();
+            }
+        }
+        let mut fastest = [Duration::MAX; 2];
+        let mut hits = [0usize; 2];
+        for _ in 0..3 {
+            for (at, pool) in [(0usize, &ws), (1usize, &spaced)] {
+                let started = Instant::now();
+                let found = pool.usages("held", usize::MAX).unwrap();
+                let reading = started.elapsed();
+                // The cheap property at every timed repeat: the walk walked,
+                // and no room means no cut.
+                assert!(!found.more, "no room to cut, so no cut");
+                hits[at] = found.hits();
+                fastest[at] = fastest[at].min(reading);
+            }
+        }
+        assert!(hits[0] > 0, "the walk found no rows to check");
+        assert_eq!(hits[1], hits[0] * 4, "four corpora, four times the rows");
+        eprintln!(
+            "generated corpus scale: 1× in {:?}, 4× in {:?} ({:.2}×), {} rows",
+            fastest[0],
+            fastest[1],
+            fastest[1].as_secs_f64() / fastest[0].as_secs_f64(),
+            hits[1]
         );
+        assert!(
+            fastest[1] <= fastest[0] * 6,
+            "four times the corpus cost {:?} against {:?} — linear is 4× and quadratic is 16×",
+            fastest[1],
+            fastest[0]
+        );
+        let _ = fs::remove_dir_all(spaced.root());
         let _ = fs::remove_dir_all(ws.root());
     }
 

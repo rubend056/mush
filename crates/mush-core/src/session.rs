@@ -567,9 +567,19 @@ mod tests {
         std::thread::spawn(move || {
             let _ = done.send(Session::read(&dir));
         });
+        // A watchdog, not a bound (shape 2 of the rule in `outline.rs`'s
+        // `a_million_declarations_are_counted_and_not_kept`): the refusal is a
+        // metadata read, and the thread spawn and channel send around it
+        // answered in 0.16 ms on this box at its own load of ~24 and 0.69 ms
+        // under a peak of twelve busy loops — so ten seconds is tens of
+        // thousands of times the real cost, and only a read that *parked* on
+        // the FIFO can reach it. A parked read never answers at any multiple:
+        // the timeout is here so a hang fails the suite instead of hanging it.
+        let started = std::time::Instant::now();
         let read = waited
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap_or_else(|_| panic!("the read parked on the fifo — it opened the name"));
+        eprintln!("session fifo refusal: {:?}", started.elapsed());
         match read {
             Stored::Unusable(reason) => assert!(
                 reason.contains("fifo") || reason.contains("regular file"),
