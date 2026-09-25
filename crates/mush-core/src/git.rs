@@ -2052,13 +2052,16 @@ mod tests {
         // that human, through git's own road for saying it. mush itself never
         // sets this: the protocol policy in a child's checkout is the human's
         // (a repository must not be able to make mush clone a local path).
-        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
-        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
-        let added = worktree_add(&dir, 6, Some("HEAD"));
-        match previous {
-            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
-            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
-        }
+        //
+        // The variable is the process's: hold it for as long as the probe is
+        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
+        let added = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            worktree_add(&dir, 6, Some("HEAD"))
+        };
         let (path, _branch, unplaced) = added.unwrap();
 
         assert!(
@@ -2131,41 +2134,43 @@ mod tests {
         // that human, through git's own road for saying it. mush itself never
         // sets this: the protocol policy in a child's checkout is the human's
         // (a repository must not be able to make mush clone a local path).
-        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
-        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
-        // The measured chain, as a control: git's own `worktree add` and the
-        // population alone leave a worktree that is *dirty* — the clone lands on
-        // the source's default-branch `HEAD`, the checkout of the recorded
-        // commit fails, and the failure leaves the submodule at the wrong
-        // commit, which git reports as a change.
-        let control = worktree_path(&dir, 7);
-        run(
-            &dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name(7),
-                control.to_str().unwrap(),
-                "HEAD",
-            ],
-        )
-        .unwrap();
-        assert!(
-            run(&control, &["submodule", "update", "--init", "--recursive"]).is_err(),
-            "a recorded commit the source cannot serve makes the population fail"
-        );
-        assert_eq!(
-            status(&control).unwrap().dirty,
-            1,
-            "and the checkout it leaves behind is a change git reports ( M lib/sub)"
-        );
+        // The variable is the process's: hold it for as long as the probe is
+        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
+        let added = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            // The measured chain, as a control: git's own `worktree add` and the
+            // population alone leave a worktree that is *dirty* — the clone lands on
+            // the source's default-branch `HEAD`, the checkout of the recorded
+            // commit fails, and the failure leaves the submodule at the wrong
+            // commit, which git reports as a change.
+            let control = worktree_path(&dir, 7);
+            run(
+                &dir,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name(7),
+                    control.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            assert!(
+                run(&control, &["submodule", "update", "--init", "--recursive"]).is_err(),
+                "a recorded commit the source cannot serve makes the population fail"
+            );
+            assert_eq!(
+                status(&control).unwrap().dirty,
+                1,
+                "and the checkout it leaves behind is a change git reports ( M lib/sub)"
+            );
 
-        let added = worktree_add(&dir, 6, Some("HEAD"));
-        match previous {
-            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
-            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
-        }
+            worktree_add(&dir, 6, Some("HEAD"))
+        };
         let (path, _branch, unplaced) = added.unwrap();
 
         assert_eq!(
@@ -2223,15 +2228,18 @@ mod tests {
         // hold the commit the tree records, the update the child's prompt names
         // — `git submodule update --init` — populates the submodule at that
         // commit, and the worktree stays clean with it in place.
+        //
+        // The variable is the process's: hold it for as long as the probe is
+        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
         fs::remove_dir_all(&source).unwrap();
         fs::rename(&recorded, &source).unwrap();
-        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
-        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
-        let updated = run(&path, &["submodule", "update", "--init"]);
-        match previous {
-            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
-            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
-        }
+        let updated = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            run(&path, &["submodule", "update", "--init"])
+        };
         assert!(
             updated.is_ok(),
             "a source that does hold the recorded commit places it: {updated:?}"
@@ -2293,13 +2301,16 @@ mod tests {
         // A local submodule clones over the `file` transport, which git refuses
         // for submodules unless the human says otherwise; the test is that
         // human, through git's own road for saying it.
-        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
-        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
-        let made = ensure_worktree(&dir, 6, &branch_name(6));
-        match previous {
-            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
-            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
-        }
+        //
+        // The variable is the process's: hold it for as long as the probe is
+        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
+        let made = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            ensure_worktree(&dir, 6, &branch_name(6))
+        };
         let (path, unplaced) = made.unwrap();
 
         assert_eq!(path, worktree_path(&dir, 6));
@@ -2389,13 +2400,16 @@ mod tests {
         // A local submodule clones over the `file` transport, which git
         // refuses for submodules unless the human says otherwise; the test is
         // that human, through git's own road for saying it.
-        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
-        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
-        let added = worktree_add(&dir, 6, Some("HEAD"));
-        match previous {
-            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
-            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
-        }
+        //
+        // The variable is the process's: hold it for as long as the probe is
+        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
+        let added = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            worktree_add(&dir, 6, Some("HEAD"))
+        };
         let (path, _branch, unplaced) = added.unwrap();
 
         assert_eq!(
@@ -2498,16 +2512,19 @@ mod tests {
         .unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // The key is put back on the way out, so a failure here does not turn
-        // this binary's other tests into readers of a probe credential.
-        let previous = std::env::var_os("MUSH_API_KEY");
-        std::env::set_var("MUSH_API_KEY", "sk-probe-inheritance-0123456789");
-        fs::write(dir.join("b.txt"), "two\n").unwrap();
-        run(&dir, &["add", "-A"]).unwrap();
-        run(&dir, &["commit", "-qm", "with a hook"]).unwrap();
-        match previous {
-            Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
-            None => std::env::remove_var("MUSH_API_KEY"),
+        // The variable is the process's: hold it for as long as the probe key
+        // is set (see [`crate::MUSH_API_KEY_LOCK`]), and let `KeyInProcess`
+        // put back what was there when the probe ends. The hand-written
+        // restore this replaces was skipped by a panic on either road below,
+        // leaving the probe in every later test's environment.
+        {
+            let _key_lock = crate::MUSH_API_KEY_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _key = crate::KeyInProcess::set("sk-probe-inheritance-0123456789");
+            fs::write(dir.join("b.txt"), "two\n").unwrap();
+            run(&dir, &["add", "-A"]).unwrap();
+            run(&dir, &["commit", "-qm", "with a hook"]).unwrap();
         }
 
         let read = fs::read_to_string(&seen).unwrap();
