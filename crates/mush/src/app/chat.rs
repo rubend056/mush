@@ -1217,23 +1217,28 @@ pub struct Chat {
     /// are sent, or a crash between the send and the boundary loses exactly
     /// what the send blocks on ([`crate::app::App::deliver`]).
     queued: HashMap<AgentId, Vec<Queued>>,
-    /// Each painted tool call's digest — the ask, the paired result's outcome,
-    /// and that result's detail rows ([`crate::agent::digest`]) — keyed like
-    /// [`Self::spoken`]: the agent, then the index of the line it sits in, then
-    /// the call's place in that line's batch. **Both views paint through this
-    /// one entry**: the digest row is the call's header in the unfolded view
-    /// too, and the compact log differs only in hiding the details and the
+    /// Each painted tool call's block — the digest (the ask, the paired
+    /// result's outcome, and that result's detail rows, [`crate::agent::digest`])
+    /// and the rows the ask's own arguments unfold to ([`CallBlock`]) — keyed
+    /// like [`Self::spoken`]: the agent, then the index of the line it sits in,
+    /// then the call's place in that line's batch. **Both views paint through
+    /// this one entry**: the digest row is the call's header in the unfolded
+    /// view too, and the compact log differs only in hiding the details and the
     /// payload ([`call_grid`]).
     ///
     /// The arguments are parsed once per call, on the first frame that paints
     /// the call, because that parse is unbounded — H45/H46 removed the caps on
     /// a `write_file`'s `content` — and one 2 MB call cost 104.9 ms *per frame*
-    /// in a debug build (finding A13). The *outcome* is the half whose answer
+    /// in a debug build (finding A13). The same read derives the rows the ask's
+    /// own arguments unfold to ([`call_grid::ask_rows`]): the parse is only its
+    /// first half, the second is the walk of a writer's every payload line, and
+    /// neither depends on the pane, so the entry carries both and the frame
+    /// paints rows it did not derive. The *outcome* is the half whose answer
     /// can change after that first frame — the result lands in a later message
     /// — so an entry remembers how long the transcript was when it was read
     /// ([`CachedCalls::at`]), and a call with no outcome yet is read again once
     /// the transcript has grown. A message whose every call already has its
-    /// outcome is final and never re-parsed.
+    /// outcome is final and never re-read.
     facts: RefCell<HashMap<AgentId, HashMap<usize, CachedCalls>>>,
     /// The workspace root: what a digested path is shown relative to, and the
     /// directory a command's redundant leading `cd` names
@@ -1350,17 +1355,37 @@ struct Queued {
     ready_at: usize,
 }
 
-/// Every tool call's digest in one message, and the length the agent's
+/// Every tool call's block in one message, and the length the agent's
 /// transcript had when the reading was taken.
 ///
 /// The length is the staleness rule and nothing else: a result lands in a
 /// *later* message, so a reading taken while a call was still in flight has no
 /// outcome, and the entry is read again on the first frame after the transcript
 /// grew. An entry whose calls all have their outcomes cannot change — a recorded
-/// result is as immutable as the call — so it is never re-parsed.
+/// result is as immutable as the call, and no transcript road edits a recorded
+/// call's arguments — so it is never re-read.
 struct CachedCalls {
     at: usize,
-    calls: Vec<CallFacts>,
+    calls: Vec<CallBlock>,
+}
+
+/// One tool call as the pane paints it: the digest both views' headers are
+/// built from ([`CallFacts`]) and the rows the call's own arguments unfold to
+/// under the header ([`call_grid::ask_rows`]).
+///
+/// The two are one value because they come from the same bytes: a call's
+/// arguments are read once into this pair and kept ([`Chat::facts`]), so a
+/// frame's header and its block can never be painted from two different states
+/// of the call — and the expensive half, the derivation of the rows, is paid
+/// once per transcript change rather than once per painted frame (finding A13).
+#[derive(Clone)]
+struct CallBlock {
+    /// The digest: what the call asked, the paired result's outcome and
+    /// measure, and the result's own detail rows ([`call_digest`]).
+    facts: CallFacts,
+    /// The ask's own unfolded rows, before the pane's gutter and columns reach
+    /// them ([`call_grid::ask_rows`]).
+    rows: Vec<String>,
 }
 
 impl Chat {
@@ -3502,8 +3527,9 @@ impl Chat {
     }
 
     /// Both views' reading of every tool call in one message: the ask, the
-    /// outcome of the result the transcript pairs with the call, and that
-    /// result's detail rows — computed once per call and kept.
+    /// outcome of the result the transcript pairs with the call, that result's
+    /// detail rows, and the rows the call's own arguments unfold to under its
+    /// header — computed once per call and kept ([`CallBlock`]).
     ///
     /// The pairing is the transcript's own ([`Message::tool_call_id`]): the
     /// result of a call is the `tool` line after it that carries the call's id,
@@ -3516,27 +3542,30 @@ impl Chat {
     /// The value is the whole reading, never cut to a budget: the pane that
     /// paints it owns the columns ([`call_grid`]), and the reading is the same
     /// at every width, which is what lets it be cached in the first place.
-    fn call_facts(&self, on: AgentId, index: usize, message: &Message) -> Vec<CallFacts> {
+    fn call_blocks(&self, on: AgentId, index: usize, message: &Message) -> Vec<CallBlock> {
         let transcript = self.transcript(on);
         let mut cached = self.facts.borrow_mut();
         let by_index = cached.entry(on).or_default();
         if let Some(entry) = by_index.get(&index) {
-            let settled = !entry.calls.iter().any(|call| call.outcome.is_none());
+            let settled = !entry.calls.iter().any(|call| call.facts.outcome.is_none());
             if settled || entry.at == transcript.len() {
                 return entry.calls.clone();
             }
         }
-        let calls: Vec<CallFacts> = message
+        let calls: Vec<CallBlock> = message
             .tool_calls()
             .iter()
-            .map(|call| {
-                let result = result_for(transcript, index, &call.id);
-                call_digest(
+            .map(|call| CallBlock {
+                facts: call_digest(
                     &call.function.name,
                     &call.function.arguments,
-                    result,
+                    result_for(transcript, index, &call.id),
                     &self.workspace,
-                )
+                ),
+                // The ask's own rows, from the same argument bytes the digest
+                // just read: the one place the pair is made, so a cached block
+                // can never hold one call's facts beside another's rows.
+                rows: call_grid::ask_rows(&call.function.name, &call.function.arguments),
             })
             .collect();
         by_index.insert(
@@ -3563,11 +3592,12 @@ impl Chat {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
         let fold = self.message_fold(on, index, message);
-        // The calls' own reading: one digest per call, which is the header of
-        // both views — the unfolded one paints the ask's own rows, the script
-        // it carries, each result's details and its payload under it, and the
-        // compact log hides all but the one row ([`call_grid`]).
-        let facts = self.call_facts(on, index, message);
+        // The calls' own reading: one block per call — the digest that is the
+        // header of both views and the rows the ask's own arguments unfold to
+        // under it, the script a `run_command` carries, each result's details
+        // and its payload — the compact log hides all but the one header row
+        // ([`call_grid`]).
+        let blocks = self.call_blocks(on, index, message);
         // The two facts the transcript does not carry but the frame does: the
         // read window this message's payload is, and the message's own share of
         // the agent's running call. Both are read at the frame the pane is
@@ -3601,7 +3631,7 @@ impl Chat {
             fold,
             &folds,
             self.symbols,
-            &facts,
+            &blocks,
             self.call_age(on, index),
             numbers,
             followed_by_result,
@@ -5230,16 +5260,17 @@ fn folded_marked(
 /// ([`Chat::call_fold`]), and empty — or short of the call — for a caller that
 /// has none, when the call paints through the message's fold. `symbols` is the
 /// same kind of threading for the glyph rung every call's mark is painted
-/// through ([`Symbols`]), and `facts` for the calls themselves: one [`CallFacts`] per
-/// entry of `message.tool_calls()`, the reading [`Chat::call_facts`] cached, and
-/// empty — or short of the call — for a caller that has none, when the header
-/// falls back to the call's own arguments read with no result and no workspace
-/// to trim a path against rather than guessing one. `age` is the third: how long
-/// the agent's running call has been running, where this message is the one that
-/// made it ([`Chat::call_age`]) — the in-flight row's `… 12s`. `numbers` is the
-/// fourth: the file window this message's payload is, where it is a read's own
-/// lines ([`Chat::payload_numbers`]), so the dump carries the numbers a row can
-/// be cited by. And `followed_by_result` is the one fact the closing blank needs
+/// through ([`Symbols`]), and `calls` for the calls themselves: one
+/// [`CallBlock`] per entry of `message.tool_calls()` — the digest and the ask's
+/// own rows, read once by [`Chat::call_blocks`] — and empty, or short of the
+/// call, for a caller that has none, when the header falls back to the call's
+/// own arguments read with no result and no workspace to trim a path against
+/// rather than guessing one. `age` is the third: how long the agent's running
+/// call has been running, where this message is the one that made it
+/// ([`Chat::call_age`]) — the in-flight row's `… 12s`. `numbers` is the fourth:
+/// the file window this message's payload is, where it is a read's own lines
+/// ([`Chat::payload_numbers`]), so the dump carries the numbers a row can be
+/// cited by. And `followed_by_result` is the one fact the closing blank needs
 /// from *outside* the message: whether another result's payload comes next,
 /// whose blank would sit inside one call block ([`closing_blank`]).
 ///
@@ -5266,7 +5297,7 @@ fn render_message(
     fold: Fold,
     call_folds: &[Fold],
     symbols: Symbols,
-    facts: &[CallFacts],
+    calls: &[CallBlock],
     age: Option<Duration>,
     numbers: Option<Numbering>,
     followed_by_result: bool,
@@ -5384,19 +5415,25 @@ fn render_message(
             let mut age = age;
             for (at, call) in message.tool_calls().iter().enumerate() {
                 let fallback;
-                let facts = match facts.get(at) {
-                    Some(facts) => facts,
+                let block = match calls.get(at) {
+                    Some(block) => block,
                     // A caller with no cache — the tests, and any future read of
                     // a message on its own — reads the call the one way it can:
                     // its own arguments, no result, and no workspace to trim a
                     // path against.
                     None => {
-                        fallback = call_digest(
-                            &call.function.name,
-                            &call.function.arguments,
-                            None,
-                            std::path::Path::new(""),
-                        );
+                        fallback = CallBlock {
+                            facts: call_digest(
+                                &call.function.name,
+                                &call.function.arguments,
+                                None,
+                                std::path::Path::new(""),
+                            ),
+                            rows: call_grid::ask_rows(
+                                &call.function.name,
+                                &call.function.arguments,
+                            ),
+                        };
                         &fallback
                     }
                 };
@@ -5411,7 +5448,7 @@ fn render_message(
                     // A call whose result landed has a verdict, a measure, or
                     // both; one with neither is the one still running, and the
                     // elapsed time is the only sentence there is to paint.
-                    facts.outcome.is_none() && facts.measure.is_none(),
+                    block.facts.outcome.is_none() && block.facts.measure.is_none(),
                 ) {
                     (Some(elapsed), true) => {
                         age = None;
@@ -5420,11 +5457,11 @@ fn render_message(
                                 text: format!("… {}", crate::app::short_age(elapsed)),
                                 tone: Tone::Running,
                             }),
-                            ..facts.clone()
+                            ..block.facts.clone()
                         };
                         &aged
                     }
-                    _ => facts,
+                    _ => &block.facts,
                 };
                 let mark = symbols.mark(&call.function.name);
                 // The view this call's own block paints through: the human's
@@ -5452,7 +5489,7 @@ fn render_message(
                     rows.push_call(at);
                 }
                 if !call_compact {
-                    for row in call_grid::details(call, facts, width, mark) {
+                    for row in call_grid::details(&block.rows, facts, width, mark) {
                         out.push(row);
                         rows.push_call(at);
                     }
@@ -7565,6 +7602,90 @@ mod tests {
             replaced.contains("new.rs") && !replaced.contains("a.txt"),
             "a replaced transcript is read on its own: {replaced:?}"
         );
+    }
+
+    /// A call's own rows are read once, not once per frame, and again when the
+    /// message that holds the call changes (finding A13's second half). The
+    /// derivation is counted at its one parse ([`call_grid::ask_reads`]): the
+    /// first frame of a shown view takes the read — which for a 2 MB
+    /// `write_file` is every line of its content walked before the fold throws
+    /// all but a handful away — and every frame after it paints the rows the
+    /// cache holds. A replaced transcript is a new call at the same index, and
+    /// the pane must paint the new rows rather than the ones the old call left
+    /// behind.
+    ///
+    /// The count cannot be satisfied by accident. It is bumped in the one parse
+    /// the three block readers share ([`call_grid::ask_rows`]) and nowhere else,
+    /// so a reading of 1 cannot come from a call whose block was never derived;
+    /// it is thread-local, so the tests running beside this one cannot move it;
+    /// and the unchanged half is read *after* three more frames, where a
+    /// derivation that never cached would be 4 and one that never ran 0.
+    #[test]
+    fn a_tool_calls_own_rows_are_read_once_not_once_per_frame() {
+        let mut chat = Chat::bare();
+        // The unfolded view: the ask's own rows are painted there and nowhere
+        // else (the compact log is one row per call).
+        chat.set_output(true);
+        let write = |content: &str| mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "write_file".into(),
+                // The endpoint's own encoding: a content's newlines are escaped
+                // in the argument JSON, as a recorded call's are.
+                arguments: serde_json::json!({"path": "a.txt", "content": content}).to_string(),
+            },
+        };
+        let word = |word: &str| -> String { (0..10).map(|at| format!("{word} {at}\n")).collect() };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![write(&word("alpha"))]),
+                ..Default::default()
+            },
+        );
+        call_grid::forget_ask_reads();
+        let frame = |chat: &Chat| shown(&pane_rows(chat, &pane(AgentId::ROOT), 120, 14)).join("\n");
+        let first = frame(&chat);
+        assert!(
+            first.contains("write 10L · content, not output"),
+            "the ask's own block is painted: {first:?}"
+        );
+        assert!(
+            first.contains("alpha 9"),
+            "the fold's tail is where the answer is: {first:?}"
+        );
+        // Frames that change nothing paint the rows the cache holds.
+        for _ in 0..3 {
+            assert_eq!(
+                frame(&chat),
+                first,
+                "an unchanged message paints the same rows"
+            );
+        }
+        assert_eq!(
+            call_grid::ask_reads(),
+            1,
+            "one derivation for the message's many frames"
+        );
+        // A replacement transcript is a new call at the same index: the cached
+        // rows go with the old transcript, and the frame paints the new
+        // content.
+        chat.replace_transcript(
+            AgentId::ROOT,
+            vec![Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![write(&word("beta"))]),
+                ..Default::default()
+            }],
+        );
+        let replaced = frame(&chat);
+        assert!(
+            replaced.contains("beta 9") && !replaced.contains("alpha"),
+            "a replaced message is read on its own: {replaced:?}"
+        );
+        assert_eq!(call_grid::ask_reads(), 2, "a changed message is read again");
     }
 
     /// A truncated label says it was truncated. The arguments are budgeted the

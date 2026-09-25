@@ -1329,13 +1329,13 @@ fn painted_width(spans: &[Span<'_>]) -> usize {
         .sum()
 }
 
-/// The dim rows the unfolded view paints under a call's header: the text the
-/// call's own arguments carry, where they carry it — the **script** of a
-/// heredoc ([`script_rows`]) and the replacement or content of the two file
-/// writers ([`writer_rows`]) — and then the result's own fact rows — each at the
-/// block's own **gutter** ([`crate::app::symbols`]'s pipe) and cut to what the
-/// pane has left of it. The compact log paints none of them: its one row per
-/// call is the header, and these are what the human reads when the call is open.
+/// The dim rows the unfolded view paints under a call's header: the ask's own
+/// rows, derived from the call's arguments by [`ask_rows`] — the **script** of
+/// a heredoc, the replacement or content of the two file writers — and then the
+/// result's own fact rows — each at the block's own **gutter**
+/// ([`crate::app::symbols`]'s pipe) and cut to what the pane has left of it.
+/// The compact log paints none of them: its one row per call is the header, and
+/// these are what the human reads when the call is open.
 ///
 /// The gutter is the same one the result's payload wears ([`crate::app::chat`]
 /// paints it through the same constant), so the header, its facts and the dump
@@ -1343,8 +1343,14 @@ fn painted_width(spans: &[Span<'_>]) -> usize {
 /// the pane's own columns both measure against. The ask's own text stands first
 /// because it belongs to the ask: it is what the call *asked for*, and the facts
 /// behind it are what came back.
+///
+/// `rows` are the ask's own, read once per call and cached beside the digest
+/// ([`crate::app::Chat`]'s facts cache): that derivation is unbounded — H45/H46
+/// removed the caps on a `write_file`'s `content` — and it does not depend on
+/// the pane, so a frame paints the rows it was handed rather than reading the
+/// arguments again (finding A13).
 pub(crate) fn details(
-    call: &ToolCall,
+    rows: &[String],
     facts: &CallFacts,
     width: usize,
     mark: &str,
@@ -1361,15 +1367,73 @@ pub(crate) fn details(
         take => format!("{}{}", PIPE, " ".repeat(take - 1)),
     };
     let budget = width.saturating_sub(gutter);
-    let mut rows = script_rows(call, &pad, budget);
-    rows.extend(writer_rows(call, &pad, budget));
-    rows.extend(facts.details.iter().map(|fact| {
-        Line::from(Span::styled(
-            format!("{pad}{}", truncate(fact, budget)),
-            dim(),
-        ))
-    }));
+    rows.iter()
+        .chain(facts.details.iter())
+        .map(|row| {
+            Line::from(Span::styled(
+                format!("{pad}{}", truncate(row, budget)),
+                dim(),
+            ))
+        })
+        .collect()
+}
+
+/// The rows a call's own arguments unfold to, and nothing of the pane: the
+/// script a `run_command` carries ([`script_rows`]) and the replacement or
+/// content of the two file writers ([`writer_rows`]).
+///
+/// This is the **derivation** the unfolded view paints from — unpadded and
+/// uncut, since the gutter and the columns belong to [`details`] — and it is
+/// the expensive half of a call's paint: the arguments are parsed and, for a
+/// writer, every line of the payload is walked before the fold throws all but a
+/// handful away. It depends on the arguments alone and not on the pane, so the
+/// frame reads it once per call and caches it beside the digest rather than
+/// repeating it on every painted frame (finding A13). A caller with no cache —
+/// a test, the `/help` samples — calls it and paints the answer.
+pub(crate) fn ask_rows(name: &str, arguments: &str) -> Vec<String> {
+    let Some(tool) = ToolName::parse(name) else {
+        return Vec::new();
+    };
+    let mut rows = script_rows(tool, arguments);
+    rows.extend(writer_rows(tool, arguments));
     rows
+}
+
+// How many times a call's arguments have been parsed for its ask's own rows,
+// counted for the test that pins the caching
+// ([`crate::app::Chat`]'s `a_tool_calls_own_rows_are_read_once_not_once_per_frame`):
+// the frame must read them once for a call whose message has not changed, and
+// again once it has (finding A13).
+//
+// Thread-local, because the tests run in parallel threads: a count shared
+// between them would be a count no test could assert exactly. It is bumped in
+// `arguments_of` and nowhere else — the one parse the three block readers
+// share — so a reading of 1 cannot come from a block that was never derived.
+#[cfg(test)]
+thread_local! {
+    static ASK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`ASK_READS`]'s reading.
+#[cfg(test)]
+pub(crate) fn ask_reads() -> usize {
+    ASK_READS.with(std::cell::Cell::get)
+}
+
+/// [`ASK_READS`]'s reset, so a test's own paints are the whole of what it reads.
+#[cfg(test)]
+pub(crate) fn forget_ask_reads() {
+    ASK_READS.with(|count| count.set(0));
+}
+
+/// The arguments' own JSON, read once per derivation: the one parse the three
+/// block readers share, so a malformed shape — a call the schema would have
+/// refused, whose bytes the transcript keeps — is no block at all rather than a
+/// panic.
+fn arguments_of(arguments: &str) -> Option<serde_json::Value> {
+    #[cfg(test)]
+    ASK_READS.with(|count| count.set(count.get() + 1));
+    serde_json::from_str(arguments).ok()
 }
 
 /// The script a call's own arguments carry, where it carries one: the body of
@@ -1387,11 +1451,11 @@ pub(crate) fn details(
 /// ([`crate::app::chat::folded_head_tail`]): a forty-line script costs the rows
 /// a payload costs, and the compact log — which paints no detail row at all —
 /// keeps its one row per call whatever the script says.
-fn script_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
-    if ToolName::parse(&call.function.name) != Some(ToolName::RunCommand) {
+fn script_rows(tool: ToolName, arguments: &str) -> Vec<String> {
+    if tool != ToolName::RunCommand {
         return Vec::new();
     }
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+    let Some(args) = arguments_of(arguments) else {
         return Vec::new();
     };
     let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
@@ -1405,23 +1469,8 @@ fn script_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> 
             continue;
         }
         let count = crate::agent::lines_label(script.body.len());
-        rows.push(Line::from(Span::styled(
-            format!(
-                "{pad}{}",
-                truncate(&format!("script {count} {SCRIPT}"), budget)
-            ),
-            dim(),
-        )));
-        rows.extend(
-            crate::app::chat::folded_head_tail(&script.body)
-                .into_iter()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        format!("{pad}{}", truncate(&line, budget)),
-                        dim(),
-                    ))
-                }),
-        );
+        rows.push(format!("script {count} {SCRIPT}"));
+        rows.extend(crate::app::chat::folded_head_tail(&script.body));
     }
     rows
 }
@@ -1458,8 +1507,9 @@ fn script_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> 
 /// Both are folded by the payload's own rule
 /// ([`crate::app::chat::folded_head_tail`]) with the lead row's counts read from
 /// the whole strings — a five-hundred-line edit costs the eight rows a payload
-/// costs and still says exactly how much it hides — and every row is cut to the
-/// pane's columns ([`truncate`]). The compact log paints none of it: its one row
+/// costs and still says exactly how much it hides — and the pane's gutter and
+/// columns are [`details`]'s to add, so what comes back here is the block's own
+/// text and nothing of the pane. The compact log paints none of it: its one row
 /// is the whole design ([`details`]).
 ///
 /// A shape the model invented paints no block at all — `edits` that is not a
@@ -1467,13 +1517,12 @@ fn script_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> 
 /// [`script_rows`] paints nothing for a command that is not one. Nothing here
 /// panics on arguments the schema would have refused: the transcript keeps what
 /// the model sent.
-fn writer_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
-    let named = ToolName::parse(&call.function.name);
-    if named == Some(ToolName::EditFile) {
-        return edit_rows(call, pad, budget);
+fn writer_rows(tool: ToolName, arguments: &str) -> Vec<String> {
+    if tool == ToolName::EditFile {
+        return edit_rows(arguments);
     }
-    if named == Some(ToolName::WriteFile) {
-        return write_rows(call, pad, budget);
+    if tool == ToolName::WriteFile {
+        return write_rows(arguments);
     }
     // Every other ask is a summary of what the call wanted, not the text itself:
     // nothing is painted here.
@@ -1483,8 +1532,8 @@ fn writer_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> 
 /// An `edit_file`'s block: the lead row and then the replacement, edit by edit —
 /// every edit's replaced lines and then its new ones, the order the strings
 /// stand in and the order the tool applies them.
-fn edit_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+fn edit_rows(arguments: &str) -> Vec<String> {
+    let Some(args) = arguments_of(arguments) else {
         return Vec::new();
     };
     let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) else {
@@ -1524,12 +1573,12 @@ fn edit_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
         "diff {} · {ADDED}{added}{REMOVED}{removed}",
         edits_label(edits.len())
     );
-    block_rows(pad, budget, &lead, &lines)
+    block_rows(&lead, &lines)
 }
 
 /// A `write_file`'s block: the lead row and the content, line for line.
-fn write_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+fn write_rows(arguments: &str) -> Vec<String> {
+    let Some(args) = arguments_of(arguments) else {
         return Vec::new();
     };
     let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
@@ -1545,22 +1594,17 @@ fn write_rows(call: &ToolCall, pad: &str, budget: usize) -> Vec<Line<'static>> {
         "write {} · content, not output",
         crate::agent::lines_label(lines.len())
     );
-    block_rows(pad, budget, &lead, &lines)
+    block_rows(&lead, &lines)
 }
 
 /// One ask-derived block, assembled: the lead row that says what it is, then the
 /// ask's own lines folded by the payload's own rule
-/// ([`crate::app::chat::folded_head_tail`]) — and every row padded to the call's
-/// gutter and cut to the pane ([`truncate`], which sanitizes as it cuts).
-fn block_rows(pad: &str, budget: usize, lead: &str, lines: &[String]) -> Vec<Line<'static>> {
+/// ([`crate::app::chat::folded_head_tail`]). Unpadded and uncut, like everything
+/// [`ask_rows`] returns: [`details`] adds the gutter and the pane's columns, and
+/// [`truncate`] sanitizes as it cuts.
+fn block_rows(lead: &str, lines: &[String]) -> Vec<String> {
     std::iter::once(lead.to_string())
         .chain(crate::app::chat::folded_head_tail(lines))
-        .map(|line| {
-            Line::from(Span::styled(
-                format!("{pad}{}", truncate(&line, budget)),
-                dim(),
-            ))
-        })
         .collect()
 }
 
@@ -1613,6 +1657,20 @@ mod tests {
         let mut call = call(name);
         call.function.arguments = format!("\"{}\"", "x".repeat(bytes.saturating_sub(2)));
         call
+    }
+
+    /// One call's details as the pane paints them: the ask's rows derived here
+    /// from the call's own arguments — the road `details`' own doc names for a
+    /// caller with no cache ([`ask_rows`]) — and then the painting itself. The
+    /// tests below are about the painting, so this is the shorthand that keeps
+    /// them reading as the call they paint.
+    fn details(call: &ToolCall, facts: &CallFacts, width: usize, mark: &str) -> Vec<Line<'static>> {
+        super::details(
+            &ask_rows(&call.function.name, &call.function.arguments),
+            facts,
+            width,
+            mark,
+        )
     }
 
     /// A mark is supplied by the caller ([`crate::app::symbols`]), and the grid

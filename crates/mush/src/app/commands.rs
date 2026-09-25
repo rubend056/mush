@@ -801,7 +801,10 @@ pub(crate) mod tests {
         };
         let mark = Symbols::SYMBOLS.mark(name);
         // The sample is the unfolded view: the pane's own rows, the script a
-        // call carries where it carries one, and then the facts.
+        // call carries where it carries one, and then the facts. The ask's rows
+        // are derived here from the fixture's own arguments (the `{}` most
+        // samples carry paint none), the road a caller with no cache takes
+        // ([`call_grid::ask_rows`]).
         let mut rows = call_grid::header(
             &call,
             &facts,
@@ -809,7 +812,8 @@ pub(crate) mod tests {
             mark,
             call_grid::AskRows::Many,
         );
-        rows.extend(call_grid::details(&call, &facts, TRANSCRIPT_WIDTH, mark));
+        let ask = call_grid::ask_rows(&call.function.name, &call.function.arguments);
+        rows.extend(call_grid::details(&ask, &facts, TRANSCRIPT_WIDTH, mark));
         rows
     }
 
