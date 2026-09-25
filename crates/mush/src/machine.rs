@@ -1032,31 +1032,6 @@ mod tests {
         }
     }
 
-    /// `MUSH_API_KEY` set for one test, put back when it ends — panic or not.
-    /// The environment belongs to the whole process, and a probe key left
-    /// behind would be read by every test that runs after this one.
-    #[cfg(unix)]
-    struct KeyInProcess(Option<std::ffi::OsString>);
-
-    #[cfg(unix)]
-    impl KeyInProcess {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var_os("MUSH_API_KEY");
-            std::env::set_var("MUSH_API_KEY", value);
-            Self(previous)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for KeyInProcess {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
-                None => std::env::remove_var("MUSH_API_KEY"),
-            }
-        }
-    }
-
     /// The key is mush's, not the model's (finding C1). A command run through
     /// the real [`Shell`] cannot read `MUSH_API_KEY`, even while the process
     /// that spawned it holds one: the command writes what `printenv` printed to
@@ -1068,7 +1043,12 @@ mod tests {
     fn a_command_never_sees_mushs_key() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("key");
-        let _key = KeyInProcess::set("sk-probe-inheritance-0123456789");
+        // The variable is the process's: hold it for as long as the probe key
+        // is set (see [`crate::MUSH_API_KEY_LOCK`]).
+        let _key_lock = crate::MUSH_API_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _key = crate::KeyInProcess::set("sk-probe-inheritance-0123456789");
         let end = run_to_end(
             &format!("printenv MUSH_API_KEY > {}", out.display()),
             dir.path(),

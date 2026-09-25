@@ -719,8 +719,15 @@ mod tests {
     #[test]
     fn a_clipboard_child_never_sees_mushs_key() {
         let dir = Scratch::new("clipboard-child-key");
-        let previous = std::env::var_os("MUSH_API_KEY");
-        std::env::set_var("MUSH_API_KEY", "sk-probe-inheritance-0123456789");
+        // The variable is the process's: hold it for as long as the probe key
+        // is set (see [`crate::MUSH_API_KEY_LOCK`]), and let `KeyInProcess`
+        // put back what was there when this test ends. The hand-written
+        // restore this replaces was skipped by a panic on either road below,
+        // leaving the probe in every later test's environment.
+        let _key_lock = crate::MUSH_API_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _key = crate::KeyInProcess::set("sk-probe-inheritance-0123456789");
         let read = dir.join("read");
         let answer = run(
             "sh",
@@ -745,10 +752,6 @@ mod tests {
             Instant::now() + DEADLINE,
             spawn_worker,
         );
-        match previous {
-            Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
-            None => std::env::remove_var("MUSH_API_KEY"),
-        }
         assert!(
             matches!(answer, Answer::Nothing),
             "the reader road ran to its own answer"

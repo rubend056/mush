@@ -1704,6 +1704,58 @@ fn install_panic_hook_for(
 #[cfg(test)]
 pub(crate) static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The process environment's `MUSH_API_KEY`, owned by one test at a time.
+///
+/// `std::env::set_var` writes the process's one environment, every thread at
+/// once, and two tests in this binary put a probe key in it:
+/// `machine::tests::a_command_never_sees_mushs_key` and
+/// `clipboard::tests::a_clipboard_child_never_sees_mushs_key`. Run together
+/// without a lock they race: each saves the value it found and puts it back
+/// when its road ends, so the second test's save can record the first test's
+/// probe as the value to restore — putting that probe back after both have
+/// ended, into every later test's environment — and the clipboard test's
+/// restore was hand-written, so a panic on its road left the probe behind the
+/// same way. A restore landing while the other test's children are still
+/// spawning is the quieter half: the child then sees no key because the key is
+/// gone, not because the spawn scrubbed it, and the test proves less than it
+/// says.
+///
+/// A test that sets the variable holds this for as long as the probe is in the
+/// environment — `KeyInProcess` puts back what was there on the way out, panic
+/// or not — so the two can never overlap. The same one-mutex-per-global shape
+/// as the panic hook above and `machine::tests::PATH_LOCK` (the process's
+/// `PATH`).
+#[cfg(test)]
+pub(crate) static MUSH_API_KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `MUSH_API_KEY` set for one test, put back when it ends — panic or not.
+///
+/// The previous value is kept, so the restore puts back exactly what was there
+/// and an unset variable stays unset. The caller holds `MUSH_API_KEY_LOCK`
+/// from before the set until after this guard drops: the lock is what keeps a
+/// second test's save from recording this probe as the value to restore.
+#[cfg(test)]
+pub(crate) struct KeyInProcess(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl KeyInProcess {
+    pub(crate) fn set(value: &str) -> Self {
+        let previous = std::env::var_os("MUSH_API_KEY");
+        std::env::set_var("MUSH_API_KEY", value);
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeyInProcess {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(previous) => std::env::set_var("MUSH_API_KEY", previous),
+            None => std::env::remove_var("MUSH_API_KEY"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
