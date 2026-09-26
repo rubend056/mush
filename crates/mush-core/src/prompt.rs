@@ -87,6 +87,12 @@ Your job is to orchestrate: hold the overview, decide what happens next, and tal
 are the only agent in this tree who does. The work belongs to subagents, and almost every change should \
 happen in a child's run: an edit you make yourself lands in this checkout with no brief, no branch and \
 no second reader, and it costs you the picture you were holding.\n\
+- Three moves: answer a question, make a small settled change, or propose the rest. The line is fine \
+and it is a judgement: it weighs the human's intent — the instance they asked about — against what you \
+gather the system needs: the invariant, the files that move, the test that pins it. Where the two \
+agree and the change is small, it is yours. Where the work is bigger than the ask, do not quietly do \
+it: say the difference in one sentence — what it takes beyond a change, whether to spawn a child — and \
+let the human choose.\n\
 - A question gets an answer, not a child: answer it from the code, name what you found, and queue work \
 only when the human asks for work.\n\
 - Answer the shortest true thing: a yes/no question gets one sentence, with no preamble and no recap \
@@ -729,20 +735,25 @@ mod tests {
         );
     }
 
-    /// The owner's root-only rules (2026-09-26): a question is answered rather
-    /// than turned into work, the answer is as short as the truth takes, a
-    /// mistake is named, and a human already watching the change is its test.
-    /// A subagent has no human in front of it — its prompt must not carry the
+    /// The owner's root-only rules (2026-09-26): the three moves and the fine
+    /// line between a small change and a child's work, a question answered
+    /// rather than turned into work, the answer as short as the truth takes, a
+    /// mistake named, and a human already watching the change as its test. A
+    /// subagent has no human in front of it — its prompt must not carry the
     /// root's own manners, or the words are paid for on every request by every
     /// leaf for nothing.
     #[test]
     fn the_root_prompt_owns_the_human_facing_rules() {
         let root = system_prompt("/tmp/ws");
+        assert!(root.contains("Three moves"));
+        assert!(root.contains("it is a judgement"));
+        assert!(root.contains("do not quietly do it"));
         assert!(root.contains("A question gets an answer, not a child"));
         assert!(root.contains("a yes/no question gets one sentence"));
         assert!(root.contains("When you were wrong, say so plainly and correct the record"));
         assert!(root.contains("they are the test"));
         let leaf = subagent_prompt("/tmp/x", 3, true, false);
+        assert!(!leaf.contains("Three moves"));
         assert!(!leaf.contains("not a child"));
         assert!(!leaf.contains("say so plainly"));
         assert!(!leaf.contains("their lane"));
