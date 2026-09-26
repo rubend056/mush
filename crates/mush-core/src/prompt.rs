@@ -27,6 +27,8 @@ workspace.\n\
 tests, builds).\n\
 - Prefer less: removing behaviour, lines and concepts beats adding them. Solve the problem in front of \
 you, not the class you can imagine, and say what you did not build — scope is part of the answer.\n\
+- Be efficient: the fewest calls and the shortest true road, no check run to confirm what you already \
+know — and a benchmark or a sweep gets the time it needs without asking again.\n\
 - When you are done finish with a concise summary of what you did.
 - Don't forget to have fun :)";
 
@@ -75,10 +77,11 @@ stopped as a loop.";
 
 /// The root's own job, in the root's prompt only: the one agent whose work is
 /// the picture and the person rather than a file. It says what the work is, why
-/// an edit of its own is the wrong shape for it, and how it talks to the human:
-/// a question is answered rather than turned into work, in as few words as the
-/// truth takes, and a mistake is named instead of tidied away. How to delegate
-/// stays in [`DELEGATION`], which every delegating agent reads.
+/// an edit of its own is the wrong shape for it, and how it treats the human in
+/// front of it: a question is answered rather than turned into work, in as few
+/// words as the truth takes, a mistake is named instead of tidied away, and a
+/// human already watching the change is its test. How to delegate stays in
+/// [`DELEGATION`], which every delegating agent reads.
 const ROOT_ROLE: &str = "\
 Your job is to orchestrate: hold the overview, decide what happens next, and talk to the human — you \
 are the only agent in this tree who does. The work belongs to subagents, and almost every change should \
@@ -88,7 +91,10 @@ no second reader, and it costs you the picture you were holding.\n\
 only when the human asks for work.\n\
 - Answer the shortest true thing: a yes/no question gets one sentence, with no preamble and no recap \
 nobody asked for.\n\
-- When you were wrong, say so plainly and correct the record.";
+- When you were wrong, say so plainly and correct the record.\n\
+- When the human is watching the thing you are changing, they are the test: touch the file their lane \
+watches, say what to look at, and never start a second server, take their port, or build what a reload \
+will show.";
 
 /// The opening a blank brief leaves: the child's first user message and the
 /// transcript's first line, so the model and the human read the same words.
@@ -723,36 +729,46 @@ mod tests {
         );
     }
 
-    /// The owner's three corrections (2026-09-26), in the root's prompt **only**:
-    /// a question is answered rather than turned into work, the answer is as
-    /// short as the truth takes, and a mistake is named. A subagent has no human
-    /// to answer — its prompt must not carry the root's own manners, or the words
-    /// are paid for on every request by every leaf for nothing.
+    /// The owner's root-only rules (2026-09-26): a question is answered rather
+    /// than turned into work, the answer is as short as the truth takes, a
+    /// mistake is named, and a human already watching the change is its test.
+    /// A subagent has no human in front of it — its prompt must not carry the
+    /// root's own manners, or the words are paid for on every request by every
+    /// leaf for nothing.
     #[test]
-    fn the_root_prompt_answers_questions_briefly_and_owns_its_mistakes() {
+    fn the_root_prompt_owns_the_human_facing_rules() {
         let root = system_prompt("/tmp/ws");
         assert!(root.contains("A question gets an answer, not a child"));
         assert!(root.contains("a yes/no question gets one sentence"));
         assert!(root.contains("When you were wrong, say so plainly and correct the record"));
+        assert!(root.contains("they are the test"));
         let leaf = subagent_prompt("/tmp/x", 3, true, false);
         assert!(!leaf.contains("not a child"));
         assert!(!leaf.contains("say so plainly"));
+        assert!(!leaf.contains("their lane"));
     }
 
-    /// The owner's rule (2026-09-26): removal outranks addition, and scope is
-    /// part of the answer. `RULES` is the shared block, so the rule must reach
-    /// every prompt shape — the root's, a delegating subagent's and a leaf's.
-    /// The two fragments pinned are the rule's name and its scope clause, not
-    /// every word: a rewording that keeps both is a rewording this test allows.
+    /// The owner's rules of 2026-09-26, in `RULES` so they reach every prompt
+    /// shape — the root's, a delegating subagent's and a leaf's: prefer less
+    /// (removal outranks addition) and be efficient (the shortest true road,
+    /// and a benchmark or a sweep gets its time without asking again). The
+    /// fragments pinned are each rule's identifying words, not every sentence:
+    /// a rewording that keeps each rule is a rewording this test allows.
     #[test]
-    fn every_prompt_prefers_less() {
+    fn the_shared_rules_reach_every_prompt() {
         for prompt in [
             system_prompt("/tmp/ws"),
             subagent_prompt("/tmp/ws", 1, true, true),
             subagent_prompt("/tmp/ws", 3, false, false),
         ] {
-            assert!(prompt.contains("Prefer less"), "{prompt}");
-            assert!(prompt.contains("say what you did not build"), "{prompt}");
+            for rule in [
+                "Prefer less",
+                "say what you did not build",
+                "Be efficient",
+                "gets the time it needs without asking again",
+            ] {
+                assert!(prompt.contains(rule), "{rule:?} is missing from: {prompt}");
+            }
         }
     }
 
