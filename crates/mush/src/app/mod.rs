@@ -1891,7 +1891,7 @@ impl App {
             match found {
                 git::Reclaimable::Nothing => self.tree.mark_kept(id, None),
                 git::Reclaimable::Kept(why) => self.tree.mark_kept(id, Some(why)),
-                git::Reclaimable::Landable(_) => {
+                git::Reclaimable::Landable(..) => {
                     if self.in_flight_id(id) {
                         continue;
                     }
@@ -2115,17 +2115,34 @@ impl App {
     /// (finding D3).
     ///
     /// `landed` is written to the session as well as the row: it is what a
-    /// restart shows, so it goes in the same file the tree does.
+    /// restart shows, so it goes in the same file the tree does. A removal that
+    /// took ignored paths with the checkout says so on the bar, because the row
+    /// has one word for the landing and the paths are not in it.
     fn apply_reclaimed(&mut self, id: AgentId, outcome: git::Reclaimed) {
         match outcome {
             git::Reclaimed::Removed {
                 branch_kept,
                 landing,
+                dropped,
             } => {
                 self.tree.mark_reclaimed(id, landing.into());
-                // A ref git would not delete still holds the name — `-d` is the
-                // only deletion mush runs, and it deletes what it can certify —
-                // so the number is spent anyway.
+                // What the removal took with the checkout though a commit could
+                // not keep it: the row says the landing in one word, and the
+                // parent's transcript is told only when the actor's own run end
+                // made the removal (`Work::reap_line`) — so this sweep's own
+                // removal has to say it here, where its reader is the human
+                // watching the row. A removal that takes paths the project
+                // ignores is not silent (the trade [`git::reclaim`] names).
+                if !dropped.is_empty() {
+                    self.say(format!(
+                        "agent {id}'s worktree was reaped, and the paths the project ignores \
+                         went with it: {}",
+                        git::named_paths(&dropped)
+                    ));
+                }
+                // A ref neither deletion would take still holds the name —
+                // `-d` is the first ask and `-D` runs only on the re-asked
+                // question ([`git::reclaim`]) — so the number is spent anyway.
                 if branch_kept.is_some() {
                     self.tree.reserve_agents(id.0.saturating_add(1));
                 }
@@ -9193,7 +9210,10 @@ mod tests {
             conversation: app.tree.conversation(),
             stats: HashMap::new(),
             status: None,
-            sweep: vec![(AgentId(1), git::Reclaimable::Landable(git::Landing::Merged))],
+            sweep: vec![(
+                AgentId(1),
+                git::Reclaimable::Landable(git::Landing::Merged, Vec::new()),
+            )],
         });
         assert!(
             app.sweep_missed && app.sweep_in_flight,
@@ -23035,6 +23055,98 @@ mod tests {
         // A landed agent is not one to send work to: the path it was spawned
         // with is gone, and a run there would recreate it as a plain directory
         // no surface can see (finding S1).
+        assert!(app.worktree_gone(AgentId(1)).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The landing this repository's own children get is a *copy* onto the
+    /// base, not a merge, and the child that built something leaves paths the
+    /// project's ignore rules cover. The next read has to reap both the
+    /// checkout and the branch, and the notice has to name the paths that went:
+    /// a removal that takes what a commit cannot keep is not silent.
+    #[test]
+    fn a_cherry_picked_childs_ignored_leftovers_are_swept_and_named() {
+        use std::fs;
+
+        let root = repo("cherry-sweep");
+        // The project's own rules: the agent checkouts, and whatever the run
+        // generated. mush never decides that for itself.
+        fs::write(root.join(".gitignore"), ".mush/\n/out/*\n").unwrap();
+        git(&root, &["add", ".gitignore"]);
+        git(
+            &root,
+            &["commit", "-qm", "ignore the checkouts and the output"],
+        );
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
+        wait_git(&mut app, &rx);
+        let fork = git_of(&root, &["rev-parse", "HEAD"]).expect("HEAD");
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "build the thing".to_string(),
+                depth: 1,
+                branch: Some("mush/1".to_string()),
+                fork: Some(fork),
+                title: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::Done,
+        });
+        // The `Done` read owns a git process against this repository: let it
+        // finish before the test drives git itself (the index-lock race the
+        // neighbouring test names).
+        wait_git(&mut app, &rx);
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        let worktree = root.join(".mush/wt/1");
+        fs::write(worktree.join("work.txt"), "the child's work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "mush #1: work"]);
+        fs::create_dir_all(worktree.join("out")).unwrap();
+        fs::write(worktree.join("out/report.txt"), "leftover\n").unwrap();
+        // The landing: the child's commit is copied onto the base, so the base
+        // holds a different commit with the same change.
+        git(&root, &["cherry-pick", "mush/1"]);
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        settle_sweep(&mut app, &rx);
+
+        let child = app.tree.node(AgentId(1)).expect("the child is still here");
+        assert_eq!(
+            child.landed,
+            Some(Landed::Merged),
+            "a copied landing is a landing"
+        );
+        assert_eq!(child.branch, None, "the branch it named is gone with it");
+        assert_eq!(child.kept, None, "nothing is left to say about it");
+        assert!(!worktree.exists(), "the checkout is reclaimed");
+        assert!(
+            git_of(&root, &["rev-parse", "--verify", "refs/heads/mush/1"]).is_err(),
+            "and so is the branch"
+        );
+        assert!(
+            git::unlandable(&root).is_empty(),
+            "nothing is left for the cap to count"
+        );
+        let line = app
+            .status_line()
+            .map(|(line, _)| line.to_string())
+            .unwrap_or_default();
+        assert!(
+            line.contains("out/report.txt"),
+            "the notice names what went with the checkout: {line:?}"
+        );
         assert!(app.worktree_gone(AgentId(1)).is_some());
         let _ = fs::remove_dir_all(&root);
     }

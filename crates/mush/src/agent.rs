@@ -309,16 +309,22 @@ pub enum Work {
     /// The run changed nothing at all: the branch stands clean where it was.
     Clean { branch: String },
     /// The run's own end took its checkout and its branch away: the sweep found
-    /// the branch adding nothing to its base and the checkout clean — `landing`
-    /// says which of the two nothings it was ([`git::Landing`]). Its own variant
-    /// because every sentence `Clean` carries is false about it: "the branch
-    /// stands clean where it was" is a lie about a branch mush has just deleted,
-    /// and saying nothing at all is what let the human report a worktree that
-    /// never existed. `Committed` is deliberately not folded in: a run that
-    /// committed has already reported the revision it kept.
+    /// the branch adding nothing to its base — its work landed, or it never
+    /// committed (`landing` says which, [`git::Landing`]) — and the checkout
+    /// holding nothing a commit would take. Its own variant because every
+    /// sentence `Clean` carries is false about it: "the branch stands clean
+    /// where it was" is a lie about a branch mush has just deleted, and saying
+    /// nothing at all is what let the human report a worktree that never
+    /// existed. `Committed` is deliberately not folded in: a run that committed
+    /// has already reported the revision it kept. `dropped` names the paths the
+    /// removal took with it that no commit could keep — every difference the
+    /// checkout had was covered by the project's own ignore rules
+    /// ([`git::reclaim`]) — so the sentence can say what went as well as what
+    /// happened.
     Reaped {
         branch: String,
         landing: git::Landing,
+        dropped: Vec<String>,
     },
     /// The run changed only paths the repository ignores, so there was nothing
     /// to commit and nothing a commit could keep. Its own answer because
@@ -365,12 +371,29 @@ impl Work {
     /// commit's or ignored paths' line is the row's own — that worktree is still
     /// there, to be looked at — while a removal's whole fact is an absence, and
     /// the absence of the branch is what the human read as "it never existed".
+    ///
+    /// A removal that took ignored paths with it names them: they are what a
+    /// commit cannot keep, so the one reader who could still have wanted them
+    /// (the hand that wrote the brief) has to hear that they went, and which
+    /// they were. Nothing is named for a checkout that was clean.
     fn reap_line(&self, id: u64) -> Option<String> {
         match self {
-            Work::Reaped { landing, .. } => Some(format!(
-                "#{id}'s worktree was reaped — {}",
-                Self::landing_words(*landing)
-            )),
+            Work::Reaped {
+                landing, dropped, ..
+            } => {
+                let taken = if dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", and with it the paths the project ignores: {}",
+                        git::named_paths(dropped)
+                    )
+                };
+                Some(format!(
+                    "#{id}'s worktree was reaped — {}{taken}",
+                    Self::landing_words(*landing)
+                ))
+            }
             _ => None,
         }
     }
@@ -395,8 +418,23 @@ impl Work {
         match self {
             Work::Committed { branch, revision } => format!(" · committed {revision} on {branch}"),
             Work::Clean { branch } => format!(" · {branch} clean — nothing changed"),
-            Work::Reaped { branch, landing } => {
-                format!(" · {branch} was reaped — {}", Self::landing_words(*landing))
+            Work::Reaped {
+                branch,
+                landing,
+                dropped,
+            } => {
+                let taken = if dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", dropping the paths the project ignores: {}",
+                        truncate(&git::named_paths(dropped), 60)
+                    )
+                };
+                format!(
+                    " · {branch} was reaped — {}{taken}",
+                    Self::landing_words(*landing)
+                )
             }
             Work::Ignored { branch, paths } => format!(
                 " · {branch} holds ignored work only: {}",
@@ -2317,11 +2355,15 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // does not, and that is the distinction the parent's transcript, the
         // listing and the row all read (`note_work`).
         let landed = reclaim_own_worktree(&actor, &state, &outcome);
+        // Read before `landed` moves into the work fact: the UI's `Reclaimed`
+        // event carries the landing alone, and the paths the removal took are
+        // the sentence's own business ([`Work::reap_line`]).
+        let landing = landed.as_ref().map(|(landing, _)| *landing);
         let work = committed.map(|(branch, found)| work_from_end(branch, found, landed));
         if let Some(work) = &work {
             report_work(&actor, &mut transcript, work);
         }
-        if let Some(landing) = landed {
+        if let Some(landing) = landing {
             actor.ctx.emit(actor.id, AgentEvent::Reclaimed { landing });
         }
         // This run is over, and this is its number: a parent that hears the
@@ -2843,6 +2885,11 @@ fn absorb(
 /// directory*, and a run in a directory that is gone recreates it as a plain
 /// path no surface can see (finding S1). The next run's end sweeps it instead.
 ///
+/// The answer is the whole of the removal — the landing git found, and the paths
+/// the removal took with it though no commit could keep them
+/// ([`git::Reclaimed::Removed`]) — so the sentence the parent reads can name
+/// both.
+///
 /// A *stopped* run is the same fact for a different reason, and it is the road
 /// the human reported: `control stop` leaves an agent "idle, not done;
 /// `control message` resumes it", so the directory its resume runs in is still
@@ -2871,7 +2918,7 @@ fn reclaim_own_worktree(
     actor: &Actor,
     state: &ActorState,
     outcome: &Outcome,
-) -> Option<git::Landing> {
+) -> Option<(git::Landing, Vec<String>)> {
     if actor.branch.is_none()
         || matches!(outcome, Outcome::Stopped(_) | Outcome::Failed(_))
         || !state.running.is_empty()
@@ -2881,7 +2928,9 @@ fn reclaim_own_worktree(
     }
     let base = actor.base.clone().unwrap_or_else(|| "HEAD".to_string());
     match git::reclaim(&actor.ctx.root, actor.id, &base, actor.fork.as_deref()) {
-        git::Reclaimed::Removed { landing, .. } => Some(landing),
+        git::Reclaimed::Removed {
+            landing, dropped, ..
+        } => Some((landing, dropped)),
         _ => None,
     }
 }
@@ -5048,12 +5097,14 @@ fn too_many_worktrees(held: &[u64]) -> String {
         "cannot spawn: {} isolated worktrees already exist and none of them is landable \
          (the limit is {}). Each worktree a tree has published is measured against that \
          node's own base and fork, and one no tree names — a leftover, a restored agent \
-         with no base — against HEAD with no fork; each is dirty, or its branch holds \
-         commits its base does not have, and a nested child merged only into its parent's \
-         branch counts here only while the tree has not named its node: {named}{more}. \
+         with no base — against HEAD with no fork; each is tracked-dirty, or its branch \
+         holds commits whose changes its base does not have, and a nested child merged \
+         only into its parent's branch counts here only while the tree has not named its \
+         node: {named}{more}. \
          Land or drop one first: bring a branch's work to the base it is measured against \
-         (merge it), or remove the checkout and delete the branch (`git worktree remove \
-         --force .mush/wt/<id>` and `git branch -d mush/<id>`).",
+         (merge it, or copy its commits over), or remove the checkout and delete the \
+         branch (`git worktree remove --force .mush/wt/<id>` and `git branch -d \
+         mush/<id>`).",
         held.len(),
         git::MAX_WORKTREES
     )
@@ -6307,10 +6358,14 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
 fn work_from_end(
     branch: String,
     found: Result<git::Commit, String>,
-    landed: Option<git::Landing>,
+    landed: Option<(git::Landing, Vec<String>)>,
 ) -> Work {
     match (work_from_commit(branch, found), landed) {
-        (Work::Clean { branch }, Some(landing)) => Work::Reaped { branch, landing },
+        (Work::Clean { branch }, Some((landing, dropped))) => Work::Reaped {
+            branch,
+            landing,
+            dropped,
+        },
         (work, _) => work,
     }
 }
@@ -10880,6 +10935,7 @@ mod tests {
         let reaped = Work::Reaped {
             branch: "mush/1".into(),
             landing: git::Landing::NothingCommitted,
+            dropped: Vec::new(),
         };
         assert_eq!(
             reaped.digest(),
@@ -10916,6 +10972,7 @@ mod tests {
         let merged = Work::Reaped {
             branch: "mush/1".into(),
             landing: git::Landing::Merged,
+            dropped: Vec::new(),
         };
         assert_eq!(
             merged.reap_line(2).as_deref(),
@@ -10925,6 +10982,27 @@ mod tests {
             merged.digest().contains("its branch was merged"),
             "{}",
             merged.digest()
+        );
+
+        // A removal that took paths a commit cannot keep names them: the one
+        // reader who could still want them is the hand that wrote the brief.
+        let took = Work::Reaped {
+            branch: "mush/1".into(),
+            landing: git::Landing::Merged,
+            dropped: vec!["out/report.txt".into(), "run.log".into()],
+        };
+        assert_eq!(
+            took.reap_line(3).as_deref(),
+            Some(
+                "#3's worktree was reaped — its branch was merged, and with it the paths the \
+                 project ignores: out/report.txt, run.log"
+            )
+        );
+        assert!(
+            took.digest()
+                .contains("dropping the paths the project ignores: out/report.txt, run.log"),
+            "{}",
+            took.digest()
         );
     }
 
@@ -10945,6 +11023,7 @@ mod tests {
         let reaped = Work::Reaped {
             branch: "mush/1".into(),
             landing: git::Landing::NothingCommitted,
+            dropped: Vec::new(),
         };
 
         assert_eq!(
@@ -21295,6 +21374,120 @@ mod tests {
             handle.ids.agents_floor(),
             1,
             "and the number the refusal saved is still there for the next spawn"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the cap: a repository full of worktrees whose work has
+    /// *landed* must not refuse a spawn at all. The landing here is the copied
+    /// one this repository's own children get — each branch stands on a commit
+    /// the base holds only patch-equivalently — and each checkout holds the
+    /// paths the project's own rules ignore, which is exactly what used to pin
+    /// every child that ever generated a file. The cap's own question
+    /// ([`git::unlandable`]) is asserted empty with all `MAX_WORKTREES` still on
+    /// disk, and the spawn is then driven the way the refusal test drives its
+    /// own: the number the tree would hand out is reserved past the leftover
+    /// branches, as `discover_worktrees` reserves it in a real session.
+    #[test]
+    fn the_worktree_cap_lets_a_spawn_through_when_the_children_landed() {
+        let root = init_git_repo("cap-landed");
+        // The project's own rules ignore the checkouts and whatever a run
+        // generated; mush never decides that for itself.
+        fs::write(root.join(".gitignore"), ".mush/\n/out/*\n").unwrap();
+        git_in(&root, &["add", ".gitignore"]);
+        git_in(
+            &root,
+            &["commit", "-qm", "ignore the checkouts and the output"],
+        );
+        // One commit, then its copy: `--amend -m` leaves a commit the base no
+        // longer reaches whose change is in the base under another hash — the
+        // shape a cherry-picked landing leaves. Every child's branch is made at
+        // it, so the whole fixture is one landing mode and no per-child
+        // cherry-pick.
+        fs::write(root.join("work.txt"), "the work\n").unwrap();
+        git_in(&root, &["add", "work.txt"]);
+        git_in(&root, &["commit", "-qm", "mush #1: work"]);
+        let copied = git_rev_parse(&root, "HEAD").expect("the branch's revision");
+        git_in(
+            &root,
+            &["commit", "--amend", "-qm", "the same change, landed"],
+        );
+        let base = git_rev_parse(&root, "HEAD").expect("the base's copy");
+        assert_ne!(copied, base, "the base's copy is a different commit");
+        for id in 1..=git::MAX_WORKTREES as u64 {
+            let path = git::worktree_path(&root, id);
+            git_in(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &git::branch_name(id),
+                    path.to_str().unwrap(),
+                    &copied,
+                ],
+            );
+            fs::create_dir_all(path.join("out")).unwrap();
+            fs::write(path.join("out/report.txt"), "leftover\n").unwrap();
+        }
+        assert_eq!(
+            git::unlandable(&root),
+            Vec::<u64>::new(),
+            "nothing on disk is what refuses a spawn"
+        );
+
+        // The root's opening turn asks for an isolated child; the child answers
+        // whatever it is asked and stops.
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("child done")
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({ "brief": "create a file called cap.txt", "base": "main" }),
+                )])
+                .says("the child was spawned"),
+        );
+        let events = Recorder::new();
+        let handle = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.to_path_buf(),
+            scripted.clone(),
+        );
+        // What the App's `discover_worktrees` does with the ids the repository
+        // still names: the next draw starts above them, so the child does not
+        // land on a branch a leftover already holds.
+        handle.ids.reserve_agents(git::MAX_WORKTREES as u64 + 1);
+        handle
+            .tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("spawn an isolated child".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the root's run must end: {seen:?}"
+        );
+        assert!(
+            events.events().iter().any(|(_, event)| matches!(
+                event,
+                AgentEvent::Spawned { child, .. } if *child == git::MAX_WORKTREES as u64 + 1
+            )),
+            "the spawn is accepted, not refused: {:?}",
+            seen
+        );
+        assert!(
+            !events.events().iter().any(|(_, event)| matches!(
+                event,
+                AgentEvent::Message(message) if message.text().contains("none of them is landable")
+            )),
+            "and the cap's refusal never reaches the model"
         );
         let _ = fs::remove_dir_all(&root);
     }

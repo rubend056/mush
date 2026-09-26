@@ -2086,7 +2086,7 @@ mod tests {
     fn a_kept_worktree_says_why_it_is_still_there() {
         let mut open = node(Phase::Done, 1);
         open.branch = Some("mush/9".to_string());
-        open.kept = Some("mush/9 has 2 commits nobody merged into HEAD".to_string());
+        open.kept = Some("mush/9 has 2 commits whose changes are not in HEAD".to_string());
 
         let text = agent_detail(&open).join(" · ");
         assert!(text.contains("kept — mush/9 has 2 commits"), "{text:?}");
