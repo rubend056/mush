@@ -25,6 +25,8 @@ workspace.\n\
 - `read_file`, `list_files` and `search` read; `write_file` creates or replaces a whole file; \
 `edit_file` changes exact text in one. `run_command` is the shell, for everything else (git, \
 tests, builds).\n\
+- Prefer less: removing behaviour, lines and concepts beats adding them. Solve the problem in front of \
+you, not the class you can imagine, and say what you did not build — scope is part of the answer.\n\
 - When you are done finish with a concise summary of what you did.
 - Don't forget to have fun :)";
 
@@ -72,14 +74,21 @@ hands over) — but never `sleep` to wait: a finish arrives on its own, and a re
 stopped as a loop.";
 
 /// The root's own job, in the root's prompt only: the one agent whose work is
-/// the picture and the person rather than a file. It says what the work is and
-/// why an edit of its own is the wrong shape for it; how to delegate stays in
-/// [`DELEGATION`], which every delegating agent reads.
+/// the picture and the person rather than a file. It says what the work is, why
+/// an edit of its own is the wrong shape for it, and how it talks to the human:
+/// a question is answered rather than turned into work, in as few words as the
+/// truth takes, and a mistake is named instead of tidied away. How to delegate
+/// stays in [`DELEGATION`], which every delegating agent reads.
 const ROOT_ROLE: &str = "\
 Your job is to orchestrate: hold the overview, decide what happens next, and talk to the human — you \
 are the only agent in this tree who does. The work belongs to subagents, and almost every change should \
 happen in a child's run: an edit you make yourself lands in this checkout with no brief, no branch and \
-no second reader, and it costs you the picture you were holding.";
+no second reader, and it costs you the picture you were holding.\n\
+- A question gets an answer, not a child: answer it from the code, name what you found, and queue work \
+only when the human asks for work.\n\
+- Answer the shortest true thing: a yes/no question gets one sentence, with no preamble and no recap \
+nobody asked for.\n\
+- When you were wrong, say so plainly and correct the record.";
 
 /// The opening a blank brief leaves: the child's first user message and the
 /// transcript's first line, so the model and the human read the same words.
@@ -712,6 +721,39 @@ mod tests {
             title.contains("one-line"),
             "the row paints one line: {title}"
         );
+    }
+
+    /// The owner's three corrections (2026-09-26), in the root's prompt **only**:
+    /// a question is answered rather than turned into work, the answer is as
+    /// short as the truth takes, and a mistake is named. A subagent has no human
+    /// to answer — its prompt must not carry the root's own manners, or the words
+    /// are paid for on every request by every leaf for nothing.
+    #[test]
+    fn the_root_prompt_answers_questions_briefly_and_owns_its_mistakes() {
+        let root = system_prompt("/tmp/ws");
+        assert!(root.contains("A question gets an answer, not a child"));
+        assert!(root.contains("a yes/no question gets one sentence"));
+        assert!(root.contains("When you were wrong, say so plainly and correct the record"));
+        let leaf = subagent_prompt("/tmp/x", 3, true, false);
+        assert!(!leaf.contains("not a child"));
+        assert!(!leaf.contains("say so plainly"));
+    }
+
+    /// The owner's rule (2026-09-26): removal outranks addition, and scope is
+    /// part of the answer. `RULES` is the shared block, so the rule must reach
+    /// every prompt shape — the root's, a delegating subagent's and a leaf's.
+    /// The two fragments pinned are the rule's name and its scope clause, not
+    /// every word: a rewording that keeps both is a rewording this test allows.
+    #[test]
+    fn every_prompt_prefers_less() {
+        for prompt in [
+            system_prompt("/tmp/ws"),
+            subagent_prompt("/tmp/ws", 1, true, true),
+            subagent_prompt("/tmp/ws", 3, false, false),
+        ] {
+            assert!(prompt.contains("Prefer less"), "{prompt}");
+            assert!(prompt.contains("say what you did not build"), "{prompt}");
+        }
     }
 
     #[test]
