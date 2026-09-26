@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 
-use mush_core::text::truncate;
+use mush_core::text::{first_line, truncate};
 use mush_core::workspace::tail_for_model;
 
 use crate::agent::{AgentEvent, AgentMsg};
@@ -108,15 +108,18 @@ pub fn unknown_job(id: JobId) -> String {
 /// [`Registry::finish`] forgets the oldest ended record once nine have ended.
 pub const STATUS_WINDOW: usize = 6_000;
 
-/// How much of a job's command a job's line carries, in columns.
+/// How much of a job's command a **listing's** headline carries, in columns.
 ///
 /// A `run_command` is uncapped upstream — a 2 KB script is an ordinary call —
 /// while `status` is the one tool result bounded on its own terms
 /// ([`STATUS_WINDOW`]), and every headline in it carries the command: a headline
 /// that spelled one whole would put an unbounded line on top of a bounded
-/// window, however many jobs there are. The line lands in the transcript too, so
-/// it is cut where it is built, exactly as a refusal sentence cuts the command
-/// it names ([`REFUSAL_COMMAND_COLUMNS`]).
+/// window, however many jobs there are. So the *listing's* reading of a job's
+/// line cuts the command where the line is built ([`JobOutcome::listing`]),
+/// exactly as a refusal sentence cuts the command it names
+/// ([`REFUSAL_COMMAND_COLUMNS`]) — while the *transcript's* reading spells it
+/// whole ([`JobOutcome::line`]), because that is where the ask the call row made
+/// is painted and the unfolded view wraps an ask and never cuts it.
 const STATUS_COMMAND_COLUMNS: usize = 60;
 
 /// How often a running command is polled. Ten milliseconds is the latency
@@ -284,11 +287,18 @@ impl JobOutcome {
 
     /// The one line a job is reported in: `#c2 done: exit 0 · 3m12s · cargo
     /// test — test result: ok.`. Kept here so the transcript line, the bar and
-    /// `status` say the same thing about the same job.
+    /// `status` say the same thing about the same job; they part only in how
+    /// much of the command they can spend ([`Self::listing`]).
     ///
-    /// The command is cut to [`STATUS_COMMAND_COLUMNS`] here, where the line is
-    /// built: `status` prints this line for a job that has ended, and the
-    /// command it names is uncapped upstream.
+    /// The command is spelled **whole** — its own first line, whitespace
+    /// collapsed, which is the line the call row's ask is drawn from
+    /// (`crate::agent::command_ask`) — because that is what this line lands
+    /// beside: the unfolded view wraps an ask and never cuts it
+    /// (`crate::app::call_grid`), so a copy of that command cut here would
+    /// wear a `…` in the middle of a block `Ctrl-O` can make whole everywhere
+    /// else. The line goes into the transcript, which the pane folds and wraps
+    /// as its view and width ask; a *listing* that must stay bounded prints
+    /// [`Self::listing`] instead.
     ///
     /// A command that ended with its group still standing says so where its own
     /// end is said — `#c2 done: exit 0 · 1s — 1 process in its group was
@@ -302,7 +312,53 @@ impl JobOutcome {
         tail: &str,
         group: &GroupEnding,
     ) -> String {
-        let command = truncate(command, STATUS_COMMAND_COLUMNS);
+        self.spelled(id, command, age, tail, group, false)
+    }
+
+    /// The same line as a **bounded listing** prints it: the command cut to
+    /// [`STATUS_COMMAND_COLUMNS`].
+    ///
+    /// `status` carries every job's headline on top of the one window its
+    /// answer spends ([`STATUS_WINDOW`]) and a `run_command` is uncapped
+    /// upstream — a 2 KB script is an ordinary call — so a headline that spelled
+    /// one whole would put an unbounded line on top of a bounded window, however
+    /// many jobs there are. The cut is the same field-cut a refusal sentence
+    /// makes for the command it names ([`REFUSAL_COMMAND_COLUMNS`]). The bar
+    /// takes this reading too: it has one row, and a `…` with the end of the
+    /// window behind it says more there than a command running off the edge.
+    pub fn listing(
+        &self,
+        id: JobId,
+        command: &str,
+        age: Duration,
+        tail: &str,
+        group: &GroupEnding,
+    ) -> String {
+        self.spelled(id, command, age, tail, group, true)
+    }
+
+    /// The one sentence, with the command read the reader's way: the
+    /// transcript's spelling of the ask whole ([`Self::line`]), or the cut a
+    /// one-line surface can spend ([`Self::listing`]). One body, so the two
+    /// readings cannot disagree about the outcome, the age, the command or the
+    /// tail.
+    fn spelled(
+        &self,
+        id: JobId,
+        command: &str,
+        age: Duration,
+        tail: &str,
+        group: &GroupEnding,
+        listing: bool,
+    ) -> String {
+        // The command's own first line, whitespace collapsed: a line is a line,
+        // so a heredoc's thirty-line script names itself as the ask's row does
+        // (`python3 - <<'PY'`) rather than putting its body inside the report.
+        let command = if listing {
+            listed_command(command)
+        } else {
+            first_line(command)
+        };
         let head = match self {
             JobOutcome::Exited(code) => format!("{id} done: exit {code} · {}", short_age(age)),
             // The signal by its number is the one name for it every human reads
@@ -342,6 +398,18 @@ impl JobOutcome {
             format!("{head} · {command} — {tail}")
         }
     }
+}
+
+/// The command as a **listing** names it: its own first line, cut to
+/// [`STATUS_COMMAND_COLUMNS`].
+///
+/// One home for the reading every bounded headline wears — `status`'s line for
+/// a job still running, and the bounded line of one that has ended
+/// ([`JobOutcome::listing`]) — because the command is uncapped upstream and a
+/// headline rides on top of the one window a listing spends. The transcript
+/// names the same command whole ([`JobOutcome::line`]).
+fn listed_command(command: &str) -> String {
+    truncate(&first_line(command), STATUS_COMMAND_COLUMNS)
 }
 
 /// What was left in a command's process group when the command itself had
@@ -1452,8 +1520,8 @@ impl Registry {
     /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`], so
     /// a status spends the same budget on one job or on sixteen. Each job keeps
     /// its headline — what the model chooses between — and the command in it is
-    /// cut to [`STATUS_COMMAND_COLUMNS`], because a command is uncapped upstream
-    /// and a headline is not a place to spend a 2 KB script.
+    /// read by [`listed_command`], because a command is uncapped upstream and a
+    /// headline is not a place to spend a 2 KB script.
     ///
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the
@@ -1492,13 +1560,16 @@ impl Registry {
                             record.id,
                             short_age(now.saturating_duration_since(record.started)),
                             if holds { " · holds the machine" } else { "" },
-                            truncate(&record.command, STATUS_COMMAND_COLUMNS)
+                            listed_command(&record.command)
                         ),
                         live.tail(per_job),
                     )
                 }
-                // The line a job ended with carries its outcome, its age and its
-                // cut command, so it is the headline as it stands.
+                // The listing's reading of the line a job ended with: its
+                // outcome, its age and its cut command
+                // ([`JobOutcome::listing`]), which is the headline as it
+                // stands — the transcript's own line spells the ask whole, and
+                // a listing is the surface that cannot.
                 State::Ended { line, tail } => (line.clone(), tail_for_model(tail, per_job)),
             };
             lines.push(head);
@@ -1523,6 +1594,11 @@ impl Registry {
     /// A job has ended: keep the line its owner reads and the window it kept,
     /// release the machine if it was the holder, and forget the oldest ended job
     /// if there are too many.
+    ///
+    /// The line is the **listing's** reading ([`JobOutcome::listing`]): the
+    /// record is what `status` and `control`'s stop answer print, and both are
+    /// bounded one-row surfaces. The transcript's own reading went to the
+    /// actor and the UI with the same end ([`watch`], [`JobOutcome::line`]).
     ///
     /// Called from the job's own thread, which holds the job's own `Live` and is
     /// the only thing that ends its record — the one caller, so there is no "no
@@ -1707,14 +1783,20 @@ fn watch(
     // E9): nothing has to come back out of the record it ends, so `finish` has
     // no case where there is no record to report — the old fallback for one of
     // those spelled the age as `0s`.
+    //
+    // Two readings of the one line, because its readers spend the command
+    // differently: the transcript (and the books a `wait` answers from) spells
+    // the ask whole ([`JobOutcome::line`]), while the record `status` prints and
+    // the bar's one row take the bounded reading ([`JobOutcome::listing`]).
     let age = registry.clock.now().saturating_duration_since(started);
     let line = outcome.line(id, &command, age, &tail, &group);
-    registry.finish(id, line.clone(), tail);
+    let headline = outcome.listing(id, &command, age, &tail, &group);
+    registry.finish(id, headline.clone(), tail);
     registry.events.emit(
         AgentId(owner),
         AgentEvent::JobDone {
             job: id,
-            line: line.clone(),
+            line: headline,
         },
     );
     // Exactly once, and to the owner's own mailbox: a job's completion is
@@ -1950,6 +2032,68 @@ mod tests {
             line,
             "#c2 done: exit 0 · 3m12s · cargo test — running 12 tests · test result: ok. 12 passed"
         );
+        // The same sentence has two readings, and the command is the one part
+        // they spell differently: the **transcript's** is the ask the call row
+        // made — its own first line, whole — and a **listing's** is that command
+        // cut, because `status` carries every job's headline on top of the one
+        // window its answer spends.
+        let command =
+            "cargo test --workspace --all-features --release -- --test-threads=1 --nocapture";
+        let spoken = JobOutcome::Exited(0).line(
+            JobId(2),
+            command,
+            Duration::from_secs(192),
+            "test result: ok",
+            &GroupEnding::Empty,
+        );
+        assert_eq!(
+            spoken,
+            format!("#c2 done: exit 0 · 3m12s · {command} — test result: ok")
+        );
+        assert!(!spoken.contains('…'), "nothing of the ask is cut: {spoken}");
+        let listed = JobOutcome::Exited(0).listing(
+            JobId(2),
+            command,
+            Duration::from_secs(192),
+            "test result: ok",
+            &GroupEnding::Empty,
+        );
+        assert!(
+            listed.contains(&truncate(command, STATUS_COMMAND_COLUMNS)),
+            "the listing cuts the command: {listed}"
+        );
+        assert!(
+            !listed.contains("--nocapture"),
+            "a listing stays inside its headline: {listed}"
+        );
+        assert_eq!(
+            listed,
+            spoken.replace(command, &truncate(command, STATUS_COMMAND_COLUMNS)),
+            "the two readings part on the command and nothing else"
+        );
+        // A heredoc is a line too: both readings name it by the first line the
+        // ask's own row names, and neither puts the script's body in a report —
+        // the body is the call's own script block ([`crate::app::call_grid`]).
+        let script = "python3 - <<'PY'\nimport sys\nfor n in range(3):\n    print(n)\nPY";
+        let spoken = JobOutcome::Exited(0).line(
+            JobId(2),
+            script,
+            Duration::from_secs(192),
+            "0\n1\n2",
+            &GroupEnding::Empty,
+        );
+        assert_eq!(
+            spoken,
+            "#c2 done: exit 0 · 3m12s · python3 - <<'PY' — 0 · 1 · 2"
+        );
+        let listed = JobOutcome::Exited(0).listing(
+            JobId(2),
+            script,
+            Duration::from_secs(192),
+            "0\n1\n2",
+            &GroupEnding::Empty,
+        );
+        assert_eq!(listed, spoken, "a short first line is the same in both");
         assert!(JobOutcome::Exited(0).is_news(), "a result nobody has read");
         // A signal death is its own outcome and its own sentence: `-1` was not
         // an exit code, and it said nothing about what ended the job — an OOM

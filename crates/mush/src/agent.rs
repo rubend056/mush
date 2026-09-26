@@ -890,10 +890,12 @@ pub enum AgentMsg {
     /// by, and it stays read, because nothing about the result changed.
     ChildParked { id: u64 },
     /// A job this agent started ended. `line` is the report its owner reads,
-    /// rendered once by the registry; `news` says whether it is worth waking a
-    /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
-    /// killed is the human's doing, not a result). A [`JobId`], so a job's
-    /// report can never be filed against a child's id.
+    /// rendered once by the registry — the **transcript's** reading, whose
+    /// command spells the ask the call row made whole (`docs/mush.md` §5.6,
+    /// [`crate::jobs::JobOutcome::line`]) — and `news` says whether it is worth
+    /// waking a napping agent for (`ChildDone` and `Outcome::is_news` again: a
+    /// job mush killed is the human's doing, not a result). A [`JobId`], so a
+    /// job's report can never be filed against a child's id.
     CommandDone { id: JobId, line: String, news: bool },
 }
 
@@ -1107,9 +1109,12 @@ pub enum AgentEvent {
         job: JobId,
         command: String,
     },
-    /// A job ended, with the line its owner reads (`#c2 done: exit 0 · 3m12s ·
-    /// cargo test — …`). Emitted by the job's own thread, so a job that ends
-    /// while its owner naps still updates the screen.
+    /// A job ended, with the line the bar shows (`#c2 done: exit 0 · 3m12s ·
+    /// cargo test — …`). It is the bounded reading
+    /// ([`crate::jobs::JobOutcome::listing`]): the bar has one row. The
+    /// transcript's own reading of the same end reaches the actor as an
+    /// [`AgentMsg::CommandDone`]. Emitted by the job's own thread, so a job
+    /// that ends while its owner naps still updates the screen.
     JobDone {
         job: JobId,
         line: String,

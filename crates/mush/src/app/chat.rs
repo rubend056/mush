@@ -12238,4 +12238,239 @@ mod tests {
             );
         }
     }
+
+    /// A detached command's line in the transcript spells the **ask** whole:
+    /// the command the call row made, wrapped by the pane exactly as the same
+    /// command's foreground row is — no `…` standing inside it, because the
+    /// unfolded view wraps an ask and never cuts it ([`call_grid`]) and this
+    /// line lands in that same view. The command here is longer than a
+    /// listing's bound (`jobs::STATUS_COMMAND_COLUMNS`), which is what makes a
+    /// cut visible.
+    #[test]
+    fn a_detached_commands_line_spells_the_ask_whole() {
+        use crate::ids::JobId;
+        use crate::jobs::{GroupEnding, JobOutcome};
+
+        let command =
+            "cargo test --workspace --all-features --release -- --test-threads=1 --nocapture";
+        let mut chat = Chat::bare();
+        // The shown view: the one whose ask wraps whole.
+        chat.set_output(true);
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![tool_call(
+                    "c2",
+                    "run_command",
+                    &format!(
+                        r#"{{"command":{},"detach":true}}"#,
+                        serde_json::to_string(command).unwrap()
+                    ),
+                )]),
+                ..Message::assistant("")
+            },
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "c2",
+                "[still running — detached as #c2; you will be told when it finishes]",
+            ),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::mush(JobOutcome::Exited(0).line(
+                JobId(2),
+                command,
+                Duration::from_secs(192),
+                "test result: ok. 1164 passed",
+                &GroupEnding::Empty,
+            )),
+        );
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 80, 40));
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("· #c2 done"))
+            .unwrap_or_else(|| panic!("the job's report is painted: {rows:#?}"));
+        // The call's own ask wraps the command whole, on the rows above the
+        // report.
+        assert!(
+            rows[..at].iter().any(|row| row.contains("--nocapture")),
+            "the call row spells the ask: {rows:#?}"
+        );
+        // And the line the job is reported in spells that same command: every
+        // word of it is on the report's rows, and no `…` stands inside it.
+        let report: Vec<String> = rows[at..]
+            .iter()
+            .take_while(|row| !row.is_empty())
+            .map(|row| row.trim_start().to_string())
+            .collect();
+        let spelled = report.join(" ");
+        assert!(
+            spelled.contains(command),
+            "the report spells the ask whole: {report:#?}"
+        );
+        assert!(
+            report.iter().all(|row| !row.contains('…')),
+            "no cut inside the report: {report:#?}"
+        );
+    }
+
+    /// The whole behaviour, on the same command twice: a detached command's
+    /// block reads like its foreground counterpart's. The call's ask is the
+    /// **same words at the same widths** — bar the `· background` chip that says
+    /// how it ran — because the unfolded view wraps an ask and never cuts it;
+    /// the job's report in the transcript spells that same ask whole; and the
+    /// compact log still gives every call its one row (its one-row cut is the
+    /// compact log's own design, and a *listing*'s cut — `status`, the bar — is
+    /// pinned in `jobs`'s own test).
+    ///
+    /// Swept over widths, so the wrap is exercised and the pin is not one
+    /// pane's luck.
+    #[test]
+    fn a_detached_commands_block_reads_like_a_foreground_ones() {
+        use crate::ids::JobId;
+        use crate::jobs::{GroupEnding, JobOutcome};
+
+        let command =
+            "cargo test --workspace --all-features --release -- --test-threads=1 --nocapture";
+
+        /// The same call answered the two ways: the tool call's own result in
+        /// the transcript, or the handover line and the job's report.
+        fn transcript(detached: bool) -> Chat {
+            let command =
+                "cargo test --workspace --all-features --release -- --test-threads=1 --nocapture";
+            let output = "test result: ok. 1164 passed";
+            let arguments = if detached {
+                format!(
+                    r#"{{"command":{},"detach":true}}"#,
+                    serde_json::to_string(command).unwrap()
+                )
+            } else {
+                format!(
+                    r#"{{"command":{}}}"#,
+                    serde_json::to_string(command).unwrap()
+                )
+            };
+            let mut chat = Chat::bare();
+            chat.push_message(
+                AgentId::ROOT,
+                Message {
+                    tool_calls: Some(vec![tool_call("c1", "run_command", &arguments)]),
+                    ..Message::assistant("")
+                },
+            );
+            if detached {
+                chat.push_message(
+                    AgentId::ROOT,
+                    Message::tool(
+                        "c1",
+                        "[still running — detached as #c1; you will be told when it finishes]",
+                    ),
+                );
+                chat.push_message(
+                    AgentId::ROOT,
+                    Message::mush(JobOutcome::Exited(0).line(
+                        JobId(1),
+                        command,
+                        Duration::from_secs(192),
+                        output,
+                        &GroupEnding::Empty,
+                    )),
+                );
+            } else {
+                chat.push_message(
+                    AgentId::ROOT,
+                    Message::tool("c1", format!("{output}\n[exit 0 after 3m12s]")),
+                );
+            }
+            chat
+        }
+
+        /// One call block's rows: everything from its first row through the row
+        /// its grid arrow stands on.
+        fn block(rows: &[String], width: usize) -> Vec<String> {
+            let head = rows
+                .iter()
+                .position(|row| has_grid_arrow(row, width))
+                .unwrap_or_else(|| panic!("the call's arrow row: {rows:#?}"));
+            rows[..=head].to_vec()
+        }
+
+        /// What a block's ask says: the columns left of the grid's arrow, joined
+        /// by the spaces the wrap dropped — so two calls are compared on their
+        /// words and not on where the pane broke them.
+        fn ask_of(block: &[String], width: usize) -> String {
+            block
+                .iter()
+                .map(|row| match grid_arrow_at(row, width) {
+                    Some(at) => row[..at].trim().to_string(),
+                    None => row.trim().to_string(),
+                })
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        for width in [40usize, 60, 80, 120] {
+            let mut foreground = transcript(false);
+            foreground.set_output(true);
+            let plain = shown(&pane_rows(&foreground, &pane(AgentId::ROOT), width, 60));
+            let mut detached = transcript(true);
+            detached.set_output(true);
+            let registered = shown(&pane_rows(&detached, &pane(AgentId::ROOT), width, 60));
+
+            // The asks are the same words at the same widths: the one difference
+            // is the chip that says how the detached call ran.
+            let one = ask_of(&block(&plain, width), width);
+            let other = ask_of(&block(&registered, width), width).replace("· background", "");
+            assert_eq!(
+                other.trim_end(),
+                one,
+                "{width} columns: the same ask either way: {registered:#?}"
+            );
+            assert!(
+                one.contains(command),
+                "{width} columns: the ask wraps the whole command, cut nowhere: {one:?}"
+            );
+
+            // And the job's report spells that same ask whole, at this width.
+            let at = registered
+                .iter()
+                .position(|row| row.starts_with("· #c1 done"))
+                .unwrap_or_else(|| {
+                    panic!("{width} columns: the report is painted: {registered:#?}")
+                });
+            let report: Vec<String> = registered[at..]
+                .iter()
+                .take_while(|row| !row.is_empty())
+                .map(|row| row.trim_start().to_string())
+                .collect();
+            assert!(
+                report.join(" ").contains(command),
+                "{width} columns: the report spells the ask whole: {report:#?}"
+            );
+            assert!(
+                report.iter().all(|row| !row.contains('…')),
+                "{width} columns: no cut inside the report: {report:#?}"
+            );
+        }
+
+        // The compact log keeps its one row per call in both cases: `Ctrl-O` is
+        // where an ask expands, and what the two views differ in is the ask's
+        // own rows — never the number of calls per row.
+        for width in [40usize, 80, 120] {
+            for detached in [false, true] {
+                let mut chat = transcript(detached);
+                chat.set_output(false);
+                let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), width, 60));
+                assert_eq!(
+                    block(&rows, width).len(),
+                    1,
+                    "{width} columns, detached={detached}: one row per call: {rows:#?}"
+                );
+            }
+        }
+    }
 }

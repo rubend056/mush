@@ -1207,8 +1207,15 @@ owner's mailbox exactly like `ChildDone`: it wakes a napping agent, is delivered
 once, and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: ok. …`.
 A job's kept output is a **tail**, consistently, in the completion line and in
 `status` alike: a job is read when it *ends*, and what ended it is at the bottom,
-not the top. Jobs are budgeted (`MAX_JOBS`, machine-wide and beside `MAX_AGENTS`)
-because each is a thread, a process group, and disk; a job does **not** count
+not the top. The **command** inside that line is the one part the two readers
+spell differently: the transcript carries the ask the call row made — the
+command's own first line, whole, so `Ctrl-O` wraps it exactly as it wraps the
+ask above it and no `…` stands inside it — while a *listing* that must stay
+bounded (`status`, whose every headline rides on top of one `STATUS_WINDOW`; the
+bar, which has one row) cuts it to `STATUS_COMMAND_COLUMNS`
+(`jobs::JobOutcome::line` and `::listing`). Jobs are budgeted (`MAX_JOBS`,
+machine-wide and beside `MAX_AGENTS`) because each is a thread, a process group,
+and disk; a job does **not** count
 against `MAX_AGENTS`, and the budget is one machine-wide cap rather than a
 per-agent one, since a per-agent cap would let every agent `MAX_AGENTS` allows
 hold eight builds each. They die with their agent (`Shutdown`, Ctrl-N), with
