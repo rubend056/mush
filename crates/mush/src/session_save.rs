@@ -851,10 +851,19 @@ mod tests {
         fs::remove_file(root.join(".mush")).unwrap();
         writer.flush();
         assert_eq!(last_message(&root), "kept", "the retained snapshot landed");
-        assert_eq!(
-            writer.writes(),
-            2,
-            "two attempts: the failed one and the retry"
+        // At least the failed attempt and the attempt that landed it, and at
+        // most one more: the wake of the *first* flush above can arrive while
+        // the store is still broken and retry there, so the retry that lands is
+        // sometimes the third attempt rather than the second (measured: with
+        // twelve busy loops on the box, three attempts where the box is calm
+        // gives two). What the rule promises is that the snapshot lands on a
+        // *wake* — the `last_message` above, with one `save` in the whole test,
+        // is that promise — and that no wake loops on the failure, which the
+        // upper bound is here to catch.
+        assert!(
+            (2..=3).contains(&writer.writes()),
+            "the failure, one retry per wake, and the write that lands it: {}",
+            writer.writes()
         );
         let _ = fs::remove_dir_all(&root);
     }
