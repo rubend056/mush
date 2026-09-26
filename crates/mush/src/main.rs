@@ -2107,7 +2107,7 @@ mod tests {
         assert_eq!(field("model"), "no model");
         assert_eq!(
             field("window"),
-            "8192 tokens (assumed from mush's model table)"
+            "32768 tokens (assumed from mush's model table)"
         );
         assert_eq!(field("temperature"), "1.0");
         // Nothing stated: the two knobs report the provider default they will
@@ -2117,7 +2117,7 @@ mod tests {
         assert_eq!(
             field("reply cap"),
             format!("{} tokens as max_tokens", cap),
-            "an 8192-token window affords the floor, and the row says which number that is"
+            "at the default window the cap is its eighth, and the row says which number"
         );
         assert_eq!(field("api key"), "(none)");
         assert_eq!(field("auto-approve"), "no");

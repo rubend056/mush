@@ -3015,10 +3015,10 @@ impl App {
     /// ([`mush_core::transcript::compaction_trigger`], printed at its own
     /// place), and the attach gate measures its room from it. Comparing the
     /// same `used` to the *window* instead made the marks unreachable in
-    /// normal operation: on the 8 K default the fold fires at ≈3.7k of the
-    /// budget, which the old meter read as 45 % — so `full` never happened,
-    /// and the human had no way to see a fold or a cut coming (the audit's
-    /// finding). The window keeps its own number, with the mark of the road it
+    /// normal operation: on the 8 K window of the day the fold fires at ≈3.7k
+    /// of the budget, which the old meter read as 45 % — so `full` never
+    /// happened, and the human had no way to see a fold or a cut coming (the
+    /// audit's finding). The window keeps its own number, with the mark of the road it
     /// came by ([`window_mark`]): `~8k` assumed from the model table, `≈8k`
     /// advertised by the endpoint's model list, `≤8k` named in a refusal, and
     /// no mark on the human's own number — so what the budget is a reserve off
@@ -7954,23 +7954,29 @@ mod tests {
         assert!(over.contains(" over"), "{over}");
     }
 
-    /// A8, the probe: on a window whose fold cannot fit — a fold is refused
-    /// below ≈5.5 k tokens, and `/context` accepts down to 1,024 — the pane's
-    /// copy accumulates every turn the actor's list cut, and the store and the
-    /// meter used to grow with it without bound.
+    /// A8, the probe: the pane's copy accumulates every turn the actor's list
+    /// cut, and the store and the meter used to grow with it without bound.
+    /// (The window here was once 5,376 — a band where a fold was refused —
+    /// but the prompt has grown until the trim's own floor, prompt + note +
+    /// the turns it must keep, no longer fits that window's 8,064-byte
+    /// budget.)
     ///
     /// The fix reads a bounded view: `used_weight_for` and `session_snapshot`
     /// trim a copy of the conversation the way an actor trims its own list, so
-    /// the `ctx` meter reads what the next request will carry and the file
-    /// stays within one turn of the budget. The pane keeps the full record —
-    /// scrolling the human's conversation is what the pane is for.
+    /// the pane's record and that view differ, the `ctx` meter reads what the
+    /// next request will carry, the file stays within one turn of the budget,
+    /// and the marks stay off while the view fits. The window is 8,192 because
+    /// the bounded view's floor — the real prompt, the note, and the newest
+    /// turns the trim must keep, 9,883 B — has to fit the 12,288-byte budget
+    /// the window leaves. The pane keeps the full record — scrolling the
+    /// human's conversation is what the pane is for.
     #[test]
     fn the_store_and_the_meter_hold_a_bounded_view() {
         let (mut app, _rx) = test_app("bounded-view");
-        // 5,376 tokens is an 8,064-byte budget, just inside the band where the
-        // fold is refused (it fits from ≈5,504): every turn the actor cuts is a
-        // turn the pane used to keep forever.
-        app.cell.edit(|cfg| cfg.set_context(5_376));
+        // 8,192 tokens is a 12,288-byte budget; the bounded view's floor is
+        // 9,883 B, so every turn the actor cuts is a turn the pane used to keep
+        // forever.
+        app.cell.edit(|cfg| cfg.set_context(8_192));
         let budget = app.cfg().history_budget();
         let conversation = app.tree.conversation();
         for run in 1..=24 {
@@ -17798,13 +17804,13 @@ mod tests {
 
         assert_eq!(
             app.cfg().context_tokens,
-            8_192,
+            32_768,
             "the model has no documented window, so the table's fallback stands"
         );
         assert_eq!(app.cfg().context_source, WindowSource::Table);
         assert_eq!(
             text_of(&app),
-            "ctx ~8.2k · assumed from mush's model table — the statement is forgotten"
+            "ctx ~32.8k · assumed from mush's model table — the statement is forgotten"
         );
 
         let stored = Session::load(&root).expect("the forgetting flushed");
@@ -17813,7 +17819,10 @@ mod tests {
             "the stored statement is gone, not left to be re-applied"
         );
         let resolved = resolved_from_session(&stored);
-        assert_eq!(resolved.context_tokens, 8_192, "a restart derives it again");
+        assert_eq!(
+            resolved.context_tokens, 32_768,
+            "a restart derives it again"
+        );
         assert!(
             !resolved.context_explicit(),
             "and reads no statement into the fresh process"

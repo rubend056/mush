@@ -314,11 +314,12 @@ pictures are never given up, and pricing is still by pixels.
 
 ### History budget
 
-Small local models have small contexts (a custom provider's default window is
-8 K, `provider::PROVIDERS`). Every request reserves room for the tool schemas,
-the reply and a margin, and the rest is the history budget the run trims and
-folds at. Before each request the agent
-folds or trims, in that order, and always cuts at a **user** message boundary so
+A window nobody states is 32,768 tokens — a custom provider's default (the
+`custom` row of `provider::PROVIDERS` reads `DEFAULT_CONTEXT_TOKENS`), because
+the system prompt and a real screenshot no longer fit an 8k budget. Every
+request reserves room for the tool schemas, the reply and a margin, and the
+rest is the history budget the run trims and folds at. Before each request the
+agent folds or trims, in that order, and always cuts at a **user** message boundary so
 assistant/tool pairs stay valid.
 
 Trimming drops information, so it is the fallback, not the first move: once the

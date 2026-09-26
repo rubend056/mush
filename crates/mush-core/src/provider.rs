@@ -218,7 +218,7 @@ pub fn thinking_default_hint() -> String {
 }
 
 /// How the home config's own header spells the built-in window per provider,
-/// e.g. `120000 for deepseek, 8192 for custom`. Spelled from the table like the
+/// e.g. `120000 for deepseek, 32768 for custom`. Spelled from the table like the
 /// other hints, so the number a human reads in a hand-editable file cannot
 /// drift from the one a request would be sized against.
 pub fn context_default_hint() -> String {
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(names_piped(), "deepseek|custom");
         assert_eq!(
             context_default_hint(),
-            "120000 for deepseek, 8192 for custom"
+            "120000 for deepseek, 32768 for custom"
         );
         assert_eq!(thinking_default_hint(), "on for deepseek, off elsewhere");
         assert_eq!(
@@ -337,13 +337,13 @@ mod tests {
 
     /// The window a provider falls back to when nobody stated one: for DeepSeek
     /// the number the human stated (120k), not a small guess that truncates
-    /// ordinary work; for an endpoint mush knows nothing about, the small
-    /// window a local server really has. Neither is a statement, so neither is
-    /// ever stored as if a human had made it.
+    /// ordinary work; for an endpoint mush knows nothing about, the window mush
+    /// assumes by default ([`DEFAULT_CONTEXT_TOKENS`]). Neither is a statement,
+    /// so neither is ever stored as if a human had made it.
     #[test]
     fn the_fallback_windows_are_the_shipped_numbers() {
         assert_eq!(Provider::DeepSeek.spec().fallback_context_tokens, 120_000);
-        assert_eq!(Provider::Custom.spec().fallback_context_tokens, 8_192);
+        assert_eq!(Provider::Custom.spec().fallback_context_tokens, 32_768);
     }
 
     #[test]

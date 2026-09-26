@@ -13712,13 +13712,15 @@ mod tests {
     /// request that carries them goes out over the window — or, on a transcript
     /// a trim can cut, is cut again. Measured through `run_loop` on the shape
     /// the audit used (a first turn: one user line, the system prompt) and the
-    /// 8k default: four results at the cap left the next request carrying
-    /// 13,768 bytes against a 12,288-byte budget, with no cut, no note and no
-    /// fold: a transcript with one user line has no older turn to drop, and a
-    /// transcript over the budget cannot fold. Now the first result takes what
-    /// it can and each later one gets what is left of the fifth, so the request
-    /// that carries the whole batch fits. The audit counted 3,247 bytes for the
-    /// prompt; the fixture below measures the real one, which has grown since.
+    /// 8k window of the day: four results at the cap left the next request
+    /// carrying 13,768 bytes against a 12,288-byte budget, with no cut, no note
+    /// and no fold: a transcript with one user line has no older turn to drop,
+    /// and a transcript over the budget cannot fold. Now the first result takes
+    /// what it can and each later one gets what is left of the fifth, so the
+    /// request that carries the whole batch fits. The audit counted 3,247 bytes
+    /// for the prompt; the fixture below measures the real one, which has grown
+    /// since. The test runs on the shipped default, whose fifth is 12,404 bytes
+    /// — the same shape, a bigger room.
     #[test]
     fn one_turns_results_share_the_room_under_the_ceiling() {
         let big = "x".repeat(100_000);
@@ -13782,7 +13784,7 @@ mod tests {
             "every call in the batch is still answered"
         );
         let room = budget - trim_target(budget);
-        assert_eq!(room, 2_458, "the fifth the ceiling leaves");
+        assert_eq!(room, 12_404, "the fifth the default window leaves");
         let carried: usize = second.messages.iter().map(Message::weight).sum();
         assert!(
             carried <= budget,
@@ -13831,10 +13833,17 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let budget = test_cfg().config().unwrap().history_budget();
         // The shape a long run builds: the opening pair and then turns, over
-        // the ceiling so the drain has to cut.
+        // the ceiling so the drain has to cut. A turn's size is derived from
+        // the budget, so a bigger shipped window does not leave the shape
+        // under it: fifty turns of a tenth of the budget each are five
+        // budgets' worth.
+        let chunk = budget / 10;
         let mut messages = vec![Message::system("you are mush"), Message::user("first")];
         for i in 0..50 {
-            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(500))));
+            messages.push(Message::assistant(format!(
+                "reply {i} {}",
+                "x".repeat(chunk)
+            )));
             messages.push(Message::tool(format!("call{i}"), "result"));
             messages.push(Message::user(format!("again {i}")));
         }
@@ -13958,6 +13967,11 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let budget = test_cfg().config().unwrap().history_budget();
+        // Sized from the budget rather than spelled: a result of a third of it
+        // leaves exactly one whole result after three largest-first sheds at
+        // any prompt size that still leaves a turn — the spelled 6,000 rotted
+        // when the prompt grew.
+        let result_len = budget / 3;
         let mut messages = vec![
             measured_prompt(&actor),
             Message::user("go"),
@@ -13978,7 +13992,7 @@ mod tests {
             },
         ];
         for n in 1..=4 {
-            messages.push(Message::tool(format!("c{n}"), "x".repeat(6_000)));
+            messages.push(Message::tool(format!("c{n}"), "x".repeat(result_len)));
         }
         let before: usize = messages.iter().map(Message::weight).sum();
         assert!(before > budget, "the shape is over the window: {before}");
@@ -14009,7 +14023,8 @@ mod tests {
         assert!(!shed.is_empty(), "the window took something back");
         assert!(!kept.is_empty(), "and took no more than the room needed");
         assert!(
-            kept.iter().all(|message| message.text().len() == 6_000),
+            kept.iter()
+                .all(|message| message.text().len() == result_len),
             "a kept result is whole"
         );
         // The human is told in one line too, because a transcript that quietly
@@ -14025,11 +14040,12 @@ mod tests {
     /// prompt and the opening task are not droppable, a picture is not mush's to
     /// shed, and this turn has no older turn to cut: the request would go out
     /// over the window and the endpoint would answer a 400 with the money
-    /// already spent. Measured at the 8k default: a 2,560×1,440 png is 3,686,400
-    /// px at 750 px/token, ×3 bytes, which on top of the real system prompt —
-    /// measured in the test, never spelled, because it grows — is over the
-    /// 12,288-byte budget. The turn ends with one line naming the road out — a
-    /// downscale — and the picture is never sent.
+    /// already spent. Measured at the shipped default (32,768 tokens, a
+    /// 62,016-byte budget): a 4,096×4,096 png is 16,777,216 px at 750 px/token,
+    /// ×3 bytes, which on top of the real system prompt — measured in the test,
+    /// never spelled, because it grows — is over the budget. The turn ends with
+    /// one line naming the road out — a downscale — and the picture is never
+    /// sent.
     #[test]
     fn a_picture_the_window_cannot_hold_is_refused_before_the_wire() {
         let scripted = Arc::new(Scripted::new().says("looked"));
@@ -14051,7 +14067,7 @@ mod tests {
             measured_prompt(&actor),
             Message::user_with_images(
                 "what is wrong here?",
-                vec![image_at("shot.png", 2_560, 1_440)],
+                vec![image_at("shot.png", 4_096, 4_096)],
             ),
         ];
         let over: usize = messages.iter().map(Message::weight).sum();
@@ -14178,7 +14194,11 @@ mod tests {
         assert!(outcome.is_ok(), "the shed road keeps the turn: {outcome:?}");
         assert_eq!(sent, 1);
 
-        // A picture that fits the same window goes out — and fits.
+        // A picture that fits the same window goes out — and fits. The real
+        // prompt leaves ≈56 KB of the 62,016-byte budget, and the 1920×1080
+        // screenshot this case was always about is 2,765 tokens (8,312 B) with
+        // its path and mime — well inside it, where at 8k the prompt left only
+        // ~6.2 KB and the same picture no longer did.
         let fitting = Arc::new(Scripted::new().says("looked"));
         let (outcome, sent) = run(
             "invariant-fitting-picture",
@@ -14190,18 +14210,20 @@ mod tests {
         );
         assert!(
             outcome.is_ok(),
-            "a 1920×1080 screenshot fits an 8k window: {outcome:?}"
+            "a 1920×1080 screenshot fits the default window: {outcome:?}"
         );
         assert_eq!(sent, 1);
 
-        // A picture that cannot: nothing goes out.
+        // A picture that cannot: nothing goes out. 4,096×4,096 is 16,777,216 px
+        // — 22,370 tokens at the 750 px/token rule, 67,110 bytes — over the
+        // whole 62,016-byte budget before the prompt is even counted.
         let over = Arc::new(Scripted::new().says("looked"));
         let (outcome, sent) = run(
             "invariant-over-picture",
             &over,
             vec![Message::user_with_images(
                 "here",
-                vec![image_at("shot.png", 2_560, 1_440)],
+                vec![image_at("shot.png", 4_096, 4_096)],
             )],
         );
         assert!(outcome.is_err(), "an over-window picture is refused");
@@ -14984,8 +15006,11 @@ mod tests {
     /// the bytes themselves were never at risk, because they are on disk.
     #[test]
     fn a_write_over_the_window_ends_the_turn_and_leaves_the_file() {
-        let content = "x".repeat(40_000);
         let budget = test_cfg().config().unwrap().history_budget();
+        // The write has to out-weigh the whole budget: the content travels in
+        // the tool call, and the request carrying it back is what the window
+        // refuses. Sized from the budget, because the shipped window moved.
+        let content = "x".repeat(budget + 1_000);
         assert!(
             content.len() > budget,
             "the shape this test means to drive: {} > {budget}",
@@ -15763,6 +15788,9 @@ mod tests {
         fs::write(actor.ws.root().join("blob.bin"), b"held\0\0").unwrap();
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        // The result cap this window leaves: read, not spelled, because the
+        // shipped window moved and the cap moved with it.
+        let cap = result_cap(&actor, &state);
         let mut call =
             |args: Value| exec_tool(&actor, &mut state, ToolName::Usages, &args, &cancel);
 
@@ -15784,9 +15812,10 @@ mod tests {
         // cap pays for, the note names the road that prints the rest, and the
         // skip that was seen before the cap still rides along.
         fs::create_dir_all(actor.ws.root().join("many")).unwrap();
+        // Rows long enough that the 200 the walk keeps overrun the result cap.
         let mut big = String::new();
         for _ in 0..201 {
-            big.push_str("held\n");
+            big.push_str(&format!("{} held\n", "x".repeat(cap / 100)));
         }
         fs::write(actor.ws.root().join("many/held.txt"), big).unwrap();
         let capped = call(json!({ "symbol": "held" })).unwrap();
@@ -22745,10 +22774,12 @@ mod tests {
     #[test]
     fn an_asked_compact_the_window_cannot_hold_is_not_attempted() {
         let scripted = Arc::new(Scripted::new().says("summarized"));
+        let cfg = test_cfg();
+        let context = cfg.config().unwrap().context_tokens;
         let (actor, events, _mailbox) = build_actor_about(
             "asked-fold-cannot-fit",
             scripted.clone(),
-            test_cfg(),
+            cfg,
             Arc::new(ScriptedMachine::new()),
             Arc::new(clock::System),
         );
@@ -22757,10 +22788,17 @@ mod tests {
             compact_requested: true,
             ..ActorState::default()
         };
+        // Past what the fold's request can carry: the schemas and the floored
+        // summary cap leave this many tokens under the window, so a transcript
+        // above them cannot be summarized by a request that fits. Derived from
+        // the window rather than spelled — the old 37,210 measured the 8k
+        // default — and the fold's own numbers are the derivation.
+        let text_len =
+            (context - SCHEMA_TOKENS - 1_024) * mush_core::config::BYTES_PER_TOKEN + 1_000;
         let mut transcript = vec![
             measured_prompt(&actor),
             Message::user("task"),
-            Message::user("x".repeat(37_210)),
+            Message::user("x".repeat(text_len)),
         ];
 
         compact_now(&actor, &mut state, &mut transcript);
@@ -22779,7 +22817,7 @@ mod tests {
         assert_eq!(refusals.len(), 1, "one line: {refusals:?}");
         assert_eq!(
             transcript[2].text().len(),
-            37_210,
+            text_len,
             "the transcript is untouched: a refused fold is not a trim"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -23743,6 +23781,10 @@ mod tests {
         );
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         cfg.max_completion_tokens = true;
+        // The 8k window this case measures: at the shipped 32k default the
+        // summary's own ceiling binds instead of what the window leaves, which
+        // is the other half of `the_folds_cap_is_what_the_window_leaves`.
+        cfg.set_context(8_192);
         let context = cfg.context_tokens;
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;

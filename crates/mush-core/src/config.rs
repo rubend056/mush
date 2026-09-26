@@ -26,8 +26,16 @@ pub use crate::provider::{
 };
 
 /// Context window assumed when nothing better is known: `MUSH_CONTEXT`, an
-/// endpoint's own metadata, or the provider's per-model table all beat it.
-pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
+/// endpoint's own metadata, or the provider's per-model table all beat it (the
+/// `custom` row is the one that reads this number).
+///
+/// 32,768 rather than the 8,192 it assumed before: the system prompt has grown
+/// to ~6 KB, and at 8,192 the 12,288-byte budget left barely 6.2 KB for the
+/// conversation — less than a real 1,920×1,080 screenshot, which weighs 8,312
+/// B with its path and mime. A window that small is still reachable the ways
+/// it always was: a human's number, an endpoint's advertised one, or a
+/// provider row.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 32_768;
 
 /// The largest window that can be stored. A window is untrusted input — a
 /// `MUSH_CONTEXT`, or an endpoint's advertised metadata — and one past this is
@@ -2386,11 +2394,12 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the reserve is capped at half the window (the margin
-        // below is 5_000, which alone is more than half of an 8k window), so
-        // history gets the other half — 12_288 bytes. The schema line of the
-        // reserve has moved with every contract change, test and comment
-        // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
+        // 32,768 tokens, the shipped default: the reserve is the three numbers
+        // themselves — 3,000 schemas + 4,096 reply (an eighth of the window,
+        // above the cap's floor) + 5,000 margin = 12,096 tokens — below the
+        // half-window cap, so history gets the other 20,672 tokens, 62,016
+        // bytes. The schema line of the reserve has moved with every contract
+        // change, test and comment together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
         // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
         // pass fit the same rules in fewer bytes, 1200 after the cut to six
         // tools took the shell's work off the schema list, 1300 when `wait`
@@ -2402,7 +2411,7 @@ mod tests {
         // See `SCHEMA_TOKENS`.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 12_288);
+        assert_eq!(small.history_budget(), 62_016);
 
         // A big window leaves a much larger budget, and the reply's share of it
         // grows with the window: 128k reserves 16k for one reply.
@@ -2566,18 +2575,20 @@ mod tests {
         cfg.context_tokens = cfg.fallback_context();
         assert_eq!(cfg.cmd_cap(), CMD_CAP, "a huge window keeps the ceiling");
 
-        // An 8k local window: one command result may take the fifth a cut
-        // leaves between its stopping point (four fifths) and the ceiling — not
-        // a quarter, which would land the next request over the ceiling and
-        // have it cut again.
+        // The shipped default window: one command result may take the fifth a
+        // cut leaves between its stopping point (four fifths) and the ceiling —
+        // not a quarter, which would land the next request over the ceiling and
+        // have it cut again. Even at 32k the fifth is under `CMD_CAP`, so the
+        // ceiling is what a huge window keeps.
         let small = Config::new("http://x:1", "m", None);
+        assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
         assert_eq!(
             small.cmd_cap(),
             small.history_budget() - trim_target(small.history_budget())
         );
         assert!(
             small.cmd_cap() < CMD_CAP,
-            "an 8k transcript cannot hold the ceiling: {}",
+            "the default window cannot hold the ceiling: {}",
             small.cmd_cap()
         );
 
@@ -2601,10 +2612,10 @@ mod tests {
         assert_eq!(cfg.context_tokens, 64_000);
         let mut cfg = Config::new("http://x:1", "m", None);
         assert!(
-            cfg.adopt_context(32_768, WindowSource::Advertised),
+            cfg.adopt_context(48_000, WindowSource::Advertised),
             "discovery fills in a guess"
         );
-        assert_eq!(cfg.context_tokens, 32_768);
+        assert_eq!(cfg.context_tokens, 48_000);
     }
 
     /// A full-size tool result on top of a transcript the trim has just cut
@@ -2643,8 +2654,13 @@ mod tests {
             );
         }
         // The measured 8k numbers, spelled so a change to either formula has to
-        // face them.
-        let eight_k = Config::new("http://x:1", "m", None);
+        // face them. The window is stated rather than taken from `Config::new`,
+        // which now builds the 32k default: these three numbers are the audit's
+        // and stay pinned to the 8k window they were measured at.
+        let eight_k = Config {
+            context_tokens: 8_192,
+            ..Config::new("http://x:1", "m", None)
+        };
         assert_eq!(eight_k.history_budget(), 12_288);
         assert_eq!(trim_target(12_288), 9_830);
         assert_eq!(

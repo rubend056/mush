@@ -377,15 +377,16 @@ first of these that knows:
    named, and on `/url`, `/provider`, `/models`.
 3. **The model's documented window** — `deepseek-flash` and `deepseek-v4-pro`
    are 500k, so a hosted API (which answers with ids and nothing else) is not
-   silently treated as an 8k local model.
-4. **The provider default**: 120k for DeepSeek, 8192 for a custom endpoint.
+   silently treated as a small local model.
+4. **The provider default**: 120k for DeepSeek, 32768 for a custom endpoint.
 
 A reply is capped at a share of that window, and `mush --print-config` prints
 the number it resolved to — beside the tool schemas every request reserves and
 the history budget those leave. The cap is what mush sends as `max_tokens` (or
 `max_completion_tokens`). The command cap follows the window, so one command's
-output can never fill an 8k transcript; a request that does not fit is refused
-by mush itself, one line before the wire, naming the roads that make room
+output can never fill the whole transcript; a request that does not fit is
+refused by mush itself, one line before the wire, naming the roads that make
+room
 (downscale a picture, `/compact`, read less). If a server still rejects a
 request over its context length, mush reads the number out of the complaint,
 tells the UI, and retries once — a backstop, not the mechanism.

@@ -63,7 +63,7 @@ TRIGGER_DENOMINATOR = 10
 # default for this script, because the window that matters is the one the
 # process that wrote the file was using, and assuming a number is how this
 # script came to call a 500k session a 128k one.
-BUILT_IN_CONTEXT = 8192
+BUILT_IN_CONTEXT = 32768
 
 
 def window_from_environment():
