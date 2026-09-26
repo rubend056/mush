@@ -673,32 +673,63 @@ pub fn worktree_add(
     Ok((path, branch, unplaced))
 }
 
-/// Bring the new checkout's submodules in, when its tree records any — and keep
-/// only the ones that sit at the commit the tree records. A submodule that
-/// cannot is left empty: an absent submodule is honest (this worktree does not
-/// have it) where one at the wrong commit makes git call the tree dirty, and
-/// mush then attributes that dirt to the agent.
+/// Bring the new checkout's submodules in, from the local disk that holds them,
+/// recursively — and keep only the ones that sit at the commit the tree
+/// records. A submodule that cannot is left empty: an absent submodule is
+/// honest (this worktree does not have it) where one at the wrong commit makes
+/// git call the tree dirty, and mush then attributes that dirt to the agent.
 ///
 /// `git worktree add` copies refs, not submodule contents: a base tree that
 /// records one at `lib/sub` leaves that directory empty in the new worktree,
 /// and `git status --porcelain` is empty — a tracked directory that is not
 /// populated is not a change git reports (measured: `worktree_add` for a
 /// repository with one local submodule leaves `lib/sub` empty and the status
-/// clean, finding F5). `git submodule update --init --recursive` is git's own
-/// road for filling it, run only when the checkout carries `.gitmodules`, so an
-/// ordinary spawn spends no process on the question.
+/// clean, finding F5).
+///
+/// **The road is the local disk, and the only one.** `git submodule update
+/// --init --recursive` is git's own road and it resolves every gitlink through
+/// the URL in `.gitmodules`: a recorded commit that was never pushed — an
+/// agent's own work inside a submodule, a vendored directory's local branch —
+/// is one no clone from that URL can check out. Measured on git 2.55, the
+/// clone lands on the source's default branch, the checkout fails with
+/// `fatal: remote error: upload-pack: not our ref <sha>`, and the new worktree
+/// is born dirty with ` M lib/sub` and a `+<sha> lib/sub (heads/master)` line.
+/// A submodule *inside* a submodule is a layer that road reaches only if the
+/// outer clone came from a URL that could serve the outer's commit, and
+/// `--reference <local>` does not fix it either: the reference borrows the main
+/// store's objects at runtime — the child stops being able to read its commit
+/// after a `gc --prune=now` in that store (measured) — and it names one path,
+/// so the inner layer, whose objects are not under it, still fails. mush never
+/// goes to a submodule's remote: an object no local repository holds leaves the
+/// directory empty and the path is named in the answer.
+///
+/// Per recorded submodule the road is: read the gitlink the level records
+/// (`git submodule status` prints `-<sha> <path>` for a submodule that is not
+/// there), ask the local repositories — the main checkout's own copy of the
+/// submodule, and the store git keeps beside it, which survives a `deinit` —
+/// whether one holds that commit (`cat-file -e`), and when one does, clone it
+/// with `git clone --no-checkout --local`, `checkout --detach` the recorded
+/// commit, and `submodule absorbgitdirs` the clone into the place git keeps
+/// modules for this worktree. Then the same question is asked of the submodule
+/// that just landed, with its own `.gitmodules` — a submodule inside a
+/// submodule is a submodule like any other. A plain local clone was measured
+/// against the alternatives: an unreachable, never-pushed commit lands in tens
+/// of milliseconds, and the copy is hard links into the new module's own store
+/// (no `objects/info/alternates`, so a `gc` in the main store cannot take the
+/// child's objects away). `git fetch <local path> <sha>` + `checkout --detach`
+/// works too — upload-pack serves an object it has even when no ref reaches it
+/// (measured) — but it needs the repository made first and the module's git
+/// directory placed by hand, which the clone and `absorbgitdirs` do as git's
+/// own commands.
 ///
 /// Deliberately best-effort: the branch and the refs are right, and a submodule
-/// that cannot be fetched (no network, a private remote, a protocol the human's
-/// git refuses) is a fact the child can act on — its prompt names the road it
-/// would run by hand — never a reason to lose the worktree a spawn is standing
-/// on.
+/// the local disk cannot serve is a fact the child can act on — its prompt
+/// names the road it would run by hand — never a reason to lose the worktree a
+/// spawn is standing on.
 ///
-/// **The part that is not best-effort is honesty.** When the commit the tree
-/// records for a submodule is not fetchable from its source, the population
-/// half-succeeds: the clone succeeds at the source's default-branch `HEAD`, the
-/// checkout of the recorded commit fails (`fatal: remote error: upload-pack:
-/// not our ref …`), and the failure used to be swallowed. What is left is a
+/// **The part that is not best-effort is honesty.** A population can
+/// half-succeed: a clone that lands on the source's default-branch `HEAD`, a
+/// checkout of the recorded commit that fails, and a swallowed failure leave a
 /// submodule at the *wrong commit*, which is a change git reports — measured,
 /// the new worktree was born dirty:
 ///
@@ -725,7 +756,13 @@ fn populate_submodules(worktree: &Path) -> Vec<String> {
     if !worktree.join(".gitmodules").is_file() {
         return Vec::new();
     }
-    let _ = run(worktree, &["submodule", "update", "--init", "--recursive"]);
+    // The local road first, recursing into every submodule it lands. It reads
+    // the repositories of the worktree's own repository — the main checkout,
+    // and the module store beside it — so a spawn from the main checkout and a
+    // spawn from a linked worktree are served the same way.
+    if let Some(sources) = LocalSources::of(worktree) {
+        place_level(worktree, &sources);
+    }
     // The *read* helper, not `run`: `run` trims both ends, and the space git
     // prints in front of a submodule that sits at the commit the tree records
     // is a leading byte of data — the same column the porcelain read had to
@@ -739,13 +776,13 @@ fn populate_submodules(worktree: &Path) -> Vec<String> {
         // state git did not print.
         return Vec::new();
     };
-    let found: Vec<(u8, String)> = listing.lines().filter_map(submodule_line).collect();
-    let known: Vec<String> = found.iter().map(|(_, path)| path.clone()).collect();
+    let found: Vec<(u8, String, String)> = listing.lines().filter_map(submodule_line).collect();
+    let known: Vec<String> = found.iter().map(|(_, _, path)| path.clone()).collect();
     let mut unplaced = Vec::new();
-    for (state, path) in &found {
+    for (state, _commit, path) in &found {
         // A space is git saying the checkout holds this submodule at the commit
         // the tree records — the one state that is kept. `-` is already honest:
-        // the population never got it. Anything else — `+` for another commit,
+        // the local road never got it. Anything else — `+` for another commit,
         // `U` for a conflict, and any shape this reader does not recognise — is
         // a submodule the tree lies about, and it goes.
         if *state == b' ' {
@@ -759,13 +796,166 @@ fn populate_submodules(worktree: &Path) -> Vec<String> {
     unplaced
 }
 
-/// One line of `git submodule status --recursive`, read from its first byte the
-/// way [`changes`] reads a status entry's `XY` code — the leading state byte is
+/// The local repositories a recorded submodule's commit can come from, at one
+/// level of the recursion: the main checkout, and the object store git keeps
+/// beside it.
+///
+/// The main checkout is the first entry of `git worktree list` — git's own
+/// order, the call [`worktrees`] reads — and the store is the repository's
+/// common git directory: the clone of a module lives at
+/// `<common>/modules/<path>`, and one level deeper for each nesting
+/// (`<common>/modules/<outer>/modules/<inner>`, measured on git 2.55). The
+/// names are spelled the way git spells them for a submodule added at its
+/// path, which is every submodule mush's own fixtures add; a name the human
+/// changed simply misses, and the commit stays unplaced — never misplaced.
+struct LocalSources {
+    /// The main checkout, absent when git names no worktree with a working
+    /// tree (a bare repository).
+    main: Option<PathBuf>,
+    /// The git directory the modules of this level hang under.
+    store: PathBuf,
+}
+
+impl LocalSources {
+    /// The sources for the worktree's own level, or `None` when git cannot say
+    /// where the repository's common git directory is (no git, no repository).
+    fn of(worktree: &Path) -> Option<LocalSources> {
+        // git answers relative to the directory it ran in, which is the
+        // worktree; `join` leaves an absolute answer alone.
+        let common = git(worktree, &["rev-parse", "--git-common-dir"])?;
+        Some(LocalSources {
+            main: worktrees(worktree)
+                .and_then(|list| list.into_iter().next().map(|tree| tree.path)),
+            store: worktree.join(common),
+        })
+    }
+
+    /// The sources for the submodule at `path` inside the level these sources
+    /// describe: the main checkout's own copy of it, and the store that copy
+    /// was cloned into.
+    fn child(&self, path: &str) -> LocalSources {
+        LocalSources {
+            main: self.main.as_ref().map(|main| main.join(path)),
+            store: self.store.join("modules").join(path),
+        }
+    }
+
+    /// The first of the level's local repositories that holds `sha`, if any.
+    fn holding(&self, sha: &str) -> Option<&Path> {
+        self.main
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(self.store.as_path()))
+            .find(|dir| holds(dir, sha))
+    }
+}
+
+/// Whether the repository at `dir` — *that* one, not one above it — holds the
+/// object `sha`.
+///
+/// `git -C` walks *up* to the first repository it finds, so a `cat-file -e` run
+/// in an empty `lib/sub` inside the main checkout answers for the main checkout
+/// and can say yes to an object that directory itself does not have (measured);
+/// the clone that followed such a yes would fail with `repository … does not
+/// exist`. A directory is worth asking only when it looks like a repository of
+/// its own: a checkout has `.git`, and a bare repository or a submodule's git
+/// directory has the `HEAD` and `objects` a repository is made of.
+fn holds(dir: &Path, sha: &str) -> bool {
+    let is_a_repository =
+        dir.join(".git").exists() || (dir.join("HEAD").is_file() && dir.join("objects").is_dir());
+    is_a_repository && git(dir, &["cat-file", "-e", sha]).is_some()
+}
+
+/// Place every submodule `checkout`'s tree records that a local repository
+/// holds, and recurse into each one that lands.
+///
+/// `git submodule init` comes first and is not optional: a `submodule status`
+/// state byte is read from the *config* as much as from the checkout — a
+/// submodule sitting at the commit the tree records still reads `-` while its
+/// URL is unregistered (measured), and a second placement would clone into a
+/// checkout that is already there — and `init` copies the URLs out of
+/// `.gitmodules` into the config without touching a remote, which is what
+/// makes the verification at the top read a placed submodule as placed.
+///
+/// Only a `-` line is placed: a space is git saying the submodule is already at
+/// the commit the tree records, and anything else (`+`, `U`) is a state the
+/// verification undoes rather than a state to build on.
+fn place_level(checkout: &Path, sources: &LocalSources) {
+    if !checkout.join(".gitmodules").is_file() {
+        return;
+    }
+    let _ = run(checkout, &["submodule", "init"]);
+    let Some(listing) = git(checkout, &["submodule", "status"]) else {
+        return;
+    };
+    for (state, sha, path) in listing.lines().filter_map(submodule_line) {
+        if state != b'-' {
+            continue;
+        }
+        // The submodule's own repositories, not this level's: the candidates
+        // are the main checkout's copy of *this* submodule and the store it was
+        // cloned into, which is also where the recursion's level lives.
+        let child = sources.child(&path);
+        let Some(source) = child.holding(&sha) else {
+            continue;
+        };
+        if place_submodule(checkout, &path, &sha, source).is_ok() {
+            place_level(&checkout.join(&path), &child);
+        }
+    }
+}
+
+/// Put the submodule at `path` — which `checkout`'s tree records at `sha` — at
+/// that commit, with every object coming from the local repository at
+/// `source`.
+///
+/// Three git commands do it, in git's own shape: `clone --no-checkout --local`
+/// copies the source's object store as hard links (unreachable commits
+/// included, and no `objects/info/alternates` — measured), `checkout --detach`
+/// puts the recorded commit in the working tree, and `submodule absorbgitdirs`
+/// moves the clone's git directory to the place git keeps modules for this
+/// worktree, leaving the `.git` file a submodule checkout has.
+///
+/// A failure is undone where it happened: `submodule deinit -f` clears the
+/// half-built checkout and leaves the directory empty (measured; it absorbs a
+/// `.git` directory left by a clone that did not get as far as the absorb),
+/// which is the honest state for a submodule the worktree does not hold. The
+/// verification at the end of the spawn is the backstop if even that fails.
+///
+/// A directory that is not empty is left alone: a fresh worktree holds an empty
+/// one here (and a deinit leaves one), and anything else is not mush's to
+/// overwrite.
+fn place_submodule(checkout: &Path, path: &str, sha: &str, source: &Path) -> Result<(), String> {
+    let dest = checkout.join(path);
+    if std::fs::read_dir(&dest).is_ok_and(|mut entries| entries.next().is_some()) {
+        return Err(format!("`{}` is not empty", dest.display()));
+    }
+    let (Some(source_arg), Some(dest_arg)) = (source.to_str(), dest.to_str()) else {
+        return Err(format!(
+            "cannot place the submodule at `{}`: a path git cannot be given",
+            dest.display()
+        ));
+    };
+    let placed = run(
+        checkout,
+        &["clone", "--no-checkout", "--local", source_arg, dest_arg],
+    )
+    .and_then(|_| run(&dest, &["checkout", "--detach", sha]))
+    .and_then(|_| run(checkout, &["submodule", "absorbgitdirs", path]))
+    .map(|_| ());
+    if placed.is_err() {
+        let _ = run(checkout, &["submodule", "deinit", "-f", path]);
+    }
+    placed
+}
+
+/// One line of `git submodule status`, read from its first byte the way
+/// [`changes`] reads a status entry's `XY` code — the leading state byte is
 /// data, not padding, the same rule [`git`] keeps by never trimming the front of
-/// a line answer. The state git prints in
-/// front of the submodule (a space for one at the commit the tree records, `-`
-/// for one the checkout does not hold, `+` for one at another commit) and its
-/// path.
+/// a line answer. The state git prints in front of the submodule (a space for
+/// one at the commit the tree records, `-` for one the checkout does not hold,
+/// `+` for one at another commit), the commit it names — for `-`, the commit
+/// the tree records, which is the one the local road places — and its path.
 ///
 /// `None` for a line that does not have that shape, so an answer this reader
 /// does not know is skipped rather than read as a submodule that is fine. The
@@ -773,15 +963,15 @@ fn populate_submodules(worktree: &Path) -> Vec<String> {
 /// ` (<describe>)`, which only a submodule git could look inside carries:
 /// measured on git 2.55, an unpopulated one reads `-<sha> lib/sub` and one at
 /// another commit `+<sha> lib/sub (heads/master)`.
-fn submodule_line(line: &str) -> Option<(u8, String)> {
+fn submodule_line(line: &str) -> Option<(u8, String, String)> {
     let state = *line.as_bytes().first()?;
     let rest = line.get(1..)?;
-    let (_commit, path) = rest.split_once(' ')?;
+    let (commit, path) = rest.split_once(' ')?;
     let path = match path.rsplit_once(" (") {
         Some((path, tail)) if tail.ends_with(')') => path,
         _ => path,
     };
-    Some((state, path.to_string()))
+    Some((state, commit.to_string(), path.to_string()))
 }
 
 /// Undo the population of the submodule at `path` (relative to `worktree`), so
@@ -2306,22 +2496,11 @@ mod tests {
         .unwrap();
         run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
 
-        // A local submodule clones over the `file` transport, which git
-        // refuses for submodules unless the human says otherwise; the test is
-        // that human, through git's own road for saying it. mush itself never
-        // sets this: the protocol policy in a child's checkout is the human's
-        // (a repository must not be able to make mush clone a local path).
-        //
-        // The variable is the process's: hold it for as long as the probe is
-        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
-        let added = {
-            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _allow_file = crate::ProtocolInProcess::allow_file();
-            worktree_add(&dir, 6, Some("HEAD"))
-        };
-        let (path, _branch, unplaced) = added.unwrap();
+        // The local road needs no protocol permission: the clone is mush's own
+        // command against a path, not a submodule clone over a URL, so the
+        // `file` transport policy — which git applies to submodule clones the
+        // user did not ask for — never enters into it.
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
 
         assert!(
             unplaced.is_empty(),
@@ -2344,6 +2523,483 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&source);
+    }
+
+    /// A recorded submodule commit the submodule's own remote never got is the
+    /// case the local road exists for: `git submodule update` resolves the
+    /// gitlink through the URL, and a source that does not have the commit
+    /// cannot be checked out of it — measured below, the clone lands on the
+    /// source's default branch, the checkout fails with `upload-pack: not our
+    /// ref`, and the worktree is born dirty (the ` M lib/sub` of finding F5).
+    /// The main checkout *is* that commit's home: work an agent did inside a
+    /// submodule is committed there and pushed nowhere, which is exactly how
+    /// the owner met this.
+    ///
+    /// The mechanism is a plain local clone — measured on git 2.55, a
+    /// never-pushed commit that no ref reaches lands from the main checkout in
+    /// tens of milliseconds: `clone --no-checkout --local` copies the object
+    /// store (unreachable objects included) as hard links and writes no
+    /// `objects/info/alternates`, so the new module owns its objects and a
+    /// later `gc --prune=now` in the main store cannot pull them out from under
+    /// it (measured: a `--reference` clone that borrows them stops being able to
+    /// hold its commit after exactly that).
+    #[test]
+    fn an_unpushed_submodule_commit_comes_from_the_local_disk() {
+        let source = init_repo("local-first-source");
+        let dir = init_repo("local-first-super");
+        git_in(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "lib/sub",
+            ],
+        );
+        git_in(&dir, &["commit", "-qm", "add the submodule"]);
+
+        // The commit only this checkout has, made the way an agent makes one:
+        // inside the submodule, on a detached HEAD, pushed nowhere.
+        let sub = dir.join("lib/sub");
+        git_in(&sub, &["checkout", "-q", "--detach"]);
+        fs::write(sub.join("u.txt"), "the agent's own work\n").unwrap();
+        git_in(&sub, &["add", "-A"]);
+        git_in(&sub, &["commit", "-qm", "the agent's own work"]);
+        let sha = resolve(&sub, "HEAD").unwrap();
+        git_in(&dir, &["add", "lib/sub"]);
+        git_in(&dir, &["commit", "-qm", "record the unpushed sha"]);
+        assert_eq!(
+            gitlink(&dir, "lib/sub"),
+            sha,
+            "the base tree records the unpushed commit"
+        );
+        assert!(
+            run(&source, &["cat-file", "-e", &sha]).is_err(),
+            "the submodule's URL does not have the commit — the URL is not the source below"
+        );
+
+        // Git's own road, as a control, in a worktree of its own: the road a
+        // human would run by hand. It clones from the URL, cannot check the
+        // recorded commit out, and leaves a checkout born dirty.
+        let control = worktree_path(&dir, 7);
+        git_in(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch_name(7),
+                control.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let old = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            run(&control, &["submodule", "update", "--init", "--recursive"])
+        };
+        assert!(
+            old.is_err(),
+            "a recorded commit the URL cannot serve cannot be checked out from it: {old:?}"
+        );
+        assert_eq!(
+            status(&control).unwrap().dirty,
+            1,
+            "and that road leaves the checkout dirty (` M lib/sub`)"
+        );
+
+        // ... and mush's road, which takes the commit off local disk.
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
+        assert!(
+            unplaced.is_empty(),
+            "the main checkout held the commit, so nothing was left empty: {unplaced:?}"
+        );
+        assert_eq!(
+            resolve(&path.join("lib/sub"), "HEAD").as_deref(),
+            Some(sha.as_str()),
+            "the submodule sits at the commit the tree records"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/u.txt")).unwrap(),
+            "the agent's own work\n",
+            "with the work only the local disk had"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the worktree is born clean"
+        );
+        assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+
+        // The caveat the mechanism was chosen for: the new module's object
+        // store is its own, not a window onto the main store.
+        let gitdir = git(&path.join("lib/sub"), &["rev-parse", "--absolute-git-dir"]).unwrap();
+        let alternates = PathBuf::from(gitdir)
+            .join("objects")
+            .join("info")
+            .join("alternates");
+        let borrowed = fs::read_to_string(&alternates).unwrap_or_default();
+        assert!(
+            borrowed.trim().is_empty(),
+            "the new module borrows objects from `{}`: {borrowed:?}",
+            dir.display()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// The opportunistic claim's actual test: the submodule's configured URL
+    /// cannot answer at all (nothing listens on port 1 of the loopback, so any
+    /// contact is a refused connection), the recorded commit exists only on
+    /// local disk — and the checkout still lands, quickly, with no remote
+    /// tried.
+    ///
+    /// `GIT_TRACE` is the proof of the last part: every `git` child appends its
+    /// command line to the file, so a URL that only ever reaches a command on a
+    /// network road cannot appear without that road having run. The wall-clock
+    /// bound beside it is a runaway guard, not a claim about the machine: the
+    /// measured road is tens of milliseconds, and one waiting on a dead address
+    /// would not finish this test.
+    #[test]
+    fn a_submodule_lands_from_local_disk_without_touching_its_remote() {
+        let source = init_repo("no-remote-source");
+        let dir = init_repo("no-remote-super");
+        git_in(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "lib/sub",
+            ],
+        );
+        git_in(&dir, &["commit", "-qm", "add the submodule"]);
+        let sub = dir.join("lib/sub");
+        git_in(&sub, &["checkout", "-q", "--detach"]);
+        fs::write(sub.join("u.txt"), "the agent's own work\n").unwrap();
+        git_in(&sub, &["add", "-A"]);
+        git_in(&sub, &["commit", "-qm", "the agent's own work"]);
+        let sha = resolve(&sub, "HEAD").unwrap();
+        git_in(&dir, &["add", "lib/sub"]);
+        // The URL is rewritten to one that can never answer; the commit is
+        // still only on local disk.
+        fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = http://127.0.0.1:1/mush-cannot-answer.git\n",
+        )
+        .unwrap();
+        git_in(&dir, &["add", ".gitmodules"]);
+        git_in(&dir, &["commit", "-qm", "point the URL at a dead address"]);
+
+        let trace = dir.join("git-trace");
+        let started = std::time::Instant::now();
+        let (path, _branch, unplaced) = {
+            let _trace_lock = crate::GIT_TRACE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _trace = crate::TraceInProcess::to(&trace);
+            worktree_add(&dir, 6, Some("HEAD"))
+        }
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            unplaced.is_empty(),
+            "local disk held the commit, so nothing was left empty: {unplaced:?}"
+        );
+        assert_eq!(
+            resolve(&path.join("lib/sub"), "HEAD").as_deref(),
+            Some(sha.as_str()),
+            "the submodule sits at the commit the tree records"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/u.txt")).unwrap(),
+            "the agent's own work\n",
+            "and the commit's contents are the tree's"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the worktree is born clean"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the spawn waited on something for {elapsed:?}"
+        );
+
+        let seen = fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            !seen.contains("127.0.0.1:1"),
+            "mush reached the submodule's remote:\n{seen}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// The other side of "never a remote": when no local repository holds the
+    /// recorded commit but the configured source does, mush leaves the
+    /// directory empty and names the path — the honest state #249 landed —
+    /// instead of fetching the commit from the network. The control shows the
+    /// configured source *can* serve it, so the empty directory is mush's
+    /// choice and not a source that happened to be missing.
+    #[test]
+    fn a_submodule_only_its_remote_holds_is_left_empty_and_named() {
+        let source = init_repo("remote-only-source");
+        fs::write(source.join("s.txt"), "the remote's copy\n").unwrap();
+        git_in(&source, &["add", "-A"]);
+        git_in(&source, &["commit", "-qm", "a commit only this source has"]);
+        let sha = resolve(&source, "HEAD").unwrap();
+
+        // The superproject records that commit without ever cloning it, so the
+        // main checkout holds no `lib/sub` for the local road to read.
+        let dir = init_repo("remote-only-super");
+        fs::write(
+            dir.join(".gitmodules"),
+            format!(
+                "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = {}\n",
+                source.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let entry = format!("160000,{sha},lib/sub");
+        git_in(&dir, &["update-index", "--add", "--cacheinfo", &entry]);
+        git_in(&dir, &["add", ".gitmodules"]);
+        git_in(
+            &dir,
+            &["commit", "-qm", "record a submodule mush has never cloned"],
+        );
+
+        // The control: git's own road clones from the source and checks the
+        // recorded commit out, so the source can serve it.
+        let control = worktree_path(&dir, 7);
+        git_in(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch_name(7),
+                control.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let old = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            run(&control, &["submodule", "update", "--init", "--recursive"])
+        };
+        assert!(
+            old.is_ok(),
+            "the configured source can serve the recorded commit: {old:?}"
+        );
+        assert_eq!(
+            resolve(&control.join("lib/sub"), "HEAD").as_deref(),
+            Some(sha.as_str()),
+            "and git's own road lands it"
+        );
+
+        let trace = dir.join("git-trace");
+        let (path, _branch, unplaced) = {
+            let _trace_lock = crate::GIT_TRACE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _trace = crate::TraceInProcess::to(&trace);
+            worktree_add(&dir, 6, Some("HEAD"))
+        }
+        .unwrap();
+
+        assert_eq!(
+            unplaced,
+            vec!["lib/sub".to_string()],
+            "the caller is told which recorded submodule the local disk could not serve"
+        );
+        assert!(
+            !path.join("lib/sub/.git").exists(),
+            "nothing was cloned into the worktree's checkout"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the worktree is born clean — an absent submodule is honest"
+        );
+        assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+
+        let seen = fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            !seen.contains(source.to_str().unwrap()),
+            "mush went to the submodule's source:\n{seen}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// A submodule inside a submodule is a submodule like any other, and the
+    /// outer clone does not bring the inner one in: git's own road reaches the
+    /// inner layer only through the URLs, one clone at a time — measured below,
+    /// with the outer's recorded commit pushed and the inner's not, git places
+    /// the outer and then fails on the inner (`upload-pack: not our ref`),
+    /// leaving the inner at the source's default branch and the superproject
+    /// dirty (` M lib/sub`) even though the outer landed. The local road reads
+    /// each landed submodule's own `.gitmodules` and asks local disk again,
+    /// which is a layer no `git submodule` road with a local `--reference`
+    /// reaches either (measured: the reference is one path and the inner's
+    /// objects are not under it).
+    #[test]
+    fn a_submodule_inside_a_submodule_lands_too() {
+        let inner = init_repo("nested-local-inner");
+        let outer_remote = bare_repo("nested-local-outer-remote");
+        let outer_stage = init_repo("nested-local-outer-stage");
+        git_in(
+            &outer_stage,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                inner.to_str().unwrap(),
+                "inner",
+            ],
+        );
+        git_in(&outer_stage, &["commit", "-qm", "add the inner submodule"]);
+        git_in(
+            &outer_stage,
+            &["push", "-q", outer_remote.to_str().unwrap(), "master"],
+        );
+
+        let dir = init_repo("nested-local-super");
+        git_in(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                outer_remote.to_str().unwrap(),
+                "lib/sub",
+            ],
+        );
+        git_in(&dir, &["commit", "-qm", "add the submodule"]);
+        // The outer's own clone of the inner, so the local disk holds every
+        // layer — a human's road, run by the fixture.
+        {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            run(&dir, &["submodule", "update", "--init", "--recursive"]).unwrap();
+        }
+
+        // An unpushed commit at each layer: the inner's first, then the outer
+        // recording it, then the superproject recording the outer. The outer's
+        // recorded commit is pushed, so git's own road *does* reach the outer —
+        // it is the inner it cannot reach.
+        let inner_checkout = dir.join("lib/sub/inner");
+        git_in(&inner_checkout, &["checkout", "-q", "--detach"]);
+        fs::write(inner_checkout.join("u.txt"), "the inner's own work\n").unwrap();
+        git_in(&inner_checkout, &["add", "-A"]);
+        git_in(&inner_checkout, &["commit", "-qm", "the inner's own work"]);
+        let inner_sha = resolve(&inner_checkout, "HEAD").unwrap();
+
+        let outer_checkout = dir.join("lib/sub");
+        git_in(&outer_checkout, &["add", "inner"]);
+        git_in(
+            &outer_checkout,
+            &["commit", "-qm", "record the inner's unpushed sha"],
+        );
+        let outer_sha = resolve(&outer_checkout, "HEAD").unwrap();
+        git_in(&outer_checkout, &["push", "-q", "origin", "master"]);
+
+        git_in(&dir, &["add", "lib/sub"]);
+        git_in(&dir, &["commit", "-qm", "record the outer's sha"]);
+        assert_eq!(
+            gitlink(&dir, "lib/sub"),
+            outer_sha,
+            "the base tree records the outer at the layer's commit"
+        );
+
+        // Git's own road, as a control: the outer lands, the inner does not —
+        // the recursively-walking road cannot reach a layer whose commit was
+        // never pushed.
+        let control = worktree_path(&dir, 7);
+        git_in(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch_name(7),
+                control.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let old = {
+            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _allow_file = crate::ProtocolInProcess::allow_file();
+            run(&control, &["submodule", "update", "--init", "--recursive"])
+        };
+        assert!(
+            old.is_err(),
+            "the inner's commit is not on its URL: {old:?}"
+        );
+        assert_eq!(
+            resolve(&control.join("lib/sub"), "HEAD").as_deref(),
+            Some(outer_sha.as_str()),
+            "git's road does reach the outer"
+        );
+        assert_ne!(
+            resolve(&control.join("lib/sub/inner"), "HEAD").as_deref(),
+            Some(inner_sha.as_str()),
+            "... but never the inner: it sits at the source's default branch"
+        );
+        assert_eq!(
+            status(&control).unwrap().dirty,
+            1,
+            "and the superproject ends dirty (` M lib/sub`)"
+        );
+
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
+        assert!(
+            unplaced.is_empty(),
+            "the local disk held every layer, so nothing was left empty: {unplaced:?}"
+        );
+        assert_eq!(
+            resolve(&path.join("lib/sub"), "HEAD").as_deref(),
+            Some(outer_sha.as_str()),
+            "the outer sits at the commit the tree records"
+        );
+        assert_eq!(
+            resolve(&path.join("lib/sub/inner"), "HEAD").as_deref(),
+            Some(inner_sha.as_str()),
+            "and the inner's unpushed commit comes off local disk too"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/inner/u.txt")).unwrap(),
+            "the inner's own work\n",
+            "with the inner worktree's contents"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the superproject is clean with both layers in place"
+        );
+        assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&inner);
+        let _ = fs::remove_dir_all(&outer_remote);
+        let _ = fs::remove_dir_all(&outer_stage);
     }
 
     /// A submodule the base tree records and its source cannot serve at that
@@ -2388,49 +3044,42 @@ mod tests {
         run(&dir, &["add", ".gitmodules"]).unwrap();
         run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
 
-        // A local submodule clones over the `file` transport, which git
-        // refuses for submodules unless the human says otherwise; the test is
-        // that human, through git's own road for saying it. mush itself never
-        // sets this: the protocol policy in a child's checkout is the human's
-        // (a repository must not be able to make mush clone a local path).
-        // The variable is the process's: hold it for as long as the probe is
-        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
-        let added = {
+        // The measured chain, as a control, in a worktree of its own: git's own
+        // road clones from the URL and cannot check the recorded commit out of
+        // it, so the clone is left at the source's default-branch `HEAD`, which
+        // git reports as a change. The control is the human's road, run by the
+        // test; mush's road below does not go to the URL at all.
+        let control = worktree_path(&dir, 7);
+        git_in(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch_name(7),
+                control.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let old = {
             let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _allow_file = crate::ProtocolInProcess::allow_file();
-            // The measured chain, as a control: git's own `worktree add` and the
-            // population alone leave a worktree that is *dirty* — the clone lands on
-            // the source's default-branch `HEAD`, the checkout of the recorded
-            // commit fails, and the failure leaves the submodule at the wrong
-            // commit, which git reports as a change.
-            let control = worktree_path(&dir, 7);
-            run(
-                &dir,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch_name(7),
-                    control.to_str().unwrap(),
-                    "HEAD",
-                ],
-            )
-            .unwrap();
-            assert!(
-                run(&control, &["submodule", "update", "--init", "--recursive"]).is_err(),
-                "a recorded commit the source cannot serve makes the population fail"
-            );
-            assert_eq!(
-                status(&control).unwrap().dirty,
-                1,
-                "and the checkout it leaves behind is a change git reports ( M lib/sub)"
-            );
-
-            worktree_add(&dir, 6, Some("HEAD"))
+            run(&control, &["submodule", "update", "--init", "--recursive"])
         };
-        let (path, _branch, unplaced) = added.unwrap();
+        assert!(
+            old.is_err(),
+            "a recorded commit the source cannot serve cannot be checked out from it: {old:?}"
+        );
+        assert_eq!(
+            status(&control).unwrap().dirty,
+            1,
+            "and that road leaves behind a change git reports ( M lib/sub)"
+        );
+
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
 
         assert_eq!(
             unplaced,
@@ -2557,20 +3206,11 @@ mod tests {
             "the row's checkout is not there yet"
         );
 
-        // A local submodule clones over the `file` transport, which git refuses
-        // for submodules unless the human says otherwise; the test is that
-        // human, through git's own road for saying it.
-        //
-        // The variable is the process's: hold it for as long as the probe is
-        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
-        let made = {
-            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _allow_file = crate::ProtocolInProcess::allow_file();
-            ensure_worktree(&dir, 6, &branch_name(6))
-        };
-        let (path, unplaced) = made.unwrap();
+        // The local road needs no protocol permission (the clone is mush's own
+        // command against a path, not a submodule clone over a URL), and the
+        // recorded commit is not on local disk here: the checkout is born
+        // empty, clean, and named below.
+        let (path, unplaced) = ensure_worktree(&dir, 6, &branch_name(6)).unwrap();
 
         assert_eq!(path, worktree_path(&dir, 6));
         assert_eq!(
@@ -2641,35 +3281,30 @@ mod tests {
         run(&outer, &["commit", "-qm", "add inner"]).unwrap();
         let outer_sha = resolve(&outer, "HEAD").unwrap();
 
-        // ... and the superproject, which records the outer one at `lib/sub`.
+        // ... and the superproject, which records the outer one at `lib/sub`
+        // *and holds a clone of it*: the outer is on local disk, so the road
+        // under test has a layer to place and the inner layer is what local
+        // disk cannot serve.
         let dir = init_repo("nested-submodule");
-        fs::write(
-            dir.join(".gitmodules"),
-            format!(
-                "[submodule \"lib/sub\"]\n\tpath = lib/sub\n\turl = {}\n",
-                outer.to_str().unwrap()
-            ),
-        )
-        .unwrap();
-        let entry = format!("160000,{outer_sha},lib/sub");
-        run(&dir, &["update-index", "--add", "--cacheinfo", &entry]).unwrap();
-        run(&dir, &["add", ".gitmodules"]).unwrap();
-        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+        git_in(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                outer.to_str().unwrap(),
+                "lib/sub",
+            ],
+        );
+        git_in(&dir, &["commit", "-qm", "add the submodule"]);
+        assert_eq!(
+            gitlink(&dir, "lib/sub"),
+            outer_sha,
+            "the base tree records the outer at the commit its source holds"
+        );
 
-        // A local submodule clones over the `file` transport, which git
-        // refuses for submodules unless the human says otherwise; the test is
-        // that human, through git's own road for saying it.
-        //
-        // The variable is the process's: hold it for as long as the probe is
-        // installed (see [`crate::GIT_ALLOW_PROTOCOL_LOCK`]).
-        let added = {
-            let _protocol = crate::GIT_ALLOW_PROTOCOL_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _allow_file = crate::ProtocolInProcess::allow_file();
-            worktree_add(&dir, 6, Some("HEAD"))
-        };
-        let (path, _branch, unplaced) = added.unwrap();
+        let (path, _branch, unplaced) = worktree_add(&dir, 6, Some("HEAD")).unwrap();
 
         assert_eq!(
             unplaced,
@@ -2690,6 +3325,38 @@ mod tests {
             "the superproject ends clean — the nested dirt is not a change it reports"
         );
         assert_eq!(status(&path).unwrap().dirty, 0, "and `status` agrees");
+
+        // The undo road, at the layer where it has to run: a nested submodule
+        // sitting at the wrong commit — the state git's own road leaves when a
+        // layer's commit is not on its URL — is emptied from the checkout that
+        // records it, and the worktree ends clean.
+        let wrong = path.join("lib/sub/inner");
+        git_in(
+            &path,
+            &["clone", inner.to_str().unwrap(), wrong.to_str().unwrap()],
+        );
+        git_in(
+            &path.join("lib/sub"),
+            &["submodule", "absorbgitdirs", "inner"],
+        );
+        assert_ne!(
+            resolve(&wrong, "HEAD").as_deref(),
+            Some(inner_sha.as_str()),
+            "the hand-placed inner sits at the source's default branch, not the recorded commit"
+        );
+        assert_eq!(
+            super::populate_submodules(&path),
+            vec!["lib/sub/inner".to_string()],
+            "the verify names the nested path it had to undo"
+        );
+        assert!(
+            !wrong.join(".git").exists(),
+            "and the undo ran in `lib/sub`, the checkout that records the gitlink"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "the worktree is clean again"
+        );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outer);
         let _ = fs::remove_dir_all(&inner);
@@ -2810,6 +3477,16 @@ mod tests {
         fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// A bare repository with no commit, for a fixture that needs a remote a
+    /// push can update: a non-bare repository refuses to update the branch it
+    /// has checked out, and git's own road has to be able to serve the commit
+    /// the test pushes.
+    fn bare_repo(name: &str) -> Scratch {
+        let dir = Scratch::new(&format!("git-{name}"));
+        run(&dir, &["init", "-q", "--bare"]).unwrap();
         dir
     }
 
@@ -3132,6 +3809,16 @@ mod tests {
     // real git, because the whole question is what git still names after mush
     // has been through — and the answer a caller reads decides whether a branch
     // is deleted.
+
+    /// The commit a superproject's tree records for the gitlink at `path`.
+    ///
+    /// [`resolve`] cannot answer this one: git reads `HEAD:<path>^{commit}` as
+    /// a *path* named `<path>^{commit}` and refuses it (measured), so a gitlink
+    /// is read as the plain revision the tree entry names — which is already a
+    /// commit id.
+    fn gitlink(dir: &Path, path: &str) -> String {
+        git(dir, &["rev-parse", &format!("HEAD:{path}")]).unwrap()
+    }
 
     /// Run git in `dir`, failing the test if it does.
     fn git_in(dir: &Path, args: &[&str]) {

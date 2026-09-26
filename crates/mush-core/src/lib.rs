@@ -130,6 +130,51 @@ impl Drop for ProtocolInProcess {
     }
 }
 
+/// The process environment's `GIT_TRACE`, owned by one test at a time.
+///
+/// The variable is the process's, so a test that points it at a file holds
+/// this from before the set until after the guard drops — the same rule
+/// [`GIT_ALLOW_PROTOCOL_LOCK`] enforces for `GIT_ALLOW_PROTOCOL`, and for the
+/// same reason: two probes writing one variable cannot both see their own
+/// value. Git's trace is what lets a test ask what the `git` children mush
+/// starts with actually *ran* — every one of them appends a line to the file —
+/// which is how a road that must not reach a remote is held to that: a URL
+/// that is only ever handed to a command on a network road cannot appear in
+/// the trace without that road having run.
+#[cfg(test)]
+pub(crate) static GIT_TRACE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `GIT_TRACE` pointed at a file for one test, put back when it ends — panic or
+/// not.
+///
+/// The previous value is kept, so the restore puts back exactly what was there
+/// and an unset variable stays unset. The caller holds [`GIT_TRACE_LOCK`] from
+/// before the set until after this guard drops, and reads the file after the
+/// guard is gone: git appends as it goes, and every child the probe's own
+/// process starts inherits the variable.
+#[cfg(test)]
+pub(crate) struct TraceInProcess(Option<std::ffi::OsString>);
+
+#[cfg(test)]
+impl TraceInProcess {
+    /// Have every `git` child from here on append its command line to `path`.
+    pub(crate) fn to(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("GIT_TRACE");
+        std::env::set_var("GIT_TRACE", path);
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TraceInProcess {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(previous) => std::env::set_var("GIT_TRACE", previous),
+            None => std::env::remove_var("GIT_TRACE"),
+        }
+    }
+}
+
 /// `MUSH_API_KEY` set for one test, put back when it ends — panic or not.
 ///
 /// The previous value is kept, so the restore puts back exactly what was there
