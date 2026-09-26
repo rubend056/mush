@@ -15,8 +15,7 @@ use serde_json::{json, Value};
 
 use crate::tools::ToolName;
 
-/// How to work, for every agent at every depth. One home: the root and a
-/// subagent used to spell these rules twice, and the copies had drifted.
+/// How to work, for every agent at every depth.
 const RULES: &str = "\
 Rules:\n\
 - Work inside the workspace: paths are workspace-relative (\"src/main.rs\", not an absolute \
@@ -32,8 +31,7 @@ know — and a benchmark or a sweep gets the time it needs without asking again.
 - When you are done finish with a concise summary of what you did.
 - Don't forget to have fun :)";
 
-/// What is true of the machine for every agent, root or leaf. One home, read by
-/// both prompts; the child pays for every word here on every request.
+/// What is true of the machine for every agent, root or leaf.
 const MACHINE: &str = "\
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
 - A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
@@ -50,9 +48,7 @@ beside the holder, told when it did, only its own exclusive claim is refused, an
 not block on the lock.";
 
 /// The delegation policy, for every agent that has the orchestration tools:
-/// the root and any subagent below `MAX_DEPTH`. It used to live only in the
-/// root's prompt, so a depth-1 orchestrator could spawn with no idea its brief
-/// had to be self-contained (audit row 6).
+/// the root and any subagent below `MAX_DEPTH`.
 const DELEGATION: &str = "\
 Delegation:\n\
 - spawn_agent(brief, title?, base?) starts a subagent with no memory of this conversation: the brief \
@@ -83,8 +79,8 @@ stopped as a loop.";
 /// human already watching the change is its test. How to delegate stays in
 /// [`DELEGATION`], which every delegating agent reads.
 const ROOT_ROLE: &str = "\
-Your job is to orchestrate: hold the overview, decide what happens next, and talk to the human — you \
-are the only agent in this tree who does. The work belongs to subagents, and almost every change should \
+Your job is to orchestrate: hold the overview, decide what happens next, and talk to the human. \
+The work belongs to subagents, and almost every change should \
 happen in a child's run: an edit you make yourself lands in this checkout with no brief, no branch and \
 no second reader, and it costs you the picture you were holding.\n\
 - Three moves: answer a question, make a small settled change, or propose the rest. The line is fine \
@@ -93,14 +89,23 @@ gather the system needs: the invariant, the files that move, the test that pins 
 agree and the change is small, it is yours. Where the work is bigger than the ask, do not quietly do \
 it: say the difference in one sentence — what it takes beyond a change, whether to spawn a child — and \
 let the human choose.\n\
-- A question gets an answer, not a child: answer it from the code, name what you found, and queue work \
-only when the human asks for work.\n\
+- You need no one's word for: the next step after a child reports, a check that has gone red, a sentence \
+that lies about the code, the housekeeping the human has already ruled on, and who does the work. You \
+need their word for: a change of policy, anything irreversible, and any campaign they did not open — a \
+new feature, a new reach, a new dependency.\n\
+- Two tempos. When the human is at the keyboard the loop is theirs: make the edit, run the cheapest true \
+check — a compile, the one test — and stop there. Whole-suite runs, benchmarks and sweeps belong to a \
+settled boundary: the human says done, the work ships, or nobody is waiting. When the work is yours to \
+munch through, take the time it needs and verify before you report.\n\
+- A question gets an answer, not a child: answer it from the code, name what you found.\n\
 - Answer the shortest true thing: a yes/no question gets one sentence, with no preamble and no recap \
 nobody asked for.\n\
 - When you were wrong, say so plainly and correct the record.\n\
 - When the human is watching the thing you are changing, they are the test: touch the file their lane \
 watches, say what to look at, and never start a second server, take their port, or build what a reload \
-will show.";
+will show.\n\
+- Commit on the human's word, not your own: \"perfect\", \"continue\", \"take the wheel\", any sign the edits \
+are good — until then the change is a draft in their tree.";
 
 /// The opening a blank brief leaves: the child's first user message and the
 /// transcript's first line, so the model and the human read the same words.
@@ -141,9 +146,10 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool, delegates: bool
              and every command already starts there — so never `cd` to an absolute path a brief \
              or a task names: that is another checkout, and work done there lands outside your \
              branch. A worktree is a checkout of refs, not a copy of the parent's tree: its \
-             submodules come with it when the base's tree records any (mush fetches them as the \
-             worktree is made), and `git submodule update --init` is the road if one is still \
-             empty."
+             submodules come with it when the base's tree records any — placed recursively from \
+             the objects already on this disk, never from a remote, so a directory left empty is \
+             a commit that is not here. Never run a git command that fetches from or pushes to a \
+             remote origin."
         )
     } else {
         format!("Your workspace is `{root}`.")
@@ -748,15 +754,23 @@ mod tests {
         assert!(root.contains("Three moves"));
         assert!(root.contains("it is a judgement"));
         assert!(root.contains("do not quietly do it"));
+        assert!(root.contains("You need no one's word for"));
+        assert!(root.contains("You need their word for"));
+        assert!(root.contains("Two tempos"));
+        assert!(root.contains("the cheapest true check"));
         assert!(root.contains("A question gets an answer, not a child"));
         assert!(root.contains("a yes/no question gets one sentence"));
         assert!(root.contains("When you were wrong, say so plainly and correct the record"));
         assert!(root.contains("they are the test"));
+        assert!(root.contains("Commit on the human's word"));
         let leaf = subagent_prompt("/tmp/x", 3, true, false);
         assert!(!leaf.contains("Three moves"));
+        assert!(!leaf.contains("You need no one's word for"));
+        assert!(!leaf.contains("Two tempos"));
         assert!(!leaf.contains("not a child"));
         assert!(!leaf.contains("say so plainly"));
         assert!(!leaf.contains("their lane"));
+        assert!(!leaf.contains("Commit on the human's word"));
     }
 
     /// The owner's rules of 2026-09-26, in `RULES` so they reach every prompt
@@ -866,19 +880,28 @@ mod tests {
         let prompt = subagent_prompt("/tmp/wt/3", 1, true, false);
         assert!(prompt.contains("worktree of your own branch"), "{prompt}");
         assert!(prompt.contains("`/tmp/wt/3`"), "{prompt}");
-        // What a fresh worktree *is*, and the road for a submodule that did
-        // not come with it: a child that finds an empty `third_party/` must
-        // know both that the tree is a checkout of refs and what to run
-        // (finding F5).
+        // What a fresh worktree *is*, where its submodules come from, and the one
+        // thing it must not do with git: a child that finds an empty
+        // `third_party/` must know that the tree is a checkout of refs, that mush
+        // places submodules from the objects already on disk and never from a
+        // remote, and that a remote is not its to reach for — the owner's rule
+        // for an isolated child, whose branch nobody asked to publish.
         assert!(
             prompt.contains("a checkout of refs, not a copy of the parent's tree"),
             "{prompt}"
         );
-        assert!(prompt.contains("git submodule update --init"), "{prompt}");
+        assert!(prompt.contains("never from a remote"), "{prompt}");
+        assert!(
+            prompt.contains("fetches from or pushes to a remote origin"),
+            "{prompt}"
+        );
         // A shared child gets the shared-workspace sentence instead.
         let shared = subagent_prompt("/tmp/wt/3", 1, false, false);
         assert!(!shared.contains("worktree of your own branch"), "{shared}");
-        assert!(!shared.contains("git submodule update --init"), "{shared}");
+        assert!(
+            !shared.contains("fetches from or pushes to a remote origin"),
+            "{shared}"
+        );
     }
 
     /// Every tool already runs in the workspace with its cwd at the root, so
