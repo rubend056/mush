@@ -23,7 +23,12 @@ unicode-truncate.workspace = true
 # `flock(2)` for the one-mush-per-workspace lock. The workspace forbids
 # `unsafe`, so the syscall comes from a safe wrapper rather than a hand-written
 # `extern "C"`; rustix is already in the tree under tempfile and rustls.
-rustix = { version = "1", features = ["fs", "process"] }
+# `event` is the hangup road's: `poll(2)` on the terminal, so a UI thread that
+# cannot be reached any other way can still be told its terminal is gone
+# (finding U16). `fs` is the lock's and `process` the machine's liveness test;
+# `IsTerminal` from std answers the isatty half of the watcher's choice, so no
+# termios feature is owed.
+rustix = { version = "1", features = ["event", "fs", "process"] }
 # The signal road: a handler that only sets a flag the event loop reads, so a
 # killed mush ends through the same cleanup `Ctrl-Q` runs (finding E1). Not a
 # new crate in the build — crossterm already links `signal-hook` — and the road
@@ -48,6 +53,12 @@ webpki-roots = "0.26"
 # product.
 [dev-dependencies]
 mush-core = { path = "../mush-core", features = ["test-support"] }
+# The same crate again, for the hangup tests only: `pty` lets the suite allocate
+# a real pty pair, close the master and assert that the slave is hung up (and
+# that its read then answers the `Ok(0)` crossterm spins on) rather than taking
+# the kernel's word for it. A plain `cargo build` does not consult this table,
+# so the product still links exactly the rustix it linked before.
+rustix = { version = "1", features = ["pty"] }
 
 [lints]
 workspace = true

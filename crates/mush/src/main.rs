@@ -10,6 +10,7 @@ mod attach;
 mod clipboard;
 mod clock;
 mod events;
+mod hangup;
 mod http;
 mod ids;
 mod input;
@@ -63,8 +64,39 @@ pub(crate) fn auto_approve() -> bool {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{}", error_line(&error.to_string()));
+        say(&mut io::stderr(), &error_line(&error.to_string()));
         std::process::exit(1);
+    }
+}
+
+/// Say one line on the terminal, which may no longer be there.
+///
+/// Every road out of mush ends by telling the shell what happened — a failure's
+/// sentence here, the exit road's notes below — and the terminal those words go
+/// to is the very thing a hangup takes away: a write to a hung-up pty's slave
+/// answers `EIO` (measured), and `eprintln!` *panics* on a failed write. That
+/// panic is worse than the silence it replaces: it lands after the cleanup has
+/// already run — the flush, the kill walk, the socket's unlink — and turns the
+/// road's own status into a 101 (finding U16: a hangup taken between frames
+/// ended in exactly that panic, on `main`'s failure line, which is what this
+/// function and [`say_notes`] answer).
+///
+/// The failure of *this* write cannot be said either, for the same reason: the
+/// terminal is gone, and mush's business with it is over. So the write is made,
+/// its error dropped, and the road walks on.
+fn say(writer: &mut impl Write, line: &str) {
+    let _ = writeln!(writer, "{line}");
+}
+
+/// The exit road's last act: every note, on whatever terminal is left.
+///
+/// A note is a sentence the human is owed — a bound that expired, a worker's
+/// panic words — and the loop must reach its end for every one of them: a
+/// terminal that cannot carry the first is not a reason to drop the rest, and
+/// it is never a reason to panic ([`say`]).
+fn say_notes(writer: &mut impl Write, notes: impl IntoIterator<Item = String>) {
+    for note in notes {
+        say(writer, &format!("mush: {note}"));
     }
 }
 
@@ -1146,6 +1178,21 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let panics = PanicRoute::new();
     install_panic_hook(panics.clone());
+    // The terminal mush is about to take can also be taken *from* it — sshd
+    // drops the session, the emulator closes — and a mush whose pty is gone is
+    // a mush wedged inside crossterm's read loop with no road out (see
+    // `hangup`). Armed here, before the terminal is entered and not after it:
+    // the descriptor is watched from before crossterm reads it, and the
+    // stand-down at the bottom of this function is what keeps an exit already
+    // in progress out of the hard path. A watcher that cannot be armed is said
+    // and not fatal, the shape `attach::serve`'s failed bind has.
+    let hangup = match hangup::watch() {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!("mush: hangup detection disabled — {error}");
+            None
+        }
+    };
     let mut guard = TerminalGuard::enter()?;
     // The screen is mush's from here until it is handed back: a worker's panic
     // now leaves its words in the route instead of on the alternate screen
@@ -1157,7 +1204,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Ok(size) = guard.terminal.size() {
         app.set_term_size(size.width, size.height);
     }
-    let result = event_loop(&mut guard.terminal, &mut app, &rx, &theme);
+    let result = match event_loop(&mut guard.terminal, &mut app, &rx, &theme) {
+        Ok(()) => Ok(()),
+        // A terminal that went away mid-frame is not mush failing: the one write
+        // a frame makes is to the terminal, a hung-up pty's slave answers `EIO`
+        // to it, and that `EIO` *is* the hangup arriving by the other door — the
+        // loop can only be told by an error, because it is inside the write when
+        // it happens. The road out is the quit road (the cleanup below is the
+        // same either way), and the error is not reported: the terminal that
+        // would read the sentence is the thing that went away. `hangup::take`
+        // ends the watcher's wait, so the process is not ended raw over an exit
+        // that is already running (finding U16).
+        Err(error) if hangup::take() || terminal_is_gone(&*error) => Ok(()),
+        Err(error) => Err(error),
+    };
     // The exit road runs first — the flush, the actors' endings, the quit fence
     // and the kill walk, the writer's thread — and the terminal and the socket
     // are handed back last (finding R3). The order is the fact: a signal that
@@ -1172,14 +1232,34 @@ fn run() -> Result<(), Box<dyn Error>> {
     // words of any worker that panicked while the screen was mush's (finding
     // PM9).
     let _ = signals::take_force();
+    // And the hangup watcher is stood down before the road rather than after
+    // it: the terminal may have gone while a `Ctrl-Q` or a signal was already
+    // ending mush, and a watcher still armed would end the process raw in the
+    // middle of the flush and the kill walk. `hangup`'s own docs carry the
+    // order and why the join is what makes the promise.
+    drop(hangup);
     let notes = app.shutdown();
     drop(app);
     drop(_attach);
     drop(guard);
-    for note in notes.into_iter().chain(panics.lower()) {
-        eprintln!("mush: {note}");
-    }
+    say_notes(&mut io::stderr(), notes.into_iter().chain(panics.lower()));
     result
+}
+
+/// Whether an error out of the event loop is the terminal itself being gone.
+///
+/// The one write a frame makes is to the terminal, and a hung-up pty's slave
+/// answers `EIO` to a write and to nothing else on that road — no other failure
+/// of mush's has that errno there. [`hangup::take`] is the primary question (the
+/// watcher saw the hangup and raised its flag); this is the same fact reaching
+/// the loop by the other half of the race, and it is asked because the two are
+/// not ordered: the write can fail before the watcher's thread is scheduled to
+/// raise the flag.
+fn terminal_is_gone(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::raw_os_error)
+        == Some(rustix::io::Errno::IO.raw_os_error())
 }
 
 fn event_loop(
@@ -1527,7 +1607,10 @@ impl Drop for TerminalGuard {
 }
 
 /// The signal road's one step: the flag the watcher thread set becomes the
-/// quit.
+/// quit — and the hangup watcher's flag ([`hangup`]) takes the same step and
+/// the same road, because the terminal closing is what [`App::signal_quit`]
+/// names first (see `hangup`: a terminal that is gone ends mush, and it ends it
+/// the way a signal does).
 ///
 /// The thread matters. A handler runs on whichever thread the kernel chose;
 /// the quit road runs on this one, where `App` lives — so the session's flush,
@@ -1535,7 +1618,13 @@ impl Drop for TerminalGuard {
 /// to reach into another's tree. Returns whether a quit was asked, so the loop
 /// can leave without painting a frame nobody will read.
 pub(crate) fn take_signal_quit(app: &mut App) -> bool {
-    if signals::quit_requested() {
+    // Both flags are *read and taken*, never short-circuited: a flag left
+    // standing by the other road's quit would be one the watcher behind it
+    // waits on for its bound — and then ends a process whose exit road is
+    // already running.
+    let by_signal = signals::quit_requested();
+    let by_hangup = hangup::take();
+    if by_signal || by_hangup {
         app.signal_quit();
         return true;
     }
@@ -3068,6 +3157,93 @@ mod tests {
                 "a failure in the {failed} step left the modes entered"
             );
         }
+    }
+
+    /// The loop's failure, told apart from the terminal's own going away.
+    ///
+    /// The clause is a race's other half: a frame whose write fails because the
+    /// pty is hung up gets its `EIO` back before the watcher's thread may have
+    /// been scheduled to raise its flag, and the road out is the same one — the
+    /// quit road — either way. What must *not* be swallowed is every other
+    /// failure, which is what the negative half pins.
+    #[test]
+    fn a_terminal_write_failure_is_told_from_an_ordinary_failure() {
+        let hung_up = io::Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error());
+        assert!(
+            terminal_is_gone(&hung_up),
+            "a hung-up pty's slave answers EIO"
+        );
+        assert!(!terminal_is_gone(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
+        assert!(!terminal_is_gone(&io::Error::other(
+            "the terminal would not build"
+        )));
+        let sentence: Box<dyn Error> = "the workspace is locked".into();
+        assert!(
+            !terminal_is_gone(&*sentence),
+            "an error that is not even an io::Error is not the terminal"
+        );
+    }
+
+    /// A stderr that is gone, the way a hung-up pty's slave is gone: every
+    /// write fails with the kernel's `EIO` (measured — the same error a write
+    /// to a closed master's slave gets), and every attempt is counted, so a
+    /// test can see that the road *tried* each note rather than stopping at the
+    /// first failure.
+    struct GoneStderr(usize);
+
+    impl io::Write for GoneStderr {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            self.0 += 1;
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))
+        }
+    }
+
+    /// A terminal that cannot carry the words is not a reason to stop saying
+    /// them — and never a reason to panic.
+    ///
+    /// The exit road's own hazard, on the road the human's re-run caught
+    /// (finding U16): `eprintln!` panics on a failed write, and a write to a
+    /// hung-up pty's slave fails. What panicked on that run was `main`'s
+    /// *failure* line rather than this loop — the loop had no note to say that
+    /// time — but the two are the same hazard on the same road, and both are
+    /// [`say`] now. The assertion is both halves of the fix: one write attempt
+    /// per note, so the road reached its end for every one of them, and the
+    /// test *being here* at all.
+    #[test]
+    fn a_note_on_a_dead_terminal_does_not_end_the_exit_road() {
+        let mut gone = GoneStderr(0);
+        say_notes(
+            &mut gone,
+            [
+                "a bound expired".to_string(),
+                "a worker panicked".to_string(),
+            ],
+        );
+        assert_eq!(
+            gone.0, 2,
+            "every note was attempted, and the loop reached its end"
+        );
+    }
+
+    /// A failure's sentence goes the same way, for the same reason: the shell
+    /// reading it is on the terminal that just went away, so the write is made
+    /// and its failure dropped — the status the road chose is the one thing
+    /// left to say, and it is said by exiting.
+    #[test]
+    fn a_failure_line_on_a_dead_terminal_does_not_panic() {
+        let mut gone = GoneStderr(0);
+        say(&mut gone, &error_line("the workspace is locked"));
+        assert_eq!(gone.0, 1, "the sentence was at least attempted");
     }
 
     /// The escape sequences a panic writes, captured: the `Write` seam

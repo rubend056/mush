@@ -7,10 +7,10 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--mouse|--shift-enter|--cancel|--sigterm|--lock]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--mouse|--shift-enter|--cancel|--sigterm|--hangup|--lock]
 
-The resize, mouse, shift-enter, cancel, sigterm and lock scenarios need no model
-endpoint; the others do.
+The resize, mouse, shift-enter, cancel, sigterm, hangup and lock scenarios need
+no model endpoint; the others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
 Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).
@@ -719,6 +719,272 @@ def scenario_sigterm(binary: str, root: pathlib.Path) -> bool:
     return all(results)
 
 
+# How long the mid-frame close keeps the UI painting before the pty goes, and
+# how often it forces a repaint: a resize every gap, each one a full paint of
+# the 200×600 screen the phase opens, so the close lands inside a frame rather
+# than in the read between two of them.
+HANGUP_STORM_SECONDS = 0.4
+HANGUP_STORM_GAP = 0.005
+
+
+def scenario_hangup(binary: str, root: pathlib.Path) -> bool:
+    """A closed terminal must end mush, and it must not cost the store.
+
+    The finding (U16, 2026-09-27): an ssh session's pty went away under a
+    running mush and nothing happened. crossterm reads its events through a
+    `read` that answers `Ok(0)` for ever once the pty's slave is hung up, and
+    its loop falls through on that arm instead of returning, so `event::poll`
+    never came back: the UI thread spun at ~9.7M reads/s for 19 minutes with no
+    tick, `session.json` frozen at its last snapshot because the debounce's
+    write needs one, SIGTERM/SIGHUP/SIGINT inert (they set a flag whose only
+    reader was the wedged loop), every attach request timing out, and `kill -9`
+    plus a restart as the recovery.
+
+    mush now polls that descriptor from a thread of its own
+    (`crates/mush/src/hangup.rs`): the close is a `POLLHUP` the watcher sees
+    where the loop cannot, so it raises the flag the event loop takes where it
+    takes the signal's, and — a wedged loop being exactly what cannot take it —
+    ends the process itself (status 0, no destructor) if the flag is still
+    standing a second later.
+
+    **Both roads are driven, and which one each close took is printed.** The
+    race is real and is the whole subject: the flag is taken at the top of a
+    frame, and the UI thread is inside crossterm's read — the wedge itself — for
+    much of every frame, so an idle UI often dies the watcher's way, while a UI
+    that is *painting* when the terminal dies reaches the top of the loop
+    without touching the hung-up descriptor and takes the ordinary quit road (or
+    loses the paint itself to `EIO`, which the loop's error road answers with
+    the same quit). So the scenario closes the master twice: once under an idle
+    UI, and once in the middle of a resize storm that keeps a 200×600 screen
+    repainting. Each close reports its own road; the checks assert what holds on
+    *either* road (mush gone, status 0, the store whole), never that a
+    particular road ran — a test that demanded one side of a race would be the
+    flake, not the witness.
+
+    The checks are what a closed terminal must not cost. *The death*: mush ends
+    within seconds of each close, status 0 on both roads — the raw road's is its
+    own (`process::exit`), and the ordinary road's is a quit's, including its
+    words: every line the exit road writes — a failure's sentence, the exit
+    road's notes — goes through `main::say`, which drops the failure of a write
+    to a terminal that is gone instead of panicking on it (that panic is what
+    this scenario's ordinary road caught: a hangup taken between frames used to
+    end 101 *after* the cleanup had run). *The store*: a
+    clean quit first puts a conversation there, and neither hangup may leave it
+    unparsable or truncated, with the restart shelving no `.bak` (that file is
+    what mush leaves when it cannot *read* a session). *The lock*: `flock` is
+    the kernel's, so even a raw death releases it and the workspace opens again.
+    *The socket*: the stale file the raw road leaves is cleared by that start,
+    proved from outside by `mush agents` answering, which takes a live listener
+    behind the name.
+    """
+    print(f"\n== hangup == {root}")
+    env = {"MUSH_URL": "http://127.0.0.1:1", "MUSH_PROVIDER": "custom", "MUSH_MODEL": "probe"}
+    session = root / ".mush" / "session.json"
+    socket_path = root / ".mush" / "mush.sock"
+    question = "the line a closed terminal must not cost"
+
+    def close_and_wait(tui: Tui):
+        """Close the pty master and wait, bounded, for mush to end.
+
+        `Tui.close` must not be used: it writes Ctrl-Q to the master this
+        closes. The road is read off the socket — the raw road (`process::exit`)
+        runs no destructor, and the attach socket's unlink is one of the
+        destructors it skips — and it is a *report*, because both roads leave
+        status 0 and which one a given close takes is the race. Returns
+        `(exit code or None, seconds, road, socket left behind)`.
+        """
+        os.close(tui.master)
+        closed_at = time.time()
+        try:
+            code = tui.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            tui.proc.kill()
+            code = None
+        elapsed = time.time() - closed_at
+        left = socket_path.exists()
+        if code is None:
+            road = "the harness had to kill it"
+        elif left:
+            road = "the raw road — the socket is still on disk, so no destructor ran"
+        else:
+            road = "the ordinary quit road — the socket was unlinked on the way out"
+        return code, elapsed, road, left
+
+    # Phase one: make the store real. A run that ends a second after the close
+    # has nothing on disk yet — a conversation reaches the file on a minute's
+    # debounce or on the exit flush, and the raw road runs neither — so the
+    # question is put there the way a human puts it there: typed, then quit
+    # cleanly. The endpoint refuses every connection, so the send has failed and
+    # nothing is in flight by the time the two Ctrl-Q presses go out.
+    first = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    first.pump(2.0)
+    first.send(question + "\r", settle=1.0)
+    first_exit = first.close()
+    stored = session.read_text() if session.exists() else ""
+
+    results = [
+        check("the store's own run quit cleanly", first_exit == 0, f"exit {first_exit}"),
+        check(
+            "a clean quit wrote the question to the store",
+            question in stored,
+            f"{len(stored)} bytes in .mush/session.json",
+        ),
+    ]
+
+    # Phase two: the terminal goes away under an idle UI. Closing the master is
+    # what a dropped ssh session does, and it hangs the slave up as well as
+    # sending SIGHUP — the hung-up descriptor crossterm reads is the one the
+    # watcher sees. An idle UI is inside that read nearly all the time, which is
+    # the finding's own road: the loop cannot come around to take the flag, and
+    # the watcher ends the process itself.
+    idle = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    idle.pump(2.0)
+    idle_socket_up = socket_path.exists()
+    idle_code, idle_elapsed, idle_road, _ = close_and_wait(idle)
+
+    # Phase three: the same close with the UI mid-frame. The flag is taken at
+    # the top of a *frame*, so this aims at the other road: a UI that is
+    # painting when the terminal dies reaches that top without ever reading the
+    # hung-up descriptor — or loses the paint itself to `EIO`, which the loop's
+    # error road answers with the same quit road. The frame is made long on
+    # purpose: a resize every few milliseconds, each one a full repaint of a
+    # 200×600 screen, alternating the shape so nothing is coalesced, and the
+    # close lands in the middle of the storm. Nothing forces the race — a close
+    # that lands while the loop *is* inside the read dies raw exactly like the
+    # one above, and the line says which happened.
+    busy = Tui(binary, root, rows=200, cols=600, env_extra=env)
+    busy.pump(2.0)
+    busy_socket_up = socket_path.exists()
+    shape = (200, 600)
+    storm_until = time.time() + HANGUP_STORM_SECONDS
+    while time.time() < storm_until:
+        shape = (shape[1], shape[0])
+        fcntl.ioctl(busy.master, termios.TIOCSWINSZ, struct.pack("HHHH", *shape, 0, 0))
+        os.kill(busy.proc.pid, signal.SIGWINCH)
+        time.sleep(HANGUP_STORM_GAP)
+    busy_code, busy_elapsed, busy_road, busy_left = close_and_wait(busy)
+
+    stored_after = session.read_text() if session.exists() else ""
+    try:
+        json.loads(stored_after)
+        parses = True
+    except ValueError:
+        parses = False
+
+    results += [
+        # The socket has to be up before each close, or "still on disk
+        # afterwards" would say nothing about which road was taken.
+        check("the attach socket was up before the idle close", idle_socket_up),
+        check(
+            "the idle close ended mush",
+            idle_code is not None,
+            f"{idle_elapsed:.2f}s after the close — {idle_road}"
+            if idle_code is not None
+            else f"still running {idle_elapsed:.2f}s after the close",
+        ),
+        check("and that death is status 0", idle_code == 0, f"exit {idle_code} — {idle_road}"),
+        check("the attach socket was up before the mid-frame close", busy_socket_up),
+        check(
+            "the mid-frame close ended mush",
+            busy_code is not None,
+            f"{busy_elapsed:.2f}s after the close — {busy_road}"
+            if busy_code is not None
+            else f"still running {busy_elapsed:.2f}s after the close",
+        ),
+        check("and that death is status 0", busy_code == 0, f"exit {busy_code} — {busy_road}"),
+        check(
+            "the store is still there and still parses",
+            session.exists() and parses,
+            f"{len(stored_after)} bytes of JSON"
+            if parses
+            else f"unreadable: {stored_after[:120]!r}",
+        ),
+        check(
+            "the stored conversation is still in it",
+            question in stored_after,
+            "neither death truncated anything"
+            if question in stored_after
+            else repr(stored_after[:200]),
+        ),
+    ]
+
+    # A notice, not a check: the two closes aim at the two roads, and the run
+    # says whether it saw both (or twice the same) rather than leaving the
+    # reader to infer it from the two detail lines above.
+    if idle_road.startswith("the raw") and busy_road.startswith("the ordinary"):
+        print("  both roads seen: the idle close died raw, the mid-frame close took the quit road")
+
+    # Phase four: the workspace opens again — the lock is `flock`, so even the
+    # raw death released it — and the stale socket is cleared. The stale case is
+    # made deterministic here: the raw road leaves a socket file with nothing
+    # behind it, and a run that took the ordinary road gets the same file bound
+    # by hand, exactly as a `kill -9` leaves one. Either way this start's probe
+    # is what stands between the file and a live listener
+    # (`attach::serve_with`; `scenario_lock` covers the other half of that rule,
+    # that a *live* listener is not stolen).
+    if busy_left:
+        stale = "the hangup's own leftover"
+    else:
+        dead = socket.socket(socket.AF_UNIX)
+        dead.bind(str(socket_path))
+        dead.close()
+        stale = "a crash's leftover, bound by the harness"
+
+    third = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    third.pump(2.0)
+    # A start that lost the race for the workspace is refused before the
+    # terminal is taken — the lock is held before the session is read — so a
+    # process still here two seconds later took it. This wait *is* the
+    # assertion: a refusal prints its sentence and exits, and nothing else about
+    # it is visible this late.
+    try:
+        third_exit = third.proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        third_exit = None
+    up = third_exit is None
+
+    # While it is up: a `mush agents` answer can only come from a live listener,
+    # and the only way there is one is that the start cleared the stale name and
+    # bound it. A failed bind is non-fatal (mush runs with attach disabled), and
+    # the subcommand would then time out instead.
+    subcommand = subprocess.run(
+        [binary, "agents", str(root)], capture_output=True, text=True, timeout=30
+    )
+    # A mush still up is quit the ordinary way; one that is already gone was
+    # refused the lock, and its own status is all there is.
+    third_code = third.close() if up else third_exit
+
+    results += [
+        check(
+            "the next start takes the workspace",
+            up,
+            "still running, so the lock was free"
+            if up
+            else f"exit {third_exit} — {third.tail().strip()[-200:]}",
+        ),
+        check(
+            "the stale socket was cleared and a live listener bound",
+            subcommand.returncode == 0 and "root" in subcommand.stdout,
+            f"{stale}; exit {subcommand.returncode}: {subcommand.stdout.strip()[:200]}",
+        ),
+        # Last, because this is the restart that *read* the store the deaths
+        # left behind: a session mush cannot parse is set aside as `.bak` by
+        # `keep_unreadable` at start, so no `.bak` beside the file is what says
+        # that start read the conversation the deaths did not cost.
+        check(
+            "no session was shelved as .mush/session.json.bak",
+            not (root / ".mush" / "session.json.bak").exists(),
+            "the start after the deaths read the session",
+        ),
+        check("and the workspace quits cleanly", third_code == 0, f"exit {third_code}"),
+    ]
+    if not all(results):
+        print(idle.tail())
+        print(busy.tail())
+        print(third.tail())
+    return all(results)
+
+
 def find_job_group(command: str) -> int:
     """The pgid of a live `sh -c <command>`, or None while it is not up yet."""
     wanted = "sh -c " + command
@@ -768,6 +1034,7 @@ def main() -> int:
     )
     parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
     parser.add_argument("--sigterm", action="store_true", help="run only the sigterm scenario")
+    parser.add_argument("--hangup", action="store_true", help="run only the hangup scenario")
     parser.add_argument("--lock", action="store_true", help="run only the lock scenario")
     args = parser.parse_args()
 
@@ -783,6 +1050,7 @@ def main() -> int:
         args.shift_enter,
         args.cancel,
         args.sigterm,
+        args.hangup,
         args.lock,
     ]
     both = not any(chosen)
@@ -800,6 +1068,8 @@ def main() -> int:
         passed &= scenario_cancel(binary, base / "cancel")
     if both or args.sigterm:
         passed &= scenario_sigterm(binary, base / "sigterm")
+    if both or args.hangup:
+        passed &= scenario_hangup(binary, base / "hangup")
     # Last, and not only because it is cheap: it needs the workspace to itself.
     if both or args.lock:
         passed &= scenario_lock(binary, base / "lock")

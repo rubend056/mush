@@ -1292,6 +1292,7 @@ the title now read that one derivation instead of each making their own.
 | U13 | **After a restart, a stored isolated agent whose worktree is gone keeps a branch its actor does not have.** `restore_agents` passes the stored `branch` straight to the node (`app/mod.rs`), while `revive` filters it on `worktree_path(root, id).exists()` and points the actor's workspace at the root — so the restored row offers `/diff`/`/merge` for a reclaimed directory and the footer paints a dead path, while a nudge is refused by the UI guard even though the actor would have run it in the root. Two surfaces contradicting the promise both restore paths make ("continues in the main checkout"). Found by the duplication review of `c4aa2e3`; untested (both restore tests store `branch: None`). | ✅ | one decision now: `agent::live_branch` is the one place a stored branch is filtered, shared by `restore_agents`, `revive` and the node (`642fda8`), and `a_restored_branch_whose_worktree_is_gone_is_dropped` stores one and asserts the node drops it, the nudge is delivered and `/diff` stops naming it |
 | U14 | **A run parked in a `wait` wears the working icon.** Finding U7 taught the row's *words* (`waiting on results 3s`), the transcript's foot and the row's footer to tell a model call from a run parked on somebody else's result — and stopped one surface short of the glyph, which is the surface a glance reads. Observed live in the session running this repository: the root was parked in a `wait` on a child, its row read `◐ #0 ⏸1 root  waiting on results 3s`, and the human asked why the icon said working. The same fact was wrong in two more places: `Phase::label` answered `working` to the attach roster, and `AgentTree::roster` counted a parked run in the title's `N working`. | ✅ | one derivation, four readers: `Phase::waiting` now reaches the glyph (`⧗`, the one hourglass `unicode-width` calls a single column — `⌛` measures two), `Phase::label` (`waiting`), and `roster`'s buckets, so the title counts a parked run beside the napping parents it already counted there; `busy_counts`/`is_busy` stay "a run is in flight", which is what `⏸N` and the bar's promise read (§8.38) |
 | U15 | **The foot is the one surface that does not name what the run is doing.** A tool call in flight — a twenty-minute `cargo test` — wore the same `working.` as a model call, and a run parked in a `wait`, which the row beside it names (`⧗ waiting on results 5s`), painted no foot line at all (U7's fix chose silence: it kept the point and cost the fact). | ✅ | one derivation, three surfaces: `Phase::words` (the row builds on it through `phase_detail`, the foot paints `words + the dot beat`), `Pane.words` replaces `busy`/`compacting`, and `Phase::doing` answers `waiting` for a parked wait so the roster, the quit warning and the foot share one word — `235c3bc`..`a185aa7` (§8.43) |
+| U16 | **A terminal that goes away wedges mush for ever, and every road out of it is behind the wedge.** An ssh pty died at ~16:05 on 2026-09-27 (pid 3866512, cwd `p/tiny`) and mush ran for 19 minutes with ~100 % of a core in `read()` — ~9.7M calls/s, three quarters of it kernel time (`/proc/PID/io`: `syscr` +19.3M in 2 s with `rchar` flat) — because crossterm's unix event source loops on `Ok(0)`: `crossterm-0.28.1/src/event/source/unix/mio.rs`, `UnixInternalEventSource::try_read` (`:68`), the `TTY_TOKEN` arm (`:94–:121`), whose inner `loop` (`:95`) reads the tty, falls through on a zero-byte read (and on every error that is neither `WouldBlock` nor `Interrupted`) and reads again — a hung-up pty is readable for ever, so `try_read` and `event::poll` never return. Every road out of mush is behind that call: no `tick`, so `session.json` stayed frozen at its 16:05:41 snapshot for 19 minutes; SIGTERM/SIGHUP/SIGINT inert *although their handler ran* (`signals`' flag is read by the wedged loop), so only the third press's raw death — raised by the signals watcher thread, not by the loop — ended it; and every attach request timed out after `ASK_TIMEOUT` = 30 s. Recovery was `kill -9` and a start that restored from `session.json`. The human's ruling (2026-09-27): **a terminal that is gone ends mush, promptly and as cleanly as the moment allows**; survivability — attach, takeover, headless — is out of scope on purpose, because outliving a terminal is a wrapper's job (tmux owns the terminal and can hand mush a new one); no crossterm fork, no new dependency, no `mush quit`, and job process groups orphaned on the hard path is accepted. | ✅ | built in `crates/mush/src/hangup.rs` and wired into `main.rs` (§8.114): a watcher thread blocking-`poll`s the descriptor crossterm reads (a dup of stdin when stdin is a tty, else `/dev/tty` read/write — `tty_fd()`'s own rule) for `POLLHUP|POLLERR` alone; it raises the flag the event loop takes beside `signals::quit_requested()`, waits `TAKE_BOUND` = 1 s for the take, and only then ends the process raw with `std::process::exit(0)`. `main` stands it down before `App::shutdown`, under a fence, so an exit already in progress is never cut short. Proved in the suite (socketpair; **a real pty whose master closes**: the watcher fires and the slave's read answers the `Ok(0)` crossterm spins on; the death road in a re-exec'd process, ~1 s, status 0) and end to end by `scripts/smoke.py --hangup`, which closes a real pty twice — idle, and mid-repaint — asserts status 0 on **both** roads and prints which each took. The hard path is a hard death, and its price is named: no destructor runs, so the attach socket outlives mush (the next start's stale-file probe clears it), job process groups are orphaned, and the keyboard-enhancement frame mush pushed stays on the emulator's stack (`docs/mush.md` §4) — though the terminal that would need that pop is the very thing that just went away. The ordinary road's own hole, found by the human's re-run (§8.114), is closed too: every line the exit road says goes through `main::say`, which drops the failure of a write to a terminal that is gone, and a frame whose paint answers `EIO` is the hangup by the other door rather than a failure — so a hangup ends 0 whichever road it takes |
 
 ## 2. Observed live: a delivered completion is invisible, and can be delivered twice
 
@@ -11480,3 +11481,136 @@ bullet says otherwise):
 Every number above is a command's output or a commit's own body re-read at
 `f9a911d`; the pass changes no line under `crates/` or `scripts/`.
 
+---
+
+## 8.114 The terminal that goes away ends mush (U16, `crates/mush/src/hangup.rs`)
+
+**The incident, as measured.** An ssh pty died under a running mush at ~16:05
+on 2026-09-27 (pid 3866512, cwd `p/tiny`). The UI thread spun at ~9.7M
+`read()`/s — ~100 % CPU, three quarters of it kernel time (`/proc/PID/io`:
+`syscr` +19.3M in 2 s with `rchar` flat) — for **19 minutes**. No `tick` ran, so
+`session.json` stayed frozen at its 16:05:41 snapshot. The first two
+SIGTERM/SIGHUP/SIGINT were inert *although their handler ran* — `signals`' flag
+is read by the loop that would not come around — and only the third press's raw
+death, raised by the signals watcher thread and not by the wedged loop, ended
+the process; every attach request timed out after `ASK_TIMEOUT` = 30 s; recovery
+was `kill -9` and a start that restored from `session.json`.
+
+**The loop.** `crossterm-0.28.1/src/event/source/unix/mio.rs` is the event
+source the build uses (`use-dev-tty` is off, so `src/event/source/unix.rs`
+selects `mio`). `UnixInternalEventSource::try_read` (`:68`) reaches the
+`TTY_TOKEN` arm (`:94–:121`), whose inner `loop` (`:95`) reads the tty, falls
+through on a zero-byte read — and on every error that is neither `WouldBlock`
+nor `Interrupted` — then asks the parser (nothing) and reads again. A hung-up
+pty is readable for ever, so the loop never leaves and `try_read` never returns
+to `event::poll`. There is nothing to swap and nothing to bump: `EventSource`
+is `pub(crate)` (`src/event/source.rs:13`) and so is its module
+(`src/event.rs:123`), and crossterm 0.29.0's `mio.rs` is **byte-identical** to
+0.28.1's (both `md5 a4d49587057d0c13e6c578dc5f41669a` — fetched into the local
+registry and diffed, not assumed).
+
+**The policy (the human's ruling, 2026-09-27).** A terminal that is gone ends
+mush — promptly, and as cleanly as the moment allows. Survivability is out of
+scope on purpose: attach, takeover and headless are not built, because mush is
+a surface on a terminal and outliving one is a wrapper's job — tmux owns the
+terminal and can hand mush a new one. No crossterm fork, no new dependency, no
+`mush quit`, no viewer. Job process groups may be orphaned on the hard path;
+that is accepted.
+
+**The road.** `crates/mush/src/hangup.rs` arms a watcher thread on the
+descriptor crossterm will read, chosen by `tty_fd()`'s own rule
+(`terminal/sys/file_descriptor.rs`: a dup of stdin when stdin is a tty, else
+`/dev/tty` opened read/write), and blocking-`poll`s it for `POLLHUP|POLLERR` and
+nothing else — so an idle terminal never wakes the thread (its whole cost is a
+sleeping task) and a keypress is never taken from crossterm. On the hangup:
+(a) the flag the event loop takes beside `signals::quit_requested()` is raised,
+so a hangup that lands between frames leaves through the ordinary quit road —
+the flush, the actors' endings, the kill walk, the socket's unlink (R3);
+(b) `TAKE_BOUND` = 1 s is waited out for the take (a frame is 30 ms, so the
+bound is only ever spent when nothing *can* take it); (c) if it is still
+untaken, the UI thread is inside crossterm's spin and the process ends there
+with `std::process::exit(0)`. `exit(0)` rather than `signals::die`'s
+`raise(SIGKILL)`: this is a condition and not a human's insistence, and the two
+roads leave the same status, so a script cannot tell whether the wedge path was
+needed. `main` stands the watcher down (`drop(hangup)`) **before**
+`App::shutdown`, under a mutex the watcher's death decision also takes, so an
+exit already in progress — a `Ctrl-Q`, a signal — is never cut short by (c);
+the join in `Drop` is what makes that a promise. An arm that fails (no terminal
+to watch) is said on stderr and is not fatal, the shape `attach::serve`'s
+failed bind has.
+
+**The hole the human's own re-run found.** The ordinary road used to
+write its last words with `eprintln!`, which panics on a failed write — and a
+write to a hung-up pty's slave fails (`EIO`, measured). Re-running this change,
+the human's close took that road: *0.05 s, the ordinary quit road*, **exit 101**,
+with the flush, the kills and the socket's unlink already done. So the hole was
+not a future hazard but a live one, and it is closed here in three pieces.
+First, every line mush says on the way out — a failure's sentence in `main`, the
+exit road's notes — goes through `say`, which makes the write and drops its
+failure: the terminal that would carry the words is the thing that went away,
+and there is nowhere to say *that* either. Second, the loop's own error road is
+no longer a failure when the terminal is the reason: a frame whose write answers
+`EIO` is the hangup arriving by the other door, so `run` takes it as the quit
+road (asking the watcher's flag, or the `EIO` itself, because the two arrive in
+either order) and returns `Ok`. Third — the correction the re-run made to this
+section — the 101 was *not* the notes loop, which had nothing to say that run:
+with the loop's error door disabled and the write fix in place the same close
+exits **1**, which is `run` returning the error and `main` reporting it; the
+notes loop is guarded for the same reason, not because it was the culprit.
+
+**What that buys, exactly.** A hangup ends **0** whichever door it comes by: the
+watcher's raw exit (below), the flag taken at the top of a frame, a frame write
+that fails mid-paint, or a signal's quit that a hangup then lands on. One door
+is *not* covered, and stays where it was found: a terminal that is already hung
+up when mush starts never reaches the loop at all — `TerminalGuard::enter`'s
+all-or-nothing entry fails, termios on a hung-up slave answering `EIO` (PM8) —
+so that run ends **1** with its words dropped rather than panicking (measured: a
+mush started on a closed pty). It is the entry's road, not a hangup arriving at
+a running mush. The cleanup — the flush, the actors' endings, the kill walk, the
+socket's unlink — is complete on every road but the raw one, and the smoke's two
+closes assert the status on both roads rather than on whichever one the race
+happened to pick.
+
+**What the hard path costs, said rather than hidden.** (c) runs no destructor.
+The attach socket stays on disk — the next start's stale-file probe clears it
+and binds, which the script test checks; job process groups are orphaned; and
+the keyboard-enhancement frame mush pushed stays on the emulator's stack,
+which is exactly the hard death `docs/mush.md` §4 already records for any
+SIGKILL or third press, with `printf '\033[<1u'` the pop typed at the shell —
+though on an ssh hangup the terminal that would need that pop is usually gone
+too, which is the very thing the watcher fires on. And a raw death *inside*
+`Session::save` can leave one `.mush/.tmpXXXXXX` scratch file behind:
+`atomic_write` is a temp file plus a rename, so the store is never half-written
+and a restart reads the last good snapshot, and the scratch file is read by
+nothing. Left in place deliberately — sweeping `.mush/.tmp*` at start would be
+a new behaviour on the start road, deleting files by the shape of their names in
+the human's own directory, for at most one invisible dot-file per hard death.
+
+**What is proved, and what is only read.** In the suite: a socketpair whose peer
+closes fires the watcher, and a live one never does; the take clears the flag
+once; a watcher armed the way `main` arms one — published in the process-global
+slot — is seen by the free `take` the event loop calls; a hangup already in
+flight when `main` stands the watcher down leaves the process alive past the
+bound (the test running is the assertion); the death road
+in a process of its own (`lock`'s re-exec pattern) ends at ~1 s with status 0
+and never reaches its own later line; and — the premise of the whole module,
+asserted rather than taken from a manual — a **real pty** (`rustix::pty`,
+`TIOCGPTPEER`) whose master closes both fires the watcher and answers `Ok(0)` to
+the slave's read, which is the incident's own condition. The exit road's words
+are pinned the way the human asked: a writer whose every write fails (`EIO`, the
+hung-up slave's own error) under `say_notes` and `say` reaches the end of the
+road rather than panicking, and `terminal_is_gone` is asserted to tell that
+`EIO` from an ordinary failure. End to end, `scripts/smoke.py --hangup` runs the
+real binary under a real pty and closes the master **twice** — once under an
+idle UI and once mid-repaint, the second forced by a resize storm so the
+ordinary road is exercised on purpose rather than by luck — asserting for each
+that mush is gone within seconds with status 0 and printing which road it took,
+and then that `session.json` still parses and still holds the conversation
+written before it, that the lock is free, and that the next start clears a stale
+`mush.sock` and answers an attach request. Only *read*, not measured here: the
+incident's own numbers (the human's report) and crossterm 0.29's arm (fetched
+and diffed, never built against).
+
+**Not built, on purpose.** Attach/headless survivability, `mush quit`, a
+crossterm fork, the `.mush/.tmp*` sweep, and the census/§11 bookkeeping a wave
+does — this is one change with its tests, not a wave.
