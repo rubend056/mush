@@ -376,7 +376,12 @@ flags only when it answers yes; on a terminal that cannot, or does not answer,
 `Shift-Enter` arrives as a plain `Enter` and sends, and `Alt-Enter` is the
 spelling that is always there. Under tmux the query and the flags travel only
 with tmux ≥ 3.2 and `set -g extended-keys on` — old tmux, or a session that has
-not turned it on, is the same quiet `Shift-Enter`-sends case.
+not turned it on, is the same quiet `Shift-Enter`-sends case. mush pops the one
+frame it pushed on the way out; what `stty sane` and `reset` cannot be counted
+on to undo after a hard death — any `SIGKILL`, or the third signal press — is
+that push itself: termios and the screen come back, the flags do not, because
+the stack is the emulator's and lives per window. The pop, typed at the shell
+that is left, is `printf '\033[<1u'`; a fresh terminal tab is the other road.
 
 **Keys and commands.** `mush --help` prints exactly these two tables, and so do
 the blocks below (a test fails while either is stale):
