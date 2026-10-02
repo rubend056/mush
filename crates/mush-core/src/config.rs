@@ -570,13 +570,16 @@ pub fn parse_key_env(value: &str) -> Result<String, String> {
 /// The host of an endpoint URL: the authority, port included; the scheme, the
 /// path and the query are not part of it.
 ///
-/// This is the part an API key is minted for (findings C6, D6).
+/// This is the part an API key is minted for (findings C6, D6), and it is the
+/// key the home config's `api_keys` map is written under
+/// ([`crate::userconfig::UserConfig::save_to`]) — one spelling of "the host of
+/// an endpoint", so the write and the lookup cannot disagree.
 /// `http://Box:8078/v1` and `https://box:8078` name one host — a key sent to
 /// either is sent to the same server — while `http://box:9000` names another,
 /// because two ports on one box can be two different servers. Case is not part
 /// of the answer either, because DNS is not case-sensitive; callers compare
 /// with [`str::eq_ignore_ascii_case`].
-fn host_of(url: &str) -> &str {
+pub(crate) fn host_of(url: &str) -> &str {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     after_scheme
         .split(['/', '?', '#'])
@@ -1111,6 +1114,11 @@ pub fn resolve_with(
     let url_given = cli.url.is_some() || env.url.is_some();
     let provider_given = cli.provider.is_some() || env.provider.is_some();
     let model_given = cli.model.is_some() || env.model.is_some();
+    // A key stated by the CLI or the environment is never taken from the file:
+    // the environment's is already in the base config, and this is the analogue
+    // of `url_given` for the one field that is a secret. mush has no
+    // `--api-key` flag, so `cli.api_key` is the environment's only company.
+    let key_given = cli.api_key.is_some() || env.api_key.is_some();
     // The temperature and the reply cap's name have no `MUSH_*` spelling, so
     // no environment layer can state them (`Overrides::from_env` leaves both
     // unset): the flag is the only layer above the home config.
@@ -1120,27 +1128,6 @@ pub fn resolve_with(
     let thinking_given = cli.thinking.is_some() || env.thinking.is_some();
 
     // 2. Home config: machine-global defaults, and where the API key lives.
-    if config.api_key.is_none() {
-        // An empty string in the file is no key, not a key. Hand-edited, it
-        // used to become `Some("")`, and three surfaces then disagreed about
-        // one state: `/key`'s ack read `api key set (••••…)`, `--print-config`
-        // read `(none)` (it filters the empty string itself), and every
-        // request carried `Authorization: Bearer ` with nothing after it
-        // (finding D22). `MUSH_API_KEY=""` is already dropped by
-        // `env_nonempty`, so this is the file's own road to that state.
-        //
-        // A stated key is checked before it is kept, and the file's path is
-        // named with the refusal, for the reason the `base_url` arm below
-        // names it: `MUSH_CONFIG` can point anywhere, so the layer's name
-        // alone is not enough to find the line to fix (finding C7).
-        config.api_key = home
-            .api_key
-            .as_deref()
-            .map(|key| checked_key(key, "home config's api_key"))
-            .transpose()
-            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path_label()))?
-            .filter(|key| !key.is_empty());
-    }
     if !provider_given && !home.provider.is_empty() {
         // A typo here is an error, exactly as it is for `--provider` and
         // `MUSH_PROVIDER`: ignoring it would leave the provider at its default
@@ -1169,6 +1156,41 @@ pub fn resolve_with(
         // layer's name alone is not enough to find the line to fix.
         config.base_url = checked_url(&home.base_url, "home config's base_url")
             .map_err(|error| format!("{error} — {}", crate::userconfig::config_path_label()))?;
+    }
+    // The file's key for the endpoint now settled: the map's entry for the
+    // endpoint's host, or — for a file written before the map existed, or one
+    // whose host has no entry — the older flat `api_key`. This waits for the
+    // arms above so the host looked up is the endpoint that won, not one a
+    // later arm replaces. A key stated above this layer is not the file's to
+    // state, so it stays: the environment's is already in the base config
+    // (findings C6, D6).
+    if !key_given && config.api_key.is_none() {
+        let host = host_of(&config.base_url);
+        let entry = home
+            .api_keys
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(host));
+        let (road, stated) = match entry {
+            Some((_, key)) => ("home config's api_keys", Some(key.as_str())),
+            None => ("home config's api_key", home.api_key.as_deref()),
+        };
+        // An empty string in the file is no key, not a key. Hand-edited, it
+        // used to become `Some("")`, and three surfaces then disagreed about
+        // one state: `/key`'s ack read `api key set (••••…)`, `--print-config`
+        // read `(none)` (it filters the empty string itself), and every
+        // request carried `Authorization: Bearer ` with nothing after it
+        // (finding D22). `MUSH_API_KEY=""` is already dropped by
+        // `env_nonempty`, so this is the file's own road to that state.
+        //
+        // A stated key is checked before it is kept, and the file's path is
+        // named with the refusal, for the reason the `base_url` arm above
+        // names it: `MUSH_CONFIG` can point anywhere, so the layer's name
+        // alone is not enough to find the line to fix (finding C7).
+        config.api_key = stated
+            .map(|key| checked_key(key, road))
+            .transpose()
+            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path_label()))?
+            .filter(|key| !key.is_empty());
     }
     if !model_given && config.model.is_empty() && !home.model.is_empty() {
         config.model = home.model.clone();
@@ -1860,6 +1882,163 @@ mod tests {
         .unwrap()
         .config;
         assert_eq!(config.api_key.as_deref(), Some("sk-home"));
+    }
+
+    /// The home config's map holds one key per host, and resolving for an
+    /// endpoint adopts the entry for *that* endpoint's host and nothing else:
+    /// switching to a second host and back re-adopts each host's own key
+    /// (findings C6, D6). The file's own `base_url` is the endpoint a switch
+    /// left behind, which is what the next start resolves against.
+    #[test]
+    fn switching_the_endpoint_to_a_second_host_and_back_re_adopts_each_hosts_key() {
+        let home_at = |base_url: &str| UserConfig {
+            provider: "custom".into(),
+            base_url: base_url.into(),
+            api_keys: [
+                ("a:1".to_string(), "sk-a".to_string()),
+                ("b:2".to_string(), "sk-b".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..UserConfig::default()
+        };
+        let at = |base_url: &str| {
+            resolve_with(
+                Config::new("http://base:0", "m", None),
+                &Overrides::default(),
+                &Overrides::default(),
+                &home_at(base_url),
+                None,
+            )
+            .unwrap()
+            .config
+        };
+        assert_eq!(at("http://a:1").api_key.as_deref(), Some("sk-a"));
+        assert_eq!(at("http://b:2").api_key.as_deref(), Some("sk-b"));
+        assert_eq!(at("http://a:1").api_key.as_deref(), Some("sk-a"));
+    }
+
+    /// A `--url`/`MUSH_URL` move to a second host adopts that host's own entry:
+    /// the endpoint named above the home config still gets the file's key for
+    /// it, because the key is chosen by the endpoint that won.
+    #[test]
+    fn a_command_line_endpoint_adopts_its_own_hosts_key() {
+        let home = UserConfig {
+            api_keys: [
+                ("a:1".to_string(), "sk-a".to_string()),
+                ("b:2".to_string(), "sk-b".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..UserConfig::default()
+        };
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                url: Some("http://b:2/v1".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.base_url, "http://b:2/v1");
+        assert_eq!(config.api_key.as_deref(), Some("sk-b"));
+    }
+
+    /// A key stated by the layer above the file — the environment, already in
+    /// the base config — beats every stored key: the file's map is not the
+    /// human's to overrule a key they stated for this run (finding C11).
+    #[test]
+    fn a_key_stated_by_the_environment_beats_every_stored_key() {
+        let home = UserConfig {
+            base_url: "http://a:1".into(),
+            api_keys: [("a:1".to_string(), "sk-stored".to_string())]
+                .into_iter()
+                .collect(),
+            ..UserConfig::default()
+        };
+        let config = resolve_with(
+            Config::new("http://a:1", "m", Some("sk-env".into())),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key.as_deref(), Some("sk-env"));
+    }
+
+    /// The flat `api_key` is the fallback for a host the map does not name —
+    /// what a file written before the map means — while a host the map *does*
+    /// name takes the map's entry, never the flat one.
+    #[test]
+    fn the_flat_key_falls_back_for_a_host_the_map_does_not_name() {
+        let home = UserConfig {
+            api_key: Some("sk-flat".into()),
+            api_keys: [("Box:8078".to_string(), "sk-box".to_string())]
+                .into_iter()
+                .collect(),
+            ..UserConfig::default()
+        };
+        // A host with no entry falls back to the flat key.
+        let config = resolve_with(
+            Config::new("http://a:1", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key.as_deref(), Some("sk-flat"));
+
+        // The host the map names takes its own entry, and case is not part of
+        // the host (DNS is not case-sensitive).
+        let config = resolve_with(
+            Config::new("https://box:8078/v1", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key.as_deref(), Some("sk-box"));
+    }
+
+    /// A bad key in the map is refused by name, with the file named too — the
+    /// same door the flat `api_key` goes through (finding C7): the value could
+    /// write a header line for itself, and `MUSH_CONFIG` can point anywhere, so
+    /// the layer's name alone does not say which file to fix.
+    #[test]
+    fn a_bad_key_in_the_map_is_refused_naming_the_file() {
+        let bad = "sk-inject-0123456789\r\nX-Injected-By-Key: yes";
+        let mut home = home("custom", "http://home:4", "m");
+        home.api_key = None;
+        home.api_keys.insert("home:4".into(), bad.into());
+        let error = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with(
+                "home config's api_keys contains a control character (\\r) — check the value"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains(&crate::userconfig::config_path_label()),
+            "the file is named: {error}"
+        );
+        assert!(!error.contains(bad), "the key's bytes are never echoed");
     }
 
     /// The host is the part of an endpoint a key is minted for: the authority,

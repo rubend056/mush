@@ -2351,6 +2351,51 @@ mod tests {
         );
     }
 
+    /// The dump names the resolved key — masked — and only that one: the home
+    /// config's map may hold a key for another host, and a dump is a thing a
+    /// human pastes into a bug report. The endpoint in force picks which entry
+    /// was adopted, so no other host's key is ever on the line.
+    #[test]
+    fn the_dump_names_only_the_resolved_hosts_key() {
+        let home = UserConfig {
+            base_url: "http://a:1".into(),
+            api_keys: [
+                ("a:1".to_string(), "sk-aaaa1111bbbb".to_string()),
+                ("b:2".to_string(), "sk-cccc2222dddd".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..UserConfig::default()
+        };
+        let resolved = config::resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        let lines = describe(
+            &resolved,
+            false,
+            &session::Stored::Absent,
+            &[],
+            None,
+            &theme::Theme::default(),
+        );
+        let key = lines
+            .iter()
+            .find(|(field, _)| field == "api key")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(key, format!("{} (masked)", mask_key("sk-aaaa1111bbbb")));
+        assert!(
+            !key.contains("cccc"),
+            "the other host's key is not printed: {key}"
+        );
+    }
+
     /// The human's live report: two mush sessions on one config painted `~1M`
     /// and `~500k` in the `ctx` line, and nothing in the frame or in
     /// `--print-config` could say which road each number had taken — the `~`

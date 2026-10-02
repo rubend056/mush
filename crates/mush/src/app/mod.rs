@@ -4154,6 +4154,14 @@ impl App {
     /// still land. A host change's `None` is a statement too, not silence
     /// (findings C6, D6).
     ///
+    /// The key lives in the home config's host → key map now, so the statement
+    /// `None` means "no entry for this host" rather than "drop the key":
+    /// `save_to` clears only the legacy flat field and leaves every host's entry
+    /// where it was. That is what stops a host change erasing the key that
+    /// belonged to the host just left — and what makes the flat field's clearing
+    /// still necessary, so the old key cannot be re-homed by whichever host
+    /// comes next.
+    ///
     /// Returns whether the write landed, and *says* a failure here, in the one
     /// status slot: a caller whose ack promises what the file holds —
     /// `saved to …`, `provider: …`, `model: …` — must speak only on `true`.
@@ -4186,10 +4194,13 @@ impl App {
             // the file already holds.
             ..UserConfig::default()
         };
-        // A key is written when the human stated one, or when the statement is
-        // "none" — the absence a host change left, which must reach the file
-        // or the old host's key would be re-homed by the next start. An env
-        // key in force is neither: the file keeps its own.
+        // `/key` states the key for the file; every other save keeps the
+        // file's own. The exception is a save with no key in force at all — a
+        // host change that dropped one, or an endpoint that never had one —
+        // which states "none": `save_to` clears the legacy flat field (so a
+        // later host cannot adopt it) and keeps every map entry, so the host
+        // just left keeps its own key. An environment key in force is neither,
+        // so it never reaches disk (finding C11).
         let key = if self.key_stated || self.cfg().api_key.is_none() {
             KeyWrite::Stated
         } else {
@@ -18686,9 +18697,13 @@ mod tests {
         run(&mut app, &format!("/url {endpoint}"));
         let saved = UserConfig::load_from(&path).config;
         assert_eq!(
-            saved.api_key.as_deref(),
+            saved.api_keys.values().next().map(String::as_str),
             Some("sk-file-0123456789"),
             "the environment's key did not reach the file"
+        );
+        assert!(
+            !saved.api_keys.values().any(|key| key == "sk-env-0123456789"),
+            "and it is nowhere else in the map either"
         );
         assert_eq!(saved.base_url, endpoint, "the command's own field landed");
         // The line the human reads promises nothing about a file, because
@@ -18700,19 +18715,68 @@ mod tests {
         );
 
         // `/key` is the road where the human states a key *for the file*: it
-        // writes it, and the ack names where.
+        // writes it under the host in force, and the ack names where.
         run(&mut app, "/key sk-typed-0123456789");
         let saved = UserConfig::load_from(&path).config;
         assert_eq!(
-            saved.api_key.as_deref(),
+            saved.api_keys.values().next().map(String::as_str),
             Some("sk-typed-0123456789"),
-            "a stated key is written"
+            "a stated key is written under its host"
         );
+        assert_eq!(saved.api_key, None, "and not left flat");
+        assert_eq!(saved.api_keys.len(), 1, "one host, one entry");
         assert!(
             text_of(&app).contains(&format!("saved to {}", path.display())),
             "{}",
             text_of(&app)
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The point of keying by host: a key stated on one endpoint is kept in the
+    /// home config when the endpoint moves to another, and a second key stated
+    /// there does not displace it. Switching between two hosts that both have
+    /// keys leaves both entries — the run has no key for the new host until the
+    /// next start adopts its own, so the ack names the road back rather than
+    /// claiming a key it does not hold.
+    #[test]
+    fn a_key_on_each_of_two_hosts_survives_the_switch_between_them() {
+        let (mut app, _rx) = test_app("two-host-keys");
+        let home = Scratch::new("app-two-host-home");
+        let path = home.join("config.json");
+        app.home_config = Some(path.clone());
+        let first = app.cfg().base_url.clone();
+
+        run(&mut app, "/key sk-first-0123456789");
+        assert_eq!(UserConfig::load_from(&path).config.api_keys.len(), 1);
+
+        // Move to a second host and state a key there: the host just left keeps
+        // its own entry.
+        run(&mut app, "/url http://127.0.0.1:9/v1");
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(saved.api_keys.len(), 1, "the host left keeps its key");
+        assert!(
+            saved.api_keys.values().any(|key| key == "sk-first-0123456789"),
+            "{saved:?}"
+        );
+        let line = text_of(&app);
+        assert!(
+            line.contains("no api key for this endpoint"),
+            "the run has no key for the new host: {line}"
+        );
+
+        run(&mut app, "/key sk-second-0123456789");
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(saved.api_keys.len(), 2, "both hosts have a key now");
+        assert!(saved.api_keys.values().any(|key| key == "sk-second-0123456789"));
+
+        // Switching back keeps the first host's entry too; nothing in the ack
+        // claims a file write it did not make.
+        run(&mut app, &format!("/url {first}"));
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(saved.api_keys.len(), 2, "both entries survive the return");
+        assert!(saved.api_keys.values().any(|key| key == "sk-first-0123456789"));
+        assert!(saved.api_keys.values().any(|key| key == "sk-second-0123456789"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

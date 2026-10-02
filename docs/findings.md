@@ -11614,3 +11614,68 @@ and diffed, never built against).
 **Not built, on purpose.** Attach/headless survivability, `mush quit`, a
 crossterm fork, the `.mush/.tmp*` sweep, and the census/§11 bookkeeping a wave
 does — this is one change with its tests, not a wave.
+
+## 8.115 One key per host, not one key per file (`crates/mush-core/src/userconfig.rs`, `config.rs`)
+
+**The cost the flat field carried.** The home config held exactly one
+`api_key` beside one endpoint, so the key could not say which host it was minted
+for and moving the endpoint dropped it: `Config::forget_key_if_host_changed`
+cleared it, and the save that followed wrote `api_key: null` as a *statement*
+(`KeyWrite::Stated`) so the old host's key was not merged onto the new one
+(findings C6/D6, C11). The refusal is right — a key is never handed to a host it
+was not minted for — but it forgot the key of the host left behind, and
+`/provider deepseek` ↔ `/url http://my-lan:8000/v1` meant re-typing each key on
+every return.
+
+**What it is now.** `UserConfig` grows `api_keys: BTreeMap<String, String>` —
+one key per host, keyed by the same spelling `config.rs`'s `host_of` produces
+(the authority, `host[:port]`, with no scheme, path or query; `host_of` is
+`pub(crate)` now, so the write and the lookup share one spelling and no second
+one is written). `config::resolve_with` adopts `api_keys[host_of(&base_url)]`
+after the `provider` and `base_url` arms — when the endpoint is settled — and
+falls back to the flat `api_key` for a host the map does not name, which is what
+a file written before the map means; an empty string is still no key (finding
+D22), and a key stated by `MUSH_API_KEY` still wins (tracked as `key_given`,
+the analogue of `url_given`). `UserConfig::save_to` takes both key fields by the
+road `KeyWrite` names: `Stated` with `Some(key)` writes `api_keys[host_of(base_url)]`
+and clears the flat field, with `None` inserts nothing and **deletes no other
+host's entry** — "no key for this host" is the absence of one — and with no
+endpoint to key on it states the flat field instead; `Keep` leaves the whole key
+structure exactly as the file had it. `App::persist_user_config` keeps `/key` on
+`Stated` and every other save on `Keep` when a key is in force; the `None`
+statement remains for the one case that has no key at all (a host change that
+dropped one, or an endpoint that never had one), where it now clears only the
+legacy flat field — the map is untouched, so the host just left keeps its own
+key and an old flat key cannot be re-homed by whatever host comes next. The
+session file is still key-free.
+
+**The tests.** In `userconfig.rs`:
+`a_stated_key_lands_under_the_host_of_its_endpoint`,
+`a_second_hosts_key_keeps_the_first_hosts_entry`,
+`a_stated_none_deletes_no_other_hosts_entry`,
+`a_keep_save_leaves_the_whole_key_structure_untouched`,
+`the_old_flat_file_migrates_under_its_host_on_the_next_stated_save`,
+`a_stated_key_with_no_endpoint_is_written_flat`, with
+`the_old_four_field_file_still_loads` and `every_field_loads_and_unknown_keys_are_kept`
+grown to carry the map. In `config.rs`:
+`switching_the_endpoint_to_a_second_host_and_back_re_adopts_each_hosts_key`,
+`a_command_line_endpoint_adopts_its_own_hosts_key`,
+`a_key_stated_by_the_environment_beats_every_stored_key`,
+`the_flat_key_falls_back_for_a_host_the_map_does_not_name`,
+`a_bad_key_in_the_map_is_refused_naming_the_file`, while
+`a_stored_session_cannot_take_the_home_key_to_its_own_host` still pins D6. In
+`mush`: `a_key_on_each_of_two_hosts_survives_the_switch_between_them` (the file
+keeps both entries) and `the_dump_names_only_the_resolved_hosts_key` (the map's
+other key never reaches `--print-config`), with the C11 test's assertions moved
+to the map.
+
+**Judgement call, recorded.** The run does not re-read the home config when a
+runtime `/url` or `/provider` moves the endpoint, so a switch *back* within one
+run has no key until the next start adopts the host's entry — the file keeps it,
+which is what the change is for, but the ack's `no api key for this endpoint`
+names the run's state, not the file's. And the app still passes `Stated` when no
+key is in force, rather than the plain `Keep` the map's other saves take: `Keep`
+would leave an old file's flat key in place after a host change, and the next
+start would hand it to the new host — the very invariant (D6) this change exists
+to keep. Not built, on purpose: a `/key` flag to list or clear another host's
+keys.

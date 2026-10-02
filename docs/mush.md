@@ -1062,14 +1062,17 @@ The API key is never stored here — it lives in the machine-global home config
 (`$MUSH_CONFIG`, else `~/.config/mush/config.json`). With `HOME` unset and no
 `MUSH_CONFIG` there is no home config, and mush says so by name rather than
 write one beside the checkout. `/key` is the one road that
-writes it there; `MUSH_API_KEY` supplies one from the environment for the run,
-and no other save copies it into the file. `.mush/.gitignore` containing `*`
+writes it there, under the endpoint's host; `MUSH_API_KEY` supplies one from the
+environment for the run, and no other save copies it into the file. `.mush/.gitignore` containing `*`
 ignores every file in the directory, **including itself**, so the directory never
 shows up in `git status` and never needs to be added to the project's own
 `.gitignore`.
 
 That file is meant to be hand-edited, and it documents itself. Every field is
-optional: `api_key`, `provider`, `base_url`, `model`, `context` (a stated
+optional: `api_keys` (a host → key map — the key for each endpoint's authority,
+so switching the endpoint keeps each host's own key and switching back adopts it
+again), `api_key` (the flat key an older file carried, and the fallback for a
+host the map does not name), `provider`, `base_url`, `model`, `context` (a stated
 window), `temperature`, `max_completion_tokens` (`true` sends the reply cap as
 `max_completion_tokens`, and `--print-config` prints the number this window
 affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`), and `thinking`

@@ -101,8 +101,10 @@ Everything can be changed at runtime from the chat — no restart:
 - `/url http://host:port` — point at any endpoint. `https://` works too (TLS
   via rustls).
 - `/key <secret>` — set the API key. Shown masked, and saved to the home
-  config file (never to the workspace). A key read from `MUSH_API_KEY` stays in
-  the environment — mush never copies it into that file.
+  config file (never to the workspace) under the current endpoint's host, so
+  pointing mush at another endpoint keeps each host's own key. A key read from
+  `MUSH_API_KEY` stays in the environment — mush never copies it into that
+  file.
 - `/models` — refresh the model list for the current endpoint.
 - `/context` — say the window and the road it came by; `/context N` states one
   for this workspace (remembered in `.mush/session.json`), and `/context auto`
@@ -116,12 +118,18 @@ is *machine-global*:
 
 ```json
 {
-  "api_key": "sk-...",
+  "api_keys": { "api.deepseek.com": "sk-..." },
   "provider": "deepseek",
   "base_url": "https://api.deepseek.com",
   "model": "deepseek-flash"
 }
 ```
+
+The key is a host → key map: one entry per endpoint, keyed by its authority
+(`host[:port]`), so moving the endpoint to another host keeps the old host's key
+and switching back adopts it again. A file written before the map carried a flat
+`api_key` instead; it is still read, and still means a key for a host the map has
+no entry for.
 
 Every knob, its default, and what `--print-config` prints: the manual's §5.
 
