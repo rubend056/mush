@@ -51,12 +51,12 @@ use crossbeam_channel::Sender;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
-use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
+use mush_core::config::{checked_url, vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
+use mush_core::provider::ProviderRow;
 use mush_core::userconfig::KeyWrite;
 use mush_core::{
-    git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
-    Workspace,
+    git, prompt, session, text::mask_key, userconfig, Config, Session, UserConfig, Workspace,
 };
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
@@ -805,6 +805,18 @@ fn new_chat_warning(lines: usize) -> String {
         session::MUSH_DIR,
         session::PREVIOUS_FILE
     )
+}
+
+/// What selecting a `/provider` row does to the endpoint, in the one phrase the
+/// picker has room for: the endpoint a row that owns one switches to, or the
+/// plain statement that a row with none leaves the endpoint in force — `custom`
+/// and a home config row with no `base_url` (finding PK5).
+fn endpoint_hint(row: &ProviderRow) -> String {
+    if row.switches_endpoint {
+        row.base_url.clone()
+    } else {
+        "keeps the endpoint".to_string()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4444,12 +4456,26 @@ impl App {
         });
     }
 
+    /// `/provider`: every row a name can select, and, on each row, the fact the
+    /// name alone does not say — where selecting it sends the requests.
+    ///
+    /// The list is the resolved table (`mush_core::provider::Catalog::rows`), not
+    /// `Provider::ALL`, so a row the home config names is a choice like any
+    /// other; and the label
+    /// carries the endpoint a row that owns one switches to, or says that a row
+    /// with none keeps the endpoint in force — the `custom` row and a config row
+    /// with no `base_url` (finding PK5). Before this the popup was two bare
+    /// names, and nothing said that one repoints the URL while the other leaves
+    /// it alone.
     fn open_provider_picker(&mut self) {
-        let items: Vec<PickerItem> = Provider::ALL
+        let items: Vec<PickerItem> = self
+            .cfg()
+            .providers
+            .rows()
             .iter()
-            .map(|provider| PickerItem {
-                id: Some(provider.name().to_string()),
-                label: provider.name().to_string(),
+            .map(|row| PickerItem {
+                id: Some(row.name.clone()),
+                label: format!("{} · {}", row.name, endpoint_hint(row)),
             })
             .collect();
         let cursor = items
@@ -4464,15 +4490,26 @@ impl App {
         });
     }
 
+    /// Select the row `name` stands for, and say what the switch did.
+    ///
+    /// The name resolves against the table the run resolved at startup, so a
+    /// row the home config defines is selectable and the refusal lists the names
+    /// that actually exist — a built-in's always among them (findings PK5, C2).
     fn apply_provider(&mut self, name: &str) {
-        let Some(provider) = Provider::parse(name) else {
+        let row = self.cfg().providers.get(name).cloned();
+        let Some(row) = row else {
             self.fail(format!(
                 "unknown provider `{name}` — try {}",
-                mush_core::provider::names_hint()
+                self.cfg().providers.names_hint()
             ));
             return;
         };
-        let forgotten = self.switch_provider(provider);
+        let Some(forgotten) = self.switch_provider(&row) else {
+            // The row states an endpoint no request may be built from, and the
+            // refusal is already the one sentence in the slot: nothing was
+            // written, and nothing else is worth saying (finding D19).
+            return;
+        };
         // What a provider writes is stored — its name, its endpoint and its
         // model — and the session outranks the home config on the next start,
         // so this has to mark the session dirty or the next start silently
@@ -4483,7 +4520,28 @@ impl App {
         // the first half is true of a save that failed, whose own sentence is
         // the one the slot must keep (finding IN12).
         if self.persist_user_config() {
-            let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
+            // Three facts moved and the old line named one: the endpoint the
+            // row switched to (or the one it kept), and the model that answers
+            // there. `/url`'s ack has carried its endpoint all along, and a
+            // human who typed `/provider` was left guessing which host the
+            // name took them to (finding PK5).
+            let endpoint = if row.switches_endpoint {
+                self.cfg().base_url.clone()
+            } else {
+                format!("keeps the endpoint {}", self.cfg().base_url)
+            };
+            let model = if self.cfg().model.is_empty() {
+                "no model".to_string()
+            } else {
+                self.cfg().model.clone()
+            };
+            let mut line = format!(
+                "provider: {} · {} · model {} · {}",
+                row.name(),
+                endpoint,
+                model,
+                self.context_label()
+            );
             if forgotten {
                 // The model-list fetch above was the first request, and it went
                 // out without the key: the acknowledgement names what is missing
@@ -4542,40 +4600,73 @@ impl App {
         moved
     }
 
-    /// Select a provider: the endpoint it owns, the model mush knows for it,
-    /// and the window that goes with both — in one write, so a request cannot
-    /// go out against the new provider with the old one's model or window
-    /// (finding A5; a window the human stated is kept by `rederive_context`).
+    /// Select a provider row: the endpoint it owns, the model it states or
+    /// offers, and the window that goes with both — in one write, so a request
+    /// cannot go out against the new provider with the old one's model or
+    /// window (finding A5; a window the human stated is kept by
+    /// `rederive_context`).
+    ///
+    /// A row's endpoint is a value the home config states and a request line is
+    /// built from it raw, so it goes through [`checked_url`] first: a row with a
+    /// control character in its `base_url` is refused with *nothing* written,
+    /// rather than switched to and refused by the request it builds (finding
+    /// D19). A row that keeps the endpoint states nothing to check.
     ///
     /// Returns whether the switch moved the endpoint to another host and
-    /// dropped the key with it ([`ConfigCell::edit`]'s rule, finding C6). A
-    /// provider that keeps the endpoint (`custom`'s own row) keeps the key,
-    /// too: the destination did not move.
-    fn switch_provider(&mut self, provider: Provider) -> bool {
-        let moves_endpoint = provider.spec().switches_endpoint;
-        let moved = self.cell.edit(|cfg| {
-            cfg.provider = provider.row();
-            // A provider that owns an endpoint points at it; one that stands for
-            // "wherever the human pointed mush" keeps the endpoint already set.
-            if provider.spec().switches_endpoint {
-                cfg.base_url = provider.default_base_url().to_string();
-            }
-            let known = cfg.default_models();
-            let mut model = cfg.model.clone();
-            if !known.contains(&model) {
-                if let Some(first) = known.first() {
-                    model = first.clone();
+    /// dropped the key with it ([`ConfigCell::edit`]'s rule, finding C6), or
+    /// `None` for a row whose endpoint was refused — the caller's `fail` is
+    /// then the one sentence in the slot. A row that keeps the endpoint
+    /// (`custom`'s own, and a config row with no `base_url`) keeps the key, too:
+    /// the destination did not move.
+    fn switch_provider(&mut self, row: &ProviderRow) -> Option<bool> {
+        let endpoint = if row.switches_endpoint {
+            match checked_url(&row.base_url, "/provider") {
+                Ok(url) => Some(url),
+                Err(error) => {
+                    self.fail(error);
+                    return None;
                 }
             }
+        } else {
+            None
+        };
+        let known = row.model_ids();
+        let moved = self.cell.edit(|cfg| {
+            cfg.provider = row.clone();
+            // A row that owns an endpoint points at it; one that stands for
+            // "wherever the human pointed mush" keeps the endpoint already set.
+            if let Some(endpoint) = endpoint {
+                cfg.base_url = endpoint;
+            }
+            // The row's own model when it states one, else the model in force
+            // when the row offers it, else the first it offers, else what the
+            // human had — a row that names no models says nothing about the
+            // model in use.
+            let model = if !row.model.is_empty() {
+                row.model.clone()
+            } else if known.contains(&cfg.model) {
+                cfg.model.clone()
+            } else {
+                known.first().cloned().unwrap_or_else(|| cfg.model.clone())
+            };
+            // `set_model`, not an assignment: the window re-derives for the
+            // model the row selected, which is the half a switch used to leave
+            // behind (finding A5).
             cfg.set_model(&model);
+            // A row that states a temperature is a human stating a fact about a
+            // host they described; a row that states none — every built-in —
+            // leaves the temperature in force alone rather than guessing one.
+            if let Some(temperature) = row.temperature {
+                cfg.temperature = temperature;
+            }
         });
         // A provider that brought its own endpoint brought its own model list
         // with it; the fetch `apply_provider` starts next is what fills it
         // (finding D4). One that keeps the human's endpoint keeps the list.
-        if moves_endpoint {
+        if row.switches_endpoint {
             self.models.clear();
         }
-        moved
+        Some(moved)
     }
 
     /// Apply the row `Enter` landed on. The row carries its own id, so nothing
@@ -6571,6 +6662,7 @@ mod tests {
     use crate::attach;
     use crate::ids::JobId;
     use mush_core::scratch::{Held, Scratch};
+    use mush_core::Provider;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -17930,7 +18022,8 @@ mod tests {
             "and the actors measure against the re-derived one"
         );
 
-        app.switch_provider(Provider::DeepSeek);
+        let deepseek = row_named(&app, "deepseek");
+        app.switch_provider(&deepseek);
         assert_eq!(app.cfg().base_url, "https://api.deepseek.com");
         assert_eq!(app.cfg().model, "deepseek-flash", "the vendor's own model");
         assert_eq!(
@@ -17947,7 +18040,8 @@ mod tests {
         // A window the human stated is theirs: neither switch touches it.
         app.cell.edit(|cfg| cfg.set_context(32_768));
         app.switch_endpoint("http://127.0.0.1:9998");
-        app.switch_provider(Provider::Custom);
+        let custom = row_named(&app, "custom");
+        app.switch_provider(&custom);
         assert_eq!(
             app.cfg().context_tokens,
             32_768,
@@ -17965,9 +18059,11 @@ mod tests {
         let (mut app, _rx) = test_app("provider-forgets-key");
         app.cell.edit(|cfg| cfg.api_key = Some("sk-lan".into()));
 
-        assert!(
-            app.switch_provider(Provider::DeepSeek),
-            "the provider owns another host"
+        let deepseek = row_named(&app, "deepseek");
+        assert_eq!(
+            app.switch_provider(&deepseek),
+            Some(true),
+            "the provider owns another host, and the key did not follow it"
         );
         assert_eq!(app.cell.ui().api_key, None, "the UI's copy");
         assert_eq!(
@@ -18135,6 +18231,190 @@ mod tests {
             text_of(&app).starts_with("provider: custom · "),
             "and the bar names the provider that was picked: {}",
             text_of(&app)
+        );
+    }
+
+    /// The resolved row a name selects, owned: a switch takes the row the name
+    /// resolved to, and a borrow of the cell cannot outlive the write it makes.
+    fn row_named(app: &App, name: &str) -> ProviderRow {
+        app.cfg()
+            .providers
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("`{name}` is a row of the table"))
+    }
+
+    /// A config row stating an endpoint, a model, and that model's window.
+    fn home_row(endpoint: &str, model: &str) -> userconfig::ProviderConfig {
+        let mut row = userconfig::ProviderConfig {
+            base_url: endpoint.to_string(),
+            model: model.to_string(),
+            ..userconfig::ProviderConfig::default()
+        };
+        row.models.insert(
+            model.to_string(),
+            userconfig::ModelConfig {
+                vision: None,
+                context: Some(32_768),
+            },
+        );
+        row
+    }
+
+    /// Put a home config's own provider table on the cell the way startup does:
+    /// one [`mush_core::provider::Catalog::of_home`] over a file naming `rows`,
+    /// so a test's `/provider` reads the same table `main` would have resolved.
+    fn install_home_providers(app: &mut App, rows: &[(&str, userconfig::ProviderConfig)]) {
+        let mut home = UserConfig::default();
+        for (name, row) in rows {
+            home.providers.insert(name.to_string(), row.clone());
+        }
+        let catalog = mush_core::provider::Catalog::of_home(&home).expect("the rows resolve");
+        app.cell.edit(|cfg| {
+            cfg.provider = catalog.default_row().clone();
+            cfg.providers = catalog;
+        });
+    }
+
+    /// `/provider` lists the resolved table, not the built-ins alone: a row the
+    /// home config names is a choice beside `deepseek` and `custom`, and every
+    /// label says what selecting it does to the endpoint — the endpoint a row
+    /// owns, or the plain fact that a row with none keeps the one in force
+    /// (finding PK5).
+    #[test]
+    fn the_provider_picker_lists_the_built_in_rows_and_the_files_rows() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("provider-picker-rows");
+        install_home_providers(
+            &mut app,
+            &[("home", home_row("http://127.0.0.1:8078", "lfm2-vl"))],
+        );
+
+        run(&mut app, "/provider");
+
+        let picker = app.picker.as_ref().expect("the provider list opened");
+        assert_eq!(picker.kind, PickerKind::Provider);
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("deepseek"), Some("custom"), Some("home")],
+            "the built-ins first, then the file's row"
+        );
+        assert_eq!(
+            labels(&picker.items),
+            vec![
+                "deepseek · https://api.deepseek.com",
+                "custom · keeps the endpoint",
+                "home · http://127.0.0.1:8078",
+            ],
+            "each row says where selecting it sends the requests"
+        );
+        assert_eq!(
+            picker.items[picker.cursor].id.as_deref(),
+            Some(app.cfg().provider.name.as_str()),
+            "the cursor opens on the row in force: {:?}",
+            labels(&picker.items)
+        );
+    }
+
+    /// `/provider home` applies the row's own endpoint, its model and the window
+    /// that comes with it in one write (finding A5), and the ack names the three
+    /// facts that moved: the row, the endpoint requests now go to, and the model
+    /// answering there (finding PK5).
+    #[test]
+    fn provider_home_switches_the_endpoint_and_the_model_and_says_so() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("provider-home-switch");
+        install_home_providers(
+            &mut app,
+            &[("home", home_row("http://127.0.0.1:2", "lfm2-vl"))],
+        );
+
+        run(&mut app, "/provider home");
+
+        assert_eq!(app.cfg().provider.name, "home", "the row the name selects");
+        assert_eq!(app.cfg().base_url, "http://127.0.0.1:2");
+        assert_eq!(app.cfg().model, "lfm2-vl");
+        assert_eq!(
+            app.cfg().context_tokens,
+            32_768,
+            "the row's stated window, re-derived with the model"
+        );
+        assert_eq!(
+            app.cell.handle().config().unwrap().model,
+            "lfm2-vl",
+            "the actors were handed the model the bar names"
+        );
+        assert_eq!(
+            text_of(&app),
+            "provider: home · http://127.0.0.1:2 · model lfm2-vl · ctx ~32.8k"
+        );
+    }
+
+    /// A name the table does not hold is refused with the names it does — the
+    /// home config's rows included, because the sentence is built from the same
+    /// table `/provider` lists — and nothing in the cell moves (findings C2,
+    /// PK5).
+    #[test]
+    fn a_provider_name_the_file_does_not_define_is_refused_naming_the_names_that_exist() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("provider-unknown");
+        install_home_providers(
+            &mut app,
+            &[("home", home_row("http://127.0.0.1:2", "lfm2-vl"))],
+        );
+        let endpoint = app.cfg().base_url.clone();
+        let model = app.cfg().model.clone();
+
+        run(&mut app, "/provider nope");
+
+        assert_eq!(
+            text_of(&app),
+            "unknown provider `nope` — try deepseek, custom or home"
+        );
+        assert_eq!(app.cfg().provider.name, "custom", "the row in force stands");
+        assert_eq!(app.cfg().base_url, endpoint);
+        assert_eq!(app.cfg().model, model);
+        assert_eq!(
+            app.cell.handle().config().unwrap().base_url,
+            endpoint,
+            "and no actor saw a switch that did not happen"
+        );
+    }
+
+    /// A row that states no endpoint — `custom`, and a config row with no
+    /// `base_url` — is the human's own endpoint under a name: selecting it
+    /// leaves the endpoint in force, and the key belongs to that endpoint and
+    /// stays with it (findings C6, D6, PK5).
+    #[test]
+    fn a_row_that_keeps_the_endpoint_leaves_it_and_its_key_alone() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("provider-keeps-endpoint");
+        install_home_providers(
+            &mut app,
+            &[("local", userconfig::ProviderConfig::default())],
+        );
+        app.cell.edit(|cfg| cfg.api_key = Some("sk-lan".into()));
+
+        run(&mut app, "/provider local");
+
+        assert_eq!(app.cfg().provider.name, "local");
+        assert_eq!(
+            app.cfg().base_url,
+            "http://127.0.0.1:1",
+            "the endpoint the human pointed mush at is still the destination"
+        );
+        assert_eq!(
+            app.cell.ui().api_key.as_deref(),
+            Some("sk-lan"),
+            "the destination did not move, so the key did not either"
+        );
+        assert_eq!(
+            text_of(&app),
+            "provider: local · keeps the endpoint http://127.0.0.1:1 · model test-model · ctx ~32.8k"
         );
     }
 
