@@ -59,6 +59,16 @@ fn comment() -> Vec<String> {
          above, the older flat field."
             .to_string(),
         format!(
+            "providers: named rows of the provider table — a base_url, the model and knobs 
+             selecting it applies, and a `models` map annotating the ids the endpoint serves 
+             (vision, context). The annotations are not a claim to be exhaustive: a model they 
+             do not name is unannotated, not assumed blind. Select a row with /provider, 
+             --provider or a workspace's session. No keys here: a provider's key is the 
+             `api_keys` entry for its host. The built-ins ({}) are always available, and a row 
+             may not take one of their names over.",
+            names_hint()
+        ),
+        format!(
             "provider: {}; `{}` defaults to the local endpoint {}.",
             names_hint(),
             DEFAULT_PROVIDER.name(),
@@ -87,6 +97,77 @@ fn comment() -> Vec<String> {
         ),
         "Keys mush does not know are ignored, and kept when mush rewrites this file. `mush --print-config` shows what these resolved to.".to_string(),
     ]
+}
+
+/// One named provider in [`UserConfig::providers`]: an OpenAI-compatible
+/// endpoint, the knobs selecting it applies, and an annotation set of the model
+/// ids it serves.
+///
+/// Every field is optional, because a row is a *statement* about a host and a
+/// human writes only what they know: an empty row is a name that keeps the
+/// endpoint already set and says nothing about it.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// The endpoint this row owns, without a trailing slash; a control
+    /// character in it is refused where every other endpoint is. Stating one
+    /// makes selecting the row *switch* to it; leaving it empty keeps the
+    /// endpoint in force, the way the `custom` row does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    /// An **annotation set keyed by model id**, not a claim to be exhaustive.
+    ///
+    /// The endpoint may serve models this map does not name, and they are still
+    /// pickable: a model nothing here names is simply *unannotated*, so it falls
+    /// through to `unknown` — never to "blind" by the field's absence. What a
+    /// row states here is the only way mush learns a capability of a model it
+    /// has never heard of (the home box serving `lfm2-vl` is the case that
+    /// matters), and it is stated, so it is trusted where a guess would not be.
+    ///
+    /// Ids compare without their namespace (`vendor/model`), exactly as
+    /// [`crate::provider::ProviderRow::documented_context`] and
+    /// [`crate::provider::ProviderRow::vision`] compare them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelConfig>,
+    /// The model selecting this row applies when nothing above states one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Ask for the host's thinking mode. `false` (and the field's absence) sends
+    /// no `thinking` field at all; `true` sends `{"type":"enabled"}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// The `reasoning_effort` a request to this host asks for when the human
+    /// states none: "low", "high" or "max", checked here rather than where it
+    /// is applied so a typo in a row nobody selected is still reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Sampling temperature selecting this row applies; clamped where every
+    /// temperature is, so a typo is a value mush can still send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// The window this row's models are budgeted against when neither the model
+    /// annotation nor the endpoint states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<usize>,
+}
+
+/// What one provider row states about one model id.
+///
+/// Both fields are `Option` on purpose: absent is "this row states nothing",
+/// which is a different fact from `vision: false` — a human's statement that
+/// the model is blind. The first leaves the model *unknown* (its parts travel,
+/// and an endpoint that cannot see says so in its own words), the second keeps
+/// today's refusal and drop.
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Whether this model accepts image content parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// The window this model has, in tokens — the same fact
+    /// [`crate::provider::known_context`] states for a documented model, stated
+    /// here by the human because only they know what their server was started
+    /// with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<usize>,
 }
 
 /// The machine-global defaults the precedence chain consults below the session.
@@ -136,8 +217,36 @@ pub struct UserConfig {
     /// [`host_of`]: crate::config::host_of
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub api_keys: BTreeMap<String, String>,
-    /// Provider name as given by [`Provider::name()`](crate::provider::Provider::name),
-    /// i.e. a name `--provider` accepts (see [`provider::PROVIDERS`](crate::provider::PROVIDERS)).
+    /// The provider rows this machine names, each an endpoint under a name the
+    /// human chose: `/provider home`, `--provider work`, and a row of their own
+    /// in the picker.
+    ///
+    /// These are ordinary rows of the table [`crate::provider::Catalog`]
+    /// resolves at startup — the built-ins (`deepseek`, `custom`) are always
+    /// there, and a row here adds a name beside them. A row may not shadow a
+    /// built-in name, which is a startup failure naming this file and the name:
+    /// two rows called `deepseek` would make the endpoint a request reaches
+    /// depend on which arm of the merge ran first.
+    ///
+    /// **A row is a preset, not a place.** Selecting it applies the fields it
+    /// states — the endpoint, the model, the window, the temperature and the
+    /// two request knobs — exactly as the built-in rows above do from their
+    /// constants; everything a layer above this file states (a flag, the
+    /// environment, a workspace's session) still outranks it.
+    ///
+    /// **No keys here.** [`Self::api_keys`] is the only place a key is stored: a
+    /// provider's key is the entry for its host, which is why that map is keyed
+    /// by host and not by name. Two names for one host share its key, and a row
+    /// that moves to another host keeps the old one untouched.
+    ///
+    /// An empty map is not written at all; a save that states no rows keeps the
+    /// ones the file already had, and one that states rows replaces the whole
+    /// map with them (the rows are this value's statement, like [`Self::api_keys`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    /// Provider name as given by [`Provider::name()`](crate::provider::Provider::name)
+    /// or by a row of [`Self::providers`], i.e. a name `--provider` accepts (see
+    /// [`provider::PROVIDERS`](crate::provider::PROVIDERS)).
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
@@ -806,6 +915,129 @@ mod tests {
         // provider's own defaults in charge.
         assert_eq!(user.reasoning_effort, None);
         assert_eq!(user.thinking, None);
+        // A file written before `providers` existed has no rows, and that is
+        // absence rather than a failure: the built-ins are the whole table.
+        assert!(
+            user.providers.is_empty(),
+            "no rows is every file mush wrote before the map existed"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The row shape a test writes: a home box with one annotated model, the
+    /// case the whole map exists for.
+    fn home_row() -> ProviderConfig {
+        ProviderConfig {
+            base_url: "http://rubendpc:8078".into(),
+            models: BTreeMap::from([(
+                "lfm2-vl".to_string(),
+                ModelConfig {
+                    vision: Some(true),
+                    context: Some(32_768),
+                },
+            )]),
+            model: "lfm2-vl".into(),
+            thinking: Some(false),
+            reasoning_effort: Some("high".into()),
+            temperature: Some(0.2),
+            context: Some(32_768),
+        }
+    }
+
+    /// A named provider's row is a field like any other: what a human writes is
+    /// what comes back, the annotation set included — a save that lost the
+    /// annotations would turn every stated capability into `unknown` on the
+    /// next start.
+    #[test]
+    fn a_named_provider_row_round_trips_through_the_file() {
+        let path = temp_path("providers-round-trip");
+        let user = UserConfig {
+            providers: BTreeMap::from([("home".to_string(), home_row())]),
+            ..UserConfig::default()
+        };
+        user.save_to(&path, KeyWrite::Keep).unwrap();
+
+        let loaded = UserConfig::load_from(&path);
+        assert!(loaded.complaint.is_none(), "{:?}", loaded.complaint);
+        assert_eq!(loaded.config.providers, user.providers);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The whole `providers` object is one statement, like the key map and
+    /// unlike the scalar fields: a save that states rows replaces the file's
+    /// map, and a save that states none — every runtime command, whose acks say
+    /// nothing about a provider — keeps it. Per-entry merging is precisely what
+    /// would let a command that never saw the file delete a row.
+    #[test]
+    fn a_save_states_the_whole_providers_map_and_keeps_it_when_the_value_states_none() {
+        let path = temp_path("providers-merge");
+        let written = UserConfig {
+            providers: BTreeMap::from([("home".to_string(), home_row())]),
+            ..UserConfig::default()
+        };
+        written.save_to(&path, KeyWrite::Keep).unwrap();
+
+        // A `/url`-shaped save: it states the connection and nothing about rows.
+        UserConfig {
+            base_url: "http://box:9".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Keep)
+        .unwrap();
+        let loaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            loaded.providers, written.providers,
+            "a save that states no rows keeps the file's"
+        );
+
+        // A save that states rows: the value's map is the whole statement.
+        let replaced = UserConfig {
+            providers: BTreeMap::from([(
+                "work".to_string(),
+                ProviderConfig {
+                    base_url: "https://api.example.com/v1".into(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..UserConfig::default()
+        };
+        replaced.save_to(&path, KeyWrite::Keep).unwrap();
+        let loaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            loaded.providers, replaced.providers,
+            "the value's map replaces the file's, annotations and all"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A row that states nothing is a name and nothing else — an empty object
+    /// loads, so a human can add one and fill it in later — and an annotation
+    /// that states only one fact states only that one.
+    #[test]
+    fn an_empty_row_and_a_one_fact_annotation_load() {
+        let path = temp_path("providers-partial");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "providers": {
+    "bare": {},
+    "home": { "models": { "lfm2-vl": { "vision": true } } }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let user = UserConfig::load_from(&path);
+        assert!(user.complaint.is_none(), "{:?}", user.complaint);
+        let home = user.config.providers.get("home").expect("the row loaded");
+        let facts = home.models.get("lfm2-vl").expect("the annotation loaded");
+        assert_eq!(facts.vision, Some(true));
+        assert_eq!(
+            facts.context, None,
+            "a fact the human did not state is not a number mush invented"
+        );
+        assert_eq!(home.base_url, "", "and the row states no endpoint");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -830,6 +1062,7 @@ mod tests {
   "max_completion_tokens": true,
   "reasoning_effort": "low",
   "thinking": false,
+  "providers": {"home": {"base_url": "http://rubendpc:8078", "models": {"lfm2-vl": {"vision": true}}}},
   "future_knob": {"a": 1}
 }"#,
         )
@@ -846,9 +1079,14 @@ mod tests {
         assert_eq!(user.max_completion_tokens, Some(true));
         assert_eq!(user.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(user.thinking, Some(false));
-
-        // The TUI's save states the connection and nothing else; the knobs and
-        // the unknown key are left exactly as the human wrote them.
+        assert_eq!(
+            user.providers
+                .get("home")
+                .and_then(|row| row.models.get("lfm2-vl"))
+                .and_then(|facts| facts.vision),
+            Some(true),
+            "a row and its annotations are fields of the value like any other"
+        );
         let saved = UserConfig {
             api_key: Some("sk-new".into()),
             provider: "custom".into(),
@@ -869,6 +1107,10 @@ mod tests {
         assert_eq!(reloaded.max_completion_tokens, Some(true));
         assert_eq!(reloaded.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(reloaded.thinking, Some(false));
+        assert_eq!(
+            reloaded.providers, user.providers,
+            "the rows and their annotations survive a save that states none"
+        );
         assert_eq!(
             reloaded.api_keys.get("old:9").map(String::as_str),
             Some("sk-map"),

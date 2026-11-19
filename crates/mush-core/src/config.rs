@@ -22,7 +22,8 @@ use crate::CMD_CAP;
 /// path. Every vendor fact behind it lives in [`crate::provider`], the only
 /// module that names one.
 pub use crate::provider::{
-    known_context, vision_capable, ModelSpec, Provider, ProviderSpec, PROVIDERS,
+    known_context, vision_capable, Catalog, ModelRow, ModelSpec, Provider, ProviderRow, ProviderSpec,
+    PROVIDERS,
 };
 
 /// Context window assumed when nothing better is known: `MUSH_CONTEXT`, an
@@ -236,7 +237,20 @@ impl WindowSource {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub provider: Provider,
+    /// The provider row in force: the built-in or home-config row a name
+    /// selected. Owned, because the table is data now — a name the human wrote
+    /// in their own file has no `Provider` variant to be. Its fields are what
+    /// the request knobs and the label read (a row's `thinking`, its effort and
+    /// its window defaults included), which is why the row travels with the
+    /// config instead of the enum it used to carry.
+    pub provider: ProviderRow,
+    /// Every row a name can select — the built-ins first, then the home
+    /// config's — resolved once at startup by [`resolve`]. It rides with the
+    /// configuration because the surfaces that ask it by name (`/provider`, the
+    /// picker, a refusal that lists the names, `--print-config`) all read a
+    /// `Config`, and an actor's clone in another thread must answer with the
+    /// same table the screen shows.
+    pub providers: Catalog,
     /// What every request is built from: [`Self::chat_url`] and
     /// [`Self::models_url`] append to it and the result is written into the
     /// request line raw, so a control character here is a request the value
@@ -357,19 +371,15 @@ impl Overrides {
     /// order is the one reported.
     pub fn from_env_checked() -> Result<Self, String> {
         let text = EnvText::read();
-        // The provider first: a key meant for somewhere else must not be sent
-        // to the default endpoint (finding A17).
-        let provider = match text.provider {
-            Some(name) => {
-                parse_provider_env(&name)?;
-                Some(name)
-            }
-            None => None,
-        };
+        // The provider's *name* is not checked here: the table it has to be a
+        // name in includes the home config's rows, and this constructor runs
+        // before the file is read. [`resolve_with`] checks it against the
+        // resolved table ([`parse_provider_env`]), which is still one place and
+        // still before anything can be sent (finding A17).
         Ok(Self {
             url: text.url.map(|value| parse_url_env(&value)).transpose()?,
             model: text.model,
-            provider,
+            provider: text.provider,
             api_key: text
                 .api_key
                 .map(|value| parse_key_env(&value))
@@ -452,17 +462,18 @@ pub fn parse_context_env(value: &str) -> Result<usize, String> {
     parse_context(value, "MUSH_CONTEXT")
 }
 
-/// Validate `MUSH_PROVIDER` the way the command line is validated. Ignoring a
-/// typo would leave the provider at its default — `Custom`, whose default
-/// endpoint is a LAN host — so a key meant for somewhere else would be sent
-/// there (finding A17).
-pub fn parse_provider_env(value: &str) -> Result<Provider, String> {
-    Provider::parse(value).ok_or_else(|| {
-        format!(
-            "MUSH_PROVIDER: unknown provider `{value}` (try {})",
-            provider::names_hint()
-        )
-    })
+/// Validate `MUSH_PROVIDER` against the resolved table, the way the command
+/// line is validated. The table and not the built-in constants, because a name
+/// the home config defines is a name the environment may use too — which is why
+/// the check cannot live in [`Overrides::from_env_checked`], the constructor
+/// that runs before the file is read. Ignoring a typo would leave the provider
+/// at its default — `Custom`, whose default endpoint is a LAN host — so a key
+/// meant for somewhere else would be sent there (finding A17).
+pub fn parse_provider_env(value: &str, catalog: &Catalog) -> Result<ProviderRow, String> {
+    catalog
+        .require(value)
+        .cloned()
+        .map_err(|error| format!("MUSH_PROVIDER: {error}"))
 }
 
 /// Validate `MUSH_REASONING_EFFORT` the way the command line is validated. A
@@ -657,7 +668,10 @@ impl Config {
             .unwrap_or_else(|| provider.default_base_url().to_string());
         let context = env.context.filter(|n| *n > 0).map(clamp_context);
         Self {
-            provider,
+            provider: ProviderRow::of(provider),
+            // Only the built-in rows, until [`resolve_with`] has the home
+            // config in hand: this constructor is the layer *below* it.
+            providers: Catalog::builtin(),
             base_url,
             model: env.model.clone().unwrap_or_default(),
             // A key is checked the way a URL is: a malformed one is dropped
@@ -696,7 +710,8 @@ impl Config {
         api_key: Option<String>,
     ) -> Self {
         Self {
-            provider: provider::DEFAULT_PROVIDER,
+            provider: ProviderRow::of(provider::DEFAULT_PROVIDER),
+            providers: Catalog::builtin(),
             base_url: normalize_url(&base_url.into()),
             model: model.into(),
             api_key,
@@ -845,18 +860,16 @@ impl Config {
     /// The provider's known models, used when the endpoint cannot list them
     /// (offline, missing key, or a server without `/v1/models`).
     pub fn default_models(&self) -> Vec<String> {
-        self.provider
-            .spec()
-            .models
-            .iter()
-            .map(|model| model.id.to_string())
-            .collect()
+        self.provider.model_ids()
     }
 
     /// The window to assume for the current model when the endpoint advertises
-    /// nothing: the documented one, else the provider's general default.
+    /// nothing: the documented one — the built-in table's, then this row's own
+    /// annotations — else the row's general default.
     pub fn fallback_context(&self) -> usize {
-        known_context(&self.model).unwrap_or(self.provider.spec().fallback_context_tokens)
+        self.provider
+            .documented_context(&self.model)
+            .unwrap_or(self.provider.fallback_context_tokens)
     }
 
     /// Adopt a window an endpoint named, unless the human stated one
@@ -907,7 +920,7 @@ impl Config {
     pub fn thinking_enabled(&self) -> bool {
         match self.thinking {
             Some(mode) => mode == ThinkingMode::On,
-            None => self.provider.spec().thinking_by_default,
+            None => self.provider.thinking_by_default,
         }
     }
 
@@ -926,7 +939,10 @@ impl Config {
     pub fn reasoning_effort(&self) -> Option<&'static str> {
         match self.reasoning_effort {
             Some(effort) => Some(effort.as_str()),
-            None => self.provider.spec().reasoning_effort_by_default,
+            None => self
+                .provider
+                .reasoning_effort_by_default
+                .map(|effort| effort.as_str()),
         }
     }
 
@@ -982,7 +998,7 @@ impl Config {
     /// by every writer ([`Self::set_base_url`], `resolve`), and a table row's
     /// `default_base_url` carries no trailing slash.
     fn on_the_providers_own_endpoint(&self) -> bool {
-        self.provider.spec().default_base_url == self.base_url
+        self.provider.base_url == self.base_url
     }
 
     /// A short label for the status bar: the model, then the endpoint — the
@@ -1008,7 +1024,7 @@ impl Config {
         } else {
             crate::text::sanitize(self.model.rsplit('/').next().unwrap_or(&self.model))
         };
-        let endpoint = match self.provider.spec().display_endpoint {
+        let endpoint = match self.provider.display_endpoint.as_deref() {
             Some(endpoint) if self.on_the_providers_own_endpoint() => endpoint.to_string(),
             _ => self.base_url.clone(),
         };
@@ -1057,37 +1073,78 @@ pub fn resolve(
     home: &UserConfig,
     session: Option<&Session>,
 ) -> Result<Resolved, String> {
+    // The table first: the environment's provider is one of the names in it, and
+    // a name the home config defines is a name `MUSH_PROVIDER` may use too. That
+    // is why the environment cannot be parsed before the file is in hand — see
+    // [`Overrides::from_env_checked`].
+    let catalog = provider::Catalog::of_home(home)?;
     let env = Overrides::from_env_checked()?;
-    resolve_with(Config::from_env_layer(&env), cli, &env, home, session)
+    resolve_in(
+        Config::from_env_layer(&env),
+        cli,
+        &env,
+        home,
+        session,
+        catalog,
+    )
 }
 
 /// The pure half of [`resolve`]: apply the layers to an already-built base
 /// config. Kept separate so the precedence can be tested without a process
 /// environment.
+///
+/// The table is resolved from `home` here rather than taken from the base
+/// config, because the base was built by a constructor that never saw the file.
+/// [`resolve`] passes the one it already built, so startup resolves it once.
 pub fn resolve_with(
-    mut config: Config,
+    config: Config,
     cli: &Overrides,
     env: &Overrides,
     home: &UserConfig,
     session: Option<&Session>,
 ) -> Result<Resolved, String> {
+    let catalog = provider::Catalog::of_home(home)?;
+    resolve_in(config, cli, env, home, session, catalog)
+}
+
+/// The precedence itself, with the table already resolved.
+fn resolve_in(
+    mut config: Config,
+    cli: &Overrides,
+    env: &Overrides,
+    home: &UserConfig,
+    session: Option<&Session>,
+    catalog: provider::Catalog,
+) -> Result<Resolved, String> {
     let mut notices: Vec<String> = Vec::new();
+    config.providers = catalog.clone();
     // 1. Command-line flags beat everything else.
     if let Some(url) = cli.url.as_deref() {
         config.base_url = checked_url(url, "--url")?;
     }
-    if let Some(provider) = cli.provider.as_deref() {
-        config.provider = Provider::parse(provider).ok_or_else(|| {
-            format!(
-                "unknown provider `{provider}` (try {})",
-                provider::names_hint()
-            )
-        })?;
+    if let Some(name) = cli.provider.as_deref() {
+        let row = catalog.require(name)?;
+        config.provider = row.clone();
         // Naming a provider on the command line selects its own endpoint — the
         // flag must reach the host the provider names, not whatever the
         // environment's provider defaulted to — unless a URL was named too.
-        if cli.url.is_none() && env.url.is_none() {
-            config.base_url = config.provider.default_base_url().to_string();
+        if cli.url.is_none() && env.url.is_none() && !row.base_url.is_empty() {
+            config.base_url = row.base_url.clone();
+        }
+    }
+    // The environment's provider, applied here rather than by the base
+    // constructor so a name the home config defines is reachable from
+    // `MUSH_PROVIDER` too — the base was built before the file was read. It is
+    // validated against the table for the same reason the flag is: a typo must
+    // not leave the provider at its default, whose endpoint a key meant for
+    // somewhere else would then be sent to (finding A17).
+    if cli.provider.is_none() {
+        if let Some(name) = env.provider.as_deref() {
+            let row = parse_provider_env(name, &catalog)?;
+            config.provider = row.clone();
+            if cli.url.is_none() && env.url.is_none() && !row.base_url.is_empty() {
+                config.base_url = row.base_url.clone();
+            }
         }
     }
     if let Some(model) = cli.model.as_deref() {
@@ -1135,19 +1192,40 @@ pub fn resolve_with(
         // for somewhere else would be sent there (finding C2). The file's path
         // is named because `MUSH_CONFIG` can point anywhere, so its own name
         // is not enough for a human to find it.
-        let provider = Provider::parse(&home.provider).ok_or_else(|| {
-            format!(
-                "home config: unknown provider `{}` (try {}) — {}",
-                home.provider,
-                provider::names_hint(),
-                crate::userconfig::config_path_label()
-            )
-        })?;
-        config.provider = provider;
-        // Switching to a hosted provider also switches its endpoint,
-        // unless the home config names one.
-        if !url_given && home.base_url.is_empty() {
-            config.base_url = provider.default_base_url().to_string();
+        let row = catalog
+            .require(&home.provider)
+            .map_err(|error| {
+                format!(
+                    "home config: {error} — {}",
+                    crate::userconfig::config_path_label()
+                )
+            })?
+            .clone();
+        config.provider = row.clone();
+        // Selecting a row is what applies it: its endpoint (when this file
+        // states none of its own — a `base_url` here is the human pointing
+        // mush somewhere by hand, and it wins, as it always has), then its
+        // model, then its own knobs. The knobs that a `Config` holds as
+        // defaults ride in the row (`thinking_by_default`,
+        // `reasoning_effort_by_default`, `fallback_context_tokens`) and are
+        // read by the accessors, so only the two fields with no default of
+        // their own are written here.
+        if !url_given && home.base_url.is_empty() && !row.base_url.is_empty() {
+            // The row's endpoint is a file's own statement, so it is checked,
+            // and the file's path is named with a refusal, for the reason the
+            // arms below name it.
+            config.base_url = checked_url(&row.base_url, "home config's providers base_url")
+                .map_err(|error| {
+                    format!("{error} — {}", crate::userconfig::config_path_label())
+                })?;
+        }
+        if !model_given && config.model.is_empty() && !row.model.is_empty() {
+            config.model = row.model.clone();
+        }
+        if !temperature_given {
+            if let Some(temperature) = row.temperature {
+                config.temperature = temperature;
+            }
         }
     }
     if !url_given && !home.base_url.is_empty() {
@@ -1264,13 +1342,16 @@ pub fn resolve_with(
             // so this must not take the TUI down. It must not be silent
             // either: the provider is named and the endpoint the session
             // stored (the one just applied above, or the one in force) is kept
-            // (finding C2).
-            match Provider::parse(&session.provider) {
-                Some(provider) => config.provider = provider,
+            // (finding C2). A row the home config lost is the same case: the
+            // name is all the session stores, so a session that names a
+            // provider that has vanished is a notice and the endpoint it
+            // stored stands.
+            match catalog.get(&session.provider) {
+                Some(row) => config.provider = row.clone(),
                 None => notices.push(format!(
                     "session: unknown provider `{}` (try {}) — keeping the endpoint {}",
                     session.provider,
-                    provider::names_hint(),
+                    catalog.names_hint(),
                     config.base_url
                 )),
             }
@@ -1302,7 +1383,7 @@ pub fn resolve_with(
     //    knobs (`reasoning_effort`, `thinking`) to a URL it does not own. A
     //    provider named alongside the URL keeps its knobs.
     if (cli.url.is_some() || env.url.is_some()) && !provider_given {
-        config.provider = Provider::Custom;
+        config.provider = catalog.default_row().clone();
     }
 
     // 5. Nothing was stated: assume the model's documented window, else the
@@ -1364,6 +1445,31 @@ mod tests {
             model: model.into(),
             ..UserConfig::default()
         }
+    }
+
+    /// The home box's row: an endpoint the built-in table has never heard of,
+    /// one model annotated as able to see, and the knobs a human stated for
+    /// that host — the shape `providers` exists for.
+    fn named_row() -> std::collections::BTreeMap<String, crate::userconfig::ProviderConfig> {
+        use crate::userconfig::{ModelConfig, ProviderConfig};
+        std::collections::BTreeMap::from([(
+            "home".to_string(),
+            ProviderConfig {
+                base_url: "http://rubendpc:8078".into(),
+                models: std::collections::BTreeMap::from([(
+                    "lfm2-vl".to_string(),
+                    ModelConfig {
+                        vision: Some(true),
+                        context: Some(32_768),
+                    },
+                )]),
+                model: "lfm2-vl".into(),
+                thinking: Some(false),
+                reasoning_effort: Some("high".into()),
+                temperature: Some(0.2),
+                context: Some(32_768),
+            },
+        )])
     }
 
     fn stored(provider: &str, base_url: &str, model: &str) -> Session {
@@ -1650,7 +1756,7 @@ mod tests {
         .config;
         assert_eq!(config.base_url, "http://cli:1");
         assert_eq!(config.model, "cli-model");
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         // The key is never taken from the CLI; the environment's is already
         // in the base config, so the home key does not apply.
         assert_eq!(config.api_key.as_deref(), Some("sk-base"));
@@ -1668,7 +1774,7 @@ mod tests {
         .unwrap()
         .config;
         assert_eq!(config.base_url, "http://session:3");
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(config.model, "session-model");
         // The home key is *not* carried to the session's host: the session's
         // endpoint is another one, and a stored endpoint does not take a key
@@ -1705,6 +1811,145 @@ mod tests {
         .unwrap()
         .config;
         assert_eq!(config.base_url, "http://env:2");
+    }
+
+    /// A row of the home config is a provider like any other: naming it selects
+    /// its endpoint, its model and its knobs, and the annotations are what
+    /// answer the capability questions a model mush has never heard of raises.
+    #[test]
+    fn a_named_provider_row_applies_its_endpoint_model_and_knobs() {
+        let home = UserConfig {
+            provider: "home".into(),
+            providers: named_row(),
+            ..UserConfig::default()
+        };
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.provider.name, "home", "the row in force is the file's");
+        assert_eq!(
+            config.base_url, "http://rubendpc:8078",
+            "the endpoint the row owns is the endpoint a request reaches"
+        );
+        assert_eq!(config.model, "lfm2-vl", "the row's model applies");
+        assert_eq!(config.temperature(), 0.2, "the row's temperature applies");
+        assert_eq!(config.context_tokens, 32_768, "the row's window applies");
+        assert_eq!(
+            config.reasoning_effort(),
+            Some("high"),
+            "the row's effort is the default a request sends"
+        );
+        assert!(
+            !config.thinking_enabled(),
+            "the row states no thinking mode, so no `thinking` field is sent"
+        );
+        assert_eq!(
+            config.default_models(),
+            vec!["lfm2-vl".to_string()],
+            "the row's ids are offered when the endpoint cannot list its own"
+        );
+    }
+
+    /// The precedence is unmoved by a row: a flag or the environment still
+    /// beats the file, and a name stated on the command line beats the file's
+    /// own `provider`.
+    #[test]
+    fn the_command_line_beats_a_named_provider_rows_fields() {
+        let home = UserConfig {
+            provider: "home".into(),
+            providers: named_row(),
+            ..UserConfig::default()
+        };
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides {
+                provider: Some("deepseek".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.provider.name, "deepseek", "the flag wins");
+        assert_eq!(config.base_url, "https://api.deepseek.com");
+        assert_eq!(config.temperature(), 1.0, "the row's temperature never applied");
+
+        // A URL beside the name is still the human's, and still means `custom`.
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides {
+                url: Some("http://localhost:11434".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.base_url, "http://localhost:11434");
+        assert_eq!(config.provider.builtin, Some(Provider::Custom));
+        assert_eq!(config.model, "lfm2-vl", "a model the file names is not a URL's to clear");
+    }
+
+    /// A row is a name the *file* defines, so a workspace that saved a pick of
+    /// it must survive the row going away: the session names a provider the
+    /// table no longer holds, which is a notice and the stored endpoint kept —
+    /// never a failure (finding C2's rule, unchanged by the table being data).
+    #[test]
+    fn a_session_naming_a_provider_the_file_lost_is_a_notice_and_keeps_its_endpoint() {
+        let home = UserConfig {
+            base_url: "http://home:4".into(),
+            ..UserConfig::default()
+        };
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&stored("home", "http://box:9", "m")),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config.base_url, "http://box:9",
+            "the endpoint the session stored is kept"
+        );
+        assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
+        let notice = &resolved.notices[0];
+        assert!(notice.contains("home"), "{notice}");
+        assert!(notice.contains("deepseek or custom"), "{notice}");
+        assert!(notice.contains("http://box:9"), "{notice}");
+    }
+
+    /// ...and while the row is there, a session naming it selects it: the
+    /// knobs are the row's, and the endpoint is the one the session stored
+    /// (a session's endpoint is a workspace fact and always wins).
+    #[test]
+    fn a_session_may_name_a_row_the_file_holds() {
+        let home = UserConfig {
+            providers: named_row(),
+            ..UserConfig::default()
+        };
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&stored("home", "http://box:9", "lfm2-vl")),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.provider.name, "home");
+        assert_eq!(resolved.config.base_url, "http://box:9");
+        assert_eq!(resolved.config.reasoning_effort(), Some("high"));
+        assert!(resolved.notices.is_empty(), "{:?}", resolved.notices);
     }
 
     #[test]
@@ -1771,8 +2016,8 @@ mod tests {
             "the endpoint the session stored is kept"
         );
         assert_eq!(
-            resolved.config.provider,
-            Provider::Custom,
+            resolved.config.provider.builtin,
+            Some(Provider::Custom),
             "the typo is not a provider"
         );
         assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
@@ -2216,7 +2461,7 @@ mod tests {
         let base = Config::from_env_layer(&env);
         assert_eq!(base.base_url, "http://env:2");
         assert_eq!(base.model, "env-model");
-        assert_eq!(base.provider, Provider::DeepSeek);
+        assert_eq!(base.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(base.api_key.as_deref(), Some("sk-env"));
         assert_eq!(base.context_tokens, 9_000);
         assert!(base.context_explicit());
@@ -2300,7 +2545,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(deepseek.provider, Provider::DeepSeek);
+        assert_eq!(deepseek.provider.builtin, Some(Provider::DeepSeek));
         assert!(deepseek.thinking_enabled());
         assert_eq!(deepseek.reasoning_effort(), Some("high"));
         assert!(!deepseek.thinking_stated());
@@ -2315,7 +2560,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(custom.provider, Provider::Custom);
+        assert_eq!(custom.provider.builtin, Some(Provider::Custom));
         assert!(!custom.thinking_enabled());
         assert_eq!(custom.reasoning_effort(), None);
         assert!(!custom.thinking_stated());
@@ -2393,7 +2638,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(
             config.reasoning_effort(),
             Some("max"),
@@ -2427,7 +2672,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(config.provider, Provider::Custom, "the URL is the human's");
+        assert_eq!(config.provider.builtin, Some(Provider::Custom), "the URL is the human's");
         assert_eq!(config.reasoning_effort(), Some("low"));
         assert!(config.thinking_enabled());
 
@@ -2447,7 +2692,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(config.reasoning_effort(), Some("high"));
         assert!(!config.thinking_enabled());
     }
@@ -2506,7 +2751,8 @@ mod tests {
     #[test]
     fn deepseek_has_preset_defaults() {
         let cfg = Config {
-            provider: Provider::DeepSeek,
+            provider: Provider::DeepSeek.row(),
+            providers: Catalog::builtin(),
             base_url: Provider::DeepSeek.default_base_url().to_string(),
             model: String::new(),
             api_key: None,
@@ -2532,7 +2778,7 @@ mod tests {
     #[test]
     fn custom_provider_stays_vanilla() {
         let cfg = Config::new("http://localhost:11434", "qwen2.5-coder", None);
-        assert_eq!(cfg.provider, Provider::Custom);
+        assert_eq!(cfg.provider.builtin, Some(Provider::Custom));
         assert!(!cfg.thinking_enabled());
         assert_eq!(cfg.reasoning_effort(), None);
         assert!(cfg.default_models().is_empty());
@@ -2556,7 +2802,8 @@ mod tests {
     #[test]
     fn a_label_names_the_providers_endpoint_only_where_a_request_goes() {
         let mut cfg = Config {
-            provider: Provider::DeepSeek,
+            provider: Provider::DeepSeek.row(),
+            providers: Catalog::builtin(),
             ..Config::new(
                 Provider::DeepSeek.default_base_url(),
                 "deepseek-flash",
@@ -2590,14 +2837,15 @@ mod tests {
             "deepseek-flash",
             None,
         );
-        assert_eq!(cfg.provider, Provider::Custom);
+        assert_eq!(cfg.provider.builtin, Some(Provider::Custom));
         assert_eq!(cfg.label(), "deepseek-flash @ https://api.deepseek.com");
 
         // A path under the provider's host is not the provider's endpoint: a
         // request goes to `<base_url>/v1/chat/completions`, so a base URL with
         // a path of its own is a different endpoint, and is shown as itself.
         let cfg = Config {
-            provider: Provider::DeepSeek,
+            provider: Provider::DeepSeek.row(),
+            providers: Catalog::builtin(),
             ..Config::new("https://api.deepseek.com/v1", "deepseek-flash", None)
         };
         assert_eq!(cfg.label(), "deepseek-flash @ https://api.deepseek.com/v1");
@@ -3039,7 +3287,7 @@ mod tests {
         // local server's answer must not survive `/provider deepseek`.
         let mut cfg = Config::new("http://x:1", "m", None);
         assert!(cfg.adopt_context(4_096, WindowSource::Advertised));
-        cfg.provider = Provider::DeepSeek;
+        cfg.provider = Provider::DeepSeek.row();
         cfg.rederive_context();
         assert_eq!(cfg.context_tokens, 120_000, "the new provider's default");
         assert_eq!(cfg.context_source, WindowSource::Table);
@@ -3066,7 +3314,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(config.base_url, "https://api.deepseek.com");
 
         // `--url localhost:11434` with a stored DeepSeek provider: the stored
@@ -3084,7 +3332,7 @@ mod tests {
         .unwrap()
         .config;
         assert_eq!(config.base_url, "http://localhost:11434");
-        assert_eq!(config.provider, Provider::Custom);
+        assert_eq!(config.provider.builtin, Some(Provider::Custom));
         assert!(!config.thinking_enabled());
         assert_eq!(config.reasoning_effort(), None);
 
@@ -3103,7 +3351,7 @@ mod tests {
         .unwrap()
         .config;
         assert_eq!(config.base_url, "http://localhost:11434");
-        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.provider.builtin, Some(Provider::DeepSeek));
         assert_eq!(config.reasoning_effort(), Some("high"));
     }
 
@@ -3126,10 +3374,18 @@ mod tests {
     /// a hosted API would be sent there (finding A17).
     #[test]
     fn a_bad_provider_environment_value_is_reported() {
-        assert_eq!(parse_provider_env("deepseek"), Ok(Provider::DeepSeek));
-        assert_eq!(parse_provider_env(" custom "), Ok(Provider::Custom));
+        let catalog = Catalog::builtin();
+        let name = |row: ProviderRow| row.name;
+        assert_eq!(
+            parse_provider_env("deepseek", &catalog).map(name),
+            Ok("deepseek".to_string())
+        );
+        assert_eq!(
+            parse_provider_env(" CUSTOM ", &catalog).map(name),
+            Ok("custom".to_string())
+        );
         for value in ["openai", "openai-compatible", "claude"] {
-            let error = parse_provider_env(value).unwrap_err();
+            let error = parse_provider_env(value, &catalog).unwrap_err();
             assert!(error.contains(value), "{error}");
         }
     }

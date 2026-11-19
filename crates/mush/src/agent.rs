@@ -18162,7 +18162,7 @@ mod tests {
     fn a_request_carries_the_cap_its_window_derives() {
         let scripted = Arc::new(Scripted::new().says("done"));
         let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
-        cfg.provider = mush_core::config::Provider::DeepSeek;
+        cfg.provider = mush_core::config::Provider::DeepSeek.row();
         cfg.set_context(120_000);
         // What the *config* derives, not a number spelled again: the arithmetic
         // is `Config`'s and is pinned in its own tests, while what this test is

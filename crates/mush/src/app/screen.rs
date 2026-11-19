@@ -949,7 +949,7 @@ impl App {
                 // of its label — a model id containing the separator is still
                 // one id (Tier 3 §7).
                 PickerKind::Model => item.id.as_deref() == Some(self.cfg().model.as_str()),
-                PickerKind::Provider => item.id.as_deref() == Some(self.cfg().provider.name()),
+                PickerKind::Provider => item.id.as_deref() == Some(self.cfg().provider.name.as_str()),
                 // Nothing in this list is a choice, so nothing is marked as
                 // one.
                 PickerKind::Notes | PickerKind::Help | PickerKind::Glyphs => false,

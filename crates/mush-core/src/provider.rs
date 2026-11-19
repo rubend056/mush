@@ -14,8 +14,18 @@
 //! choice (`--provider`, the picker, the help, the home config's comments)
 //! picks it up without being told; the test at the bottom of this module is
 //! what keeps a vendor literal from creeping back out.
+//!
+//! The table is also **data**, not only a constant: the home config's
+//! `providers` map adds rows by name ([`crate::userconfig::ProviderConfig`]),
+//! and [`Catalog`] resolves both kinds into one owned table at startup. A row a
+//! human wrote describes their own host — a LAN box serving a model mush has
+//! never heard of — and is the reason a name, an endpoint and a set of model
+//! facts no longer have to be baked into this binary to be usable. What stays
+//! here is everything mush *knows*: a built-in row is still the only vendor
+//! knowledge mush ships, and a config row can add a name but never take one over.
 
-use crate::config::DEFAULT_CONTEXT_TOKENS;
+use crate::config::{ReasoningEffort, DEFAULT_CONTEXT_TOKENS};
+use crate::userconfig::{config_path_label, ProviderConfig};
 
 /// A model id and the facts its provider documents about it. Used when the
 /// endpoint does not advertise them (`api.deepseek.com` answers with ids
@@ -172,22 +182,339 @@ impl Provider {
     pub fn default_base_url(&self) -> &'static str {
         self.spec().default_base_url
     }
+
+    /// This provider's row, owned: the shape the resolved [`Catalog`] holds and
+    /// a [`crate::config::Config`] carries, so code that has a variant in hand
+    /// can hand it to the same accessors a config-row name reaches.
+    pub fn row(&self) -> ProviderRow {
+        ProviderRow::of(*self)
+    }
+}
+
+/// A model id and what the resolved table states about it — the one shape a
+/// capability question is answered from, so a built-in row's documented facts
+/// and a home config's annotations are read by the same accessor.
+///
+/// Both fields are `Option` because *unstated* is a third answer, not a `false`:
+/// a model a row annotates `vision: false` is **known blind**, while a model
+/// nothing names is **unknown** — an endpoint may well see, and only the human
+/// can say. [`ProviderRow::vision`] keeps the two apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelRow {
+    pub id: String,
+    pub context_tokens: Option<usize>,
+    pub vision: Option<bool>,
+}
+
+/// One row of the resolved table: what a name selects, whether the row is
+/// built in or came from the home config.
+///
+/// [`ProviderSpec`] holds `&'static` data because the built-in table is a
+/// constant; a home config row is a `String` the file chose. This is the one
+/// owned shape both are resolved into once at startup, so the rest of the code
+/// asks a row by name and never has to know which kind it is holding — and
+/// `Config` can carry it (it is `Clone`) where it used to carry a `Copy`
+/// `Provider` variant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderRow {
+    /// The name a human types, and what the session and home config store.
+    pub name: String,
+    /// The built-in row this came from. `None` is a row only the home config
+    /// knows — the home box's own endpoint, say — which carries no vendor
+    /// knowledge of its own.
+    pub builtin: Option<Provider>,
+    /// The endpoint selecting this row points at. Empty is a row that states
+    /// none, and then selecting it keeps the endpoint already set (the same
+    /// silence `custom`'s row is).
+    pub base_url: String,
+    /// The models this row names: a built-in row's documented ones, a config
+    /// row's annotation set. Empty means "ask the endpoint and nothing else".
+    pub models: Vec<ModelRow>,
+    /// The window to assume when nothing documents one for the model in force.
+    pub fallback_context_tokens: usize,
+    /// Whether a request asks for the thinking mode when the human states none.
+    pub thinking_by_default: bool,
+    /// The `reasoning_effort` a request sends when the human states none.
+    /// `None` is "not stated": no such field is sent at all, because inventing
+    /// one for an endpoint whose provider never documented it is how a request
+    /// gets rejected.
+    pub reasoning_effort_by_default: Option<ReasoningEffort>,
+    /// Whether naming this row also switches the endpoint to its own.
+    pub switches_endpoint: bool,
+    /// The endpoint shown in the status bar when it is the row's own. `None`
+    /// displays the configured URL instead.
+    pub display_endpoint: Option<String>,
+    /// The temperature selecting this row applies. `None` — every built-in row
+    /// — states none, so the temperature in force stands; only a home config row
+    /// that says `temperature` replaces it, because that is a human stating a
+    /// fact about a host they described, not mush guessing one.
+    pub temperature: Option<f32>,
+    /// The model selecting this row applies when nothing above states one.
+    /// Empty for every built-in row: a vendor's documented models are already
+    /// [`Self::models`], and picking one of those for the human is
+    /// `default_models`' job.
+    pub model: String,
+}
+
+/// A model id without its namespace (`vendor/model`): the spelling every
+/// capability lookup compares by, so an endpoint's own prefixing cannot hide a
+/// fact the table states.
+fn without_namespace(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// What the built-in table states about a model id, if anything.
+fn builtin_model(model: &str) -> Option<&'static ModelSpec> {
+    let model = without_namespace(model);
+    PROVIDERS
+        .iter()
+        .flat_map(|spec| spec.models)
+        .find(|known| known.id == model)
+}
+
+impl ProviderRow {
+    /// The built-in row of a variant, owned.
+    pub fn of(provider: Provider) -> Self {
+        let spec = provider.spec();
+        Self {
+            name: spec.name.to_string(),
+            builtin: Some(provider),
+            base_url: spec.default_base_url.to_string(),
+            models: spec
+                .models
+                .iter()
+                .map(|model| ModelRow {
+                    id: model.id.to_string(),
+                    context_tokens: Some(model.context_tokens),
+                    vision: Some(model.vision),
+                })
+                .collect(),
+            fallback_context_tokens: spec.fallback_context_tokens,
+            thinking_by_default: spec.thinking_by_default,
+            reasoning_effort_by_default: spec
+                .reasoning_effort_by_default
+                .and_then(|effort| ReasoningEffort::parse(effort).ok()),
+            switches_endpoint: spec.switches_endpoint,
+            display_endpoint: spec.display_endpoint.map(str::to_string),
+            temperature: None,
+            model: String::new(),
+        }
+    }
+
+    /// A row the home config named, owned. The file's path is named with a bad
+    /// effort for the reason every other home-config refusal names it:
+    /// `MUSH_CONFIG` can point anywhere, so `home config` alone is not enough
+    /// to find the line to fix.
+    pub fn from_config(name: &str, row: &ProviderConfig) -> Result<Self, String> {
+        let reasoning_effort_by_default = match row.reasoning_effort.as_deref() {
+            None => None,
+            Some(value) => Some(ReasoningEffort::parse(value).map_err(|error| {
+                format!("home config: providers.{name}: {error} — {}", config_path_label())
+            })?),
+        };
+        Ok(Self {
+            name: name.to_string(),
+            builtin: None,
+            base_url: row.base_url.trim().trim_end_matches('/').to_string(),
+            models: row
+                .models
+                .iter()
+                .map(|(id, facts)| ModelRow {
+                    id: id.clone(),
+                    context_tokens: facts.context,
+                    vision: facts.vision,
+                })
+                .collect(),
+            fallback_context_tokens: row.context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
+            // A row that states no thinking mode sends no `thinking` field, the
+            // silence `custom`'s row keeps.
+            thinking_by_default: row.thinking.unwrap_or(false),
+            reasoning_effort_by_default,
+            // A row that names an endpoint is a row that owns it: selecting it
+            // must reach the host the human described. One that names none
+            // stands for "wherever the human pointed mush" and keeps the
+            // endpoint already set, as `custom` does.
+            switches_endpoint: !row.base_url.trim().is_empty(),
+            display_endpoint: None,
+            temperature: row.temperature,
+            model: row.model.clone(),
+        })
+    }
+
+    /// The name a human types.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The model ids this row offers when the endpoint cannot list its own
+    /// (offline, missing key, or a server without `/v1/models`): the row's own,
+    /// in the order it wrote them.
+    pub fn model_ids(&self) -> Vec<String> {
+        self.models.iter().map(|model| model.id.clone()).collect()
+    }
+
+    /// The window a model id is documented to have: the built-in table first,
+    /// then this row's own annotations.
+    ///
+    /// Built-ins first is the rule that keeps a home box's annotation from
+    /// silently re-sizing a vendor's model, and it is the same order
+    /// [`Catalog`] lists rows in. The id compares without its namespace
+    /// (`vendor/model`).
+    pub fn documented_context(&self, model: &str) -> Option<usize> {
+        if let Some(known) = builtin_model(model) {
+            return Some(known.context_tokens);
+        }
+        let model = without_namespace(model);
+        self.models
+            .iter()
+            .find(|known| known.id == model)
+            .and_then(|known| known.context_tokens)
+    }
+
+    /// Whether a model id accepts image content parts: `Some(true)` stated, or
+    /// `Some(false)` for a row that is *known blind* — a built-in row that
+    /// documents no vision, or an annotation saying so. `None` is a model the
+    /// table states nothing about (see [`ModelRow`]).
+    pub fn vision(&self, model: &str) -> Option<bool> {
+        if let Some(known) = builtin_model(model) {
+            // A built-in row documents the fact either way: a documented model
+            // without vision is a model known not to take image parts.
+            return Some(known.vision);
+        }
+        let model = without_namespace(model);
+        self.models
+            .iter()
+            .find(|known| known.id == model)
+            .and_then(|known| known.vision)
+    }
+}
+
+/// Every name a human can select, resolved once at startup: the built-in rows
+/// in the order [`PROVIDERS`] lists them, then the home config's rows in the
+/// order its map keeps them (`providers` after the built-ins, so a file's row
+/// can never take a built-in's place in the list).
+///
+/// This is the table `/provider`, the picker, `--provider` and the printed
+/// config all ask by name; it rides in [`crate::config::Config`] because every
+/// one of those surfaces reads a `Config`, and an actor's clone of it in
+/// another thread must be able to answer with the same names the UI shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Catalog {
+    rows: Vec<ProviderRow>,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+impl Catalog {
+    /// The built-in rows alone: the table a `Config` built by code starts from,
+    /// and the one a machine with no home config resolves to.
+    pub fn builtin() -> Self {
+        Self {
+            rows: PROVIDERS
+                .iter()
+                .map(|spec| ProviderRow::of(spec.provider))
+                .collect(),
+        }
+    }
+
+    /// The built-ins plus the rows `home` names.
+    ///
+    /// A config row may not shadow a built-in name: two rows called `deepseek`
+    /// would make `/provider deepseek` depend on which arm of the merge ran
+    /// first, and the endpoint a request reaches would be decided by nothing a
+    /// human could read. So it is a startup failure naming the file and the
+    /// name — the same voice as the unknown-provider refusal (findings A17,
+    /// C2).
+    pub fn of_home(home: &crate::userconfig::UserConfig) -> Result<Self, String> {
+        let mut catalog = Self::builtin();
+        for (name, row) in &home.providers {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!(
+                    "home config: a provider row has no name — {}",
+                    config_path_label()
+                ));
+            }
+            if Provider::parse(name).is_some() {
+                return Err(format!(
+                    "home config: provider `{name}` shadows the built-in provider of that name \
+                     — rename the row, and set its `base_url` from `--url` if that was the intent — {}",
+                    config_path_label()
+                ));
+            }
+            catalog.rows.push(ProviderRow::from_config(name, row)?);
+        }
+        Ok(catalog)
+    }
+
+    /// Every row, in the order the picker lists them.
+    pub fn rows(&self) -> &[ProviderRow] {
+        &self.rows
+    }
+
+    /// The row a name selects. Names compare the way `--provider` always has:
+    /// trimmed and case-insensitive.
+    pub fn get(&self, name: &str) -> Option<&ProviderRow> {
+        let name = name.trim().to_ascii_lowercase();
+        self.rows
+            .iter()
+            .find(|row| row.name.to_ascii_lowercase() == name)
+    }
+
+    /// The row a name selects, or the sentence an unknown name gets — built
+    /// from this table's own names, so a refusal can never offer a row the
+    /// table lost or hide one it gained.
+    pub fn require(&self, name: &str) -> Result<&ProviderRow, String> {
+        self.get(name).ok_or_else(|| {
+            format!(
+                "unknown provider `{}` (try {})",
+                name.trim(),
+                self.names_hint()
+            )
+        })
+    }
+
+    /// The row mush selects when nothing names one — `custom`, whose endpoint
+    /// is a LAN host: a request never pointed anywhere must not travel to a
+    /// vendor by accident.
+    pub fn default_row(&self) -> &ProviderRow {
+        self.get(DEFAULT_PROVIDER.name())
+            .expect("the built-in rows are always in the table")
+    }
+
+    /// How a message names the providers a human can choose, e.g.
+    /// `deepseek, custom or home`.
+    pub fn names_hint(&self) -> String {
+        join_names(" or ", self.rows.iter().map(|row| row.name.as_str()))
+    }
+
+    /// The same list in the bracket form the help text uses, e.g.
+    /// `deepseek|custom|home`.
+    pub fn names_piped(&self) -> String {
+        join_names("|", self.rows.iter().map(|row| row.name.as_str()))
+    }
 }
 
 /// How a message names the providers a human can choose, e.g.
 /// `deepseek or custom`. Built from the table so an error can never offer a
-/// name `--provider` would reject.
+/// name `--provider` would reject. The built-ins only: a sentence that never
+/// saw a home config cannot promise a name that file adds
+/// ([`Catalog::names_hint`] is the one that can).
 pub fn names_hint() -> String {
     join_names(" or ", PROVIDERS.iter().map(|spec| spec.name))
 }
 
 /// The same list in the bracket form the help text uses for `/provider`, e.g.
-/// `deepseek|custom`.
+/// `deepseek|custom`. Built-ins only, for the reason [`names_hint`] is.
 pub fn names_piped() -> String {
     join_names("|", PROVIDERS.iter().map(|spec| spec.name))
 }
 
-fn join_names(separator: &str, names: impl Iterator<Item = &'static str>) -> String {
+fn join_names<'a>(separator: &str, names: impl Iterator<Item = &'a str>) -> String {
     let names: Vec<&str> = names.collect();
     match names.split_last() {
         None => String::new(),
@@ -390,6 +717,114 @@ mod tests {
             ["deepseek-flash"],
             "and exactly one row documents it today"
         );
+    }
+
+    /// A row the home config names is a provider like any other: the table is
+    /// the built-ins first, then the file's rows in name order, and a name
+    /// resolves however a human spelled it.
+    #[test]
+    fn a_config_row_adds_a_name_after_the_built_ins() {
+        let home = crate::userconfig::UserConfig {
+            providers: std::collections::BTreeMap::from([
+                ("work".to_string(), crate::userconfig::ProviderConfig::default()),
+                (
+                    "home".to_string(),
+                    crate::userconfig::ProviderConfig {
+                        base_url: "http://box:9".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let catalog = Catalog::of_home(&home).expect("no row shadows a built-in");
+        let names: Vec<&str> = catalog.rows().iter().map(ProviderRow::name).collect();
+        assert_eq!(names, ["deepseek", "custom", "home", "work"]);
+        assert_eq!(catalog.names_hint(), "deepseek, custom, home or work");
+        assert_eq!(
+            catalog.get(" HOME ").map(ProviderRow::name),
+            Some("home"),
+            "a name resolves however it is spelled"
+        );
+        assert_eq!(catalog.get("deepseek").and_then(|row| row.builtin), Some(Provider::DeepSeek));
+        assert_eq!(
+            catalog.default_row().name(),
+            DEFAULT_PROVIDER.name(),
+            "a row from the file never becomes the default"
+        );
+    }
+
+    /// A config row may not take a built-in name over: two rows called
+    /// `deepseek` would make the endpoint a request reaches depend on which arm
+    /// of the merge ran first, and no surface could say which one won. It is a
+    /// startup failure naming the file and the name, in the same voice as the
+    /// unknown-provider refusal.
+    #[test]
+    fn a_config_row_that_shadows_a_built_in_is_refused_naming_the_file() {
+        let home = crate::userconfig::UserConfig {
+            providers: std::collections::BTreeMap::from([(
+                "deepseek".to_string(),
+                crate::userconfig::ProviderConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let error = Catalog::of_home(&home).unwrap_err();
+        assert!(error.contains("deepseek"), "{error}");
+        assert!(error.contains("shadows"), "{error}");
+        assert!(
+            error.contains(&crate::userconfig::config_path_label()),
+            "the file is named: {error}"
+        );
+    }
+
+    /// A row's facts are what a capability question reads, and an annotation
+    /// that states nothing is not an annotation saying no.
+    #[test]
+    fn a_config_rows_annotations_answer_for_models_the_table_never_named() {
+        let home = crate::userconfig::UserConfig {
+            providers: std::collections::BTreeMap::from([(
+                "home".to_string(),
+                crate::userconfig::ProviderConfig {
+                    base_url: "http://box:9".to_string(),
+                    models: std::collections::BTreeMap::from([
+                        (
+                            "lfm2-vl".to_string(),
+                            crate::userconfig::ModelConfig {
+                                vision: Some(true),
+                                context: Some(32_768),
+                            },
+                        ),
+                        (
+                            "blind-box".to_string(),
+                            crate::userconfig::ModelConfig {
+                                vision: Some(false),
+                                context: None,
+                            },
+                        ),
+                        (
+                            "silent".to_string(),
+                            crate::userconfig::ModelConfig::default(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let catalog = Catalog::of_home(&home).unwrap();
+        let row = catalog.get("home").unwrap();
+        assert_eq!(row.vision("lfm2-vl"), Some(true));
+        assert_eq!(row.vision("vendor/lfm2-vl"), Some(true), "namespaces are not part of the id");
+        assert_eq!(row.vision("blind-box"), Some(false));
+        assert_eq!(row.vision("silent"), None, "an annotation stating no vision fact states nothing");
+        assert_eq!(row.vision("qwen2.5-coder"), None, "and a model nothing names is unknown");
+        assert_eq!(row.documented_context("lfm2-vl"), Some(32_768));
+        assert_eq!(
+            row.documented_context("deepseek-flash"),
+            Some(500_000),
+            "the built-in table is read first, so a row cannot re-size a vendor's model"
+        );
+        assert_eq!(row.model_ids(), ["blind-box", "lfm2-vl", "silent"]);
     }
 
     /// The guard this module exists for: production code outside this file

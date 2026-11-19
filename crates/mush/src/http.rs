@@ -4119,7 +4119,8 @@ mod tests {
     #[ignore]
     fn live_https_tls_handshake() {
         let cfg = mush_core::Config {
-            provider: mush_core::Provider::DeepSeek,
+            provider: mush_core::Provider::DeepSeek.row(),
+            providers: mush_core::provider::Catalog::builtin(),
             base_url: "https://api.deepseek.com".to_string(),
             model: String::new(),
             api_key: None,

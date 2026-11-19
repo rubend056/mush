@@ -4181,7 +4181,7 @@ impl App {
         };
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
-            provider: self.cfg().provider.name().to_string(),
+            provider: self.cfg().provider.name.clone(),
             base_url: self.cfg().base_url.clone(),
             model: self.cfg().model.clone(),
             // The fields this save does not state — the window, the temperature,
@@ -4454,7 +4454,7 @@ impl App {
             .collect();
         let cursor = items
             .iter()
-            .position(|item| item.id.as_deref() == Some(self.cfg().provider.name()))
+            .position(|item| item.id.as_deref() == Some(self.cfg().provider.name.as_str()))
             .unwrap_or(0);
         self.picker = Some(Picker {
             kind: PickerKind::Provider,
@@ -4554,7 +4554,7 @@ impl App {
     fn switch_provider(&mut self, provider: Provider) -> bool {
         let moves_endpoint = provider.spec().switches_endpoint;
         let moved = self.cell.edit(|cfg| {
-            cfg.provider = provider;
+            cfg.provider = provider.row();
             // A provider that owns an endpoint points at it; one that stands for
             // "wherever the human pointed mush" keeps the endpoint already set.
             if provider.spec().switches_endpoint {
@@ -5192,7 +5192,7 @@ impl App {
             .collect();
         Session {
             model: self.cfg().model.clone(),
-            provider: self.cfg().provider.name().to_string(),
+            provider: self.cfg().provider.name.clone(),
             base_url: self.cfg().base_url.clone(),
             // Only a window the human stated is worth remembering; a discovered
             // one is re-read next time, so it cannot go stale.
@@ -14109,7 +14109,7 @@ mod tests {
         let root = dir("default-context");
         let (mut app, _writer) = app_writing(&root);
         app.cell.edit(|cfg| {
-            cfg.provider = Provider::DeepSeek;
+            cfg.provider = Provider::DeepSeek.row();
             cfg.rederive_context();
         });
         assert_eq!(app.cfg().context_tokens, 120_000, "the shipped default");
@@ -18122,7 +18122,7 @@ mod tests {
         assert_eq!(picker.kind, PickerKind::Provider);
         assert_eq!(
             picker.items[picker.cursor].id.as_deref(),
-            Some(app.cfg().provider.name()),
+            Some(app.cfg().provider.name.as_str()),
             "the cursor opens on the provider in use: {:?}",
             labels(&picker.items)
         );
@@ -18130,7 +18130,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(app.picker.is_none(), "the pick closed the list");
-        assert_eq!(app.cfg().provider, Provider::Custom);
+        assert_eq!(app.cfg().provider.builtin, Some(Provider::Custom));
         assert!(
             text_of(&app).starts_with("provider: custom · "),
             "and the bar names the provider that was picked: {}",
@@ -18198,7 +18198,7 @@ mod tests {
     fn a_picked_provider_is_marked_for_the_session_file() {
         isolate_user_config();
         let stored = stored_after("picked-provider", |app| {
-            app.cell.edit(|cfg| cfg.provider = Provider::DeepSeek);
+            app.cell.edit(|cfg| cfg.provider = Provider::DeepSeek.row());
             run(app, "/provider custom");
         });
         assert_eq!(

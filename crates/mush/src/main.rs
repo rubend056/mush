@@ -874,7 +874,7 @@ fn describe(
     };
     let mut rows = vec![
         ("endpoint".to_string(), config.base_url.clone()),
-        ("provider".to_string(), config.provider.name().to_string()),
+        ("provider".to_string(), config.provider.name.clone()),
         // Before the values it can supply: endpoint, provider, model and
         // window may all have come from this layer.
         ("session".to_string(), session_layer),
@@ -2108,6 +2108,52 @@ mod tests {
         assert!(!args.yes, "after `--` even `--yes` is a path");
     }
 
+    /// `--print-config` names the provider row it resolved, and a row the home
+    /// config defines is a row like any other: the name the human wrote, the
+    /// endpoint that name owns, and the model it applies.
+    #[test]
+    fn the_printed_config_names_the_provider_row_it_resolved() {
+        use mush_core::userconfig::ProviderConfig;
+        let home = mush_core::userconfig::UserConfig {
+            provider: "home".into(),
+            providers: std::collections::BTreeMap::from([(
+                "home".to_string(),
+                ProviderConfig {
+                    base_url: "http://box:9".into(),
+                    model: "lfm2-vl".into(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let resolved = config::resolve_with(
+            Config::new("http://base:0", "", None),
+            &config::Overrides::default(),
+            &config::Overrides::default(),
+            &home,
+            None,
+        )
+        .expect("a row the file defines resolves");
+        let lines = describe(
+            &resolved.config,
+            false,
+            &session::Stored::Absent,
+            &resolved.notices,
+            None,
+            &theme::Theme::default(),
+        );
+        let field = |name: &str| {
+            lines
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("no `{name}` line in {lines:?}"))
+        };
+        assert_eq!(field("provider"), "home", "the row's own name, not a built-in's");
+        assert_eq!(field("endpoint"), "http://box:9");
+        assert_eq!(field("model"), "lfm2-vl");
+    }
+
     /// `--print-config` reports what a request will carry — the endpoint, the
     /// window and *where it came from*, the reply cap's size and its name, and a
     /// masked key — rather than what any one file wished for.
@@ -2214,7 +2260,7 @@ mod tests {
         // DeepSeek with nothing stated is the preset request: the effort and
         // the thinking mode are sent, and the line says whose they are.
         let mut preset = Config::new("https://api.deepseek.com", "deepseek-flash", None);
-        preset.provider = config::Provider::DeepSeek;
+        preset.provider = config::Provider::DeepSeek.row();
         let preset = describe(
             &preset,
             false,
@@ -2461,7 +2507,7 @@ mod tests {
     #[test]
     fn the_shipped_deepseek_session_reports_the_cap_it_sends() {
         let mut config = Config::new("https://api.deepseek.com", "", None);
-        config.provider = config::Provider::DeepSeek;
+        config.provider = config::Provider::DeepSeek.row();
         config.rederive_context();
         assert!(!config.context_explicit(), "a default, not a statement");
 
