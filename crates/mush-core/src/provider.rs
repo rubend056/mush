@@ -206,6 +206,45 @@ pub struct ModelRow {
     pub vision: Option<bool>,
 }
 
+/// What the table states about a model's image support: `Yes`, `No` (known
+/// blind — a `vision: false` annotation or a built-in row that documents no
+/// vision), or `Unknown` (nothing names the model).
+///
+/// Three answers rather than a `bool` because the two ways of being wrong are
+/// not worth the same. Withholding a picture a seeing endpoint would have read
+/// costs the human the answer they asked for, and nothing mush said tells them
+/// why; sending one to a blind endpoint costs a turn, and the endpoint's own
+/// error is visible and fixable by stating `vision: false` for that id in the
+/// home config. So a model nothing names is *unknown*, not assumed blind — the
+/// table is data now ([`Catalog::of_home`]), and a refusal it cannot support is
+/// a wrong answer (findings PK3, PK4, PK7).
+///
+/// [`crate::config::Config::vision`] is the one spelling the gates ask; this is
+/// the answer it returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vision {
+    /// The table states the model accepts image content parts.
+    Yes,
+    /// The table states it does not: a `vision: false` annotation, or a
+    /// built-in row documenting the model without vision.
+    No,
+    /// Nothing names the model. The parts travel, and an endpoint that cannot
+    /// see answers with its own error.
+    Unknown,
+}
+
+impl From<Option<bool>> for Vision {
+    /// The primitive's three answers ([`ProviderRow::vision`]), in the shape
+    /// every gate asks.
+    fn from(stated: Option<bool>) -> Self {
+        match stated {
+            Some(true) => Self::Yes,
+            Some(false) => Self::No,
+            None => Self::Unknown,
+        }
+    }
+}
+
 /// One row of the resolved table: what a name selects, whether the row is
 /// built in or came from the home config.
 ///
@@ -592,20 +631,6 @@ pub fn known_context(model: &str) -> Option<usize> {
         .map(|known| known.context_tokens)
 }
 
-/// Whether a model id is documented to accept image content parts
-/// ([`ModelSpec::vision`]). `false` is the answer for a model no provider row
-/// names: see the field — a capability mush cannot point at a document for is
-/// not assumed, because being wrong about it costs a rejected request. The id
-/// is compared without its namespace (`vendor/model`), like [`known_context`].
-pub fn vision_capable(model: &str) -> bool {
-    let model = model.rsplit('/').next().unwrap_or(model);
-    PROVIDERS
-        .iter()
-        .flat_map(|spec| spec.models)
-        .find(|known| known.id == model)
-        .is_some_and(|known| known.vision)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,30 +705,42 @@ mod tests {
         assert_eq!(known_context("qwen2.5-coder"), None);
     }
 
-    /// Vision is a per-model fact the table states, and a row that carries it is
-    /// the only way to get a `true`. Everything else — a model the table names
-    /// without vision, and every model it has never heard of — is `false`,
-    /// because bytes sent to an endpoint that cannot take them cost a whole
-    /// turn; being wrong in this direction costs an image, which a human can
-    /// ask for by other means.
+    /// Vision is a per-model fact a row states either way, and a model nothing
+    /// names is *unknown*, not blind: `Some(true)` and `Some(false)` are the two
+    /// statements a built-in row makes, and `None` is silence — a model the
+    /// table has never heard of. The three answers are what
+    /// [`Vision`] gives a gate; the annotation half of the same question is
+    /// `a_config_rows_annotations_answer_for_models_the_table_never_named`.
     #[test]
-    fn vision_is_a_row_fact_and_unknown_models_are_not_assumed_to_see() {
-        assert!(vision_capable("deepseek-flash"), "the table says so");
-        assert!(
-            vision_capable("vendor/deepseek-flash"),
+    fn vision_is_a_row_fact_and_a_model_nothing_names_states_nothing() {
+        let row = ProviderRow::of(Provider::DeepSeek);
+        assert_eq!(row.vision("deepseek-flash"), Some(true), "the table says so");
+        assert_eq!(
+            row.vision("vendor/deepseek-flash"),
+            Some(true),
             "the namespace is not part of the id"
         );
-        assert!(
-            !vision_capable("deepseek-v4-pro"),
+        assert_eq!(
+            row.vision("deepseek-v4-pro"),
+            Some(false),
             "named by the table, and not documented for images"
         );
-        assert!(
-            !vision_capable("qwen2.5-coder"),
-            "a model no row names does not default on"
+        assert_eq!(
+            row.vision("qwen2.5-coder"),
+            None,
+            "a model no row names states nothing — it is not assumed blind"
         );
-        assert!(
-            !vision_capable(""),
+        assert_eq!(
+            row.vision(""),
+            None,
             "and neither does a model id that is nothing"
+        );
+        assert_eq!(Vision::from(row.vision("deepseek-flash")), Vision::Yes);
+        assert_eq!(Vision::from(row.vision("deepseek-v4-pro")), Vision::No);
+        assert_eq!(
+            Vision::from(row.vision("qwen2.5-coder")),
+            Vision::Unknown,
+            "the third answer is a model nothing names"
         );
 
         let seeing: Vec<&str> = PROVIDERS

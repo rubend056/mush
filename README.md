@@ -94,7 +94,9 @@ reads `/v1/models` and picks the first.
 Everything can be changed at runtime from the chat — no restart:
 
 - `/provider` — pick **deepseek** (hosted API, https) or **custom** (any
-  OpenAI-compatible endpoint) from a menu.
+  OpenAI-compatible endpoint) from a menu. A row the home config names is
+  selected by name instead: `--provider home` (or `MUSH_PROVIDER=home`, or the
+  file's own `provider` field).
 - `/model` — pick a model (or press `Ctrl-P`). The list comes from the
   endpoint's `/v1/models`; when that's unreachable, the known models for the
   provider are offered (`deepseek-flash`, `deepseek-v4-pro`).
@@ -132,6 +134,36 @@ and switching back adopts it again. A file written before the map carried a flat
 entry for, and the next save migrates it under the host the file's own `base_url`
 names. Nothing ever writes `api_key: null`: the flat field is written only when
 there is a key to write.
+
+A file may also name provider rows of its own, for a box the built-in table has
+never heard of:
+
+```json
+{
+  "providers": {
+    "home": {
+      "base_url": "http://box.lan:8078",
+      "model": "lfm2-vl",
+      "thinking": false,
+      "models": { "lfm2-vl": { "vision": true, "context": 32768 } }
+    }
+  }
+}
+```
+
+Selecting a row — `"provider": "home"` in this file, `--provider home`,
+`MUSH_PROVIDER=home`, or a workspace's saved session — applies what the row
+states: its endpoint, the model it names, its temperature, thinking mode,
+`reasoning_effort` and the window its models are budgeted against. A row may not
+take a built-in's name, and no key lives here: a provider's key is the
+`api_keys` entry for its host.
+
+The `models` map is an **annotation set, not a claim to be exhaustive**. It is
+how mush learns a fact about a model it cannot look up — `vision` (whether the
+model accepts image parts) and `context` (its window) — and a model the map does
+not name is `unknown`, not assumed blind: an unknown model's pictures are sent,
+and if the endpoint cannot see them it says so, visibly, until one line here
+states `"vision": false`.
 
 Every knob, its default, and what `--print-config` prints: the manual's §5.
 

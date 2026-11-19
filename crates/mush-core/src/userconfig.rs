@@ -59,13 +59,14 @@ fn comment() -> Vec<String> {
          above, the older flat field."
             .to_string(),
         format!(
-            "providers: named rows of the provider table — a base_url, the model and knobs 
-             selecting it applies, and a `models` map annotating the ids the endpoint serves 
-             (vision, context). The annotations are not a claim to be exhaustive: a model they 
-             do not name is unannotated, not assumed blind. Select a row with /provider, 
-             --provider or a workspace's session. No keys here: a provider's key is the 
-             `api_keys` entry for its host. The built-ins ({}) are always available, and a row 
-             may not take one of their names over.",
+            "providers: named rows of the provider table — a base_url, the model and knobs \
+             selecting it applies, and a `models` map annotating the ids the endpoint serves \
+             (vision, context). The annotations are not a claim to be exhaustive: a model they \
+             do not name is unannotated, not assumed blind — its image parts are sent, and a \
+             `vision: false` here is what restores the refusal. Select a row with this file's \
+             `provider` field, --provider or a workspace's session. No keys here: a provider's \
+             key is the `api_keys` entry for its host. The built-ins ({}) are always available, \
+             and a row may not take one of their names over.",
             names_hint()
         ),
         format!(

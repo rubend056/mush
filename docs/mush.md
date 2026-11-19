@@ -198,7 +198,7 @@ delegation tool, and three that manage what an agent started:
 | Tool | Arguments | What it does |
 |---|---|---|
 | `edit_file` | `path`, `edits` | exact-and-unique replacement; `edits` is always a list (a lone edit is a list of one), `replace_all` opts into an ambiguous match, and the batch lands all-or-nothing in one call |
-| `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers, and one trailing sentence saying what the window left; an unbounded read — `offset` and `limit` both absent — of a file longer than the result cap answers with the file's outline instead of a cut head, and names the `offset`/`limit` range that reads on; a png, jpeg, gif or webp — sniffed from the file's own bytes, never its name — comes back as the image itself, if the model is documented to see; works beside a held lock |
+| `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers, and one trailing sentence saying what the window left; an unbounded read — `offset` and `limit` both absent — of a file longer than the result cap answers with the file's outline instead of a cut head, and names the `offset`/`limit` range that reads on; a png, jpeg, gif or webp — sniffed from the file's own bytes, never its name — comes back as the image itself, unless the table states the model is blind; works beside a held lock |
 | `outline` | `path` | the definitions in one file, one row per declaration — `line  <that line, cut to a width>` — so a file's shape costs a screen instead of a window; textual and best-effort across the languages a source file is likely to be written in (Rust, Go, Python, JavaScript and TypeScript, C and C++, C#, Java, Swift, Kotlin, Ruby, PHP, Scala, Haskell, SQL, and the rest — it is not a compiler: macro-generated items are invisible, and a Java method whose return type is not `void`, a C `int main(void)`, a shell `build() {` and a Makefile `build:` are misses), and each row is the anchor `read_file {offset}` and `edit_file {old_string}` are built from; a file with no definitions answers with a sentence, never a refusal |
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush` — mush's own state, session and pastes and the isolated children's checkouts among it, so a listing is the work and not the bookkeeping (a path under it is still opened by name, and a listing asked for `.mush` still descends into it); capped at `LIST_LIMIT` names with the way past it |
@@ -266,14 +266,19 @@ saved: `crates/mush-core/src/workspace.rs` (`pasted_images`,
 `save_pasted_image`).
 
 Four facts can refuse an attachment before it is sent — no model at all; a model
-the provider table does not document as accepting image parts (`Ctrl-P` is the
-road named); a picture the window cannot carry; and the box's own bound on
-picture bytes — because an endpoint that may reject image parts must not cost a
-turn to discover it. The seeing fact is asked at the box, at the wire, and when
-the request is assembled. The box and the wire refuse the message; assembly
-cannot, because the words are already in the transcript — it drops the image
-parts from the request alone, leaves each message's placeholder text standing
-where its images were, and says one line naming `/model`.
+the table **states** is blind (`vision: false` in the home config's `providers`,
+or a built-in row documenting the model without vision; `Ctrl-P` is the road
+named, and stating the fact for an unknown id is the other one); a picture the
+window cannot carry; and the box's own bound on picture bytes — because an
+endpoint that may reject image parts must not cost a turn to discover it. The
+seeing fact is asked at the box, at the wire, and when the request is assembled.
+The box and the wire refuse the message; assembly cannot, because the words are
+already in the transcript — it drops the image parts from the request alone,
+leaves each message's placeholder text standing where its images were, and says
+one line naming `/model`. A model the table states nothing about is *unknown*,
+and every door lets it through: its pictures travel, and an endpoint that
+cannot see them answers with its own error, which is the one report worth
+trusting.
 
 A room shortage is said and not refused: an image that does not fit the room the
 conversation has left — the history budget minus the system prompt, the
@@ -291,11 +296,16 @@ Three facts decide whether an image travels:
 - **The format is sniffed, not named.** Png, jpeg, gif and webp are recognised
   by their own first bytes; an extension is a claim by whoever wrote the file,
   and a `data:` URL's mime is read by an endpoint that never sees a name.
-- **The model must be documented to see it.** Vision is a per-model fact in the
-  provider table (`ModelSpec::vision`; `deepseek-flash` is the one row that
-  states it), and everything else — including every model mush has never heard
-  of — is off. Being wrong in that direction costs an image the model could have
-  read; being wrong the other way costs the whole turn.
+- **The model must be stated to see it — or be unknown.** Vision is a per-model
+  fact the table states: a built-in row's `ModelSpec::vision` (`deepseek-flash`
+  is the one built-in model that states it), or a `vision` annotation under the
+  home config's `providers` for a model mush has never heard of. Only a stated
+  `false` — a built-in row documenting the model without vision, an annotation
+  saying so — is *blind*, and only a blind model is refused at the box and
+  dropped from the request. A model nothing names is *unknown*, and its parts
+  travel: if the endpoint cannot see them it answers with its own error, which
+  is visible and fixed by one line in the home config (`"vision": false`), not
+  by withholding a picture a seeing endpoint would have read.
 - **An image is capped (2 MB) and cannot be windowed.** `offset`/`limit` are
   lines and an image has none, so the refusal names the one road that makes a big
   picture readable: downscale it with `run_command` and read that.
@@ -1038,6 +1048,19 @@ calls its host — is one row of `provider::PROVIDERS` in
 fails on a vendor literal found anywhere else in the two crates' production code.
 Adding a provider is a row there, not a hunt.
 
+That table is where the *built-in* rows come from. The table every surface asks
+is the built-ins plus the rows the home config's `providers` map names, resolved
+once at startup into one owned table (`provider::Catalog`, carried by `Config`):
+`Config::provider` is the row in force and `Config::providers` every row a name
+can select. A row the file names is selected the way a built-in is — the file's
+own `provider` field, `--provider <name>`, `MUSH_PROVIDER=<name>`, or a
+workspace's session — and it applies what it states: its `base_url`, the model it
+names, its `thinking`, `reasoning_effort`, `temperature` and the window its
+models are budgeted against. `/provider`'s picker and `/help` still list the
+built-in names; the file's own row is named with the flag, the variable or the
+file. A row may not take a built-in name over (a startup refusal naming the
+file), and a name no row carries is refused by name.
+
 What the audit that shaped this section found, and the defects each rule fixed:
 `docs/findings.md`.
 
@@ -1076,21 +1099,57 @@ fallback for a host the map does not name, migrated under its host by the next
 save and never written afresh — and never null), `provider`, `base_url`, `model`,
 `context` (a stated window), `temperature`, `max_completion_tokens` (`true` sends
 the reply cap as `max_completion_tokens`, and `--print-config` prints the number
-this window affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`), and
+this window affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`),
 `thinking` (`true` asks for the provider's thinking mode, `false` sends no
-`thinking` field and leaves the model's own default). Unknown keys are ignored
-*and kept* when mush rewrites the file, and so is any field a particular writer
-leaves unstated: `/key` saves the connection without erasing what a human typed
-by hand. Unstated,
-the provider's own default applies, and a value mush does not know is rejected at
-startup by name, never sent and never quietly replaced. The fields and the writer
-are `crates/mush-core/src/userconfig.rs`.
+`thinking` field and leaves the model's own default), and `providers` (the rows
+below). Unknown keys are ignored *and kept* when mush rewrites the file, and so
+is any field a particular writer leaves unstated: `/key` saves the connection
+without erasing what a human typed by hand. Unstated, the provider's own default
+applies, and a value mush does not know is rejected at startup by name, never
+sent and never quietly replaced. The fields and the writer are
+`crates/mush-core/src/userconfig.rs`.
+
+**`providers`: rows of your own.** A box the built-in table has never heard of
+is a row under `providers`, keyed by the name you want to type:
+
+```json
+{
+  "providers": {
+    "home": {
+      "base_url": "http://box.lan:8078",
+      "model": "lfm2-vl",
+      "thinking": false,
+      "models": { "lfm2-vl": { "vision": true, "context": 32768 } }
+    }
+  }
+}
+```
+
+Every field is optional, and selecting the row — its `provider` name in this
+file, `--provider home`, `MUSH_PROVIDER=home`, or a workspace's session — applies
+whatever it states: `base_url` (an endpoint selecting it switches to), `model`,
+`thinking`, `reasoning_effort`, `temperature`, and `context` (the row's general
+window). A row may not take a built-in name over: two rows called `deepseek`
+would make the endpoint a request reaches depend on which arm of the merge ran
+first, so it is a startup refusal naming the file. No key lives in a row — a
+provider's key is the `api_keys` entry for its host.
+
+The `models` map is an **annotation set keyed by model id, not a claim to be
+exhaustive**. It is the only way mush learns a capability of a model it cannot
+look up, and today it states two facts: `vision` (whether the model accepts image
+parts) and `context` (its window in tokens). An id the map does not name is
+*unknown*, and unknown is not blind: the model's pictures are sent, and an
+endpoint that cannot see them answers with its own error until `"vision": false`
+states the fact. A built-in row's documented facts are read first, so an
+annotation cannot silently re-size a vendor's model.
 
 `mush --print-config` prints what those layers resolved to — endpoint, provider,
 what the stored session was (`none`, how much of a conversation it read, or that
-the file is there and *unreadable*), model, whether that model is documented to
-see an image (`vision`), window and the road it came by, temperature, reasoning
-effort and thinking mode (each with whether a human stated it), the reply cap's
+the file is there and *unreadable*), model, what the table states about that
+model's image support (`vision`: `yes`, a known `no`, or `unknown` — whose parts
+are sent, and the line says how to state the fact), window and the road it came
+by, temperature, reasoning effort and thinking mode (each with whether a human
+stated it), the reply cap's
 size and the name it travels under, the tool schemas every request reserves and
 the history budget those leave, the key — always stated, masked, `(none)` when
 there is none — `-y`, and the hue the window would wear — and exits 0 without

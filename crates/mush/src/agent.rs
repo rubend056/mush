@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
 use mush_core::config::parse_context_hint;
-use mush_core::config::{vision_capable, BYTES_PER_TOKEN, SCHEMA_TOKENS};
+use mush_core::config::{Vision, BYTES_PER_TOKEN, SCHEMA_TOKENS};
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
@@ -3175,26 +3175,33 @@ fn request_bytes(request: &ChatRequest<'_>) -> Result<usize, String> {
 }
 
 /// The messages a request may carry for the model it is addressed to: the
-/// transcript it was handed, minus the image parts of a model the provider
-/// table says cannot see ([`vision_capable`]).
+/// transcript it was handed, minus the image parts of a model the table states
+/// is blind ([`Config::vision`]).
 ///
 /// The gate is asked here, where the request's parts are assembled, and not
 /// only where an image is attached or read: a mid-run model switch points a
-/// conversation that already holds pictures at a model the table says is blind,
-/// and a request that replays them would carry `image_url` parts an endpoint may
-/// reject — a whole turn and the human's money. The bytes stay in the actor's
-/// transcript (a picture goes with the turn it arrived in, and only the
-/// request's own copy is a copy) — bar the payloads the conversation's own byte
-/// cap has already given up
+/// conversation that already holds pictures at a model whose row says it cannot
+/// see, and a request that replays them would carry `image_url` parts an
+/// endpoint may reject — a whole turn and the human's money. The bytes stay in
+/// the actor's transcript (a picture goes with the turn it arrived in, and only
+/// the request's own copy is a copy) — bar the payloads the conversation's own
+/// byte cap has already given up
 /// ([`IMAGE_BYTES_KEPT`](mush_core::message::IMAGE_BYTES_KEPT), applied by
 /// `retain_image_bytes` before this runs), which are gone from the actor's
 /// transcript too; each message's own placeholder text stands where its images
 /// were (`Message::drop_images`), so the model still learns a picture was there
 /// and which file it came from, and one line says the model is why and `/model`
 /// is the road.
+///
+/// Only [`Vision::No`] strips. An unknown model — the home box's, most often —
+/// keeps its parts: mush holds no document saying it cannot see, and dropping a
+/// picture on a guess costs the human the answer they asked for while saying
+/// nothing they can act on. If the endpoint cannot see, it answers with its own
+/// error, and `vision: false` for that id in the home config's `providers` is
+/// the fix (findings PK3, PK4, PK7; §8.116).
 fn for_the_model<'a>(actor: &Actor, cfg: &Config, messages: &'a [Message]) -> Cow<'a, [Message]> {
     let images: usize = messages.iter().map(|message| message.images.len()).sum();
-    if images == 0 || vision_capable(&cfg.model) {
+    if images == 0 || cfg.vision() != Vision::No {
         return Cow::Borrowed(messages);
     }
     let what = if images == 1 {
@@ -6417,22 +6424,26 @@ fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
 fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutput, String> {
     let path = tools::arg_string(args, "path")?;
     if let Some(image) = actor.ws.read_image(&path)? {
-        // Vision is a per-model fact ([`Config::model`]'s row in the provider
-        // table), and the read is refused *before* the bytes are stored: the
-        // request gate ([`for_the_model`]) would drop the image part rather
-        // than let a blind model be sent it, but this is the honest place — the
-        // model learns at once that the picture it asked for cannot travel, and
-        // no megabytes of it are carried for nobody to look at. The refusal
-        // names what to do instead, because "this model cannot see" is not
-        // something the model can change.
-        let model = actor.ctx.cfg.config()?.model;
-        if !vision_capable(&model) {
+        // Vision is a per-model fact a row states ([`Config::vision`] reads the
+        // row in force), and the read is refused *before* the bytes are stored
+        // only when the table says the model is blind: the request gate
+        // ([`for_the_model`]) would drop the image part rather than let a blind
+        // model be sent it, but this is the honest place — the model learns at
+        // once that the picture it asked for cannot travel, and no megabytes of
+        // it are carried for nobody to look at. A model nothing names is read
+        // into the transcript: the human's home box may well see, and the
+        // endpoint's own error is a better report than mush's refusal. The
+        // refusal names what to do instead, because "this model cannot see" is
+        // not something the model can change.
+        let cfg = actor.ctx.cfg.config()?;
+        let model = cfg.model.clone();
+        if cfg.vision() == Vision::No {
             let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
             return Err(format!(
-                "{path} is a {format} image ({} bytes), and `{model}` is not a model mush knows \
-                 to accept images — so its bytes cannot travel. Work from the file's path, and if \
-                 the picture itself is what the task turns on, say so in your summary: a model \
-                 whose row documents vision can read it",
+                "{path} is a {format} image ({} bytes), and `{model}` is a model mush knows \
+                 cannot accept images — so its bytes cannot travel. Work from the file's path, \
+                 and if the picture itself is what the task turns on, say so in your summary: a \
+                 model whose row documents vision can read it",
                 image.bytes.len()
             ));
         }
@@ -14051,7 +14062,7 @@ mod tests {
         let scripted = Arc::new(Scripted::new().says("looked"));
         // A model the table documents as seeing: the picture has to meet the
         // window invariant, not the vision gate (`for_the_model` drops an image
-        // part for a model `vision_capable` says cannot see).
+        // part only for a model the table states is blind).
         let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
         let budget = cfg.config().unwrap().history_budget();
         let (actor, _events, _mailbox) = build_actor_about(
@@ -14240,24 +14251,31 @@ mod tests {
         assert_eq!(sent, 0);
     }
 
-    /// No request ever carries an image part to a model `vision_capable` says
-    /// cannot see. The attach and deliver gates ask at the box, but a request
-    /// that *replays* a transcript does not: a mid-run model switch (Ctrl-P)
-    /// leaves pictures a seeing model's turns brought in, and the request built
-    /// for the new model would carry `image_url` parts it may reject. The actor's
-    /// transcript keeps the picture whole — only the request's copy loses the
-    /// bytes — and the placeholder line stands where it was, so the model still
-    /// learns a picture arrived and which file it came from. One line names what
-    /// was dropped and `/model` as the road.
+    /// A model the table states is blind never has an image part sent to it.
+    /// The attach and deliver gates ask at the box, but a request that
+    /// *replays* a transcript does not: a mid-run model switch (Ctrl-P) leaves
+    /// pictures a seeing model's turns brought in, and the request built for
+    /// the new model would carry `image_url` parts an endpoint may reject. The
+    /// actor's transcript keeps the picture whole — only the request's copy
+    /// loses the bytes — and the placeholder line stands where it was, so the
+    /// model still learns a picture arrived and which file it came from. One
+    /// line names what was dropped and `/model` as the road.
+    ///
+    /// The fixture is a model the built-in table documents without vision: a
+    /// model *nothing* names is a third answer (`Vision::Unknown`), and its
+    /// parts travel — `a_model_nothing_names_is_not_assumed_blind_at_the_wire`
+    /// is that fact, and the change findings PK3/PK4/PK7 bought.
     #[test]
     fn a_blind_model_is_never_sent_an_image_part() {
-        // `test_cfg`'s model is one no provider row names, and the table says a
-        // capability mush cannot point at a document for is not assumed.
         let scripted = Arc::new(Scripted::new().says("I cannot see it"));
         let (actor, events, _mailbox) = build_actor_about(
             "blind-request",
             scripted.clone(),
-            test_cfg(),
+            ConfigHandle::own(Config::new(
+                "http://127.0.0.1:1",
+                "deepseek-v4-pro",
+                None,
+            )),
             Arc::new(ScriptedMachine::new()),
             Arc::new(clock::System),
         );
@@ -14310,10 +14328,194 @@ mod tests {
             .collect();
         assert_eq!(told.len(), 1, "one line for the drop: {told:?}");
         assert!(
-            told[0].contains("`test`") && told[0].contains("/model"),
+            told[0].contains("`deepseek-v4-pro`") && told[0].contains("/model"),
             "the line names the model and the road: {}",
             told[0]
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A config whose row in force is one the home config named, with `model`
+    /// annotated the way a human states their own box — the shape a capability
+    /// question about a model mush has never heard of is asked in. `None`
+    /// states nothing about vision, which is the *unknown* answer.
+    fn home_row_cfg(model: &str, vision: Option<bool>) -> ConfigHandle {
+        use mush_core::userconfig::{ModelConfig, ProviderConfig, UserConfig};
+        let mut row = ProviderConfig {
+            base_url: "http://rubendpc:8078".into(),
+            ..ProviderConfig::default()
+        };
+        if let Some(vision) = vision {
+            row.models.insert(
+                model.to_string(),
+                ModelConfig {
+                    vision: Some(vision),
+                    context: Some(32_768),
+                },
+            );
+        }
+        let home = UserConfig {
+            provider: "home".into(),
+            model: model.to_string(),
+            providers: std::collections::BTreeMap::from([("home".to_string(), row)]),
+            ..UserConfig::default()
+        };
+        let config = mush_core::config::resolve_with(
+            Config::new("http://127.0.0.1:1", "", None),
+            &mush_core::Overrides::default(),
+            &mush_core::Overrides::default(),
+            &home,
+            None,
+        )
+        .expect("the file's row resolves")
+        .config;
+        ConfigHandle::own(config)
+    }
+
+    /// The change findings PK3/PK4/PK7 bought, end to end: a model the table
+    /// names nowhere, on a row the *human* described. The file states that
+    /// `lfm2-vl` sees, and the request the actor sends still holds the
+    /// `image_url` part — capabilities are stated by whoever described the
+    /// host, and mush believes them over its own silence (§8.116).
+    #[test]
+    fn a_stated_seeing_model_keeps_its_image_parts_at_the_wire() {
+        let scripted = Arc::new(Scripted::new().says("I see it"));
+        let cfg = home_row_cfg("lfm2-vl", Some(true));
+        assert_eq!(cfg.config().unwrap().model, "lfm2-vl", "the row's model applies");
+        assert_eq!(cfg.config().unwrap().vision(), Vision::Yes, "the file stated it");
+        let (actor, _events, _mailbox) = build_actor_about(
+            "stated-vision",
+            scripted.clone(),
+            cfg,
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("what is this?", vec![image_at("shot.png", 64, 64)]),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("I see it"));
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1);
+        let parts: usize = asked[0].messages.iter().map(|message| message.images.len()).sum();
+        assert_eq!(parts, 1, "the part travels to the stated model");
+        let wire = serde_json::to_string(&asked[0].messages).unwrap();
+        assert!(
+            wire.contains(r#""type":"image_url""#),
+            "and it is the part the endpoint reads: {wire}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A model the table names *nowhere* is unknown, not blind: its picture
+    /// travels too, and the endpoint's own error is the report — the 400 a
+    /// home box's model answers with is visible, fixable by one line in the
+    /// home config, and cheaper than withholding a picture a seeing endpoint
+    /// would have read. Only a stated `No` keeps the drop.
+    #[test]
+    fn a_model_nothing_names_is_not_assumed_blind_at_the_wire() {
+        let scripted = Arc::new(Scripted::new().says("answered"));
+        let cfg = test_cfg();
+        assert_eq!(
+            cfg.config().unwrap().vision(),
+            Vision::Unknown,
+            "nothing names this model"
+        );
+        let (actor, events, _mailbox) = build_actor_about(
+            "unknown-request",
+            scripted.clone(),
+            cfg,
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("what is this?", vec![image_at("shot.png", 64, 64)]),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("answered"));
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1);
+        let parts: usize = asked[0].messages.iter().map(|message| message.images.len()).sum();
+        assert_eq!(parts, 1, "an unknown model's part is not dropped");
+        let told: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("dropped") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert!(told.is_empty(), "and nothing was said about a drop: {told:?}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other side of the annotation: a row that states `vision: false` for
+    /// an id the built-ins never heard of is *known blind*, and the request
+    /// drops the part with the same Notice a built-in blind row gets — the
+    /// refusal a human's own statement restores.
+    #[test]
+    fn a_stated_blind_model_is_dropped_at_the_wire_with_the_notice() {
+        let scripted = Arc::new(Scripted::new().says("cannot see it"));
+        let cfg = home_row_cfg("blind-box", Some(false));
+        assert_eq!(cfg.config().unwrap().vision(), Vision::No);
+        let (actor, events, _mailbox) = build_actor_about(
+            "stated-blind",
+            scripted.clone(),
+            cfg,
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("what is this?", vec![image_at("shot.png", 64, 64)]),
+        ];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "a stated blind model is sent no image part"
+        );
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .any(|message| message.text().contains("[image: shot.png (png)")),
+            "the placeholder stands where the picture was"
+        );
+        let told: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("dropped") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), 1, "one line for the drop: {told:?}");
+        assert!(
+            told[0].contains("`blind-box`")
+                && told[0].contains("not a model mush knows to accept images"),
+            "with today's Notice, naming the model: {}",
+            told[0]
+        );
+        assert_eq!(messages[1].images.len(), 1, "the transcript keeps the picture");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -14332,7 +14534,7 @@ mod tests {
                 .says(summary)
                 .says("carried on"),
         );
-        let cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        let cfg = Config::new("http://127.0.0.1:1", "deepseek-v4-pro", None);
         let budget = cfg.history_budget();
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.to_path_buf(), scripted.clone()).tx;
@@ -14882,13 +15084,19 @@ mod tests {
     }
 
     /// Two refusals an image can meet, each naming a move that exists: a model
-    /// that cannot see it (nothing the model can change — it says so in its
-    /// summary) and an image past the 2 MB cap (downscale it, and read that).
-    /// Neither sentence may borrow the other's road.
+    /// the table states is blind (nothing the model can change — it says so in
+    /// its summary) and an image past the 2 MB cap (downscale it, and read
+    /// that). Neither sentence may borrow the other's road.
     #[test]
     fn an_image_that_cannot_travel_is_refused_with_the_move_that_can() {
         const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
-        let (actor, _mailbox) = test_actor("read-image-off");
+        let blind = ConfigHandle::own(Config::new(
+            "http://127.0.0.1:1",
+            "deepseek-v4-pro",
+            None,
+        ));
+        let (actor, _events, _mailbox) =
+            build_actor("read-image-off", Arc::new(HttpModel::new(blind.clone())), blind);
         fs::write(actor.ws.root().join("shot.png"), PNG).unwrap();
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -14902,7 +15110,10 @@ mod tests {
         )
         .unwrap_err();
         let why = refused.text();
-        assert!(why.contains("`test`"), "it names the model: {why}");
+        assert!(
+            why.contains("`deepseek-v4-pro`"),
+            "it names the model: {why}"
+        );
         assert!(why.contains("cannot travel"), "{why}");
         assert!(
             why.contains("summary"),
@@ -15100,13 +15311,14 @@ mod tests {
     ///
     /// The fixture's model is the provider table's one vision model, asserted
     /// here so the pictures cannot be silently stripped ([`for_the_model`]
-    /// drops a blind model's image parts, and a request without them would pass
-    /// for a different reason).
+    /// drops a *known blind* model's image parts, and a request without them
+    /// would pass for a different reason).
     #[test]
     fn a_request_under_the_window_can_still_be_refused_for_its_bytes() {
         let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
-        assert!(
-            vision_capable(&cfg.config().unwrap().model),
+        assert_eq!(
+            cfg.config().unwrap().vision(),
+            Vision::Yes,
             "the table's one vision model, or `for_the_model` strips the pictures"
         );
         let scripted = Arc::new(Scripted::new().says("done"));

@@ -51,7 +51,7 @@ use crossbeam_channel::Sender;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
-use mush_core::config::{checked_url, vision_capable, BYTES_PER_TOKEN};
+use mush_core::config::{checked_url, Vision, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
 use mush_core::provider::ProviderRow;
 use mush_core::userconfig::KeyWrite;
@@ -345,11 +345,13 @@ pub fn image_label(image: &Image, columns: usize) -> String {
     format!("{}{tail}", mush_core::text::truncate(&name, name_columns))
 }
 
-/// The line an image gets when the model is not documented to accept image
-/// parts. One sentence for one fact, because two gates stop a picture on it —
-/// the box that takes the attachment and the wire that sends it — and a human
-/// who meets both must not read two different explanations of the same
-/// refusal.
+/// The line an image gets when the table states the model is blind. One
+/// sentence for one fact, because two gates stop a picture on it — the box that
+/// takes the attachment and the wire that sends it — and a human who meets both
+/// must not read two different explanations of the same refusal.
+///
+/// Said only for [`Vision::No`]: a model nothing names is *unknown*, and its
+/// pictures travel (findings PK3, PK4, PK7; §8.116).
 fn blind_model_line(model: &str) -> String {
     format!(
         "`{model}` is not a model mush knows to accept images — Ctrl-P picks one whose row \
@@ -3401,11 +3403,14 @@ impl App {
         // when a picture is attached ([`Self::attach_image`]) is asked again
         // here, at the wire: an endpoint that never documented image parts may
         // reject the whole request, which is a turn and the human's money for a
-        // message that was never going to arrive. The refusal changes nothing,
-        // so the caller's box keeps the words and the pictures.
+        // message that was never going to arrive. Only a model the table states
+        // is blind ([`Vision::No`]) is refused — an unknown one travels, and
+        // the endpoint's own error is the report (findings PK3, PK4, PK7). The
+        // refusal changes nothing, so the caller's box keeps the words and the
+        // pictures.
         if !images.is_empty() {
             let model = self.cfg().model.clone();
-            if !vision_capable(&model) {
+            if self.cfg().vision() == Vision::No {
                 let line = blind_model_line(&model);
                 self.fail(&line);
                 return Err(line);
@@ -5620,11 +5625,12 @@ impl App {
     /// (`attached 4 images — Enter sends them with the message`).
     ///
     /// Four facts can stop the whole gesture before any of it attaches, and
-    /// each is asked once, of the batch: no model at all, a model not
-    /// documented to see, the window's bound and the box's own bound. A stop
-    /// means *nothing* attaches and the whole paste lands as text with the one
-    /// refusal [`Self::attach_image`] says — a gesture is atomic, so half a
-    /// batch is not a thing this door makes.
+    /// each is asked once, of the batch: no model at all, a model the table
+    /// states is blind ([`Vision::No`]; an unknown one's pictures travel), the
+    /// window's bound and the box's own bound. A stop means *nothing* attaches
+    /// and the whole paste lands as text with the one refusal
+    /// [`Self::attach_image`] says — a gesture is atomic, so half a batch is
+    /// not a thing this door makes.
     ///
     /// The room warning is one line too — the room is the budget minus the
     /// *focused agent's* transcript, the same arithmetic
@@ -5658,7 +5664,9 @@ impl App {
             self.fail(line);
             return false;
         }
-        if !vision_capable(&model) {
+        // Only a model the table states is blind is refused; a model nothing
+        // names is unknown, and its pictures travel (findings PK3, PK4, PK7).
+        if self.cfg().vision() == Vision::No {
             self.fail(blind_model_line(&model));
             return false;
         }
@@ -5792,10 +5800,13 @@ impl App {
     ///
     /// - **No model at all.** Sending would be a guaranteed refusal, and it is
     ///   said in the words [`Self::deliver`] already uses for the same state.
-    /// - **A model not documented to see.** An image sent to one is a rejected
-    ///   request — a whole turn and the human's money — so it is refused
-    ///   *before* the wire, and `Ctrl-P` is named as the road: the one road
-    ///   that changes the fact.
+    /// - **A model the table states is blind.** An image sent to one is a
+    ///   rejected request — a whole turn and the human's money — so it is
+    ///   refused *before* the wire, and `Ctrl-P` is named as the road: the one
+    ///   road that changes the fact. A model nothing names is *unknown*
+    ///   ([`Vision::Unknown`]), and its pictures travel: the endpoint's own
+    ///   error is visible, and `vision: false` for that id in the home config's
+    ///   `providers` is the fix (findings PK3, PK4, PK7; §8.116).
     /// - **A picture the window cannot carry.** Its weight — with the pictures
     ///   already in the box — is past the whole history budget
     ///   ([`mush_core::Config::history_budget`]). The system prompt and the
@@ -5850,7 +5861,9 @@ impl App {
             self.fail(line);
             return false;
         }
-        if !vision_capable(&model) {
+        // Only a model the table states is blind is refused; a model nothing
+        // names is unknown, and its pictures travel (findings PK3, PK4, PK7).
+        if self.cfg().vision() == Vision::No {
             self.fail(blind_model_line(&model));
             return false;
         }
@@ -11956,6 +11969,45 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_model("deepseek-flash"));
     }
 
+    /// Select a row the home config could have named: the file's endpoint, its
+    /// annotations and `model` in force — installed in the app's cell the way
+    /// `resolve` installs it at startup. The capability gates read the row in
+    /// force, so this is how a test asks them the question a home box raises:
+    /// what a model the built-in table never heard of can do.
+    fn let_the_home_row_be_selected(app: &mut App, model: &str, annotations: &[(&str, bool)]) {
+        use mush_core::config::Catalog;
+        use mush_core::userconfig::{ModelConfig, ProviderConfig, UserConfig};
+        let home = UserConfig {
+            providers: std::collections::BTreeMap::from([(
+                "home".to_string(),
+                ProviderConfig {
+                    base_url: "http://rubendpc:8078".into(),
+                    models: annotations
+                        .iter()
+                        .map(|(id, vision)| {
+                            (
+                                id.to_string(),
+                                ModelConfig {
+                                    vision: Some(*vision),
+                                    context: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..UserConfig::default()
+        };
+        let catalog = Catalog::of_home(&home).expect("the row names no built-in");
+        let row = catalog.get("home").expect("the row is in the table").clone();
+        app.cell.edit(|cfg| {
+            cfg.providers = catalog;
+            cfg.provider = row;
+            cfg.model = model.to_string();
+        });
+    }
+
     /// Spawn child `id` as an *isolated* agent: a `mush/<id>` branch, and the
     /// worktree on disk the branch names, so the child's own tools resolve
     /// paths in a workspace of their own. The spawn goes through the real
@@ -12289,6 +12341,7 @@ mod tests {
     #[test]
     fn a_paste_of_images_that_cannot_ride_lands_whole_as_text() {
         let (mut app, _rx) = test_app("paste-four-blind");
+        let_the_home_row_be_selected(&mut app, "blind-box", &[("blind-box", false)]);
         std::fs::write(app.ws.root().join("shot-a.png"), png(0)).unwrap();
         std::fs::write(app.ws.root().join("shot-b.png"), png(4)).unwrap();
         let paste = "shot-a.png shot-b.png";
@@ -12299,7 +12352,7 @@ mod tests {
         assert!(app.chat.attachments().is_empty());
         let (line, kind) = app.status_line().expect("the refusal stays on the bar");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("blind-box"), "the model is named: {line}");
         assert!(line.contains("Ctrl-P"), "and the road is: {line}");
         assert_eq!(line.matches("Ctrl-P").count(), 1, "said once: {line}");
     }
@@ -12402,12 +12455,13 @@ mod tests {
         );
     }
 
-    /// When the model is not documented to see, the path lands as text and the
-    /// refusal says why: the model, what mush does not know about it, and the
-    /// one key that changes the fact.
+    /// When the table states the model is blind, the path lands as text and the
+    /// refusal says why: the model, what mush knows about it, and the one key
+    /// that changes the fact.
     #[test]
     fn a_paste_that_cannot_ride_lands_as_text_with_the_reason() {
         let (mut app, _rx) = test_app("paste-blind");
+        let_the_home_row_be_selected(&mut app, "blind-box", &[("blind-box", false)]);
         std::fs::write(app.ws.root().join("shot.png"), png(0)).unwrap();
 
         app.update(Msg::Paste("shot.png".into()));
@@ -12420,17 +12474,62 @@ mod tests {
         assert!(app.chat.attachments().is_empty());
         let (line, kind) = app.status_line().expect("the refusal stays on the bar");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("blind-box"), "the model is named: {line}");
         assert!(line.contains("Ctrl-P"), "and the road is: {line}");
     }
 
+    /// The behaviour findings PK3/PK4/PK7 bought, at the box: a picture for a
+    /// model the file states can see attaches, and one for a model it states is
+    /// blind does not — with the sentence it always got. An id nothing
+    /// annotates is *unknown* (`Vision::Unknown`), and its picture travels: mush
+    /// cannot point at a document saying it cannot see, so it does not refuse on
+    /// a guess (§8.116).
+    #[test]
+    fn the_attach_gate_takes_a_stated_seeing_models_picture() {
+        let (mut app, _rx) = test_app("attach-annotated");
+        let_the_home_row_be_selected(
+            &mut app,
+            "lfm2-vl",
+            &[("lfm2-vl", true), ("blind-box", false)],
+        );
+
+        assert!(
+            app.attach_image(image("shot.png")),
+            "the file states lfm2-vl sees"
+        );
+        assert_eq!(app.chat.attachments().len(), 1, "and it is in the box");
+        assert!(
+            app.attach_images(vec![image("one.png"), image("two.png")]),
+            "a batch rides to the same model"
+        );
+
+        // The same box, one id the file states is blind: refused, with the one
+        // sentence, and neither door attaches.
+        app.cell.edit(|cfg| cfg.set_model("blind-box"));
+        let held = app.chat.attachments().len();
+        assert!(!app.attach_image(image("shot.png")), "stated blind: refused");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("blind-box"), "the model is named: {line}");
+        assert!(line.contains("Ctrl-P"), "and the road is: {line}");
+        assert!(!app.attach_images(vec![image("one.png"), image("two.png")]));
+        assert_eq!(app.chat.attachments().len(), held, "nothing was attached");
+
+        // And an id no annotation names: unknown, so the picture travels.
+        app.cell.edit(|cfg| cfg.set_model("unannotated"));
+        assert!(
+            app.attach_image(image("shot.png")),
+            "unknown is not blind"
+        );
+    }
+
     /// The gate itself, on its two refusing arms: no model at all, and a model
-    /// the provider table does not document as seeing. Neither attaches, and
-    /// the line names what the second one needs — `Ctrl-P`, the one key that
-    /// changes the fact.
+    /// the table states is blind. Neither attaches, and the line names what the
+    /// second one needs — `Ctrl-P`, the one key that changes the fact.
     #[test]
     fn the_attach_gate_refuses_a_model_that_may_not_see() {
         let (mut app, _rx) = test_app("attach-gate");
+        let_the_home_row_be_selected(&mut app, "blind-box", &[("blind-box", false)]);
         app.cell.edit(|cfg| cfg.model.clear());
 
         assert!(!app.attach_image(image("shot.png")), "no model, no attach");
@@ -12439,12 +12538,12 @@ mod tests {
         assert_eq!(kind, StatusKind::Error);
         assert!(line.contains("no model"), "{line}");
 
-        app.cell.edit(|cfg| cfg.set_model("test-model"));
+        app.cell.edit(|cfg| cfg.set_model("blind-box"));
         assert!(!app.attach_image(image("shot.png")));
         assert!(app.chat.attachments().is_empty(), "still not attached");
         let (line, kind) = app.status_line().expect("the refusal");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("blind-box"), "the model is named: {line}");
         assert!(line.contains("Ctrl-P"), "and the road is: {line}");
     }
 
@@ -13891,7 +13990,7 @@ mod tests {
 
     /// The vision gate holds at the wire, not only at the box: a model can be
     /// switched (`Ctrl-P`) between the attachment and the `Enter` that sends
-    /// it, and a model mush does not know to see must not be handed image
+    /// it, and a model the table states is blind must not be handed image
     /// parts for the endpoint to reject — a turn and the human's money. The
     /// refusal changes nothing, so the words and the picture are still there.
     #[test]
@@ -13901,7 +14000,7 @@ mod tests {
         app.chat.attach(image("shot.png"));
         app.chat.insert("look at this");
 
-        app.cell.edit(|cfg| cfg.set_model("test-model"));
+        app.cell.edit(|cfg| cfg.set_model("deepseek-v4-pro"));
         app.send_message();
 
         assert!(
@@ -13916,7 +14015,7 @@ mod tests {
         assert_eq!(app.chat.attachments().len(), 1, "and so did the picture");
         let (line, kind) = app.status_line().expect("the refusal");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("deepseek-v4-pro"), "the model is named: {line}");
         assert!(line.contains("Ctrl-P"), "and the road is: {line}");
     }
 

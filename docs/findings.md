@@ -11679,3 +11679,88 @@ would leave an old file's flat key in place after a host change, and the next
 start would hand it to the new host — the very invariant (D6) this change exists
 to keep. Not built, on purpose: a `/key` flag to list or clear another host's
 keys.
+
+## 8.116 The table is data, and a model it names nowhere is unknown — not blind (PK3, PK4, PK7; `crates/mush-core/src/provider.rs`, `crates/mush-core/src/config.rs`)
+
+**What was wrong.** The provider table was a compiled-in constant: two rows, a
+two-variant enum, `&'static` data. A human with a home box serving a model mush
+had never heard of could not name it (a `/provider` name is a `Provider` variant,
+so there was no third row to be), and the one capability question mush asked —
+`provider::vision_capable(model) -> bool` — answered from the built-in rows alone
+and returned `false` for every model it did not name. That `false` was read as
+"cannot see" in five places (`for_the_model` and `read_tool` in `agent.rs`, the
+send gate, `attach_image` and `attach_images` in `app/mod.rs`, and
+`--print-config`'s `vision` row), so the home box's model had its picture dropped
+at the wire with a Notice, refused at the box with `blind_model_line`, and
+refused again when a model asked to read one — a capability mush could not point
+at a document for, treated as a fact about the human's own hardware.
+
+**What it is now.** The table is data (the previous commit): a `providers` map of
+the home config names its own rows, `provider::Catalog::of_home` resolves the
+built-ins plus the file's rows into one owned table at startup, `Config` carries
+the row in force (`provider`) and the table (`providers`), and
+`ProviderRow::vision` answers `Some(true)`/`Some(false)`/`None`. This change is
+the capability half: `provider::Vision { Yes, No, Unknown }` and
+`Config::vision()` — one accessor, `self.provider.vision(&self.model).into()` —
+are the single spelling every gate asks, and `vision_capable` is gone (its
+re-export in `config.rs` with it). Only `Vision::No` keeps the old behaviour
+exactly: refused at attach with the same `blind_model_line`, dropped at the wire
+with the same Notice text in `for_the_model`, refused by `read_tool` with the
+same sentence (whose false clause, "not a model mush knows to accept images", is
+now "a model mush knows cannot accept images"). `Vision::Unknown` — a model no
+row and no annotation names — lets the parts travel at every door: a picture is
+attached, read into the transcript and sent, and if the endpoint cannot see it
+answers with its own error, which is visible and fixed by stating `vision: false`
+(or `true`) for that id in the home config's `providers`. That trade is the
+reason the change is right rather than a tidy-up: being wrong about a model that
+can see costs the human the answer they asked for and says nothing they can act
+on, while being wrong about one that cannot costs a turn and one file line.
+`--print-config` grew the third answer (`unknown — image parts are sent; state it
+in the home config's providers if the endpoint refuses them`), and
+`no — no model yet` is still the empty-model line.
+
+**The tests.** In `provider.rs`,
+`vision_is_a_row_fact_and_a_model_nothing_names_states_nothing` pins
+`Some(true)`/`Some(false)` from a built-in row and `None` for an id nothing names
+(the annotation half stays `a_config_rows_annotations_answer_for_models_the_table_never_named`'s).
+In `config.rs`, `the_vision_question_has_three_answers` pins the accessor: `No`
+for a built-in model documented without vision, `Yes` and `No` from a file row's
+annotations for ids the built-ins never heard of, and `Unknown` for an unnamed
+one. End to end, in `agent.rs`,
+`a_stated_seeing_model_keeps_its_image_parts_at_the_wire` drives a `home` row
+(`http://rubendpc:8078`, `lfm2-vl` annotated `vision: true`) through `run_loop`
+and asserts the request the actor sent still holds its `image_url` part,
+`a_model_nothing_names_is_not_assumed_blind_at_the_wire` pins the same for an
+unnamed model and that no drop is announced, and
+`a_stated_blind_model_is_dropped_at_the_wire_with_the_notice` pins the other
+annotation: `vision: false` for an id the built-ins never heard of is dropped
+with today's Notice. `a_blind_model_is_never_sent_an_image_part` and
+`the_folds_request_is_stripped_too_for_a_blind_model` moved their fixture from an
+unnamed model to a built-in model documented without vision, and
+`an_image_that_cannot_travel_is_refused_with_the_move_that_can` moved its first
+half the same way. At the box, `the_attach_gate_takes_a_stated_seeing_models_picture`
+attaches for `lfm2-vl` (and a batch), refuses for `blind-box` with the one
+sentence, and attaches for an id nothing annotates;
+`the_attach_gate_refuses_a_model_that_may_not_see`,
+`a_paste_that_cannot_ride_lands_as_text_with_the_reason`,
+`a_paste_of_images_that_cannot_ride_lands_whole_as_text` and
+`a_model_switched_after_the_attach_is_refused_at_the_wire` now name a stated
+blind model instead of relying on an unnamed one; and `main.rs`'s
+`the_dump_answers_the_image_gate` pins all three answers, the unknown one
+included.
+
+**What the docs say now.** `README.md` and `docs/mush.md` §3/§5 describe the
+`providers` map and its `models` annotation set, what selecting a row applies, and
+the change itself — unknown models' pictures travel, `vision: false` restores the
+refusal. The home config's own header says both, and its `providers` line also
+stopped claiming `/provider` selects a row: at runtime `/provider` still lists
+and parses the built-in rows, and a row the file names is reached by the file's
+`provider` field, `--provider` or `MUSH_PROVIDER`.
+
+**Not built, on purpose.** No probe of an endpoint's own capabilities (a first
+request with a picture would spend the turn this change exists to protect), no
+learned-capability store (a 400 that mentions images would be a guess about
+*why*, and mush has one place a human's statement lives), and no rewiring of
+`/provider`'s picker or `/help`'s name list onto the catalog — those are the
+surface half of the same audit (PK3's `switch_provider` bundle) and this change
+is the capability half.

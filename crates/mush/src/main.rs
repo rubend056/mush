@@ -804,22 +804,28 @@ fn describe(
         mush_core::text::sanitize(&config.model)
     };
     // The image gate: whether the model in force may be sent a picture is the
-    // one *capability* a request can be refused for, and it lives only in the
-    // provider table — a human pasting a screenshot at a custom endpoint used
-    // to learn it from the refusal, having spent the gesture (finding C12).
-    // The answer comes from the same function the three gate sites ask
-    // (`mush_core::provider::vision_capable`), so the dump cannot advertise a
-    // picture the run would refuse, and the model it names is the one the gate
+    // one *capability* a request can be refused for, and the dump is where a
+    // human finds out before spending the gesture (finding C12). The answer is
+    // read through the one accessor the three gate sites ask
+    // ([`mush_core::Config::vision`]), so the dump cannot advertise a picture
+    // the run would refuse — and it has **three** answers, not two: a model the
+    // table states is blind is the refusal-shaped line, and a model nothing
+    // names is *unknown*, whose pictures travel until the human states the fact
+    // (findings PK3, PK4, PK7; §8.116). The model it names is the one the gate
     // reads, defanged the way the model row defangs it.
-    let vision = if mush_core::provider::vision_capable(&config.model) {
-        "yes — image parts are sent".to_string()
-    } else if config.model.is_empty() {
+    let model_id = mush_core::text::sanitize(&config.model);
+    let vision = if config.model.is_empty() {
         "no — no model yet".to_string()
     } else {
-        format!(
-            "no — the table does not document image parts for {}",
-            mush_core::text::sanitize(&config.model)
-        )
+        match config.vision() {
+            config::Vision::Yes => "yes — image parts are sent".to_string(),
+            config::Vision::Unknown => "unknown — image parts are sent; state it in the home \
+                 config's providers if the endpoint refuses them"
+                .to_string(),
+            config::Vision::No => {
+                format!("no — the table does not document image parts for {model_id}")
+            }
+        }
     };
     // The window is the one fact whose *source* matters, and a number can come
     // by four roads: the human, mush's own table, the endpoint's model list, the
@@ -2282,10 +2288,13 @@ mod tests {
 
     /// The dump answers the image gate, not only the request knobs: whether
     /// the model in force may be sent a picture is the one *capability* a
-    /// request can be refused for, and it lived only in the provider table —
-    /// a human pasting a screenshot learned it by spending the gesture
-    /// (finding C12). The answer is read through the same function the gate
-    /// asks, so the dump cannot promise an image the run would drop.
+    /// request can be refused for, and a human pasting a screenshot used to
+    /// learn it by spending the gesture (finding C12). The answer is read
+    /// through the one accessor the gates ask ([`Config::vision`]), so the dump
+    /// cannot promise an image the run would drop — and it has three answers:
+    /// `yes`, a known `no`, and `unknown` for a model nothing names, whose parts
+    /// travel until the human states the fact (findings PK3, PK4, PK7;
+    /// §8.116).
     #[test]
     fn the_dump_answers_the_image_gate() {
         let vision = |model: &str| {
@@ -2303,8 +2312,8 @@ mod tests {
             .map(|(_, value)| value)
             .unwrap_or_else(|| panic!("no `vision` row for `{model}`"))
         };
-        // The table's one row that documents vision, and a model it does not
-        // name: both directions of the gate the request will meet.
+        // Both directions a built-in row can state, and the third answer a
+        // model no row names gets.
         assert_eq!(
             vision("deepseek-flash"),
             "yes \u{2014} image parts are sent"
@@ -2314,6 +2323,12 @@ mod tests {
             "no \u{2014} the table does not document image parts for deepseek-v4-pro"
         );
         assert_eq!(vision(""), "no \u{2014} no model yet");
+        assert_eq!(
+            vision("lfm2-vl"),
+            "unknown \u{2014} image parts are sent; state it in the home config's providers \
+             if the endpoint refuses them",
+            "nothing names this model, so the parts travel and the line says how to state it"
+        );
         // The row's model is the one the gate reads, and it is defanged like
         // the model row: an endpoint-chosen id on its way to a terminal.
         assert_eq!(

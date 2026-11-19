@@ -22,7 +22,7 @@ use crate::CMD_CAP;
 /// path. Every vendor fact behind it lives in [`crate::provider`], the only
 /// module that names one.
 pub use crate::provider::{
-    known_context, vision_capable, Catalog, ModelRow, ModelSpec, Provider, ProviderRow, ProviderSpec,
+    known_context, Catalog, ModelRow, ModelSpec, Provider, ProviderRow, ProviderSpec, Vision,
     PROVIDERS,
 };
 
@@ -870,6 +870,26 @@ impl Config {
         self.provider
             .documented_context(&self.model)
             .unwrap_or(self.provider.fallback_context_tokens)
+    }
+
+    /// Whether the model in force may be sent image content parts: the one
+    /// spelling of the vision question, asked by every gate that stops a
+    /// picture — the box that takes an attachment, the wire that sends one, the
+    /// `read_file` that hands one back, and the `vision` row `--print-config`
+    /// prints.
+    ///
+    /// Three answers, not two, because they cost differently. [`Vision::No`] is
+    /// a fact the table states — a `vision: false` annotation, or a built-in row
+    /// documenting the model without it — and today's refusal stays exactly as
+    /// it was for it. [`Vision::Unknown`] is a model nothing names (a home
+    /// box's, most often), and its pictures *travel*: mush cannot point at a
+    /// document saying it cannot see, and refusing would take the answer the
+    /// human asked for on the strength of a guess. If the endpoint really cannot
+    /// see, it says so in its own words — visible, and fixed by stating
+    /// `vision: false` (or `true`) for that id in the home config's `providers`
+    /// (findings PK3, PK4, PK7; §8.116).
+    pub fn vision(&self) -> Vision {
+        self.provider.vision(&self.model).into()
     }
 
     /// Adopt a window an endpoint named, unless the human stated one
@@ -1854,6 +1874,81 @@ mod tests {
             vec!["lfm2-vl".to_string()],
             "the row's ids are offered when the endpoint cannot list its own"
         );
+    }
+
+    /// The capability question a gate asks, in the three answers the table can
+    /// give: a model nothing names is `Unknown` (its pictures travel, and the
+    /// endpoint's own error is the report), a model a built-in row documents
+    /// without vision is a known `No`, and a row the file states answers for the
+    /// ids it names — in both directions. The behaviour each answer buys is
+    /// `for_the_model`'s and the attach gate's; this pins the one spelling they
+    /// read (findings PK3, PK4, PK7).
+    #[test]
+    fn the_vision_question_has_three_answers() {
+        use crate::userconfig::{ModelConfig, ProviderConfig};
+        let home = UserConfig {
+            provider: "home".into(),
+            providers: std::collections::BTreeMap::from([(
+                "home".to_string(),
+                ProviderConfig {
+                    base_url: "http://rubendpc:8078".into(),
+                    models: std::collections::BTreeMap::from([
+                        (
+                            "lfm2-vl".to_string(),
+                            ModelConfig {
+                                vision: Some(true),
+                                context: None,
+                            },
+                        ),
+                        (
+                            "blind-box".to_string(),
+                            ModelConfig {
+                                vision: Some(false),
+                                context: None,
+                            },
+                        ),
+                    ]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..UserConfig::default()
+        };
+        let mut config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        let at = |config: &mut Config, model: &str| {
+            config.set_model(model);
+            config.vision()
+        };
+
+        assert_eq!(config.provider.name, "home", "the file's row is in force");
+        assert_eq!(
+            at(&mut config, "lfm2-vl"),
+            Vision::Yes,
+            "the human stated this id sees, and the built-ins never heard of it"
+        );
+        assert_eq!(
+            at(&mut config, "blind-box"),
+            Vision::No,
+            "a stated `vision: false` is the known-blind answer"
+        );
+        assert_eq!(
+            at(&mut config, "qwen2.5-coder"),
+            Vision::Unknown,
+            "a model nothing names is unknown, not assumed blind"
+        );
+
+        // A built-in row documents the fact either way: `deepseek-v4-pro` is
+        // named by the table and not documented for images.
+        let builtin = Config::new("http://base:0", "deepseek-v4-pro", None);
+        assert_eq!(builtin.vision(), Vision::No, "named, and known blind");
+        assert_eq!(Config::new("http://base:0", "", None).vision(), Vision::Unknown);
     }
 
     /// The precedence is unmoved by a row: a flag or the environment still
