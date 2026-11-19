@@ -201,7 +201,12 @@ written as JSON, or the answer as plain text.";
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
-const MAX_AGENTS: u64 = 16;
+///
+/// 32 is still inside the two windows that would otherwise start refusing: a
+/// spawn cannot be turned away for want of a worktree (`git::MAX_WORKTREES` is
+/// 70) or a history slot (`CHILD_HISTORY` is 50), so this number remains the
+/// only limit a full tree meets.
+const MAX_AGENTS: u64 = 32;
 /// Default `wait` timeout in seconds; 0 means forever.
 const WAIT_TIMEOUT_SECS: u64 = 600;
 /// How wide one line of a `status` digest may be, in columns. A listing
