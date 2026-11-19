@@ -2010,6 +2010,56 @@ mod tests {
         assert_eq!(config.api_key.as_deref(), Some("sk-box"));
     }
 
+    /// The flat key a save migrates under its host is still the key `resolve`
+    /// adopts for the file's own endpoint: the save states no key itself, so the
+    /// migration is what keeps the file's key working for the host it was
+    /// written for (findings C6, D6).
+    #[test]
+    fn a_migrated_flat_key_is_adopted_for_the_files_own_host() {
+        use crate::scratch::Scratch;
+        use crate::userconfig::KeyWrite;
+
+        let dir = Scratch::new("config-migrated-key");
+        let path = dir.path().join("config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "api_key": "sk-legacy",
+  "provider": "custom",
+  "base_url": "http://a:1"
+}"#,
+        )
+        .unwrap();
+
+        // The save a host change leaves: the file's own endpoint, and no key
+        // stated for it.
+        UserConfig {
+            provider: "custom".into(),
+            base_url: "http://a:1".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+        let home = UserConfig::load_from(&path).config;
+
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.base_url, "http://a:1");
+        assert_eq!(
+            config.api_key.as_deref(),
+            Some("sk-legacy"),
+            "the migrated entry is the key the file's endpoint adopts"
+        );
+    }
+
     /// A bad key in the map is refused by name, with the file named too — the
     /// same door the flat `api_key` goes through (finding C7): the value could
     /// write a header line for itself, and `MUSH_CONFIG` can point anywhere, so

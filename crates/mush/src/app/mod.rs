@@ -4138,29 +4138,24 @@ impl App {
     /// Remember the current setup in the home config file so the API key (and
     /// endpoint defaults) survive restarts. Never writes to the workspace.
     ///
-    /// The key is saved *with* the endpoint it is for: a save that follows a
-    /// switch which moved the host states `api_key: None`, and the write treats
-    /// that as a statement, so the old host's key is not merged forward to the
-    /// new one (findings C6, D6).
-    ///
-    /// The key is also saved only when it is the human's to write. The key
-    /// this function can see is the *resolved* one, and `/url`, `/model` and
-    /// `/provider` are commands whose acks say nothing about a file: a key the
-    /// human supplied for one run through `MUSH_API_KEY` — the README's own
+    /// The key is the human's to write only through `/key`: that is the one road
+    /// that says a key is *for the file*, and its ack says `saved to <path>`.
+    /// The key this function can see is the *resolved* one, and `/url`, `/model`
+    /// and `/provider` are commands whose acks say nothing about a file: a key
+    /// the human supplied for one run through `MUSH_API_KEY` — the README's own
     /// road for a key they did not want in one — was written to disk by any of
-    /// them, in a file that outlives the run (finding C11). Only `/key` states
-    /// a key *for the file*, and its ack says `saved to <path>`; every other
-    /// save keeps whatever key the file holds, while the fields it does own
-    /// still land. A host change's `None` is a statement too, not silence
-    /// (findings C6, D6).
+    /// them, in a file that outlives the run (finding C11). So only a save whose
+    /// `/key` stated this run's key states one ([`KeyWrite::Stated`]); every
+    /// other save keeps whatever key the file holds ([`KeyWrite::Keep`]), while
+    /// the fields it does own still land.
     ///
-    /// The key lives in the home config's host → key map now, so the statement
-    /// `None` means "no entry for this host" rather than "drop the key":
-    /// `save_to` clears only the legacy flat field and leaves every host's entry
-    /// where it was. That is what stops a host change erasing the key that
-    /// belonged to the host just left — and what makes the flat field's clearing
-    /// still necessary, so the old key cannot be re-homed by whichever host
-    /// comes next.
+    /// A host change needs no exception for "no key in force": the map entry for
+    /// the host just left is no longer at risk, because `Keep` restores the map
+    /// exactly and a host with no entry is a host with no key (findings C6, D6).
+    /// A legacy flat key is not dropped either: the next save that states a key
+    /// migrates it under the host the file's own `base_url` names, and a save
+    /// that states none writes no flat field at all — never `null`
+    /// ([`mush_core::userconfig::KeyWrite`]).
     ///
     /// Returns whether the write landed, and *says* a failure here, in the one
     /// status slot: a caller whose ack promises what the file holds —
@@ -4194,14 +4189,14 @@ impl App {
             // the file already holds.
             ..UserConfig::default()
         };
-        // `/key` states the key for the file; every other save keeps the
-        // file's own. The exception is a save with no key in force at all — a
-        // host change that dropped one, or an endpoint that never had one —
-        // which states "none": `save_to` clears the legacy flat field (so a
-        // later host cannot adopt it) and keeps every map entry, so the host
-        // just left keeps its own key. An environment key in force is neither,
-        // so it never reaches disk (finding C11).
-        let key = if self.key_stated || self.cfg().api_key.is_none() {
+        // `/key` is the one save that states the key for the file; every other
+        // save keeps the file's own, whichever layer the run's key came from.
+        // The old "no key in force" exception is gone with the flat field's
+        // risk: a host change's `None` is not a statement any more, because the
+        // map entry for the host just left survives a `Keep`, and a host with
+        // no entry is a host with no key (findings C6, D6). An environment key
+        // is never stated here, so it never reaches disk (finding C11).
+        let key = if self.key_stated {
             KeyWrite::Stated
         } else {
             KeyWrite::Keep
@@ -18730,6 +18725,53 @@ mod tests {
             "{}",
             text_of(&app)
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A home config that never had a flat key is never given one — nor a null —
+    /// by the commands whose acks say nothing about a file: `/url` and
+    /// `/provider` keep every map entry the file holds and leave `api_key`
+    /// absent entirely. The flat field is legacy, and a write that states no key
+    /// writes no field (finding C11).
+    #[test]
+    fn an_unrelated_command_writes_no_flat_key_into_the_file() {
+        let (mut app, _rx) = test_app("no-flat-key");
+        let home = Scratch::new("no-flat-key-home");
+        let path = home.join("config.json");
+        app.home_config = Some(path.clone());
+        std::fs::write(
+            &path,
+            r#"{
+  "api_keys": {"a:1": "sk-a", "b:2": "sk-b"},
+  "base_url": "http://a:1",
+  "model": "m"
+}"#,
+        )
+        .unwrap();
+
+        run(&mut app, "/url http://b:2/v1");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("\"api_key\""),
+            "/url wrote a flat field: {written}"
+        );
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(saved.api_keys.len(), 2, "every entry survived /url");
+        assert_eq!(
+            saved.base_url, "http://b:2/v1",
+            "the command's field landed"
+        );
+
+        run(&mut app, "/provider custom");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("\"api_key\""),
+            "/provider wrote a flat field: {written}"
+        );
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(saved.api_keys.len(), 2, "every entry survived /provider");
+        assert_eq!(saved.api_keys.get("a:1").map(String::as_str), Some("sk-a"));
+        assert_eq!(saved.api_keys.get("b:2").map(String::as_str), Some("sk-b"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

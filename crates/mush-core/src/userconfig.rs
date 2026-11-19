@@ -47,8 +47,10 @@ fn comment() -> Vec<String> {
     vec![
         "mush home config — hand-editable, and every field is optional.".to_string(),
         "Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.".to_string(),
-        "api_key: the provider's secret; also read from MUSH_API_KEY, and a \
-         control character in it is refused. Never written into a workspace."
+        "api_key: the flat key an older file carried — a legacy fallback for a host \
+         `api_keys` does not name, migrated under its host by the next save, and never \
+         written as null. Also read from MUSH_API_KEY, and a control character in it is \
+         refused. Never written into a workspace."
             .to_string(),
         "api_keys: one key per host — the endpoint's authority, host[:port] as `base_url` \
          names it. A key is minted for one host, so `/key` writes it under the endpoint in \
@@ -99,20 +101,25 @@ fn comment() -> Vec<String> {
 /// nothing reads would be a promise, not a setting.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct UserConfig {
-    /// API key for the provider. Stored in plain text on your own machine;
-    /// never written to the workspace.
+    /// The legacy flat key: what a file written before [`Self::api_keys`]
+    /// carries, and the fallback [`crate::config::resolve`] reads for a host
+    /// the map does not name. Stored in plain text on your own machine; never
+    /// written to the workspace.
     ///
-    /// It is written by the roads that state one *for the file*: `/key`, and
-    /// a save that keeps the file's own key where it is ([`KeyWrite`]). A key
-    /// that reached the run through `MUSH_API_KEY` was deliberately kept out
-    /// of files, and no save triggered by an unrelated command copies it in
+    /// A stated key has a host to live under, so `/key` writes the map; the
+    /// flat field is written only by a save whose value states a key for a file
+    /// that names no endpoint, and by nothing else. A save that has no flat key
+    /// to write removes the field rather than writing `null`: an absent field
+    /// reads back as `None`, and `"api_key": null` in every saved file is the
+    /// noise this legacy field was supposed to leave behind. A key that reached
+    /// the run through `MUSH_API_KEY` was deliberately kept out of files, and no
+    /// save triggered by an unrelated command copies it in, flat or keyed
     /// (finding C11).
     ///
-    /// A key written by a `/key` since the map below existed lands there
-    /// instead, under its own host; this flat field is what a file written
-    /// before the map carries, and [`crate::config::resolve`] falls back to it
-    /// for a host the map has no entry for.
-    #[serde(default)]
+    /// A legacy value is migrated under its own host — the one the file's
+    /// `base_url` names — by the next [`KeyWrite::Stated`] save, and left
+    /// exactly as it is by [`KeyWrite::Keep`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// The keys this machine holds, one per host: the host [`host_of`] names
     /// for an endpoint, i.e. the authority (`host[:port]`) exactly as
@@ -240,8 +247,8 @@ pub struct Loaded {
     pub complaint: Option<String>,
 }
 
-/// The road a home-config save takes the key fields by — the flat `api_key`
-/// and the host → key `api_keys` map together.
+/// The road a home-config save takes the key fields by — the legacy flat
+/// `api_key` and the host → key `api_keys` map together.
 ///
 /// The key is the one thing whose statement a save may have to *withhold*, so
 /// the road is an argument rather than a convention. It can come from a layer
@@ -251,19 +258,27 @@ pub struct Loaded {
 /// about a file — must not be the road that copies it in (finding C11). Every
 /// other field of the value is stated either way, and the ordinary merge still
 /// fills in whatever this value leaves unstated.
+///
+/// Neither road ever writes `api_key: null`: a flat key is written only when
+/// there is a string to write, and removed otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyWrite {
     /// State the key this value holds: `Some` writes it under the host of this
-    /// value's `base_url` and clears the flat field, while `None` says this
-    /// endpoint has none — by there being no entry, never by deleting another
-    /// host's. `None` is a statement, not silence — the save that follows a
-    /// host change writes it so no key is re-homed to the new one (findings
-    /// C6, D6).
+    /// value's `base_url` (flat, when that endpoint is empty), while `None`
+    /// says this endpoint has none — by there being no entry, never by deleting
+    /// another host's (findings C6, D6).
+    ///
+    /// A legacy flat key in the file is migrated on the way: its host is the
+    /// one the file's own `base_url` names, and while the map has no entry for
+    /// it the key moves there instead of being dropped. No endpoint, or an
+    /// entry already there, means no migration — and the flat field is left
+    /// exactly as it was, because a key is never deleted on a guess.
     Stated,
     /// Leave the file's own key structure exactly as it is — the map and the
-    /// flat field, present or absent — whatever this value holds. The road for
-    /// a save whose key is not the human's to write: it is not a statement
-    /// about the endpoint, it is silence about the key.
+    /// flat field, present or absent — whatever this value holds: no migration,
+    /// no insert, no delete. The road for a save whose key is not the human's to
+    /// write: it is not a statement about the endpoint, it is silence about the
+    /// key (finding C11).
     Keep,
 }
 
@@ -350,16 +365,25 @@ impl UserConfig {
     /// `api_key` and `api_keys` are the fields with a road of their own
     /// ([`KeyWrite`]), because the key is the one thing a save may have to
     /// withhold. [`KeyWrite::Stated`] makes the key an ordinary stated field:
-    /// `Some(l)` writes `l` under the host of this value's `base_url` and
-    /// clears the flat `api_key`, while `None` means this endpoint has no key —
-    /// stated by there being no entry for it, never by deleting another host's,
-    /// because the key lives beside the endpoint it was minted for and the save
-    /// that drops it is the save that just moved the endpoint (findings C6,
-    /// D6); merging the old host's key forward would hand it to the new one on
-    /// the next start. An empty `base_url` has no host to key on, so the key is
-    /// stated flat instead. [`KeyWrite::Keep`] writes the file's own map and
-    /// flat key back, present or absent, which is what lets a command whose ack
-    /// says nothing about a file avoid putting a key in one (finding C11).
+    /// `Some(l)` writes `l` under the host of this value's `base_url`, or flat
+    /// when that endpoint is empty, while `None` means this endpoint has no key
+    /// — stated by there being no entry for it, never by deleting another
+    /// host's, because the key lives beside the endpoint it was minted for and
+    /// the save that drops it is the save that just moved the endpoint
+    /// (findings C6, D6); merging the old host's key forward would hand it to
+    /// the new one on the next start. A flat `api_key` the file still carries is
+    /// a legacy key with no host of its own, and the file's `base_url` is the
+    /// only hint there is: a `Stated` save migrates it under that host while the
+    /// map has no entry for it, and leaves it alone when there is no host to key
+    /// it on or the map already speaks for that host. [`KeyWrite::Keep`] writes
+    /// the file's own map and flat key back, present or absent, and migrates
+    /// nothing: it is what lets a command whose ack says nothing about a file
+    /// avoid putting a key in one (finding C11).
+    ///
+    /// `api_key` is never written as `null` — the field is inserted only when
+    /// there is a string to insert, and an absent field reads back as `None`.
+    /// The flat field is a legacy read-only fallback, not something every save
+    /// restates.
     ///
     /// A file that is there and is not an object mush can merge into — not
     /// JSON, JSON that is not an object, or unreadable — is moved beside itself
@@ -428,47 +452,63 @@ impl UserConfig {
                 .map(str::to_string);
             match key {
                 // Silence about the key: the map and the flat field go back
-                // exactly as the file had them, present or absent.
+                // exactly as the file had them, present or absent — no
+                // migration, no insert, no delete.
                 KeyWrite::Keep => {
                     if let Some(map) = file_map {
                         fields.insert("api_keys".to_string(), Value::Object(map));
                     }
-                    fields.insert(
-                        "api_key".to_string(),
-                        file_flat.map(Value::String).unwrap_or(Value::Null),
-                    );
+                    if let Some(flat) = file_flat {
+                        fields.insert("api_key".to_string(), Value::String(flat));
+                    }
                 }
-                // A statement. `Some` writes the key under the host it was
-                // minted for and clears the flat field — the key now lives
-                // beside its true host, and leaving it flat would let a later
-                // host adopt it (findings C6, D6). `None` says this host has
-                // none, and says it by there being no entry: never by deleting
-                // another host's, whose key is still the key for that host.
+                // A statement. A flat key the file still carries is legacy:
+                // the host it belongs to is the one the file's own `base_url`
+                // names, and that is the only hint there is — so move it under
+                // that host before this save states anything. No endpoint, or
+                // an entry the map already has, means no migration, and then
+                // the flat field is left exactly as it was: a key is never
+                // deleted on a guess, and only the migration above may clear
+                // it.
                 KeyWrite::Stated => {
                     let mut map = file_map.unwrap_or_default();
-                    let flat = match self.api_key.as_deref() {
-                        Some(written) => {
-                            let host = crate::config::host_of(&self.base_url);
-                            if host.is_empty() {
-                                // No endpoint, no host to key on: the map has
-                                // nowhere to put the key, so it is stated flat
-                                // as the old file did — the only shape that can
-                                // carry it, and one no host can claim.
-                                Some(written.to_string())
-                            } else {
-                                map.insert(host.to_string(), Value::String(written.to_string()));
-                                None
-                            }
+                    let file_host = existing
+                        .as_ref()
+                        .and_then(|file| file.get("base_url"))
+                        .and_then(Value::as_str)
+                        .map(crate::config::host_of)
+                        .unwrap_or("");
+                    let file_host_taken = map
+                        .keys()
+                        .any(|stored| stored.eq_ignore_ascii_case(file_host));
+                    let mut flat = file_flat.clone();
+                    if let Some(legacy) = file_flat.as_deref() {
+                        if !file_host.is_empty() && !file_host_taken {
+                            map.insert(file_host.to_string(), Value::String(legacy.to_string()));
+                            flat = None;
                         }
-                        None => None,
-                    };
+                    }
+                    // `None` says this host has none, by there being no entry:
+                    // never by deleting another host's, whose key is still the
+                    // key for that host.
+                    if let Some(written) = self.api_key.as_deref() {
+                        let host = crate::config::host_of(&self.base_url);
+                        if host.is_empty() {
+                            // No endpoint, no host to key on: the map has
+                            // nowhere to put the key, so it is stated flat
+                            // as the old file did — the only shape that can
+                            // carry it, and one no host can claim.
+                            flat = Some(written.to_string());
+                        } else {
+                            map.insert(host.to_string(), Value::String(written.to_string()));
+                        }
+                    }
                     if !map.is_empty() {
                         fields.insert("api_keys".to_string(), Value::Object(map));
                     }
-                    fields.insert(
-                        "api_key".to_string(),
-                        flat.map(Value::String).unwrap_or(Value::Null),
-                    );
+                    if let Some(flat) = flat {
+                        fields.insert("api_key".to_string(), Value::String(flat));
+                    }
                 }
             }
         }
@@ -1035,9 +1075,10 @@ mod tests {
     }
 
     /// The four-field file has no map: its key is flat, and it stays flat until
-    /// a save states a key for the current host — then it migrates under that
-    /// host and the flat field is cleared. This is the road that turns an old
-    /// file into a map without losing the key.
+    /// the next `Stated` save — one that states a key for the current host moves
+    /// it under that host and clears the flat field, and one that states none
+    /// migrates it under the host the file's own `base_url` names. This is the
+    /// road that turns an old file into a map without losing the key.
     #[test]
     fn the_old_flat_file_migrates_under_its_host_on_the_next_stated_save() {
         let path = temp_path("migrate");
@@ -1096,6 +1137,242 @@ mod tests {
         let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(reloaded.api_key.as_deref(), Some("sk-homeless"));
         assert_eq!(reloaded.api_keys.get("a:1").map(String::as_str), Some("sk-a"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A save never writes `"api_key": null`: a file that never had a flat key
+    /// gets no `api_key` field at all, whichever road the save takes. An absent
+    /// field reads back as `None`, and the null every `/url`, `/model` or
+    /// `/provider` used to leave behind was exactly the noise the legacy field
+    /// was supposed to shed.
+    #[test]
+    fn a_save_never_writes_a_null_flat_key() {
+        let keep = temp_path("no-null-keep");
+        UserConfig {
+            base_url: "http://a:1".into(),
+            model: "m".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&keep, KeyWrite::Keep)
+        .unwrap();
+        let written = fs::read_to_string(&keep).unwrap();
+        assert!(
+            !written.contains("\"api_key\""),
+            "a Keep save writes no flat field: {written}"
+        );
+        assert_eq!(UserConfig::load_from(&keep).config.api_key, None);
+
+        let stated = temp_path("no-null-stated");
+        UserConfig {
+            base_url: "http://a:1".into(),
+            model: "m".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&stated, KeyWrite::Stated)
+        .unwrap();
+        let written = fs::read_to_string(&stated).unwrap();
+        assert!(
+            !written.contains("\"api_key\""),
+            "a Stated+None save writes no flat field: {written}"
+        );
+        assert_eq!(UserConfig::load_from(&stated).config.api_key, None);
+        let _ = fs::remove_dir_all(keep.parent().unwrap());
+        let _ = fs::remove_dir_all(stated.parent().unwrap());
+    }
+
+    /// `Keep` is silence about the key: a legacy flat key is neither migrated nor
+    /// rewritten, and no null stands in its place. The map it sits beside is
+    /// restored untouched too.
+    #[test]
+    fn a_keep_save_does_not_migrate_a_legacy_flat_key() {
+        let path = temp_path("keep-legacy");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "api_key": "sk-legacy",
+  "base_url": "http://a:1",
+  "api_keys": {"b:2": "sk-b"}
+}"#,
+        )
+        .unwrap();
+
+        UserConfig {
+            base_url: "http://a:1".into(),
+            model: "m".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Keep)
+        .unwrap();
+
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            reloaded.api_key.as_deref(),
+            Some("sk-legacy"),
+            "the flat key stays flat: a Keep save is not a statement about it"
+        );
+        assert_eq!(
+            reloaded.api_keys.len(),
+            1,
+            "no entry was minted for its host"
+        );
+        assert_eq!(
+            reloaded.api_keys.get("b:2").map(String::as_str),
+            Some("sk-b")
+        );
+        assert_eq!(reloaded.model, "m", "the fields the save owns still land");
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("\"api_key\": \"sk-legacy\""),
+            "the legacy string is still what the field holds: {written}"
+        );
+        assert!(
+            !written.contains("\"api_key\": null"),
+            "and no null stands in for it: {written}"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A save that states no key still rescues a legacy flat one: the file's own
+    /// `base_url` is the only host it can belong to, so the key moves there and
+    /// the flat field goes — a save must not drop a key it did not state. A
+    /// second such save neither duplicates the entry nor overwrites it.
+    #[test]
+    fn a_stated_none_save_migrates_a_legacy_flat_key_under_the_files_own_host() {
+        let path = temp_path("migrate-none");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "api_key": "sk-legacy",
+  "provider": "custom",
+  "base_url": "http://a:1/v1"
+}"#,
+        )
+        .unwrap();
+
+        // The save a host change leaves behind: the file's own endpoint, and no
+        // key stated for it.
+        let stated_none = || UserConfig {
+            provider: "custom".into(),
+            base_url: "http://a:1/v1".into(),
+            ..UserConfig::default()
+        };
+        stated_none().save_to(&path, KeyWrite::Stated).unwrap();
+
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            reloaded.api_keys.get("a:1").map(String::as_str),
+            Some("sk-legacy"),
+            "the flat key moved under the host the file's own base_url names"
+        );
+        assert_eq!(reloaded.api_key, None, "and no flat key was left behind");
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("\"api_key\""),
+            "the flat field is gone, not null: {written}"
+        );
+
+        stated_none().save_to(&path, KeyWrite::Stated).unwrap();
+        let again = UserConfig::load_from(&path).config;
+        assert_eq!(again.api_keys.len(), 1, "the entry was not duplicated");
+        assert_eq!(
+            again.api_keys.get("a:1").map(String::as_str),
+            Some("sk-legacy"),
+            "and the second save did not overwrite it"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// No endpoint in the file is no host to migrate a legacy flat key to: the
+    /// key is left exactly as it was rather than dropped or keyed on a guess.
+    #[test]
+    fn a_stated_none_save_with_no_endpoint_leaves_a_flat_key_alone() {
+        let path = temp_path("no-host-migrate");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"api_key": "sk-legacy"}"#).unwrap();
+
+        UserConfig {
+            model: "m".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            reloaded.api_key.as_deref(),
+            Some("sk-legacy"),
+            "a key is never deleted on a guess"
+        );
+        assert!(reloaded.api_keys.is_empty(), "and no host was invented");
+        assert_eq!(reloaded.model, "m");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A host the map already speaks for is not migrated onto: the flat key is
+    /// left exactly as it is rather than replacing, or being replaced by, the
+    /// entry that host already has.
+    #[test]
+    fn a_stated_none_save_does_not_migrate_over_an_existing_entry() {
+        let path = temp_path("no-overwrite-migrate");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "api_key": "sk-flat",
+  "api_keys": {"a:1": "sk-map"},
+  "base_url": "http://a:1"
+}"#,
+        )
+        .unwrap();
+
+        UserConfig {
+            base_url: "http://a:1".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(reloaded.api_key.as_deref(), Some("sk-flat"));
+        assert_eq!(
+            reloaded.api_keys.get("a:1").map(String::as_str),
+            Some("sk-map"),
+            "the entry that host already has is not overwritten"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A stated key for another host does not delete a flat key the migration
+    /// could not place: with no endpoint in the file there is no host to move it
+    /// under, so it stays the fallback for a host the map does not name — no
+    /// writer removes a key it did not state.
+    #[test]
+    fn a_stated_key_for_another_host_keeps_an_unplaceable_flat_key() {
+        let path = temp_path("stated-other-host-keeps-flat");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"api_key": "sk-legacy"}"#).unwrap();
+
+        UserConfig {
+            api_key: Some("sk-new".into()),
+            base_url: "http://b:2".into(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(
+            reloaded.api_keys.get("b:2").map(String::as_str),
+            Some("sk-new"),
+            "the stated key lands under its own host"
+        );
+        assert_eq!(
+            reloaded.api_key.as_deref(),
+            Some("sk-legacy"),
+            "and the flat key the migration could not place is still there"
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

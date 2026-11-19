@@ -1071,15 +1071,17 @@ shows up in `git status` and never needs to be added to the project's own
 That file is meant to be hand-edited, and it documents itself. Every field is
 optional: `api_keys` (a host → key map — the key for each endpoint's authority,
 so switching the endpoint keeps each host's own key and switching back adopts it
-again), `api_key` (the flat key an older file carried, and the fallback for a
-host the map does not name), `provider`, `base_url`, `model`, `context` (a stated
-window), `temperature`, `max_completion_tokens` (`true` sends the reply cap as
-`max_completion_tokens`, and `--print-config` prints the number this window
-affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`), and `thinking`
-(`true` asks for the provider's thinking mode, `false` sends no `thinking` field
-and leaves the model's own default). Unknown keys are ignored *and kept* when
-mush rewrites the file, and so is any field a particular writer leaves unstated:
-`/key` saves the connection without erasing what a human typed by hand. Unstated,
+again), `api_key` (the flat key an older file carried: a legacy read-only
+fallback for a host the map does not name, migrated under its host by the next
+save and never written afresh — and never null), `provider`, `base_url`, `model`,
+`context` (a stated window), `temperature`, `max_completion_tokens` (`true` sends
+the reply cap as `max_completion_tokens`, and `--print-config` prints the number
+this window affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`), and
+`thinking` (`true` asks for the provider's thinking mode, `false` sends no
+`thinking` field and leaves the model's own default). Unknown keys are ignored
+*and kept* when mush rewrites the file, and so is any field a particular writer
+leaves unstated: `/key` saves the connection without erasing what a human typed
+by hand. Unstated,
 the provider's own default applies, and a value mush does not know is rejected at
 startup by name, never sent and never quietly replaced. The fields and the writer
 are `crates/mush-core/src/userconfig.rs`.

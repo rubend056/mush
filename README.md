@@ -128,8 +128,10 @@ is *machine-global*:
 The key is a host → key map: one entry per endpoint, keyed by its authority
 (`host[:port]`), so moving the endpoint to another host keeps the old host's key
 and switching back adopts it again. A file written before the map carried a flat
-`api_key` instead; it is still read, and still means a key for a host the map has
-no entry for.
+`api_key` instead; it is still read, still means a key for a host the map has no
+entry for, and the next save migrates it under the host the file's own `base_url`
+names. Nothing ever writes `api_key: null`: the flat field is written only when
+there is a key to write.
 
 Every knob, its default, and what `--print-config` prints: the manual's §5.
 
