@@ -6844,10 +6844,10 @@ mod tests {
         // `MUSH_CONFIG` once into the field every save goes through, so an App
         // built before the first isolate call carries the human's own path —
         // and any `/url`, `/provider` or picker in its test then rewrites
-        // `~/.config/mush/config.json` with a fixture's endpoint and model.
+        // `~/.config/mush/config.toml` with a fixture's endpoint and model.
         // Measured: `switching_to_a_provider_forgets_the_key`, run alone with
         // `XDG_CONFIG_HOME` at a throwaway directory, wrote that directory's
-        // `mush/config.json` with `http://127.0.0.1:2` while its own `test_app`
+        // `mush/config.toml` with `http://127.0.0.1:2` while its own `test_app`
         // preceded the isolate call.
         isolate_user_config();
         let ws = Workspace::new(root).unwrap();
@@ -16414,7 +16414,7 @@ mod tests {
     /// `pick` persists what the human picked (`persist_user_config`), and the
     /// two picker tests below are the only places in this suite that press
     /// `Enter` on a row: without this they would rewrite the human's own
-    /// `~/.config/mush/config.json` with a fixture's endpoint and model.
+    /// `~/.config/mush/config.toml` with a fixture's endpoint and model.
     /// `MUSH_CONFIG` is the override `mush_core::userconfig` documents for
     /// exactly this, and nothing else here reads the home config.
     ///
@@ -16437,7 +16437,7 @@ mod tests {
         SET.call_once(|| {
             static ROOT: std::sync::OnceLock<Scratch> = std::sync::OnceLock::new();
             let root = ROOT.get_or_init(|| Scratch::new("user-config"));
-            std::env::set_var("MUSH_CONFIG", root.path().join("config.json"));
+            std::env::set_var("MUSH_CONFIG", root.path().join("config.toml"));
         });
     }
 
@@ -19051,7 +19051,7 @@ mod tests {
     fn an_unrelated_command_does_not_move_an_environment_key_into_the_home_config() {
         let (mut app, _rx) = test_app("env-key-stays-out");
         let home = Scratch::new("app-env-key");
-        let path = home.join("config.json");
+        let path = home.join("config.toml");
         app.home_config = Some(path.clone());
 
         // The file's own key for the endpoint in force, and a key the run got
@@ -19116,22 +19116,24 @@ mod tests {
     fn an_unrelated_command_writes_no_flat_key_into_the_file() {
         let (mut app, _rx) = test_app("no-flat-key");
         let home = Scratch::new("no-flat-key-home");
-        let path = home.join("config.json");
+        let path = home.join("config.toml");
         app.home_config = Some(path.clone());
         std::fs::write(
             &path,
-            r#"{
-  "api_keys": {"a:1": "sk-a", "b:2": "sk-b"},
-  "base_url": "http://a:1",
-  "model": "m"
-}"#,
+            r#"base_url = "http://a:1"
+model = "m"
+
+[api_keys]
+"a:1" = "sk-a"
+"b:2" = "sk-b"
+"#,
         )
         .unwrap();
 
         run(&mut app, "/url http://b:2/v1");
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !written.contains("\"api_key\""),
+            !written.contains("api_key = "),
             "/url wrote a flat field: {written}"
         );
         let saved = UserConfig::load_from(&path).config;
@@ -19144,7 +19146,7 @@ mod tests {
         run(&mut app, "/provider custom");
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !written.contains("\"api_key\""),
+            !written.contains("api_key = "),
             "/provider wrote a flat field: {written}"
         );
         let saved = UserConfig::load_from(&path).config;
@@ -19164,7 +19166,7 @@ mod tests {
     fn a_key_on_each_of_two_hosts_survives_the_switch_between_them() {
         let (mut app, _rx) = test_app("two-host-keys");
         let home = Scratch::new("app-two-host-home");
-        let path = home.join("config.json");
+        let path = home.join("config.toml");
         app.home_config = Some(path.clone());
         let first = app.cfg().base_url.clone();
 
@@ -19253,7 +19255,7 @@ mod tests {
         let dir = Scratch::new("blocked-home");
         let blocked = dir.join("blocked");
         std::fs::write(&blocked, "not a directory\n").unwrap();
-        let path = blocked.join("config.json");
+        let path = blocked.join("config.toml");
         app.home_config = Some(path.clone());
 
         // `/key`: the key reaches the cell — the run has it — but the file did

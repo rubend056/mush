@@ -304,7 +304,7 @@ Three facts decide whether an image travels:
   saying so — is *blind*, and only a blind model is refused at the box and
   dropped from the request. A model nothing names is *unknown*, and its parts
   travel: if the endpoint cannot see them it answers with its own error, which
-  is visible and fixed by one line in the home config (`"vision": false`), not
+  is visible and fixed by one line in the home config (`vision = false`), not
   by withholding a picture a seeing endpoint would have read.
 - **An image is capped (2 MB) and cannot be windowed.** `offset`/`limit` are
   lines and an image has none, so the refusal names the one road that makes a big
@@ -1085,47 +1085,114 @@ What the audit that shaped this section found, and the defects each rule fixed:
 ```
 
 The API key is never stored here — it lives in the machine-global home config
-(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). With `HOME` unset and no
-`MUSH_CONFIG` there is no home config, and mush says so by name rather than
-write one beside the checkout. `/key` is the one road that
-writes it there, under the endpoint's host; `MUSH_API_KEY` supplies one from the
-environment for the run, and no other save copies it into the file. `.mush/.gitignore` containing `*`
-ignores every file in the directory, **including itself**, so the directory never
-shows up in `git status` and never needs to be added to the project's own
-`.gitignore`.
+(`$MUSH_CONFIG`, else the platform config directory;
+`~/.config/mush/config.toml` on Linux). With `HOME` unset and no `MUSH_CONFIG`
+there is no home config, and mush says so by name rather than write one beside
+the checkout. The file mush wrote before TOML was `config.json`: a `MUSH_CONFIG`
+naming a `.json` path is that legacy file, and mush reads and writes the `.toml`
+sibling of the same name, so the path a human set keeps resolving. A
+`config.json` beside the missing `config.toml` is migrated once, on startup,
+before anything reads a value — the values verbatim (a flat `api_key` stays
+flat, the `api_keys` map stays a map), the old file removed only after the new
+one has been read back and agrees — and the run says one line, `home config
+migrated to … — the old … is gone` (on the status bar at startup, and as a
+`notice` row in `mush --print-config`). A migration that cannot write, or whose
+read-back disagrees, or that finds a JSON it cannot read leaves the JSON exactly
+where it was, leaves no half-migrated TOML behind, and says why: the run reads
+the JSON. `/key` is the one road that writes it there, under the endpoint's
+host; `MUSH_API_KEY` supplies one from the environment for the run, and no other
+save copies it into the file. `.mush/.gitignore` containing `*` ignores every
+file in the directory, **including itself**, so the directory never shows up in
+`git status` and never needs to be added to the project's own `.gitignore`.
 
-That file is meant to be hand-edited, and it documents itself. Every field is
-optional: `api_keys` (a host → key map — the key for each endpoint's authority,
-so switching the endpoint keeps each host's own key and switching back adopts it
-again), `api_key` (the flat key an older file carried: a legacy read-only
-fallback for a host the map does not name, migrated under its host by the next
-save and never written afresh — and never null), `provider`, `base_url`, `model`,
-`context` (a stated window), `temperature`, `max_completion_tokens` (`true` sends
-the reply cap as `max_completion_tokens`, and `--print-config` prints the number
-this window affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`),
-`thinking` (`true` asks for the provider's thinking mode, `false` sends no
-`thinking` field and leaves the model's own default), and `providers` (the rows
-below). Unknown keys are ignored *and kept* when mush rewrites the file, and so
-is any field a particular writer leaves unstated: `/key` saves the connection
-without erasing what a human typed by hand. Unstated, the provider's own default
-applies, and a value mush does not know is rejected at startup by name, never
-sent and never quietly replaced. The fields and the writer are
-`crates/mush-core/src/userconfig.rs`.
+That file is meant to be hand-edited, and it is short on purpose. It is TOML
+with real `#` comments: a four-line preamble naming the format and that every
+field is optional, the precedence, the two commands that name another file and
+show the resolution, and the one promise that makes editing safe (what mush does
+not know, it keeps); then one `#` line directly above each key mush writes. The
+reasons a field exists are here, in the manual, not in a file a human opens to
+change one number. Every field is optional: `api_keys` (a host → key map — the
+key for each endpoint's authority, so switching the endpoint keeps each host's
+own key and switching back adopts it again), `api_key` (the flat key an older
+file carried: a legacy read-only fallback for a host the map does not name,
+migrated under its host by the next save and never written afresh — and never
+null, since TOML has none), `provider`, `base_url`, `model`, `context` (a stated
+window), `temperature`, `max_completion_tokens` (`true` sends the reply cap as
+`max_completion_tokens`, and `--print-config` prints the number this window
+affords), `reasoning_effort` (`"low"`, `"high"` or `"max"`), `thinking` (`true`
+asks for the provider's thinking mode, `false` sends no `thinking` field and
+leaves the model's own default), and `providers` (the rows below). Unknown keys
+are ignored *and kept* when mush rewrites the file, and so is any field a
+particular writer leaves unstated: `/key` saves the connection without erasing
+what a human typed by hand. A save is a merge over the human's own text
+(`toml_edit`), so the `#` comments they wrote, their formatting and any key or
+table mush does not know survive it: the block at the very top is mush's
+preamble and is rewritten, and the one line directly above a documented key is
+mush's and kept current, while the lines a human stacks above that one survive.
+An `_comment` array an old file still carries is deleted by the first save.
+Unstated, the provider's own default applies, and a value mush does not know is
+rejected at startup by name, never sent and never quietly replaced. The fields
+and the writer are `crates/mush-core/src/userconfig.rs`.
+
+A file mush wrote on a machine whose endpoint is a home box, in full — the
+preamble, one line per key, and a row a human added:
+
+```toml
+# mush home config — hand-editable TOML, and every field is optional.
+# Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.
+# `MUSH_CONFIG` names another file, and `mush --print-config` shows what these resolved to.
+# Unknown keys are ignored and kept, and so are the comments you write yourself; the reasons a field exists are in docs/mush.md and the manual, not here.
+
+# provider: deepseek or custom; `custom` defaults to the local endpoint http://rubendpc:8078.
+provider = "custom"
+# base_url: an OpenAI-compatible endpoint, without a trailing slash; a control character in it is refused.
+base_url = "http://rubendpc:8078"
+# model: the model id to start with, when nothing above names one.
+model = "lfm2-vl"
+# context: a context window in tokens; the built-in default is 120000 for deepseek, 32768 for custom. Stating it here beats what the endpoint advertises, as --context does.
+context = 32768
+# temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.
+temperature = 0.2
+# max_completion_tokens: true sends the reply cap — an eighth of the window, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.
+max_completion_tokens = true
+# reasoning_effort: "low", "high" or "max" — exactly what the DeepSeek OpenAI format documents. The provider's own default is `high` for deepseek, no field elsewhere.
+reasoning_effort = "low"
+# thinking: true asks for the provider's thinking mode (the request carries {"type":"enabled"}); false sends no thinking field and leaves the model's own default. The provider's own default is on for deepseek, off elsewhere.
+thinking = false
+
+# api_keys: one key per host — the endpoint's `host[:port]`, as `base_url` names it. `/key` writes the endpoint in force, switching endpoints keeps every other host's entry, and a host with no entry falls back to `api_key` above.
+[api_keys]
+"rubendpc:8078" = "sk-0123456789"
+
+# providers: rows of your own — a base_url, the model and knobs selecting it applies, and a `models` map annotating the ids that endpoint serves (vision, context). The annotations are not exhaustive: a model they do not name is unannotated, not assumed blind — its pictures are sent, and a `vision: false` here restores the refusal. Select a row with /provider, --provider, MUSH_PROVIDER or a workspace's session. No keys in this table: a provider's key is the `api_keys` entry for its host. The built-ins (deepseek or custom) are always available, and a row may not take one of their names over.
+[providers]
+
+[providers.home]
+base_url = "http://rubendpc:8078"
+model = "lfm2-vl"
+thinking = false
+reasoning_effort = "high"
+temperature = 0.2
+context = 32768
+
+[providers.home.models.lfm2-vl]
+vision = true
+context = 32768
+```
 
 **`providers`: rows of your own.** A box the built-in table has never heard of
-is a row under `providers`, keyed by the name you want to type:
+is a row under `providers`, keyed by the name you want to type, and a `models`
+sub-table annotates the ids that endpoint serves:
 
-```json
-{
-  "providers": {
-    "home": {
-      "base_url": "http://box.lan:8078",
-      "model": "lfm2-vl",
-      "thinking": false,
-      "models": { "lfm2-vl": { "vision": true, "context": 32768 } }
-    }
-  }
-}
+```toml
+[providers.home]
+base_url = "http://box.lan:8078"
+model = "lfm2-vl"
+thinking = false
+
+[providers.home.models.lfm2-vl]
+vision = true
+context = 32768
 ```
 
 Every field is optional, and selecting the row — `/provider home`, its
@@ -1143,7 +1210,7 @@ exhaustive**. It is the only way mush learns a capability of a model it cannot
 look up, and today it states two facts: `vision` (whether the model accepts image
 parts) and `context` (its window in tokens). An id the map does not name is
 *unknown*, and unknown is not blind: the model's pictures are sent, and an
-endpoint that cannot see them answers with its own error until `"vision": false`
+endpoint that cannot see them answers with its own error until `vision = false`
 states the fact. A built-in row's documented facts are read first, so an
 annotation cannot silently re-size a vendor's model.
 
@@ -1628,10 +1695,12 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --sigterm
    enough, or they want their own pane, is open. The human should not have to ask
    a model what is running on their machine.
 7. `[OPEN]` A fuzz target for path resolution.
-8. `[DECIDED]` Config file format: a machine-global JSON file (`$MUSH_CONFIG`,
-   else the platform config directory), hand-editable and self-documenting. Not
-   `mush.toml` in `.mush/`, which would make the endpoint a workspace fact, and
-   not environment-only, which would make a hand-edited setting impossible.
+8. `[DECIDED]` Config file format: a machine-global TOML file (`$MUSH_CONFIG`,
+   else the platform config directory), hand-editable and self-documenting —
+   real `#` comments, so a human can annotate their own file and a save keeps
+   them. Not `mush.toml` in `.mush/`, which would make the endpoint a workspace
+   fact, and not environment-only, which would make a hand-edited setting
+   impossible.
 9. `[DECIDED]` The size tiers: compact at 80×20, the floor at 40×10, the agent
    pane capped at 50 columns and the transcript at 110.
 10. `[DECIDED]` Job output is a **tail**, consistently; a *foreground* command

@@ -706,7 +706,10 @@ fn unreadable_session_notice(
 ///
 /// A read and nothing else: no `.mush/` is created, no lock is taken and no
 /// request is made, and a directory that does not exist yet is described as the
-/// fresh workspace it would be. The theme is resolved from the same directory
+/// fresh workspace it would be. The home config is the caller's, read before
+/// this — and the one write the dump can therefore make is the legacy-format
+/// migration that read performs, which it reports as a notice row rather than
+/// doing silently (finding C12). The theme is resolved from the same directory
 /// argument, tolerating one that does not canonicalize yet, because the dump
 /// describes a workspace that is allowed not to exist.
 ///
@@ -1015,6 +1018,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     // but it is not silent either: the complaint travels to `--print-config` as
     // a row and to the window as a failure before the first frame (finding
     // C3).
+    //
+    // This is also the one road that converts a legacy JSON file to TOML, and
+    // that read says so (`migrated`): the file a human keeps moving is news
+    // that belongs on the same lines as the resolution notices, not a failure
+    // and not silence (finding C12).
     let home = UserConfig::load();
 
     if args.print_config {
@@ -1023,7 +1031,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         // is where the layers are read, and where a session file that cannot be
         // read stays a fact about the layer rather than being flattened into
         // absence (finding B2).
-        let (resolved, stored, theme) = resolved_config(&dir, &overrides, &env, &home.config)?;
+        let (mut resolved, stored, theme) = resolved_config(&dir, &overrides, &env, &home.config)?;
+        // The migration is the one thing this dump writes, and it writes it as
+        // the startup road does — through the same read — so the row that says
+        // so belongs beside the notices (finding C12).
+        if let Some(migrated) = home.migrated.clone() {
+            resolved.notices.push(migrated);
+        }
         print_config(
             &resolved.config,
             &stored,
@@ -1174,6 +1188,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     // they are the ones that must not be overwritten on the bar.
     for notice in notices {
         app.say(notice);
+    }
+    if let Some(migrated) = home.migrated.clone() {
+        // The one line a converted file owes the human: where it is now, and
+        // that the old one is gone. Said, not printed, because the window is
+        // where the other facts about the startup read land (finding C12).
+        app.say(migrated);
     }
     if let Some(complaint) = home.complaint {
         app.stored_unreadable(complaint);
@@ -2624,7 +2644,7 @@ mod tests {
     #[test]
     fn describe_reports_an_unreadable_home_config() {
         let cfg = Config::new("http://host:1", "m", None);
-        let complaint = "could not read /tmp/x/config.json — expected value at line 1 column 2; \
+        let complaint = "could not read /tmp/x/config.toml — TOML parse error at line 1, column 3; \
                          using defaults";
         let rows = describe(
             &cfg,
@@ -2643,7 +2663,7 @@ mod tests {
         let row = &rows[at].1;
         assert!(row.starts_with("unreadable — "), "{row}");
         assert!(
-            row.contains("/tmp/x/config.json") && row.contains("using defaults"),
+            row.contains("/tmp/x/config.toml") && row.contains("using defaults"),
             "{row}"
         );
 
@@ -2667,7 +2687,7 @@ mod tests {
     #[test]
     fn an_unreadable_home_config_travels_to_the_dump() {
         let dir = Scratch::new("main-home");
-        let path = dir.join("config.json");
+        let path = dir.join("config.toml");
         std::fs::write(&path, "{ \"api_key\": \"sk-secret\", ").unwrap();
 
         let loaded = UserConfig::load_from(&path);
@@ -2704,11 +2724,13 @@ mod tests {
     }
 
     /// `--print-config` is a diagnostic: it reads the layers and writes
-    /// nothing. A workspace nothing has opened yet is described as the fresh
-    /// one it would be, with no `.mush/` appearing, and a session file it
-    /// cannot read is reported unreadable and left exactly where it is —
+    /// nothing of its own. A workspace nothing has opened yet is described as
+    /// the fresh one it would be, with no `.mush/` appearing, and a session file
+    /// it cannot read is reported unreadable and left exactly where it is —
     /// setting it aside is the *startup* path's job, not the dump's (finding
-    /// B2).
+    /// B2). The one file it can move is the home config, because the read that
+    /// converts a legacy JSON file is the startup read this dump shares, and a
+    /// migration is said as a notice row (finding C12).
     #[test]
     fn describing_a_config_writes_nothing() {
         let env = theme::EnvText {
@@ -2733,7 +2755,7 @@ mod tests {
         std::fs::write(&file, "{ not json").unwrap();
         // The dump reads the home file too; a `MUSH_CONFIG` another test set
         // is none of this test's business, so it names a config of its own.
-        let home = UserConfig::load_from(Path::new("/nonexistent/mush/config.json"));
+        let home = UserConfig::load_from(Path::new("/nonexistent/mush/config.toml"));
         let (resolved, stored, theme) =
             resolved_config(ws.root(), &Overrides::default(), &env, &home.config).unwrap();
         let row = describe(

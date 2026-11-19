@@ -2406,15 +2406,14 @@ mod tests {
         use crate::userconfig::KeyWrite;
 
         let dir = Scratch::new("config-migrated-key");
-        let path = dir.path().join("config.json");
+        let path = dir.path().join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            r#"{
-  "api_key": "sk-legacy",
-  "provider": "custom",
-  "base_url": "http://a:1"
-}"#,
+            r#"api_key = "sk-legacy"
+provider = "custom"
+base_url = "http://a:1"
+"#,
         )
         .unwrap();
 

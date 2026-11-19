@@ -1831,7 +1831,7 @@ impl Workspace {
     /// read-only is a sentence the model can read instead of an override it
     /// cannot see. The mode refusal lives here, at the model's door, and not in
     /// [`atomic_write`], which `session::save` and the human's own
-    /// `config.json` writer also use: they may replace a file whatever its
+    /// `config.toml` writer also use: they may replace a file whatever its
     /// mode, but a model may not. The type refusal is shared with
     /// [`atomic_write`], because a rename over a socket destroys it whatever
     /// door it came through.
@@ -2521,7 +2521,7 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
 ///   one on a box that chose `002` or `077`.
 /// - [`Fresh::Private`] — mush's own store: the session file, the
 ///   `.mush/session.json.previous` copy a new chat keeps beside it, and the
-///   key-bearing home `config.json` — conversations and the human's secrets.
+///   key-bearing home `config.toml` — conversations and the human's secrets.
 ///   `0o600`, because a human's `022` umask is about the files the box shares
 ///   and must not hand mush's private ones to the group.
 ///
@@ -2554,7 +2554,7 @@ impl Fresh {
 /// device is refused rather than destroyed. That guard lives here beside the
 /// rename as well as at [`Workspace::write_file`], so a caller that does not
 /// pass through the tool's door (`session::save`, the human's own
-/// `config.json`) cannot rename over a socket either.
+/// `config.toml`) cannot rename over a socket either.
 ///
 /// The mode is a fact of the file, not of this function. `tempfile`'s scratch
 /// file is `0600` by default and the rename would carry that onto the target,
@@ -2697,7 +2697,7 @@ fn what_it_is(kind: &fs::Metadata) -> &'static str {
 /// [`entry_for_write`]'s refusal as an IO error: the kind that says "the name
 /// is wrong", not "the disk is". The callers inside a workspace wrap it in the
 /// sentence their model reads, and the callers outside one (`session::save`,
-/// the home `config.json`) report it through their own error channel.
+/// the home `config.toml`) report it through their own error channel.
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }

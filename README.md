@@ -115,44 +115,77 @@ Everything can be changed at runtime from the chat — no restart:
 
 **Resolution order on startup: CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults.** The home config lives at `$MUSH_CONFIG`,
-else the platform config directory (`~/.config/mush/config.json` on Linux); with
+else the platform config directory (`~/.config/mush/config.toml` on Linux); with
 `HOME` unset and no `MUSH_CONFIG` there is none, and a save refuses by name — it
-is *machine-global*:
+is *machine-global*. It is TOML, hand-editable, and every field is optional; the
+`#` comments mush writes are a four-line preamble naming the precedence and a
+single line above each key, and a save keeps the comments you write yourself,
+your formatting, and any key or table mush does not know:
 
-```json
-{
-  "api_keys": { "api.deepseek.com": "sk-..." },
-  "provider": "deepseek",
-  "base_url": "https://api.deepseek.com",
-  "model": "deepseek-flash"
-}
+```toml
+# mush home config — hand-editable TOML, and every field is optional.
+# Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.
+# `MUSH_CONFIG` names another file, and `mush --print-config` shows what these resolved to.
+# Unknown keys are ignored and kept, and so are the comments you write yourself; the reasons a field exists are in docs/mush.md and the manual, not here.
+
+# provider: deepseek or custom; `custom` defaults to the local endpoint http://rubendpc:8078.
+provider = "custom"
+# base_url: an OpenAI-compatible endpoint, without a trailing slash; a control character in it is refused.
+base_url = "http://rubendpc:8078"
+# model: the model id to start with, when nothing above names one.
+model = "lfm2-vl"
+# context: a context window in tokens; the built-in default is 120000 for deepseek, 32768 for custom. Stating it here beats what the endpoint advertises, as --context does.
+context = 32768
+# temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.
+temperature = 0.2
+# max_completion_tokens: true sends the reply cap — an eighth of the window, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.
+max_completion_tokens = true
+# reasoning_effort: "low", "high" or "max" — exactly what the DeepSeek OpenAI format documents. The provider's own default is `high` for deepseek, no field elsewhere.
+reasoning_effort = "low"
+# thinking: true asks for the provider's thinking mode (the request carries {"type":"enabled"}); false sends no thinking field and leaves the model's own default. The provider's own default is on for deepseek, off elsewhere.
+thinking = false
+
+# api_keys: one key per host — the endpoint's `host[:port]`, as `base_url` names it. `/key` writes the endpoint in force, switching endpoints keeps every other host's entry, and a host with no entry falls back to `api_key` above.
+[api_keys]
+"rubendpc:8078" = "sk-0123456789"
 ```
 
 The key is a host → key map: one entry per endpoint, keyed by its authority
-(`host[:port]`), so moving the endpoint to another host keeps the old host's key
-and switching back adopts it again. A file written before the map carried a flat
-`api_key` instead; it is still read, still means a key for a host the map has no
-entry for, and the next save migrates it under the host the file's own `base_url`
-names. Nothing ever writes `api_key: null`: the flat field is written only when
-there is a key to write.
+(`host[:port]`, a quoted key in the file because it is not a bare one), so
+moving the endpoint to another host keeps the old host's key and switching back
+adopts it again. A file written before the map carried a flat `api_key`
+instead; it is still read, still means a key for a host the map has no entry
+for, and the next save migrates it under the host the file's own `base_url`
+names. A null is never written (TOML has none): the flat field is written only
+when there is a key to write.
+
+The file mush wrote before this one was `config.json`, and the first startup
+that finds it converts it once — the TOML file missing with the JSON beside it,
+or the `.json` path `MUSH_CONFIG` names, which mush resolves to the `.toml`
+sibling of the same name. The values cross verbatim (a flat `api_key` stays
+flat, the `api_keys` map stays a map), and the old file is removed only after
+the new one has been read back and states the same values. One line names both
+paths — `home config migrated to … — the old … is gone` — on the status bar at
+startup and as a `notice` row in `mush --print-config`. A write that fails, a
+read-back that disagrees, or a JSON file that cannot be read at all leaves the
+JSON exactly where it was, leaves no half-migrated TOML behind, and says why;
+the run then reads the JSON.
 
 A file may also name provider rows of its own, for a box the built-in table has
 never heard of:
 
-```json
-{
-  "providers": {
-    "home": {
-      "base_url": "http://box.lan:8078",
-      "model": "lfm2-vl",
-      "thinking": false,
-      "models": { "lfm2-vl": { "vision": true, "context": 32768 } }
-    }
-  }
-}
+```toml
+[providers.home]
+base_url = "http://box.lan:8078"
+model = "lfm2-vl"
+thinking = false
+
+[providers.home.models.lfm2-vl]
+vision = true
+context = 32768
 ```
 
-Selecting a row — `/provider home`, `"provider": "home"` in this file,
+Selecting a row — `/provider home`, `provider = "home"` in this file,
 `--provider home`, `MUSH_PROVIDER=home`, or a workspace's saved session — applies
 what the row states: its endpoint, the model it names, its temperature, thinking
 mode, `reasoning_effort` and the window its models are budgeted against. A row
@@ -164,7 +197,7 @@ how mush learns a fact about a model it cannot look up — `vision` (whether the
 model accepts image parts) and `context` (its window) — and a model the map does
 not name is `unknown`, not assumed blind: an unknown model's pictures are sent,
 and if the endpoint cannot see them it says so, visibly, until one line here
-states `"vision": false`.
+states `vision = false`.
 
 Every knob, its default, and what `--print-config` prints: the manual's §5.
 
@@ -444,7 +477,7 @@ tells the UI, and retries once — a backstop, not the mechanism.
   `session.json.bak` (then `.bak.2`, …), `session.json.previous` (the
   conversation the last new chat kept), `wt/` for isolated agents' worktrees,
   and `paste/` for pictures pasted into the chat.
-- The platform config directory (e.g. `~/.config/mush/config.json`) —
+- The platform config directory (e.g. `~/.config/mush/config.toml`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.
 

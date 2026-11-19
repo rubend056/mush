@@ -6,15 +6,24 @@
 //! on every command line. Resolution order on startup is
 //! `CLI flags > environment > saved session > this file > built-in defaults`.
 //!
-//! The file is meant to be hand-edited, so it is written to be readable without
-//! this module: every field is optional, the file mush writes carries a
-//! `_comment` header naming the precedence and each field, and an unknown key is
-//! ignored (and kept) rather than fatal, so a newer mush can add one without
-//! breaking an older one. `mush --print-config` prints what the layers above
-//! resolved to.
+//! The file is **TOML**, and it is meant to be hand-edited: every field is
+//! optional, the file mush writes carries a short `#` preamble naming the
+//! precedence, one `#` line above each key saying what that key does, and an
+//! unknown key is ignored (and kept) rather than fatal, so a newer mush can add
+//! one without breaking an older one. The long explanations live in
+//! `docs/mush.md` and the manual, not in the file (finding C12).
+//! `mush --print-config` prints what the layers above resolved to.
+//!
+//! [`toml_edit`] and not a plain TOML serializer, because a save is a *merge*
+//! over the human's own file: what a save does not state — their `#` comments,
+//! their formatting, a key or a table a newer mush invented — has to survive it,
+//! which is what the format-preserving parser is for (finding C12). The
+//! extension names the format: a `MUSH_CONFIG` path ending in `.json` is the
+//! file mush wrote before this change, read as JSON and migrated to TOML by the
+//! first startup (`UserConfig::load_at`).
 //!
 //! Path: `$MUSH_CONFIG`, else the platform config directory
-//! (`$XDG_CONFIG_HOME/mush/config.json`, usually `~/.config/mush/config.json`
+//! (`$XDG_CONFIG_HOME/mush/config.toml`, usually `~/.config/mush/config.toml`
 //! on Unix, Application Support on macOS, `%APPDATA%` on Windows). When
 //! neither names one — `HOME` unset with no `MUSH_CONFIG`, and no home the
 //! passwd database can name — there is no home config at all: mush refuses it
@@ -27,77 +36,119 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::workspace::{atomic_write, Fresh};
 
-/// The key the self-documenting header travels under. A plain JSON key, not a
-/// JSONC dialect: `_` sorts it to the top, every parser survives it, and it is
-/// never read back — the fields below say what is editable.
+/// The key mush's old JSON header travelled under: the eleven paragraphs that
+/// documented the file. It is not a setting, nothing ever read it back, and a
+/// save deletes it — the file documents itself with real `#` comments now
+/// (finding C12).
 const COMMENT_KEY: &str = "_comment";
 
-/// What every file mush writes says about itself: the precedence, then the
-/// fields, then the command that shows what they resolved to.
+/// What every file mush writes says about itself, above the first key and
+/// separated from it by the blank line that closes the block.
 ///
-/// The provider names and the endpoint `custom` falls back to are spelled from
-/// [`crate::provider::PROVIDERS`], so this header cannot offer a choice the
-/// `/provider` picker would not.
-fn comment() -> Vec<String> {
-    use crate::provider::{names_hint, Provider, DEFAULT_PROVIDER};
-    vec![
-        "mush home config — hand-editable, and every field is optional.".to_string(),
-        "Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.".to_string(),
-        "api_key: the flat key an older file carried — a legacy fallback for a host \
-         `api_keys` does not name, migrated under its host by the next save, and never \
-         written as null. Also read from MUSH_API_KEY, and a control character in it is \
-         refused. Never written into a workspace."
+/// Four lines, because everything else the old header said is now one `#` line
+/// above the key it is about, and the reasons a field exists are the manual's.
+/// What is left here is what a hand-editor needs before reading any key: the
+/// file's format and that every field is optional, the precedence, the two
+/// commands that name another file or show the resolution, and the one promise
+/// that makes editing safe (mush keeps what it does not know).
+const PREAMBLE: &str = "\
+# mush home config — hand-editable TOML, and every field is optional.
+# Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.
+# `MUSH_CONFIG` names another file, and `mush --print-config` shows what these resolved to.
+# Unknown keys are ignored and kept, and so are the comments you write yourself; the reasons a field exists are in docs/mush.md and the manual, not here.
+";
+
+/// The keys mush documents, in the order a file lists them: the values first
+/// and the two tables last, since a TOML table is written as its own section
+/// and a section ends the values above it.
+const FIELDS: &[&str] = &[
+    "api_key",
+    "provider",
+    "base_url",
+    "model",
+    "context",
+    "temperature",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "thinking",
+    "api_keys",
+    "providers",
+];
+
+/// The one `#` line above a key, or `None` for a key mush knows nothing about.
+///
+/// One line each, and spelled from [`crate::provider`] wherever a name or a
+/// number could drift from what a request actually sends: a hand-editable file
+/// is the one place a human reads a default. The provider line keeps the
+/// meaning the long header carried — the annotations are not exhaustive, a
+/// model they do not name is unannotated rather than assumed blind, and no key
+/// lives in that table.
+fn field_help(field: &str) -> Option<String> {
+    use crate::provider::{
+        context_default_hint, effort_default_hint, names_hint, thinking_default_hint, Provider,
+        DEFAULT_PROVIDER,
+    };
+    Some(match field {
+        "api_key" => "api_key: the flat key an older file carried — a legacy fallback for a host \
+                      `api_keys` does not name. A save moves it under the host this file's \
+                      `base_url` names, and mush never writes a null one."
             .to_string(),
-        "api_keys: one key per host — the endpoint's authority, host[:port] as `base_url` \
-         names it. A key is minted for one host, so `/key` writes it under the endpoint in \
-         force; switching the endpoint keeps every other host's entry, and switching back \
-         re-adopts it. A file with no entry for the current host falls back to `api_key` \
-         above, the older flat field."
+        "api_keys" => "api_keys: one key per host — the endpoint's `host[:port]`, as `base_url` \
+                       names it. `/key` writes the endpoint in force, switching endpoints keeps \
+                       every other host's entry, and a host with no entry falls back to `api_key` \
+                       above."
             .to_string(),
-        format!(
-            "providers: named rows of the provider table — a base_url, the model and knobs \
-             selecting it applies, and a `models` map annotating the ids the endpoint serves \
-             (vision, context). The annotations are not a claim to be exhaustive: a model they \
-             do not name is unannotated, not assumed blind — its image parts are sent, and a \
-             `vision: false` here is what restores the refusal. Select a row with /provider, \
-             --provider, MUSH_PROVIDER or a workspace's session. No keys here: a provider's \
-             key is the `api_keys` entry for its host. The built-ins ({}) are always available, \
-             and a row may not take one of their names over.",
+        "providers" => format!(
+            "providers: rows of your own — a base_url, the model and knobs selecting it applies, \
+             and a `models` map annotating the ids that endpoint serves (vision, context). The \
+             annotations are not exhaustive: a model they do not name is unannotated, not assumed \
+             blind — its pictures are sent, and a `vision: false` here restores the refusal. \
+             Select a row with /provider, --provider, MUSH_PROVIDER or a workspace's session. No \
+             keys in this table: a provider's key is the `api_keys` entry for its host. The \
+             built-ins ({}) are always available, and a row may not take one of their names over.",
             names_hint()
         ),
-        format!(
+        "provider" => format!(
             "provider: {}; `{}` defaults to the local endpoint {}.",
             names_hint(),
             DEFAULT_PROVIDER.name(),
             Provider::Custom.default_base_url()
         ),
-        "base_url: an OpenAI-compatible endpoint, without a trailing slash; a \
-         control character in it is refused."
+        "base_url" => "base_url: an OpenAI-compatible endpoint, without a trailing slash; a \
+                       control character in it is refused."
             .to_string(),
-        "model: the model id to start with, when nothing above names one.".to_string(),
-        format!(
-            "context: a context window in tokens; the built-in default is {}. Stating it here beats what the endpoint advertises, as --context does.",
-            crate::provider::context_default_hint()
+        "model" => "model: the model id to start with, when nothing above names one.".to_string(),
+        "context" => format!(
+            "context: a context window in tokens; the built-in default is {}. Stating it here \
+             beats what the endpoint advertises, as --context does.",
+            context_default_hint()
         ),
-        "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.".to_string(),
-        format!(
-            "max_completion_tokens: true sends the reply cap — {}, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.",
+        "temperature" => "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own \
+                          choice, and the default."
+            .to_string(),
+        "max_completion_tokens" => format!(
+            "max_completion_tokens: true sends the reply cap — {}, at most — as \
+             max_completion_tokens; OpenAI's reasoning models reject max_tokens.",
             crate::config::REPLY_SHARE_WORDS
         ),
-        format!(
-            "reasoning_effort: \"low\", \"high\" or \"max\" — exactly what the DeepSeek OpenAI format documents. A value here reaches any endpoint; the provider's own default is {}.",
-            crate::provider::effort_default_hint()
+        "reasoning_effort" => format!(
+            "reasoning_effort: \"low\", \"high\" or \"max\" — exactly what the DeepSeek OpenAI \
+             format documents. The provider's own default is {}.",
+            effort_default_hint()
         ),
-        format!(
-            "thinking: true asks for the provider's thinking mode (the request carries {{\"type\":\"enabled\"}}); false sends no thinking field at all and leaves the model's own default. The provider's own default is {}.",
-            crate::provider::thinking_default_hint()
+        "thinking" => format!(
+            "thinking: true asks for the provider's thinking mode (the request carries \
+             {{\"type\":\"enabled\"}}); false sends no thinking field and leaves the model's own \
+             default. The provider's own default is {}.",
+            thinking_default_hint()
         ),
-        "Keys mush does not know are ignored, and kept when mush rewrites this file. `mush --print-config` shows what these resolved to.".to_string(),
-    ]
+        _ => return None,
+    })
 }
 
 /// One named provider in [`UserConfig::providers`]: an OpenAI-compatible
@@ -173,9 +224,9 @@ pub struct ModelConfig {
 
 /// The machine-global defaults the precedence chain consults below the session.
 ///
-/// Every field is optional: an absent or `null` field is simply not stated, and
-/// a file with only the four connection fields still loads and still means what
-/// it always meant. There are deliberately no knobs beyond the ones mush reads
+/// Every field is optional: an absent field is simply not stated, and a file
+/// with only the four connection fields still loads and still means what it
+/// always meant. There are deliberately no knobs beyond the ones mush reads
 /// (`Config`): no `param_style`, because the only parameter-name switch mush has
 /// is the reply cap, which `max_completion_tokens` states directly, and no
 /// `history_budget_multiplier`, because the history budget is a conservative
@@ -191,11 +242,10 @@ pub struct UserConfig {
     /// A stated key has a host to live under, so `/key` writes the map; the
     /// flat field is written only by a save whose value states a key for a file
     /// that names no endpoint, and by nothing else. A save that has no flat key
-    /// to write removes the field rather than writing `null`: an absent field
-    /// reads back as `None`, and `"api_key": null` in every saved file is the
-    /// noise this legacy field was supposed to leave behind. A key that reached
-    /// the run through `MUSH_API_KEY` was deliberately kept out of files, and no
-    /// save triggered by an unrelated command copies it in, flat or keyed
+    /// to write removes the field rather than writing a null: TOML has none at
+    /// all, and an absent key reads back as `None`. A key that reached the run
+    /// through `MUSH_API_KEY` was deliberately kept out of files, and no save
+    /// triggered by an unrelated command copies it in, flat or keyed
     /// (finding C11).
     ///
     /// A legacy value is migrated under its own host — the one the file's
@@ -248,25 +298,25 @@ pub struct UserConfig {
     /// Provider name as given by [`Provider::name()`](crate::provider::Provider::name)
     /// or by a row of [`Self::providers`], i.e. a name `--provider` accepts (see
     /// [`provider::PROVIDERS`](crate::provider::PROVIDERS)).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     /// Context window in tokens. A window stated here is a statement, not a
     /// guess: it beats what the endpoint advertises, exactly like `--context`,
     /// and only a window this workspace remembers (the session) outranks it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
     /// Sampling temperature sent with every request. Clamped by
     /// `Config::temperature`, so a typo is a value mush can still send rather
     /// than a request an endpoint rejects.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Send the reply cap as `max_completion_tokens` instead of `max_tokens`,
     /// which OpenAI's reasoning models require.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<bool>,
     /// Reasoning effort sent as `reasoning_effort`: "low", "high" or "max",
     /// exactly the values the DeepSeek OpenAI format documents. Stated here it
@@ -274,13 +324,13 @@ pub struct UserConfig {
     /// own documented default applies (`provider::PROVIDERS`), and a row that
     /// documents none is the only way the field is left off. A value mush does
     /// not know is reported at startup rather than sent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Ask for the provider's thinking mode. `true` sends the `thinking` field
     /// a provider documents (`{"type":"enabled"}`); `false` sends no
     /// `thinking` field at all and leaves the model's own default. Unstated,
     /// the provider's own default applies (see `provider::PROVIDERS`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
 }
 
@@ -292,20 +342,45 @@ fn config_path_from(
     config_dir: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(path) = override_path {
-        return Some(PathBuf::from(path));
+        return Some(toml_path(PathBuf::from(path)));
     }
-    config_dir.map(|dir| dir.join("mush/config.json"))
+    config_dir.map(|dir| dir.join("mush/config.toml"))
+}
+
+/// The file mush writes, out of the name the human gave it: a `.json` name is
+/// the *legacy* file, and the TOML is that same file with the extension the
+/// format takes now.
+///
+/// This is what keeps `MUSH_CONFIG=…/my.json` naming that machine's config
+/// after the migration, instead of naming the file the migration removed: the
+/// sibling `<stem>.toml` is where the values are written and read from then on,
+/// and the one line the migration says names both paths (finding C12).
+fn toml_path(path: PathBuf) -> PathBuf {
+    if is_legacy_json(&path) {
+        path.with_extension("toml")
+    } else {
+        path
+    }
+}
+
+/// The extension names the format: `.json` is the file mush wrote before TOML —
+/// read as JSON, and the file a migration converts — and anything else is TOML.
+fn is_legacy_json(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 /// Where the user config lives: `MUSH_CONFIG` names it outright, and otherwise
-/// it is the platform config directory (`$XDG_CONFIG_HOME/mush/config.json` on
+/// it is the platform config directory (`$XDG_CONFIG_HOME/mush/config.toml` on
 /// Unix, the Application Support directory on macOS, `%APPDATA%` on Windows).
 /// `None` is a machine with no home config at all — see the reason below.
 ///
 /// The file is the *machine-global* one the API key is written to in plain
 /// text, so a home is what it is named after and the only road to it that is
 /// not the workspace is built from one. `MUSH_CONFIG` is an explicit road the
-/// human chose, relative or not, and it is taken as given. Without it, an
+/// human chose, relative or not, and it is taken as given — as the TOML file
+/// beside a `.json` name, for the reason `toml_path` gives. Without it, an
 /// unset `HOME` and no config directory (on Unix: no `$XDG_CONFIG_HOME` and no
 /// home the passwd database can name) has no such place: the old fallback was
 /// the *relative* `.mush-user-config.json`, which is whatever directory mush
@@ -355,6 +430,15 @@ pub struct Loaded {
     /// two silences are the same only because there is nothing to say in
     /// either.
     pub complaint: Option<String>,
+    /// `Some` when this read converted a legacy JSON file to TOML: one line
+    /// naming where the file is now and that the old one is gone.
+    ///
+    /// It is not a complaint — nothing failed — but it is not silence either:
+    /// the human's file moved, and the file a save writes from now on is the
+    /// new one. It travels the road the resolution notices take, because a
+    /// migration behind a path the human named must be said out loud
+    /// (finding C12).
+    pub migrated: Option<String>,
 }
 
 /// The road a home-config save takes the key fields by — the legacy flat
@@ -369,8 +453,8 @@ pub struct Loaded {
 /// other field of the value is stated either way, and the ordinary merge still
 /// fills in whatever this value leaves unstated.
 ///
-/// Neither road ever writes `api_key: null`: a flat key is written only when
-/// there is a string to write, and removed otherwise.
+/// Neither road ever writes a null flat key: TOML has none, and a flat key is
+/// written only when there is a string to write and removed otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyWrite {
     /// State the key this value holds: `Some` writes it under the host of this
@@ -381,7 +465,7 @@ pub enum KeyWrite {
     /// A legacy flat key in the file is migrated on the way: its host is the
     /// one the file's own `base_url` names, and while the map has no entry for
     /// it the key moves there instead of being dropped. No endpoint, or an
-    /// entry already there, means no migration — and the flat field is left
+    /// entry already there, means no migration — and the flat key is left
     /// exactly as it was, because a key is never deleted on a guess.
     Stated,
     /// Leave the file's own key structure exactly as it is — the map and the
@@ -401,6 +485,12 @@ impl UserConfig {
     /// none: `HOME` unset with no `MUSH_CONFIG` is not "a file that is not
     /// there" — there is no home config at all, and the complaint says so by
     /// name instead of letting the defaults arrive in silence (finding IN14).
+    ///
+    /// This is also the one road that migrates: the TOML file mush would use is
+    /// missing and the legacy `config.json` beside it is there. A migration is
+    /// a *startup* fact — it happens once, before anything reads a value, and
+    /// the next start (or the same one, again) finds the TOML file and converts
+    /// nothing (finding C12).
     fn load_at(path: Option<PathBuf>) -> Loaded {
         let Some(path) = path else {
             return Loaded {
@@ -410,21 +500,46 @@ impl UserConfig {
                      — set HOME or MUSH_CONFIG; using defaults"
                         .to_string(),
                 ),
+                migrated: None,
             };
         };
-        Self::load_from(&path)
+        let legacy = path.with_extension("json");
+        let mut migrated = None;
+        // A `.json` path mush was handed is read as JSON by [`Self::load_from`]
+        // already; what is left is the TOML path whose legacy sibling needs
+        // converting, and that is the one case migration runs in.
+        if !is_legacy_json(&path) && !path.exists() && legacy.is_file() {
+            match migrate(&legacy, &path) {
+                Ok(line) => migrated = Some(line),
+                // The JSON is still the human's file, so it is still what this
+                // run reads — and if it cannot be read either, that is the
+                // complaint its own read gives, not a second sentence about a
+                // migration nobody asked for.
+                Err(why) => {
+                    let fallback = Self::load_from(&legacy);
+                    return Loaded {
+                        config: fallback.config,
+                        complaint: Some(fallback.complaint.unwrap_or(why)),
+                        migrated: None,
+                    };
+                }
+            }
+        }
+        let mut loaded = Self::load_from(&path);
+        loaded.migrated = migrated;
+        loaded
     }
 
     /// Read the file, or the defaults.
     ///
     /// A missing file is silence: a machine that never wrote one has nothing to
     /// complain about. A file that is *there* and cannot be used — unreadable,
-    /// not JSON, or one field of the wrong type — is the defaults *with a
-    /// complaint*: a hard failure would take the whole TUI down over one wrong
-    /// character, and silence would let the human's key and settings vanish into
-    /// the built-ins without a word (finding C3). An unknown *key* is ignored:
-    /// forward compatibility costs nothing a human editing this by hand would
-    /// miss.
+    /// not the format its name states, or one field of the wrong type — is the
+    /// defaults *with a complaint*: a hard failure would take the whole TUI down
+    /// over one wrong character, and silence would let the human's key and
+    /// settings vanish into the built-ins without a word (finding C3). An
+    /// unknown *key* is ignored: forward compatibility costs nothing a human
+    /// editing this by hand would miss.
     ///
     /// Two values in a file that *did* parse are reported by name instead, where
     /// they are read: the home config's `provider` and its `reasoning_effort`
@@ -434,12 +549,14 @@ impl UserConfig {
         let complaint = |why: String| Loaded {
             config: UserConfig::default(),
             complaint: Some(why),
+            migrated: None,
         };
         let bytes = match fs::read(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Loaded {
                     config: UserConfig::default(),
                     complaint: None,
+                    migrated: None,
                 }
             }
             Err(error) => {
@@ -450,13 +567,14 @@ impl UserConfig {
             }
             Ok(bytes) => bytes,
         };
-        match serde_json::from_slice(&bytes) {
+        match parse(&bytes, path) {
             Ok(config) => Loaded {
                 config,
                 complaint: None,
+                migrated: None,
             },
-            Err(error) => complaint(format!(
-                "could not read {} — {error}; using defaults",
+            Err(why) => complaint(format!(
+                "could not read {} — {why}; using defaults",
                 path.display()
             )),
         }
@@ -469,8 +587,16 @@ impl UserConfig {
     /// connection field — keeps the value the file already had, and so does a
     /// key this build does not know. The TUI saves only the four fields it owns
     /// (a `/key` writes the connection and nothing else), and a hand-edited
-    /// `temperature`, or a setting only a newer mush understands, must survive
-    /// that. Fields that are stated overwrite.
+    /// `temperature`, a comment, or a setting only a newer mush understands,
+    /// must survive that. Fields that are stated overwrite.
+    ///
+    /// The file is TOML edited in place ([`toml_edit`]): the human's own `#`
+    /// comments and formatting for everything this save does not state are
+    /// preserved, and so are keys and tables mush does not know. What mush does
+    /// write is the *header* — the `PREAMBLE` at the top, which a save
+    /// rewrites, and the one `#` line above each key it documents, which is
+    /// mush's line even when the human replaced it with their own
+    /// (finding C12).
     ///
     /// `api_key` and `api_keys` are the fields with a road of their own
     /// ([`KeyWrite`]), because the key is the one thing a save may have to
@@ -485,35 +611,35 @@ impl UserConfig {
     /// a legacy key with no host of its own, and the file's `base_url` is the
     /// only hint there is: a `Stated` save migrates it under that host while the
     /// map has no entry for it, and leaves it alone when there is no host to key
-    /// it on or the map already speaks for that host. [`KeyWrite::Keep`] writes
-    /// the file's own map and flat key back, present or absent, and migrates
+    /// it on or the map already speaks for that host. [`KeyWrite::Keep`] leaves
+    /// the file's own map and flat key exactly where they are, and migrates
     /// nothing: it is what lets a command whose ack says nothing about a file
     /// avoid putting a key in one (finding C11).
     ///
-    /// `api_key` is never written as `null` — the field is inserted only when
-    /// there is a string to insert, and an absent field reads back as `None`.
+    /// A flat key is never written as anything but a string: one is inserted
+    /// only when there is a key to insert, and the field is otherwise removed.
     /// The flat field is a legacy read-only fallback, not something every save
     /// restates.
     ///
-    /// A file that is there and is not an object mush can merge into — not
-    /// JSON, JSON that is not an object, or unreadable — is moved beside itself
-    /// as `<name>.bak` (then `.bak.2`, …) before anything is written: this save
-    /// states four fields and rewrites the header, so without that it would be
-    /// the thing that destroys the file the human's key is in (finding C3). A
-    /// backup that fails refuses the save rather than writing over the only
-    /// copy.
+    /// A file that is there and is not a table mush can merge into — not TOML,
+    /// not UTF-8, or unreadable — is moved beside itself as `<name>.bak` (then
+    /// `.bak.2`, …) before anything is written: this save states four fields and
+    /// rewrites the header, so without that it would be the thing that destroys
+    /// the file the human's key is in (finding C3). A backup that fails refuses
+    /// the save rather than writing over the only copy.
     pub fn save_to(&self, path: &Path, key: KeyWrite) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut merged = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
-        // What the merge can read. An object is the shape a file mush wrote
-        // (and the human edited); anything else is not content the merge can
-        // preserve, so it is the backup's business instead.
+        // What the merge can read. A table is the shape a file mush wrote (and
+        // the human edited); anything else is not content the merge can
+        // preserve, so it is the backup's business instead. The comment block
+        // at the top is mush's preamble and is rewritten below, so it is not
+        // carried into the document this save edits.
         let existing = fs::read(path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .filter(Value::is_object);
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| strip_preamble(&text).parse::<DocumentMut>().ok());
         // `missing` is the one case with a right answer of its own: there is
         // nothing to keep, so nothing is kept. Everything else that does not
         // merge gets the backup first.
@@ -521,116 +647,490 @@ impl UserConfig {
         if existing.is_none() && !missing {
             keep_unparsable(path)?;
         }
-        if let (Some(fields), Some(Value::Object(before))) = (merged.as_object_mut(), &existing) {
-            for (field, value) in before {
-                // The two key fields have a road of their own, taken just
-                // below: the merge loop must not carry a `None` over the
-                // file's `api_key`, must not let a `Keep` save's own key stand
-                // either, and must not lose the other hosts' `api_keys`
-                // entries — nor merge a value's map over them.
-                if field == "api_key" || field == "api_keys" {
-                    continue;
-                }
-                let unstated = fields.get(field).map_or(true, |current| {
-                    current.is_null() || current.as_str() == Some("")
-                });
-                if unstated && field != COMMENT_KEY {
-                    fields.insert(field.clone(), value.clone());
-                }
+        let mut doc = existing.unwrap_or_default();
+        // The JSON era's header key: mush wrote it, nothing read it, and the
+        // file documents itself with comments now (finding C12).
+        doc.as_table_mut().remove(COMMENT_KEY);
+        // The key, by the road the caller named. Both key fields travel
+        // together because both are the key, and a `Keep` save must not let a
+        // value's own map stand over the file's.
+        self.write_key(&mut doc, key);
+        // Then this value's other fields: a stated one is written with its
+        // line, and one the file holds but this value does not state keeps the
+        // value it had — and gets mush's line, because that is the header.
+        let stated = self.stated();
+        for field in FIELDS {
+            match stated.get(field) {
+                Some(item) => set_field(&mut doc, field, item.clone()),
+                None if doc.get(field).is_some() => set_comment(&mut doc, field),
+                None => {}
             }
         }
-        // The key, by the road the caller named: this value's own (`Stated`,
-        // `None` included) or the file's, present or absent (`Keep`). The map
-        // and the flat field travel together because both are the key: what the
-        // file already held is the base, and the road decides whether — and
-        // where — the value's own key is written into it.
-        if let Some(fields) = merged.as_object_mut() {
-            // Neither key field this value carries stands: the road below is
-            // the only writer of them, and a `Keep` save must not let a value's
-            // own map stand over the file's.
-            fields.remove("api_keys");
-            fields.remove("api_key");
-            let file_map = existing
-                .as_ref()
-                .and_then(|file| file.get("api_keys"))
-                .and_then(Value::as_object)
-                .cloned();
-            let file_flat = existing
-                .as_ref()
-                .and_then(|file| file.get("api_key"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            match key {
-                // Silence about the key: the map and the flat field go back
-                // exactly as the file had them, present or absent — no
-                // migration, no insert, no delete.
-                KeyWrite::Keep => {
-                    if let Some(map) = file_map {
-                        fields.insert("api_keys".to_string(), Value::Object(map));
-                    }
-                    if let Some(flat) = file_flat {
-                        fields.insert("api_key".to_string(), Value::String(flat));
-                    }
-                }
-                // A statement. A flat key the file still carries is legacy:
-                // the host it belongs to is the one the file's own `base_url`
-                // names, and that is the only hint there is — so move it under
-                // that host before this save states anything. No endpoint, or
-                // an entry the map already has, means no migration, and then
-                // the flat field is left exactly as it was: a key is never
-                // deleted on a guess, and only the migration above may clear
-                // it.
-                KeyWrite::Stated => {
-                    let mut map = file_map.unwrap_or_default();
-                    let file_host = existing
-                        .as_ref()
-                        .and_then(|file| file.get("base_url"))
-                        .and_then(Value::as_str)
-                        .map(crate::config::host_of)
-                        .unwrap_or("");
-                    let file_host_taken = map
-                        .keys()
-                        .any(|stored| stored.eq_ignore_ascii_case(file_host));
-                    let mut flat = file_flat.clone();
-                    if let Some(legacy) = file_flat.as_deref() {
-                        if !file_host.is_empty() && !file_host_taken {
-                            map.insert(file_host.to_string(), Value::String(legacy.to_string()));
-                            flat = None;
-                        }
-                    }
-                    // `None` says this host has none, by there being no entry:
-                    // never by deleting another host's, whose key is still the
-                    // key for that host.
-                    if let Some(written) = self.api_key.as_deref() {
-                        let host = crate::config::host_of(&self.base_url);
-                        if host.is_empty() {
-                            // No endpoint, no host to key on: the map has
-                            // nowhere to put the key, so it is stated flat
-                            // as the old file did — the only shape that can
-                            // carry it, and one no host can claim.
-                            flat = Some(written.to_string());
-                        } else {
-                            map.insert(host.to_string(), Value::String(written.to_string()));
-                        }
-                    }
-                    if !map.is_empty() {
-                        fields.insert("api_keys".to_string(), Value::Object(map));
-                    }
-                    if let Some(flat) = flat {
-                        fields.insert("api_key".to_string(), Value::String(flat));
-                    }
-                }
-            }
-        }
-        // The header is mush's and is always rewritten: the file explains
-        // itself, whatever the human does to it.
-        if let Some(fields) = merged.as_object_mut() {
-            fields.insert(COMMENT_KEY.to_string(), json!(comment()));
-        }
-        let json = serde_json::to_vec_pretty(&merged).unwrap_or_else(|_| b"{}".to_vec());
+        let text = format!("{PREAMBLE}\n{doc}");
         // A new file is the human's alone ([`Fresh::Private`]): it carries the
         // API key, and a `022` umask must not make it group-readable.
-        atomic_write(path, &json, Fresh::Private)
+        atomic_write(path, text.as_bytes(), Fresh::Private)
+    }
+
+    /// This value's fields as the TOML a save states: only the ones it has a
+    /// value for, so an unstated field cannot overwrite the file's, and no
+    /// absent field becomes a null (TOML has none).
+    ///
+    /// Built by hand rather than through `serde` because the *shape* is the
+    /// file's: rows and annotation sets are real tables a human edits line by
+    /// line, and an `f32` temperature is written as `0.3`, not as the widened
+    /// `0.30000001192092896` the `f64` TOML stores would print.
+    fn stated(&self) -> Table {
+        let mut stated = Table::new();
+        if !self.provider.is_empty() {
+            stated.insert("provider", text(&self.provider));
+        }
+        if !self.base_url.is_empty() {
+            stated.insert("base_url", text(&self.base_url));
+        }
+        if !self.model.is_empty() {
+            stated.insert("model", text(&self.model));
+        }
+        if let Some(context) = self.context {
+            stated.insert("context", count(context));
+        }
+        if let Some(temperature) = self.temperature {
+            stated.insert("temperature", decimal(temperature));
+        }
+        if let Some(flag) = self.max_completion_tokens {
+            stated.insert("max_completion_tokens", toml_edit::value(flag));
+        }
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            stated.insert("reasoning_effort", text(effort));
+        }
+        if let Some(flag) = self.thinking {
+            stated.insert("thinking", toml_edit::value(flag));
+        }
+        if !self.providers.is_empty() {
+            stated.insert("providers", Item::Table(self.providers_table()));
+        }
+        stated
+    }
+
+    /// The `providers` map as TOML tables: one section per row
+    /// (`[providers.home]`), the annotation set nested the same way, so a row a
+    /// human is meant to edit has a line per fact rather than one long line.
+    fn providers_table(&self) -> Table {
+        let mut rows = Table::new();
+        for (name, row) in &self.providers {
+            let mut stated = Table::new();
+            if !row.base_url.is_empty() {
+                stated.insert("base_url", text(&row.base_url));
+            }
+            if !row.model.is_empty() {
+                stated.insert("model", text(&row.model));
+            }
+            if let Some(flag) = row.thinking {
+                stated.insert("thinking", toml_edit::value(flag));
+            }
+            if let Some(effort) = row.reasoning_effort.as_deref() {
+                stated.insert("reasoning_effort", text(effort));
+            }
+            if let Some(temperature) = row.temperature {
+                stated.insert("temperature", decimal(temperature));
+            }
+            if let Some(context) = row.context {
+                stated.insert("context", count(context));
+            }
+            if !row.models.is_empty() {
+                let mut models = Table::new();
+                for (id, facts) in &row.models {
+                    let mut stated = Table::new();
+                    if let Some(vision) = facts.vision {
+                        stated.insert("vision", toml_edit::value(vision));
+                    }
+                    if let Some(context) = facts.context {
+                        stated.insert("context", count(context));
+                    }
+                    models.insert(id, Item::Table(stated));
+                }
+                stated.insert("models", Item::Table(models));
+            }
+            rows.insert(name, Item::Table(stated));
+        }
+        rows
+    }
+
+    /// The key fields, by the road [`KeyWrite`] names. Both are taken here and
+    /// not by the ordinary field loop, because the map is the caller's
+    /// statement and the flat field is a legacy fallback whose only writer is
+    /// the migration below (findings C6, D6, C11).
+    fn write_key(&self, doc: &mut DocumentMut, key: KeyWrite) {
+        if key == KeyWrite::Keep {
+            // Silence about the key: the map and the flat field stay exactly as
+            // the file had them, present or absent.
+            return;
+        }
+        let file_flat = doc.get("api_key").and_then(Item::as_str).map(str::to_owned);
+        let file_host = doc
+            .get("base_url")
+            .and_then(Item::as_str)
+            .map(crate::config::host_of)
+            .unwrap_or_default();
+        let mut map = api_keys_table(doc);
+        let mut flat = file_flat.clone();
+        // A flat key the file still carries is legacy: the host it belongs to
+        // is the one the file's own `base_url` names, and that is the only hint
+        // there is — so move it under that host before this save states
+        // anything. No endpoint, or an entry the map already has, means no
+        // migration, and then the flat key is left exactly as it was: a key is
+        // never deleted on a guess.
+        if let Some(legacy) = file_flat.as_deref() {
+            let taken = map
+                .iter()
+                .any(|(stored, _)| stored.eq_ignore_ascii_case(file_host));
+            if !file_host.is_empty() && !taken {
+                map.insert(file_host, text(legacy));
+                flat = None;
+            }
+        }
+        // `None` says this host has none, by there being no entry: never by
+        // deleting another host's, whose key is still the key for that host.
+        if let Some(written) = self.api_key.as_deref() {
+            let host = crate::config::host_of(&self.base_url);
+            if host.is_empty() {
+                // No endpoint, no host to key on: the map has nowhere to put
+                // the key, so it is stated flat as the old file did — the only
+                // shape that can carry it, and one no host can claim.
+                flat = Some(written.to_owned());
+            } else {
+                map.insert(host, text(written));
+            }
+        }
+        if map.is_empty() {
+            doc.as_table_mut().remove("api_keys");
+        } else {
+            doc.insert("api_keys", Item::Table(map));
+        }
+        match flat {
+            Some(flat) => {
+                doc.insert("api_key", text(&flat));
+            }
+            None => {
+                doc.as_table_mut().remove("api_key");
+            }
+        }
+    }
+}
+
+/// Read one home config file in the format its name states: the JSON mush wrote
+/// before TOML, or TOML.
+fn parse(bytes: &[u8], path: &Path) -> Result<UserConfig, String> {
+    if is_legacy_json(path) {
+        return serde_json::from_slice(bytes).map_err(one_line);
+    }
+    let text = std::str::from_utf8(bytes).map_err(one_line)?;
+    let document = text.parse::<DocumentMut>().map_err(one_line)?;
+    toml_edit::de::from_document(document).map_err(one_line)
+}
+
+/// A parser's complaint as one line: a status line is one line, and a TOML
+/// error is a multi-line caret diagram that would otherwise land in a chat's
+/// footer.
+fn one_line(error: impl std::fmt::Display) -> String {
+    error
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Convert a legacy `config.json` into the TOML file this machine uses now, and
+/// say so.
+///
+/// This is a *format* change and not a statement about the key, so no
+/// [`KeyWrite`] road runs here: the values cross verbatim — a flat `api_key`
+/// stays flat, the `api_keys` map stays a map — and a key the old file held is
+/// never re-homed, moved or dropped on the way.
+///
+/// The old file is removed only after the file just written has been read back
+/// and agrees, because a key is never deleted on a hope: a write that fails, a
+/// read-back that disagrees, a removal that fails, or a JSON file that cannot be
+/// read at all leaves that file exactly where it was, leaves no half-migrated
+/// TOML behind, and says why (finding C12).
+fn migrate(legacy: &Path, target: &Path) -> Result<String, String> {
+    let bytes = fs::read(legacy).map_err(|error| unreadable(legacy, &error.to_string()))?;
+    // The values the TOML is compared against are what mush reads out of the
+    // old file: a file mush cannot make a config of is not one to convert.
+    let expected = parse(&bytes, legacy).map_err(|why| unreadable(legacy, &why))?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|error| unreadable(legacy, &error.to_string()))?;
+    let mut doc = DocumentMut::new();
+    if let Some(fields) = value.as_object() {
+        // The fields a file lists, in the order a save writes them, then
+        // whatever a newer mush put in the old file. Iterating the JSON map
+        // alone would list them alphabetically, which is not the order the
+        // human will see from the next save on.
+        let known = FIELDS
+            .iter()
+            .filter_map(|field| fields.get(*field).map(|value| (*field, value)));
+        let unknown = fields
+            .iter()
+            .filter(|(field, _)| !FIELDS.contains(&field.as_str()))
+            .map(|(field, value)| (field.as_str(), value));
+        for (field, value) in known.chain(unknown) {
+            // The header key was mush's own and nothing read it; TOML has no
+            // null, and a null is a field no reader stated.
+            if field == COMMENT_KEY || value.is_null() {
+                continue;
+            }
+            if let Some(item) = item_of(value) {
+                set_field(&mut doc, field, item);
+            }
+        }
+    }
+    let text = format!("{PREAMBLE}\n{doc}");
+    if let Err(error) = atomic_write(target, text.as_bytes(), Fresh::Private) {
+        return Err(format!(
+            "could not write {} — {error}; {} is still where it was",
+            target.display(),
+            legacy.display()
+        ));
+    }
+    // Read the file that was just written: the values have to be the ones the
+    // old file stated, or the migration is the thing that lost them.
+    let written = UserConfig::load_from(target);
+    let agrees = written.complaint.is_none()
+        && serde_json::to_value(&written.config).ok() == serde_json::to_value(&expected).ok();
+    if !agrees {
+        let _ = fs::remove_file(target);
+        return Err(format!(
+            "could not migrate {} to {} — it did not read back what was written; {} is still \
+             where it was, and is what this run reads",
+            legacy.display(),
+            target.display(),
+            legacy.display()
+        ));
+    }
+    if let Err(error) = fs::remove_file(legacy) {
+        // Two files holding the key is worse than one migration retried: the
+        // TOML goes, so the state is exactly what it was before this run.
+        let _ = fs::remove_file(target);
+        return Err(format!(
+            "could not remove {} after migrating it — {error}; it is still where it was",
+            legacy.display()
+        ));
+    }
+    Ok(format!(
+        "home config migrated to {} — the old {} is gone",
+        target.display(),
+        legacy.display()
+    ))
+}
+
+/// The one sentence a file mush could not read at all is said in.
+fn unreadable(legacy: &Path, why: &str) -> String {
+    format!(
+        "could not read {} — {why}; using defaults",
+        legacy.display()
+    )
+}
+
+/// A JSON scalar as the TOML value it is: a migration writes the old file's
+/// values verbatim, so nothing the human stated changes shape on the way.
+fn scalar_of(value: &Value) -> Option<toml_edit::Value> {
+    Some(match value {
+        Value::Null => return None,
+        Value::Bool(flag) => toml_edit::Value::from(*flag),
+        Value::Number(number) => match number.as_i64() {
+            Some(integer) => toml_edit::Value::from(integer),
+            None => toml_edit::Value::from(number.as_f64()?),
+        },
+        Value::String(text) => toml_edit::Value::from(text.as_str()),
+        Value::Array(_) | Value::Object(_) => return None,
+    })
+}
+
+/// A JSON value as the TOML item a migration writes. `None` for the shapes TOML
+/// cannot hold — a null, or a table inside an array — which no home config field
+/// is; a key that cannot cross is left to the read-back check to report.
+fn item_of(value: &Value) -> Option<Item> {
+    Some(match value {
+        Value::Object(fields) => {
+            let mut table = Table::new();
+            for (field, value) in fields {
+                table.insert(field, item_of(value)?);
+            }
+            Item::Table(table)
+        }
+        Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(scalar_of(item)?);
+            }
+            Item::Value(toml_edit::Value::Array(array))
+        }
+        scalar => Item::Value(scalar_of(scalar)?),
+    })
+}
+
+/// A string field as a TOML string.
+fn text(value: &str) -> Item {
+    toml_edit::value(value)
+}
+
+/// A token count as a TOML integer.
+fn count(value: usize) -> Item {
+    toml_edit::value(value as i64)
+}
+
+/// A temperature as the human would write it: `0.3`, not the widened
+/// `0.30000001192092896` a `f32` becomes once it is the `f64` TOML stores — and
+/// always a float, since an integer `0` would not read back into an `f32` field.
+fn decimal(value: f32) -> Item {
+    match format!("{value:?}").parse::<toml_edit::Value>() {
+        Ok(float) if float.is_float() => Item::Value(float),
+        _ => Item::Value(toml_edit::Value::from(f64::from(value))),
+    }
+}
+
+/// A map that holds only maps is a grouping, not a section of its own: marking
+/// it implicit writes `[providers.home.models.lfm2-vl]` rather than an empty
+/// `[providers.home.models]` header above it. `top` exempts the field's own
+/// table — its header is where the `#` line above the field goes.
+fn implicits(item: &mut Item, top: bool) {
+    let Item::Table(table) = item else {
+        return;
+    };
+    let mut only_tables = !top && !table.is_empty();
+    for (_, inner) in table.iter_mut() {
+        implicits(inner, false);
+        only_tables &= inner.is_table();
+    }
+    table.set_implicit(only_tables);
+}
+
+/// The file's `api_keys` table, cloned so the entries this save does not speak
+/// for survive it — every other host's key, verbatim. An inline table
+/// (`api_keys = { … }`) is read the same way.
+fn api_keys_table(doc: &DocumentMut) -> Table {
+    match doc.get("api_keys") {
+        Some(Item::Table(table)) => table.clone(),
+        Some(Item::Value(toml_edit::Value::InlineTable(inline))) => inline.clone().into_table(),
+        _ => Table::new(),
+    }
+}
+
+/// Drop the comment block at the top of the file: mush's [`PREAMBLE`] lives
+/// there, and a save writes a fresh one.
+///
+/// The block ends at the first blank line. That is what keeps a human's comment
+/// above a key — which sits below that blank line — from being mistaken for the
+/// header and rewritten; and it is why the header is separated from the keys at
+/// all (finding C12).
+fn strip_preamble(text: &str) -> &str {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return match end {
+                0 => text,
+                _ => &text[(end + line.len()).min(text.len())..],
+            };
+        }
+        if !trimmed.starts_with('#') {
+            // A key before any blank line is a file with no header of ours.
+            return text;
+        }
+        end += line.len();
+    }
+    text
+}
+
+/// The lines a human stacked above a key, minus the last one — which is the
+/// line mush keeps current.
+fn leading_lines(doc: &DocumentMut, field: &str) -> String {
+    let prefix = doc
+        .key(field)
+        .and_then(|key| key.leaf_decor().prefix())
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or("");
+    split_last_comment(prefix).0.to_string()
+}
+
+/// A key's leading prefix, split at its last comment line: that line is mush's
+/// (one `#` line per key, the header this file has instead of `_comment`), and
+/// everything above it is the human's own.
+fn split_last_comment(prefix: &str) -> (&str, Option<&str>) {
+    let mut at = 0;
+    let mut last = None;
+    for line in prefix.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') {
+            last = Some((at, at + line.len()));
+        }
+        at += line.len();
+    }
+    match last {
+        Some((start, stop)) => (&prefix[..start], Some(&prefix[start..stop])),
+        None => (prefix, None),
+    }
+}
+
+/// Mush's line above a section, keeping the blank line that separates it from
+/// the values above and whatever the human stacked above mush's own line — the
+/// same rule a value key's line follows, on the decor a section header reads.
+fn section_comment(table: &mut Table, help: &str) {
+    let prefix = table
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or("")
+        .to_string();
+    let above = match split_last_comment(&prefix).0 {
+        "" => "\n",
+        above => above,
+    }
+    .to_string();
+    table.decor_mut().set_prefix(format!("{above}# {help}\n"));
+}
+
+/// Write one field over whatever the file held, with mush's line above it.
+///
+/// The human's own lines above a key are kept — only the last one, the one
+/// directly above the key, is mush's to replace — because that is the promise
+/// the preamble makes about their comments.
+fn set_field(doc: &mut DocumentMut, field: &str, mut item: Item) {
+    implicits(&mut item, true);
+    let above = leading_lines(doc, field);
+    let help = field_help(field);
+    doc.insert(field, item);
+    if let Some(Item::Table(table)) = doc.get_mut(field) {
+        // A table is written as its own section, and the line above a section
+        // belongs to the table's decor — not to the key's, which is where a
+        // value's line lives.
+        if let Some(help) = help {
+            section_comment(table, &help);
+        }
+        return;
+    }
+    if let Some(help) = help {
+        if let Some(mut key) = doc.key_mut(field) {
+            key.leaf_decor_mut()
+                .set_prefix(format!("{above}# {help}\n"));
+        }
+    }
+}
+
+/// Put mush's line above a key the file holds and this save does not state: the
+/// header is mush's and is kept current, while the field's own value — and the
+/// human's lines above mush's — stay exactly as they were.
+fn set_comment(doc: &mut DocumentMut, field: &str) {
+    let Some(help) = field_help(field) else {
+        return;
+    };
+    let above = leading_lines(doc, field);
+    if let Some(Item::Table(table)) = doc.get_mut(field) {
+        section_comment(table, &help);
+        return;
+    }
+    if let Some(mut key) = doc.key_mut(field) {
+        key.leaf_decor_mut()
+            .set_prefix(format!("{above}# {help}\n"));
     }
 }
 
@@ -661,20 +1161,32 @@ mod tests {
         // leftover from an interrupted run must not merge into this one, and
         // this run's file must go when the test does.
         let dir = Scratch::new(&format!("userconfig-{name}"));
-        let path = dir.path().join("config.json");
+        let path = dir.path().join("config.toml");
         dir.hold(path)
     }
 
-    /// The header the written file carries, joined into one string, so a test
-    /// can assert on what a human opening the file would read.
+    /// The header the written file carries — every `#` line above the first
+    /// blank line — so a test can assert on what a human opening the file would
+    /// read first (finding C12).
     fn header_of(path: &Path) -> String {
         let written = fs::read_to_string(path).unwrap();
-        let value: Value = serde_json::from_str(&written).unwrap();
-        value[COMMENT_KEY]
-            .as_array()
-            .unwrap_or_else(|| panic!("no `{COMMENT_KEY}` header in {written}"))
-            .iter()
-            .map(|line| line.as_str().unwrap_or_default())
+        let header: Vec<&str> = written
+            .lines()
+            .take_while(|line| !line.trim().is_empty())
+            .collect();
+        assert!(
+            header.iter().all(|line| line.starts_with('#')),
+            "the header is a block of comments: {written}"
+        );
+        header.join("\n")
+    }
+
+    /// Every `#` line of the written file, header and per-key lines together.
+    fn comments_of(path: &Path) -> String {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.trim_start().starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -698,13 +1210,18 @@ mod tests {
         );
         assert_eq!(
             config_path_from(None, Some(PathBuf::from("/home/someone/.config"))),
-            Some(PathBuf::from("/home/someone/.config/mush/config.json")),
+            Some(PathBuf::from("/home/someone/.config/mush/config.toml")),
             "the platform config directory is the one road"
         );
         assert_eq!(
-            config_path_from(Some(OsString::from("beside-me.json")), None),
-            Some(PathBuf::from("beside-me.json")),
+            config_path_from(Some(OsString::from("beside-me.toml")), None),
+            Some(PathBuf::from("beside-me.toml")),
             "MUSH_CONFIG is the human's own road, taken as given"
+        );
+        assert_eq!(
+            config_path_from(Some(OsString::from("beside-me.json")), None),
+            Some(PathBuf::from("beside-me.toml")),
+            "a `.json` name is the legacy file: the TOML beside it is what mush writes"
         );
     }
 
@@ -753,42 +1270,38 @@ mod tests {
         assert_eq!(loaded.provider, "deepseek");
         assert_eq!(loaded.model, "deepseek-flash");
 
+        // The file is TOML with real comments now: the `_comment` key is gone,
+        // the preamble is a four-line block at the top, and each key the save
+        // states carries its own one-line explanation (finding C12).
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains(COMMENT_KEY), "{written}");
+        assert!(
+            !written.contains(COMMENT_KEY),
+            "the old `_comment` header key is gone: {written}"
+        );
         let header = header_of(&path);
         assert!(
             header.contains("CLI flags > MUSH_* environment"),
             "the precedence is in the file, not only in the docs: {header}"
         );
-        // Every field a hand-edit may set, named in the header itself.
-        for field in [
-            "api_key",
-            "api_keys",
-            "provider",
-            "base_url",
-            "model",
-            "context",
-            "temperature",
-            "max_completion_tokens",
-            "reasoning_effort",
-            "thinking",
-        ] {
-            assert!(header.contains(field), "`{field}` is documented: {header}");
+        assert!(
+            header.contains("MUSH_CONFIG") && header.contains("--print-config"),
+            "the preamble names the two commands a hand-editor needs: {header}"
+        );
+        let comments = comments_of(&path);
+        // Every field this save states is documented, on its own line — and the
+        // ones it does not state have no key to be documented above.
+        for field in ["provider", "base_url", "model", "api_keys"] {
+            assert!(
+                comments.contains(&format!("# {field}: ")),
+                "`{field}` is documented above its key: {comments}"
+            );
         }
         // The provider line is spelled from the table, so it offers every name
         // a `/provider` could select — never a stale one.
         for spec in crate::provider::PROVIDERS {
             assert!(
-                header.contains(spec.name),
-                "`{}` is offered in the file's own header: {header}",
-                spec.name
-            );
-            // The window a provider defaults to is in the file too: a human
-            // hand-editing `context` reads the number a request would use
-            // where nothing else stated one.
-            assert!(
-                header.contains(&spec.fallback_context_tokens.to_string()),
-                "`{}`'s default window is in the header: {header}",
+                comments.contains(spec.name),
+                "`{}` is offered in the file's own header: {comments}",
                 spec.name
             );
         }
@@ -876,7 +1389,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_defaults() {
-        let loaded = UserConfig::load_from(Path::new("/nonexistent/mush/config.json"));
+        let loaded = UserConfig::load_from(Path::new("/nonexistent/mush/config.toml"));
         assert!(
             loaded.complaint.is_none(),
             "a machine that never wrote one has nothing to complain about"
@@ -895,12 +1408,11 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-old",
-  "provider": "deepseek",
-  "base_url": "https://api.deepseek.com",
-  "model": "deepseek-flash"
-}"#,
+            r#"api_key = "sk-old"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+"#,
         )
         .unwrap();
 
@@ -964,10 +1476,13 @@ mod tests {
         // The file explains itself: the header names the map and says the one
         // thing a human editing it must not get wrong (no keys, and an
         // unannotated model is not assumed blind).
-        let header = header_of(&path);
-        assert!(header.contains("providers: "), "{header}");
-        assert!(header.contains("not assumed blind"), "{header}");
-        assert!(header.contains("api_keys` entry for its host"), "{header}");
+        let comments = comments_of(&path);
+        assert!(comments.contains("# providers: "), "{comments}");
+        assert!(comments.contains("not assumed blind"), "{comments}");
+        assert!(
+            comments.contains("api_keys` entry for its host"),
+            "{comments}"
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -1027,12 +1542,11 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "providers": {
-    "bare": {},
-    "home": { "models": { "lfm2-vl": { "vision": true } } }
-  }
-}"#,
+            r#"[providers.bare]
+
+[providers.home.models.lfm2-vl]
+vision = true
+"#,
         )
         .unwrap();
 
@@ -1058,27 +1572,36 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "_comment": ["written by a newer mush"],
-  "api_key": "sk-all",
-  "api_keys": {"old:9": "sk-map"},
-  "provider": "custom",
-  "base_url": "http://host:1",
-  "model": "m",
-  "context": 64000,
-  "temperature": 0.3,
-  "max_completion_tokens": true,
-  "reasoning_effort": "low",
-  "thinking": false,
-  "providers": {"home": {"base_url": "http://rubendpc:8078", "models": {"lfm2-vl": {"vision": true}}}},
-  "future_knob": {"a": 1}
-}"#,
+            r#"_comment = ["written by a newer mush"]
+api_key = "sk-all"
+provider = "custom"
+base_url = "http://host:1"
+model = "m"
+context = 64000
+temperature = 0.3
+max_completion_tokens = true
+reasoning_effort = "low"
+thinking = false
+future_knob = { a = 1 }
+
+[api_keys]
+"old:9" = "sk-map"
+
+[providers.home]
+base_url = "http://rubendpc:8078"
+
+[providers.home.models.lfm2-vl]
+vision = true
+"#,
         )
         .unwrap();
 
         let user = UserConfig::load_from(&path).config;
         assert_eq!(user.api_key.as_deref(), Some("sk-all"));
-        assert_eq!(user.api_keys.get("old:9").map(String::as_str), Some("sk-map"));
+        assert_eq!(
+            user.api_keys.get("old:9").map(String::as_str),
+            Some("sk-map")
+        );
         assert_eq!(user.provider, "custom");
         assert_eq!(user.base_url, "http://host:1");
         assert_eq!(user.model, "m");
@@ -1145,7 +1668,10 @@ mod tests {
         user.save_to(&path, KeyWrite::Stated).unwrap();
         let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(
-            reloaded.api_keys.get("api.deepseek.com").map(String::as_str),
+            reloaded
+                .api_keys
+                .get("api.deepseek.com")
+                .map(String::as_str),
             Some("sk-hosted")
         );
         assert_eq!(
@@ -1176,8 +1702,14 @@ mod tests {
         .unwrap();
 
         let reloaded = UserConfig::load_from(&path).config;
-        assert_eq!(reloaded.api_keys.get("a:1").map(String::as_str), Some("sk-a"));
-        assert_eq!(reloaded.api_keys.get("b:2").map(String::as_str), Some("sk-b"));
+        assert_eq!(
+            reloaded.api_keys.get("a:1").map(String::as_str),
+            Some("sk-a")
+        );
+        assert_eq!(
+            reloaded.api_keys.get("b:2").map(String::as_str),
+            Some("sk-b")
+        );
         assert_eq!(reloaded.api_key, None);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -1241,12 +1773,13 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-flat",
-  "api_keys": {"a:1": "sk-a"},
-  "base_url": "http://a:1",
-  "model": "old"
-}"#,
+            r#"api_key = "sk-flat"
+base_url = "http://a:1"
+model = "old"
+
+[api_keys]
+"a:1" = "sk-a"
+"#,
         )
         .unwrap();
 
@@ -1265,7 +1798,10 @@ mod tests {
 
         let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(reloaded.api_key.as_deref(), Some("sk-flat"));
-        assert_eq!(reloaded.api_keys.get("a:1").map(String::as_str), Some("sk-a"));
+        assert_eq!(
+            reloaded.api_keys.get("a:1").map(String::as_str),
+            Some("sk-a")
+        );
         assert_eq!(
             reloaded.api_keys.len(),
             1,
@@ -1335,12 +1871,11 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-old",
-  "provider": "deepseek",
-  "base_url": "https://api.deepseek.com",
-  "model": "deepseek-flash"
-}"#,
+            r#"api_key = "sk-old"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+"#,
         )
         .unwrap();
 
@@ -1360,7 +1895,10 @@ mod tests {
 
         let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(
-            reloaded.api_keys.get("api.deepseek.com").map(String::as_str),
+            reloaded
+                .api_keys
+                .get("api.deepseek.com")
+                .map(String::as_str),
             Some("sk-old"),
             "the flat key moved under its own host"
         );
@@ -1375,7 +1913,7 @@ mod tests {
     fn a_stated_key_with_no_endpoint_is_written_flat() {
         let path = temp_path("no-endpoint");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, r#"{"api_keys": {"a:1": "sk-a"}}"#).unwrap();
+        fs::write(&path, "[api_keys]\n\"a:1\" = \"sk-a\"\n").unwrap();
 
         UserConfig {
             api_key: Some("sk-homeless".into()),
@@ -1386,7 +1924,10 @@ mod tests {
 
         let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(reloaded.api_key.as_deref(), Some("sk-homeless"));
-        assert_eq!(reloaded.api_keys.get("a:1").map(String::as_str), Some("sk-a"));
+        assert_eq!(
+            reloaded.api_keys.get("a:1").map(String::as_str),
+            Some("sk-a")
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -1407,7 +1948,7 @@ mod tests {
         .unwrap();
         let written = fs::read_to_string(&keep).unwrap();
         assert!(
-            !written.contains("\"api_key\""),
+            !written.contains("api_key = "),
             "a Keep save writes no flat field: {written}"
         );
         assert_eq!(UserConfig::load_from(&keep).config.api_key, None);
@@ -1422,7 +1963,7 @@ mod tests {
         .unwrap();
         let written = fs::read_to_string(&stated).unwrap();
         assert!(
-            !written.contains("\"api_key\""),
+            !written.contains("api_key = "),
             "a Stated+None save writes no flat field: {written}"
         );
         assert_eq!(UserConfig::load_from(&stated).config.api_key, None);
@@ -1439,11 +1980,12 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-legacy",
-  "base_url": "http://a:1",
-  "api_keys": {"b:2": "sk-b"}
-}"#,
+            r#"api_key = "sk-legacy"
+base_url = "http://a:1"
+
+[api_keys]
+"b:2" = "sk-b"
+"#,
         )
         .unwrap();
 
@@ -1473,11 +2015,11 @@ mod tests {
         assert_eq!(reloaded.model, "m", "the fields the save owns still land");
         let written = fs::read_to_string(&path).unwrap();
         assert!(
-            written.contains("\"api_key\": \"sk-legacy\""),
+            written.contains("api_key = \"sk-legacy\""),
             "the legacy string is still what the field holds: {written}"
         );
         assert!(
-            !written.contains("\"api_key\": null"),
+            !written.contains("api_key = null"),
             "and no null stands in for it: {written}"
         );
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -1493,11 +2035,10 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-legacy",
-  "provider": "custom",
-  "base_url": "http://a:1/v1"
-}"#,
+            r#"api_key = "sk-legacy"
+provider = "custom"
+base_url = "http://a:1/v1"
+"#,
         )
         .unwrap();
 
@@ -1519,7 +2060,7 @@ mod tests {
         assert_eq!(reloaded.api_key, None, "and no flat key was left behind");
         let written = fs::read_to_string(&path).unwrap();
         assert!(
-            !written.contains("\"api_key\""),
+            !written.contains("api_key = "),
             "the flat field is gone, not null: {written}"
         );
 
@@ -1540,7 +2081,7 @@ mod tests {
     fn a_stated_none_save_with_no_endpoint_leaves_a_flat_key_alone() {
         let path = temp_path("no-host-migrate");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, r#"{"api_key": "sk-legacy"}"#).unwrap();
+        fs::write(&path, "api_key = \"sk-legacy\"\n").unwrap();
 
         UserConfig {
             model: "m".into(),
@@ -1569,11 +2110,12 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            r#"{
-  "api_key": "sk-flat",
-  "api_keys": {"a:1": "sk-map"},
-  "base_url": "http://a:1"
-}"#,
+            r#"api_key = "sk-flat"
+base_url = "http://a:1"
+
+[api_keys]
+"a:1" = "sk-map"
+"#,
         )
         .unwrap();
 
@@ -1602,7 +2144,7 @@ mod tests {
     fn a_stated_key_for_another_host_keeps_an_unplaceable_flat_key() {
         let path = temp_path("stated-other-host-keeps-flat");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, r#"{"api_key": "sk-legacy"}"#).unwrap();
+        fs::write(&path, "api_key = \"sk-legacy\"\n").unwrap();
 
         UserConfig {
             api_key: Some("sk-new".into()),
@@ -1623,6 +2165,285 @@ mod tests {
             Some("sk-legacy"),
             "and the flat key the migration could not place is still there"
         );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The file mush wrote before this change is JSON, and the first startup
+    /// with TOML in its place converts it: the values cross verbatim — the flat
+    /// `api_key` stays flat, a provider row keeps its annotations — the JSON is
+    /// removed once the TOML has been read back and agrees, and a second load
+    /// converts nothing (finding C12).
+    #[test]
+    fn a_legacy_config_json_migrates_on_the_first_load() {
+        let dir = Scratch::new("userconfig-migrate-json");
+        let json = dir.path().join("config.json");
+        let toml = dir.path().join("config.toml");
+        fs::write(
+            &json,
+            r#"{
+  "api_key": "sk-flat-0123456789",
+  "provider": "custom",
+  "base_url": "http://rubendpc:8078",
+  "model": "lfm2-vl",
+  "temperature": 0.2,
+  "providers": {
+    "home": {
+      "base_url": "http://rubendpc:8078",
+      "models": { "lfm2-vl": { "vision": true, "context": 32768 } }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let first = UserConfig::load_at(Some(toml.clone()));
+        assert!(first.complaint.is_none(), "{:?}", first.complaint);
+        let line = first.migrated.expect("the migration is said, not silent");
+        assert!(line.contains(&toml.display().to_string()), "{line}");
+        assert!(line.contains(&json.display().to_string()), "{line}");
+        assert!(line.contains("gone"), "{line}");
+        assert_eq!(
+            first.config.api_key.as_deref(),
+            Some("sk-flat-0123456789"),
+            "the format changed, not the key: it is not moved under a host"
+        );
+        assert_eq!(first.config.temperature, Some(0.2));
+        let facts = first
+            .config
+            .providers
+            .get("home")
+            .and_then(|row| row.models.get("lfm2-vl"))
+            .expect("the row and its annotation crossed");
+        assert_eq!(facts.vision, Some(true));
+        assert_eq!(facts.context, Some(32_768));
+
+        // The TOML is the file now: the old header key is gone, the preamble is
+        // mush's, and the file is private because it holds a key.
+        let written = fs::read_to_string(&toml).unwrap();
+        assert!(!written.contains(COMMENT_KEY), "{written}");
+        assert!(header_of(&toml).contains("MUSH_CONFIG"), "{written}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&toml).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the file holds a key: nobody else may read it");
+        }
+        assert!(
+            !json.exists(),
+            "the old file is gone, which is what the line says"
+        );
+
+        // A second load reads the TOML and converts nothing.
+        let second = UserConfig::load_at(Some(toml.clone()));
+        assert!(second.migrated.is_none(), "the migration runs once");
+        assert!(second.complaint.is_none(), "{:?}", second.complaint);
+        assert_eq!(second.config.api_key.as_deref(), Some("sk-flat-0123456789"));
+    }
+
+    /// A migration that cannot write leaves the JSON exactly where it was, says
+    /// why, and the run still reads the values out of it: a format change that
+    /// fails must not cost the human their settings, and must not leave a
+    /// half-migrated TOML behind either (finding C12).
+    #[cfg(unix)]
+    #[test]
+    fn a_migration_whose_write_fails_leaves_the_json_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("userconfig-migrate-fail");
+        let json = dir.path().join("config.json");
+        let toml = dir.path().join("config.toml");
+        let original = r#"{"api_key": "sk-flat-0123456789"}"#;
+        fs::write(&json, original).unwrap();
+        // Nowhere to write the TOML: the directory refuses the temporary file
+        // every atomic write starts with.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let loaded = UserConfig::load_at(Some(toml.clone()));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let complaint = loaded.complaint.expect("a failed migration is said");
+        assert!(
+            complaint.contains(&toml.display().to_string()),
+            "{complaint}"
+        );
+        assert!(
+            complaint.contains(&json.display().to_string()),
+            "{complaint}"
+        );
+        assert!(
+            !toml.exists(),
+            "a migration that failed leaves no file of its own behind"
+        );
+        assert_eq!(
+            fs::read_to_string(&json).unwrap(),
+            original,
+            "the old file is exactly where and what it was"
+        );
+        assert_eq!(
+            loaded.config.api_key.as_deref(),
+            Some("sk-flat-0123456789"),
+            "and the run reads it, because it is still the human's config"
+        );
+        assert!(loaded.migrated.is_none(), "nothing was migrated");
+    }
+
+    /// What the human wrote is theirs: a `#` comment of their own and a table
+    /// mush knows nothing about survive a save, and so does the value of a field
+    /// the save does not state. The file is edited in place, not regenerated
+    /// (finding C12).
+    #[test]
+    fn a_humans_comment_and_an_unknown_table_survive_a_save() {
+        let path = temp_path("human-comments");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"model = "m"
+
+# my own note, and it is about me
+# temperature: I typed this line myself
+temperature = 0.4
+
+# a table a newer mush will read
+[future_knob]
+a = 1
+"#,
+        )
+        .unwrap();
+
+        UserConfig {
+            model: "new".into(),
+            context: Some(64_000),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Keep)
+        .unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# my own note, and it is about me"),
+            "the human's line above mush's stays: {written}"
+        );
+        assert!(
+            written.contains("# a table a newer mush will read"),
+            "and so does the one above their own table: {written}"
+        );
+        assert!(
+            written.contains("[future_knob]") && written.contains("a = 1"),
+            "an unknown table is kept, not rewritten: {written}"
+        );
+        // The line directly above a key mush documents is mush's, and it is
+        // kept current — that is the header.
+        assert!(
+            !written.contains("# temperature: I typed this line myself"),
+            "{written}"
+        );
+        assert!(written.contains("# temperature: 0.0-2.0"), "{written}");
+        let reloaded = UserConfig::load_from(&path);
+        assert!(reloaded.complaint.is_none(), "{:?}", reloaded.complaint);
+        assert_eq!(
+            reloaded.config.temperature,
+            Some(0.4),
+            "a field the save does not state keeps the file's value"
+        );
+        assert_eq!(reloaded.config.model, "new", "and the stated one lands");
+        assert_eq!(reloaded.config.context, Some(64_000));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A host with a port is a legal TOML key only when it is quoted:
+    /// `rubendpc:8078` is not a bare key, and a map written unquoted would not
+    /// read back at all (finding C12).
+    #[test]
+    fn a_host_with_a_port_round_trips_as_a_quoted_key() {
+        let path = temp_path("ported-host");
+        let user = UserConfig {
+            api_key: Some("sk-ported".into()),
+            base_url: "http://rubendpc:8078".into(),
+            ..UserConfig::default()
+        };
+        user.save_to(&path, KeyWrite::Stated).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("\"rubendpc:8078\" = \"sk-ported\""),
+            "the key is quoted: {written}"
+        );
+        let reloaded = UserConfig::load_from(&path);
+        assert!(reloaded.complaint.is_none(), "{:?}", reloaded.complaint);
+        assert_eq!(
+            reloaded
+                .config
+                .api_keys
+                .get("rubendpc:8078")
+                .map(String::as_str),
+            Some("sk-ported")
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The header is short: four lines at the top, one line per key the file
+    /// carries, and the whole of it fits on a screen. The eleven paragraphs it
+    /// replaced were the manual in a file a human opens to change one number;
+    /// what a hand-editor needs in the file is the precedence, the two commands
+    /// that name another file or show the resolution, where the reasons went,
+    /// and the one rule `providers` must not get wrong (finding C12).
+    #[test]
+    fn the_header_is_short_and_names_the_commands() {
+        let path = temp_path("short-header");
+        UserConfig {
+            provider: "custom".into(),
+            base_url: "http://a:1".into(),
+            api_key: Some("sk-short".into()),
+            context: Some(32_768),
+            temperature: Some(0.2),
+            max_completion_tokens: Some(true),
+            reasoning_effort: Some("low".into()),
+            thinking: Some(false),
+            providers: BTreeMap::from([("home".to_string(), home_row())]),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = written
+            .lines()
+            .filter(|line| line.trim_start().starts_with('#'))
+            .collect();
+        // The preamble and one line per documented key: fourteen of fifteen
+        // possible today, and the bound says a field may not grow a paragraph.
+        assert!(
+            lines.len() <= 16,
+            "the header is not a document — {} comment lines: {written}",
+            lines.len()
+        );
+        let size: usize = lines.iter().map(|line| line.len()).sum();
+        assert!(
+            size < 2_600,
+            "the header fits on a screen — {size} bytes of comment: {written}"
+        );
+        let header = lines.join("\n");
+        assert!(header.contains("MUSH_CONFIG"), "{header}");
+        assert!(header.contains("--print-config"), "{header}");
+        assert!(
+            header.contains("docs/mush.md"),
+            "the file says where the reasons are: {header}"
+        );
+        assert!(
+            header.contains("No keys in this table"),
+            "the one rule a `providers` editor must not get wrong: {header}"
+        );
+        // Both the names and the windows are spelled from the provider table,
+        // so the file cannot offer a name or a number a request would not use.
+        for spec in crate::provider::PROVIDERS {
+            assert!(
+                header.contains(spec.name),
+                "`{}` is offered in the file's own header: {header}",
+                spec.name
+            );
+            assert!(
+                header.contains(&spec.fallback_context_tokens.to_string()),
+                "`{}`'s default window is in the header: {header}",
+                spec.name
+            );
+        }
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

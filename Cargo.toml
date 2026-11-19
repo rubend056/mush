@@ -25,6 +25,10 @@ unicode-truncate = "1.1"
 # build against +1.5 MB and +16.5 s, at the cost of the two syntax differences
 # the schema states (no `\p{…}`, ASCII `\w`/`\b`).
 regex-lite = "0.1"
+# The home config's format, and the reason it is this crate and not `toml`: a
+# save merges over the human's own file, so it must keep the comments, the
+# formatting and the keys a save does not state (`userconfig.rs`, finding C12).
+toml_edit = { version = "0.22", features = ["serde"] }
 
 # mush is a terminal application that talks to the network and shells out. It
 # has never needed `unsafe`, and it should stay that way.

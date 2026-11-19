@@ -11787,3 +11787,115 @@ learned-capability store (a 400 that mentions images would be a guess about
 into the built-in rows. The `/url` ack's endpoint spelling (PK6) and the
 session/file ownership question behind PK4 are the audit's remaining items, not
 this one.
+
+## 8.117 The home config is TOML with real comments, and the old JSON converts once (C12, `crates/mush-core/src/userconfig.rs`, `crates/mush/src/main.rs`)
+
+**What was wrong.** JSON has no comments, so the home config documented itself
+with an `_comment` array of eleven long paragraphs — the manual, in a file a
+human opens to change one number. Nothing read that key back (`COMMENT_KEY` was
+written and never loaded), so it was dead weight in every file, and unreadable
+where a human would want it: eleven array elements, each one line of prose in a
+place a diff shows as a wall. And a JSON document carries nothing but keys and
+values: a human's own note about a value had nowhere to live, so the file could
+not be annotated by the one person it is for.
+
+**What it is now.** The file is TOML, read and written through `toml_edit`
+(`UserConfig::load_from`, `UserConfig::save_to`), because a save is a *merge*
+over the human's own text rather than a re-serialization of mush's values: the
+`#` comments they wrote, their formatting, and any key or table mush does not
+know survive a save, which is what the format-preserving parser is for. What
+mush writes is a header, short on purpose: `PREAMBLE`, four lines — the format
+and that every field is optional, the precedence, `MUSH_CONFIG` and
+`mush --print-config`, and the promise that unknown keys and the human's own
+comments are kept, with the reasons themselves in `docs/mush.md` — and then
+`field_help`'s single `#` line directly above each key in `FIELDS`.
+`the_header_is_short_and_names_the_commands` bounds it: fourteen of a possible
+fifteen comment lines today (the preamble plus one per documented key, less the
+absent flat `api_key`), and a field may not grow a paragraph again. Which
+comments are mush's is stated rather than assumed: the comment block at the very
+top of the file, up to its first blank line (`strip_preamble`), is the preamble
+and is rewritten; the one line directly above a documented key is mush's and is
+kept current (`set_comment`, over `split_last_comment`), while the lines a human
+stacks above that one survive; a comment above an unknown key always survives,
+because the merge only touches the keys it states. `_comment` no longer exists:
+`save_to` removes it from a document that still carries one, and `migrate` never
+writes it.
+
+The path moved with the format and the legacy name keeps resolving. The file is
+`$MUSH_CONFIG`, else the platform config directory + `mush/config.toml`
+(`~/.config/mush/config.toml` on Linux); `config_path_from` takes an explicit
+override, else the config dir, and `toml_path` turns a `.json` name into its
+`.toml` sibling, so `MUSH_CONFIG=…/my.json` keeps naming that machine's config
+after the migration instead of naming the file the migration removed. With
+`HOME` unset and no `MUSH_CONFIG` there is still no home config, and the refusal
+still says so by name (`a_machine_with_no_home_has_no_home_config_path`).
+
+Migration is one road, once, at startup, in `UserConfig::load_at`: when the TOML
+file mush would use does not exist and a legacy `config.json` is beside it (or is
+the `.json` path `MUSH_CONFIG` named, which resolves to that sibling), `migrate`
+reads the JSON, writes the equivalent TOML with
+`atomic_write(…, Fresh::Private)` (mode `0600`, because the file holds the key),
+and carries the values *verbatim* — a flat `api_key` stays flat, the `api_keys`
+map stays a map, because this is a format change and not a statement about the
+key — and then reads the new file back and compares the config it parses against
+the one the old file stated. Only then does it delete the JSON, and it says
+exactly one line: `home config migrated to <toml> — the old <json> is gone`.
+`Loaded` grew `migrated: Option<String>` for it; `main` says the line on the
+status bar before the first frame and pushes it into `resolved.notices`, where
+`mush --print-config` prints it as a `notice` row. A failure is stated and
+reversible: a write that fails, a read-back that disagrees, or a removal that
+fails leaves the JSON exactly where it was, leaves no half-migrated TOML behind
+(the two failure branches that wrote one remove it), and says why — and the run
+then reads the JSON, a JSON that cannot be read at all being that file's own
+complaint rather than a second sentence about a migration nobody asked for.
+`save_to` writes no nulls, since TOML has none: a flat key is inserted only when
+there is one to insert, and every field the value leaves unstated keeps the
+value the file already had.
+
+**The tests.** In `crates/mush-core/src/userconfig.rs`:
+`roundtrips_via_explicit_path`,
+`a_named_provider_row_round_trips_through_the_file`,
+`the_header_is_short_and_names_the_commands`,
+`a_legacy_config_json_migrates_on_the_first_load` (the line is said, the values
+cross, and the second load migrates nothing),
+`a_migration_whose_write_fails_leaves_the_json_in_place`,
+`a_humans_comment_and_an_unknown_table_survive_a_save`,
+`a_host_with_a_port_round_trips_as_a_quoted_key`,
+`a_machine_with_no_home_has_no_home_config_path`,
+`an_unreadable_home_config_is_said_and_kept`,
+`a_second_unparsable_config_does_not_overwrite_the_first`,
+`a_save_never_writes_a_null_flat_key`,
+`the_old_flat_file_migrates_under_its_host_on_the_next_stated_save`,
+`a_stated_none_save_migrates_a_legacy_flat_key_under_the_files_own_host`,
+`a_keep_save_leaves_the_whole_key_structure_untouched`, and
+`every_field_loads_and_unknown_keys_are_kept`. In
+`crates/mush-core/src/config.rs`, `a_migrated_flat_key_is_adopted_for_the_files_own_host`
+(the migrated entry is the one the file's endpoint adopts). In
+`crates/mush/src/app/mod.rs`,
+`a_key_on_each_of_two_hosts_survives_the_switch_between_them`,
+`an_unrelated_command_does_not_move_an_environment_key_into_the_home_config`,
+`an_unrelated_command_writes_no_flat_key_into_the_file`, and
+`a_save_that_failed_is_not_replaced_by_an_ack_that_says_saved`.
+
+**Judgement call, recorded.** Three, and they are the shape of the change rather
+than details of it. (i) A `.json` name in `MUSH_CONFIG` resolves to the `.toml`
+sibling rather than being read as JSON for ever: the human's path keeps working
+after the migration instead of naming a file the migration removed, and the one
+line the migration says names both paths, so nothing is silent about the move.
+(ii) The comment block at the very top of the file, up to its first blank line,
+is mush's preamble and is rewritten, while everything below that line is the
+human's: without the boundary a save would carry the old header along under the
+new one and leave a stale precedence line in the file for ever. The one `#` line
+directly above a documented key is the same trade at the key's scale — mush
+keeps it current, the lines a human stacks above it are untouched. (iii)
+`mush --print-config` performs the migration at its one read and reports it as a
+`notice` row, rather than refusing to convert because the run is not a window:
+it is the same read, and a human who looks at their config should not have to
+start the TUI to learn where the file went.
+
+**Not built, on purpose.** No knobs were added to the file or taken away: this is
+the format and the header, and every field means what it meant. No re-homing of
+a legacy flat key during the migration — the flat key crosses verbatim, and
+moving it under its host stays the save's `Stated`/`Keep` road, untouched
+(findings C6, D6, C11; §8.115). And no migration of any other file: the
+workspace's `session.json`, and everything else under `.mush/`, are as they were.

@@ -35,6 +35,11 @@ import json
 import os
 import sys
 
+try:  # `tomllib` is 3.11's; the file it reads is TOML (`userconfig::config_path`).
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - an older interpreter
+    tomllib = None
+
 # `Config::history_budget` is `(context_tokens - reserve) * 3` bytes
 # (crates/mush-core/src/config.rs) with
 # `reserve = min(SCHEMA_TOKENS + reply_cap + MARGIN_TOKENS, context/2)` and
@@ -84,19 +89,25 @@ def window_from_environment():
 
 
 def config_path():
-    """`mush_core::userconfig::config_path`, mirrored."""
+    """`mush_core::userconfig::config_path`, mirrored: the file is TOML, and a
+    `MUSH_CONFIG` name ending in `.json` is the legacy file whose `.toml`
+    sibling is the one mush reads and writes."""
     override = os.environ.get("MUSH_CONFIG")
     if override:
+        if override.lower().endswith(".json"):
+            return override[: -len(".json")] + ".toml"
         return override
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(xdg, "mush", "config.json")
+    return os.path.join(xdg, "mush", "config.toml")
 
 
 def window_from_home_config():
     """The window the human's own config states, if any."""
+    if tomllib is None:
+        return None
     try:
-        with open(config_path()) as f:
-            stated = json.load(f).get("context")
+        with open(config_path(), "rb") as f:
+            stated = tomllib.load(f).get("context")
     except (OSError, ValueError):
         return None
     return stated if isinstance(stated, int) and stated > 0 else None
