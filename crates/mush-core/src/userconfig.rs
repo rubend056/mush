@@ -961,6 +961,13 @@ mod tests {
         let loaded = UserConfig::load_from(&path);
         assert!(loaded.complaint.is_none(), "{:?}", loaded.complaint);
         assert_eq!(loaded.config.providers, user.providers);
+        // The file explains itself: the header names the map and says the one
+        // thing a human editing it must not get wrong (no keys, and an
+        // unannotated model is not assumed blind).
+        let header = header_of(&path);
+        assert!(header.contains("providers: "), "{header}");
+        assert!(header.contains("not assumed blind"), "{header}");
+        assert!(header.contains("api_keys` entry for its host"), "{header}");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
