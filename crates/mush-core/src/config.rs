@@ -1995,6 +1995,52 @@ mod tests {
         assert_eq!(config.model, "lfm2-vl", "a model the file names is not a URL's to clear");
     }
 
+    /// The environment's provider is checked against the same resolved table,
+    /// so a name the home config defines is reachable from `MUSH_PROVIDER` —
+    /// the base config is built before the file is read, which is why the check
+    /// lives in the resolution and not in the constructor that reads the
+    /// variable. A typo there is still reported in the variable's own voice.
+    #[test]
+    fn the_environment_can_name_a_row_the_file_defines() {
+        let home = UserConfig {
+            providers: named_row(),
+            ..UserConfig::default()
+        };
+        let env = Overrides {
+            provider: Some("home".into()),
+            ..Overrides::default()
+        };
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &env,
+            &home,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.provider.name, "home", "the variable names the row");
+        assert_eq!(config.base_url, "http://rubendpc:8078");
+
+        let error = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &Overrides {
+                provider: Some("claude".into()),
+                ..Overrides::default()
+            },
+            &home,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("MUSH_PROVIDER:"), "{error}");
+        assert!(error.contains("claude"), "{error}");
+        assert!(
+            error.contains("home"),
+            "the names that exist include the file's: {error}"
+        );
+    }
+
     /// A row is a name the *file* defines, so a workspace that saved a pick of
     /// it must survive the row going away: the session names a provider the
     /// table no longer holds, which is a notice and the stored endpoint kept —

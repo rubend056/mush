@@ -11680,7 +11680,7 @@ start would hand it to the new host — the very invariant (D6) this change exis
 to keep. Not built, on purpose: a `/key` flag to list or clear another host's
 keys.
 
-## 8.116 The table is data, and a model it names nowhere is unknown — not blind (PK3, PK4, PK7; `crates/mush-core/src/provider.rs`, `crates/mush-core/src/config.rs`)
+## 8.116 The table is data, and a model it names nowhere is unknown — not blind (PK3, PK4, PK5, PK7; `crates/mush-core/src/provider.rs`, `config.rs`, `crates/mush/src/app/mod.rs`)
 
 **What was wrong.** The provider table was a compiled-in constant: two rows, a
 two-variant enum, `&'static` data. A human with a home box serving a model mush
@@ -11719,6 +11719,15 @@ on, while being wrong about one that cannot costs a turn and one file line.
 in the home config's providers if the endpoint refuses them`), and
 `no — no model yet` is still the empty-model line.
 
+The surfaces followed the table: `/provider` and its picker list every resolved
+row, each labelled with the endpoint selecting it switches to (or `keeps the
+endpoint`), the cursor opens on the row in force, `/provider <name>` selects a row
+the file defines, and the ack names what moved — the row, the endpoint it applied
+(or kept) and the model — instead of the bare name PK5 caught. A row whose
+`base_url` a request line could be written from is checked before the switch
+(`checked_url`, finding D19), and a name no row carries is refused listing the
+names that exist, the file's included.
+
 **The tests.** In `provider.rs`,
 `vision_is_a_row_fact_and_a_model_nothing_names_states_nothing` pins
 `Some(true)`/`Some(false)` from a built-in row and `None` for an id nothing names
@@ -11747,20 +11756,34 @@ sentence, and attaches for an id nothing annotates;
 `a_model_switched_after_the_attach_is_refused_at_the_wire` now name a stated
 blind model instead of relying on an unnamed one; and `main.rs`'s
 `the_dump_answers_the_image_gate` pins all three answers, the unknown one
-included.
+included. At `/provider`, `the_provider_picker_lists_the_built_in_rows_and_the_files_rows`
+pins the list and its labels, `provider_home_switches_the_endpoint_and_the_model_and_says_so`
+the switch and the ack (endpoint, model, window),
+`a_row_that_keeps_the_endpoint_leaves_it_and_its_key_alone` a row that states no
+`base_url`, and `a_provider_name_the_file_does_not_define_is_refused_naming_the_names_that_exist`
+the refusal. The table itself: `a_named_provider_row_applies_its_endpoint_model_and_knobs`,
+`the_command_line_beats_a_named_provider_rows_fields` and
+`a_session_naming_a_provider_the_file_lost_is_a_notice_and_keeps_its_endpoint`
+in `config.rs`; `a_config_row_adds_a_name_after_the_built_ins`,
+`a_config_row_that_shadows_a_built_in_is_refused_naming_the_file` and
+`a_named_provider_row_round_trips_through_the_file` in `provider.rs`/`userconfig.rs`
+for the file half (`--print-config`'s row: `the_printed_config_names_the_provider_row_it_resolved`
+in `main.rs`).
 
 **What the docs say now.** `README.md` and `docs/mush.md` §3/§5 describe the
 `providers` map and its `models` annotation set, what selecting a row applies, and
 the change itself — unknown models' pictures travel, `vision: false` restores the
-refusal. The home config's own header says both, and its `providers` line also
-stopped claiming `/provider` selects a row: at runtime `/provider` still lists
-and parses the built-in rows, and a row the file names is reached by the file's
-`provider` field, `--provider` or `MUSH_PROVIDER`.
+refusal. `/provider` and its picker list every row of the resolved table — the
+built-ins and the file's, each labelled with the endpoint selecting it reaches or
+`keeps the endpoint` — and `/provider home` selects one by name; `/help`'s
+one-line synopsis still names the built-ins, because the help table is spelled
+before any file is read (a `help_notice` has no catalog). The home config's own
+header says both.
 
 **Not built, on purpose.** No probe of an endpoint's own capabilities (a first
 request with a picture would spend the turn this change exists to protect), no
 learned-capability store (a 400 that mentions images would be a guess about
-*why*, and mush has one place a human's statement lives), and no rewiring of
-`/provider`'s picker or `/help`'s name list onto the catalog — those are the
-surface half of the same audit (PK3's `switch_provider` bundle) and this change
-is the capability half.
+*why*, and mush has one place a human's statement lives), and no fold of `custom`
+into the built-in rows. The `/url` ack's endpoint spelling (PK6) and the
+session/file ownership question behind PK4 are the audit's remaining items, not
+this one.

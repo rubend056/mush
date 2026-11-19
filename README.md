@@ -93,10 +93,11 @@ reads `/v1/models` and picks the first.
 
 Everything can be changed at runtime from the chat — no restart:
 
-- `/provider` — pick **deepseek** (hosted API, https) or **custom** (any
-  OpenAI-compatible endpoint) from a menu. A row the home config names is
-  selected by name instead: `--provider home` (or `MUSH_PROVIDER=home`, or the
-  file's own `provider` field).
+- `/provider` — pick a provider from a menu — **deepseek** (hosted API, https),
+  **custom** (any OpenAI-compatible endpoint), or a row your home config names,
+  each row labelled with the endpoint selecting it reaches (`/provider home`
+  takes the name directly, and `--provider home` / `MUSH_PROVIDER=home` do the
+  same before the first frame).
 - `/model` — pick a model (or press `Ctrl-P`). The list comes from the
   endpoint's `/v1/models`; when that's unreachable, the known models for the
   provider are offered (`deepseek-flash`, `deepseek-v4-pro`).
@@ -151,11 +152,11 @@ never heard of:
 }
 ```
 
-Selecting a row — `"provider": "home"` in this file, `--provider home`,
-`MUSH_PROVIDER=home`, or a workspace's saved session — applies what the row
-states: its endpoint, the model it names, its temperature, thinking mode,
-`reasoning_effort` and the window its models are budgeted against. A row may not
-take a built-in's name, and no key lives here: a provider's key is the
+Selecting a row — `/provider home`, `"provider": "home"` in this file,
+`--provider home`, `MUSH_PROVIDER=home`, or a workspace's saved session — applies
+what the row states: its endpoint, the model it names, its temperature, thinking
+mode, `reasoning_effort` and the window its models are budgeted against. A row
+may not take a built-in's name, and no key lives here: a provider's key is the
 `api_keys` entry for its host.
 
 The `models` map is an **annotation set, not a claim to be exhaustive**. It is

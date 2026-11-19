@@ -34,14 +34,16 @@ pub struct ModelSpec {
     pub id: &'static str,
     pub context_tokens: usize,
     /// Whether this model's endpoint documents that it accepts image content
-    /// parts. Off for everything the table does not state — including every
-    /// model mush has never heard of — because a guess of "on" is not free:
-    /// an endpoint that has never documented vision may reject the bytes, and a
-    /// rejected request costs a whole turn (the actor hands the endpoint's
-    /// complaint back and the run stops there). A model nobody has written a
-    /// row for can still be asked, by text alone; if a human ever needs to
-    /// override this the way they override a window, that switch belongs
-    /// beside the other per-model facts, not as a default.
+    /// parts. A built-in row documents the fact either way, which is why the
+    /// answer here is a `bool` and not the three answers a resolved row gives
+    /// ([`ProviderRow::vision`]): a model a row documents without vision is
+    /// *known blind*, and a model no row names at all is not in this table —
+    /// the home config's `providers` can annotate it, and until something does
+    /// it is *unknown* rather than assumed blind (findings PK3, PK4, PK7). The
+    /// guess direction matters: withholding a picture a seeing endpoint would
+    /// have read costs the answer the human asked for and says nothing they
+    /// can act on, while sending one to a blind endpoint costs a turn and the
+    /// endpoint's own error is visible.
     pub vision: bool,
 }
 

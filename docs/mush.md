@@ -1056,10 +1056,13 @@ can select. A row the file names is selected the way a built-in is — the file'
 own `provider` field, `--provider <name>`, `MUSH_PROVIDER=<name>`, or a
 workspace's session — and it applies what it states: its `base_url`, the model it
 names, its `thinking`, `reasoning_effort`, `temperature` and the window its
-models are budgeted against. `/provider`'s picker and `/help` still list the
-built-in names; the file's own row is named with the flag, the variable or the
-file. A row may not take a built-in name over (a startup refusal naming the
-file), and a name no row carries is refused by name.
+models are budgeted against. `/provider` and its picker list every row — the
+built-ins and the file's, each labelled with the endpoint selecting it reaches
+(`keeps the endpoint` for `custom` and a row with no `base_url`) — and
+`/provider home` selects one by name; `/help`'s one-line synopsis still names
+the built-ins, because the help table is written before any file is read. A row
+may not take a built-in name over (a startup refusal naming the file), and a
+name no row carries is refused by name, listing the ones that exist.
 
 What the audit that shaped this section found, and the defects each rule fixed:
 `docs/findings.md`.
@@ -1125,9 +1128,10 @@ is a row under `providers`, keyed by the name you want to type:
 }
 ```
 
-Every field is optional, and selecting the row — its `provider` name in this
-file, `--provider home`, `MUSH_PROVIDER=home`, or a workspace's session — applies
-whatever it states: `base_url` (an endpoint selecting it switches to), `model`,
+Every field is optional, and selecting the row — `/provider home`, its
+`provider` name in this file, `--provider home`, `MUSH_PROVIDER=home`, or a
+workspace's session — applies whatever it states: `base_url` (an endpoint
+selecting it switches to), `model`,
 `thinking`, `reasoning_effort`, `temperature`, and `context` (the row's general
 window). A row may not take a built-in name over: two rows called `deepseek`
 would make the endpoint a request reaches depend on which arm of the merge ran
